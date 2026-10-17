@@ -188,21 +188,30 @@ describe('Scene Settings & Juices', () => {
     expect(slider2?.closest('.np-slider')).toBeTruthy();
     expect(slider3?.closest('.np-slider')).toBeTruthy();
 
-    // Check Management heading and 7:5:3 1-row layout with M3 Button components
+    // Check Management heading and buttons (Issue #57: Move members L button & Square L action buttons)
     expect(target.querySelector('[data-testid="heading-management"]')).toBeTruthy();
-    const col7 = target.querySelector<HTMLElement>('[data-testid="mgmt-col-7"]');
-    const col5 = target.querySelector<HTMLElement>('[data-testid="mgmt-col-5"]');
-    const col3 = target.querySelector<HTMLElement>('[data-testid="mgmt-col-3"]');
-    expect(col7?.style.flex).toContain('7');
-    expect(col5?.style.flex).toContain('5');
-    expect(col3?.style.flex).toContain('3');
+    const colCreate = target.querySelector<HTMLElement>('[data-testid="action-col-create"]');
+    const colDeleteLogs = target.querySelector<HTMLElement>('[data-testid="action-col-delete-logs"]');
+    const colDeleteScene = target.querySelector<HTMLElement>('[data-testid="action-col-delete-scene"]');
+    expect(colCreate?.style.flex).toContain('5');
+    expect(colDeleteLogs?.style.flex).toContain('3.2');
+    expect(colDeleteScene?.style.flex).toContain('2.2');
 
     const moveBtn = target.querySelector('[data-testid="open-move-members-btn"]');
     const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-create-scene-btn"]');
+    const deleteLogsBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-logs-btn"]');
     const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-scene-btn"]');
     expect(moveBtn?.classList.contains('np-button')).toBe(true);
+    expect(moveBtn?.classList.contains('l')).toBe(true);
     expect(createBtn?.classList.contains('np-button')).toBe(true);
+    expect(createBtn?.classList.contains('l')).toBe(true);
+    expect(createBtn?.classList.contains('square')).toBe(true);
+    expect(deleteLogsBtn?.classList.contains('np-button')).toBe(true);
+    expect(deleteLogsBtn?.classList.contains('l')).toBe(true);
+    expect(deleteLogsBtn?.classList.contains('square')).toBe(true);
     expect(deleteBtn?.classList.contains('np-button')).toBe(true);
+    expect(deleteBtn?.classList.contains('l')).toBe(true);
+    expect(deleteBtn?.classList.contains('square')).toBe(true);
     expect(deleteBtn?.classList.contains('delete-scene-tonal-btn')).toBe(true);
 
     // Open "シーンを新規作成" overlay and verify M3 Switch (.np-switch) is used for "Juicesを継承"

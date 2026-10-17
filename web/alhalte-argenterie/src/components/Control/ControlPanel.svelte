@@ -46,6 +46,8 @@
     onExportZip,
     onCollapse,
     onRequestDeleteScene,
+    onRequestDeleteSceneLogs,
+    onDeleteSceneLogs,
     onRequestDeleteCharacter,
     onRequestAssetPicker,
   }: {
@@ -75,6 +77,8 @@
     onExportZip?: () => void;
     onCollapse?: () => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
+    onRequestDeleteSceneLogs?: (scene: { id: string; name: string }) => void;
+    onDeleteSceneLogs?: (sceneId: string) => void;
     onRequestDeleteCharacter?: (char: { id: string; name: string }) => void;
     onRequestAssetPicker?: (options: {
       mediaType: AssetMediaType;
@@ -159,6 +163,8 @@
         {onDeleteScene}
         {onMoveMember}
         {onRequestDeleteScene}
+        {onRequestDeleteSceneLogs}
+        {onDeleteSceneLogs}
         {onRequestAssetPicker}
       />
     {:else if activeTab === 'characters'}
