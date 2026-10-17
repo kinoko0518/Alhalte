@@ -56,8 +56,9 @@ pub use args::{
     generate_maitre_d_args, generate_module_args,
 };
 pub use config::{
-    BanquetteConfig, BistrotConfig, CellarConfig, DEFAULT_CHUNK_SIZE_EXPONENT, DEFAULT_DATA_DIR,
-    DEFAULT_DOMAIN, DEFAULT_HOST, DEFAULT_SOCKET_DIR, MaitreDConfig, RestaurantConfig,
+    ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, DEFAULT_ARGENTERIE_PORT,
+    DEFAULT_CHUNK_SIZE_EXPONENT, DEFAULT_DATA_DIR, DEFAULT_DOMAIN, DEFAULT_HOST,
+    DEFAULT_SOCKET_DIR, MaitreDConfig, RestaurantConfig,
 };
 pub use error::{BistrotError, Result};
 pub use rops::{
@@ -65,6 +66,7 @@ pub use rops::{
     load_from_path, load_from_path_with_key, parse_bistrot_toml, parse_bistrot_toml_with_key,
 };
 pub use systemd::{
-    DEFAULT_SYSTEMD_BIN_DIR, SystemdOptions, SystemdUnits, generate_bistrot_target,
-    generate_cellar_service, generate_maitre_d_service, generate_systemd_units,
+    DEFAULT_SYSTEMD_BIN_DIR, SystemdOptions, SystemdUnits, generate_argenterie_service,
+    generate_bistrot_target, generate_cellar_service, generate_maitre_d_service,
+    generate_systemd_units,
 };

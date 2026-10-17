@@ -7,15 +7,15 @@ use alhalte_bistrot::args::{
     generate_module_args,
 };
 use alhalte_bistrot::config::{
-    BanquetteConfig, BistrotConfig, CellarConfig, MaitreDConfig, RestaurantConfig,
+    ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, MaitreDConfig, RestaurantConfig,
 };
 use alhalte_bistrot::rops::{
     decrypt_rops_toml_with_key, encrypt_bistrot_toml, is_rops_encrypted, load_from_path,
     load_from_path_with_key, parse_bistrot_toml, parse_bistrot_toml_with_key,
 };
 use alhalte_bistrot::systemd::{
-    SystemdOptions, generate_bistrot_target, generate_cellar_service, generate_maitre_d_service,
-    generate_systemd_units,
+    SystemdOptions, generate_argenterie_service, generate_bistrot_target, generate_cellar_service,
+    generate_maitre_d_service, generate_systemd_units,
 };
 use std::path::PathBuf;
 
@@ -305,6 +305,7 @@ fn test_generate_maitre_d_args() {
             anti_oracle: false,
         },
         banquette: BanquetteConfig::default(),
+        argenterie: ArgenterieConfig::default(),
     };
 
     let args = generate_maitre_d_args(&config);
@@ -349,6 +350,7 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             anti_oracle: false,
         },
         banquette: BanquetteConfig::default(),
+        argenterie: ArgenterieConfig::default(),
     };
 
     let args_without = generate_cellar_args(&config);
@@ -414,6 +416,7 @@ fn test_generate_banquette_args() {
             chunk_size_exponent: 8,
             socket_dir: None,
         },
+        argenterie: ArgenterieConfig::default(),
     };
 
     let args = generate_banquette_args(&config);
@@ -448,6 +451,7 @@ fn test_generate_all_args_and_module_args() {
             anti_oracle: false,
         },
         banquette: BanquetteConfig::default(),
+        argenterie: ArgenterieConfig::default(),
     };
 
     let all = generate_all_args(&config);
@@ -496,6 +500,7 @@ fn test_systemd_generator() {
             anti_oracle: true,
         },
         banquette: BanquetteConfig::default(),
+        argenterie: ArgenterieConfig::default(),
     };
 
     let options = SystemdOptions {
@@ -505,6 +510,7 @@ fn test_systemd_generator() {
         group: Some("alhalte".to_string()),
         restart: "always".to_string(),
         restart_sec: "10s".to_string(),
+        ..Default::default()
     };
 
     // Maitre-d service unit
@@ -534,10 +540,23 @@ fn test_systemd_generator() {
     assert!(cellar_service.contains("User=alhalte"));
     assert!(cellar_service.contains("WantedBy=alhalte-bistrot.target"));
 
+    // Argenterie service unit
+    let argenterie_service = generate_argenterie_service(&config, &options);
+    assert!(argenterie_service.contains("Description=Alhalte Argenterie"));
+    assert!(argenterie_service.contains("PartOf=alhalte-bistrot.target"));
+    assert!(argenterie_service.contains("ExecStart=pnpm run dev --host 127.0.0.1 --port 5173"));
+    assert!(
+        argenterie_service.contains("WorkingDirectory=/var/lib/alhalte/web/alhalte-argenterie")
+    );
+    assert!(argenterie_service.contains("User=alhalte"));
+    assert!(argenterie_service.contains("WantedBy=alhalte-bistrot.target"));
+
     // Target unit
     let target = generate_bistrot_target();
     assert!(target.contains("Description=Alhalte Bistrot Restaurant Suite Target"));
-    assert!(target.contains("Wants=alhalte-maitre-d.service alhalte-cellar.service"));
+    assert!(target.contains(
+        "Wants=alhalte-maitre-d.service alhalte-cellar.service alhalte-argenterie.service"
+    ));
     assert!(target.contains("WantedBy=multi-user.target"));
 
     // Writing to directory
@@ -547,6 +566,7 @@ fn test_systemd_generator() {
 
     assert!(temp_dir.path().join("alhalte-maitre-d.service").exists());
     assert!(temp_dir.path().join("alhalte-cellar.service").exists());
+    assert!(temp_dir.path().join("alhalte-argenterie.service").exists());
     assert!(temp_dir.path().join("alhalte-bistrot.target").exists());
 
     let read_target =
@@ -632,9 +652,21 @@ chunk-size-exponent = 8
     assert!(output.status.success());
     assert!(units_dir.join("alhalte-maitre-d.service").exists());
     assert!(units_dir.join("alhalte-cellar.service").exists());
+    assert!(units_dir.join("alhalte-argenterie.service").exists());
     assert!(units_dir.join("alhalte-bistrot.target").exists());
 
-    // 5. Test encrypt command and then validate with --age-key
+    // 5. Test url command
+    let output = std::process::Command::new(bin_path)
+        .arg("-c")
+        .arg(&config_path)
+        .arg("url")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), "http://127.0.0.1:5173/");
+
+    // 6. Test encrypt command and then validate with --age-key
     let identity = Identity::generate();
     let recipient = identity.to_public().to_string();
     let secret = identity.to_string();
@@ -664,4 +696,55 @@ chunk-size-exponent = 8
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cli.example.com"));
+    assert!(stdout.contains("argenterie port: 5173"));
+}
+
+// spec: alhalte-bistrot/argenterie
+#[test]
+fn test_argenterie_config_and_url() {
+    // 1. Defaults when omitted
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+"#;
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(config.argenterie.port, 5173);
+    assert_eq!(config.argenterie_url(), "http://127.0.0.1:5173/");
+
+    // 2. Explicit port and host 0.0.0.0
+    let toml_str_custom = r#"
+[restaurant]
+host = "0.0.0.0"
+
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[argenterie]
+port = 3000
+"#;
+    let config_custom = parse_bistrot_toml(toml_str_custom).unwrap();
+    assert_eq!(config_custom.argenterie.port, 3000);
+    assert_eq!(config_custom.argenterie_url(), "http://127.0.0.1:3000/");
+
+    // 3. Port 0 fails validation
+    let toml_invalid_port = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[argenterie]
+port = 0
+"#;
+    assert!(parse_bistrot_toml(toml_invalid_port).is_err());
 }
