@@ -191,3 +191,9 @@ export type {
   GenerastNestedNode,
 } from '../utils/generast.js';
 
+export type {
+  ConnectionState,
+  ConnectionManagerOptions,
+} from '../utils/connection.js';
+
+

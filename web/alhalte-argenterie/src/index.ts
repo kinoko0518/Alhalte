@@ -18,12 +18,14 @@ export * from './utils/sceneSettings.js';
 export * from './utils/backgroundDimension.js';
 export * from './utils/character.js';
 export * from './utils/generast.js';
+export * from './utils/connection.js';
 
 // WebAssembly ABI Host Runner
 export * from './wasm/runner.js';
 
 // Components
 export { default as App } from './components/App.svelte';
+export { default as OfflineIndicator } from './components/OfflineIndicator.svelte';
 export { default as HomeScreen } from './components/Home/HomeScreen.svelte';
 export { default as FieldPanel } from './components/Field/FieldPanel.svelte';
 export { default as FieldPiece } from './components/Field/FieldPiece.svelte';

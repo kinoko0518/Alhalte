@@ -6,7 +6,7 @@
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
  */
 
-import type { Juices, Scene } from '../types/index.js';
+import type { BgmSlot, Juices, Scene } from '../types/index.js';
 
 /**
  * Creates a default Juices object.

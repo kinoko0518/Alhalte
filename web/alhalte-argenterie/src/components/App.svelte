@@ -30,6 +30,12 @@
   import ControlPanel from './Control/ControlPanel.svelte';
   import FieldPanel from './Field/FieldPanel.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
+  import OfflineIndicator from './OfflineIndicator.svelte';
+  import {
+    connectionManager as defaultConnectionManager,
+    ConnectionManager,
+    type ConnectionState,
+  } from '../utils/connection.js';
 
   let {
     initialRoom,
@@ -38,6 +44,11 @@
     initialExtensions = [],
     initialMovements = [],
     isAdmin = false,
+    connectionManager: customConnectionManager,
+    connectionState,
+    onReconnect,
+    debugMode,
+    debugAlwaysShow = false,
   }: {
     initialRoom?: VisitedRoom | null;
     initialScenes?: Scene[];
@@ -45,7 +56,40 @@
     initialExtensions?: ExtensionItem[];
     initialMovements?: SceneMovementEvent[];
     isAdmin?: boolean;
+    connectionManager?: ConnectionManager;
+    connectionState?: ConnectionState;
+    onReconnect?: () => Promise<void> | void;
+    debugMode?: boolean;
+    debugAlwaysShow?: boolean;
   } = $props();
+
+  let activeConnectionManager = $derived(customConnectionManager ?? defaultConnectionManager);
+  let currentConnectionState = $state<ConnectionState>(
+    connectionState ?? defaultConnectionManager.getState(),
+  );
+
+  $effect(() => {
+    if (connectionState !== undefined) {
+      activeConnectionManager.setState(connectionState);
+    }
+  });
+
+  $effect(() => {
+    if (onReconnect) {
+      activeConnectionManager.setReconnectHandler(onReconnect);
+    }
+  });
+
+  $effect(() => {
+    const unsubscribe = activeConnectionManager.subscribe((st) => {
+      currentConnectionState = st;
+    });
+    return unsubscribe;
+  });
+
+  async function handleReconnectFromIndicator() {
+    await activeConnectionManager.reconnect();
+  }
 
   let currentRoom = $state<VisitedRoom | null>(
     initialRoom !== undefined ? initialRoom : resolveRoomFromLocation(),
@@ -430,6 +474,15 @@
     style="display: none;"
     data-testid="extension-file-input"
   />
+
+  <!-- Server connection / offline detection indicator at frontmost top of viewport -->
+  <OfflineIndicator
+    connectionState={currentConnectionState}
+    {debugMode}
+    {debugAlwaysShow}
+    onReconnect={handleReconnectFromIndicator}
+  />
+
   {#if !currentRoom}
     <HomeScreen onEnterRoom={handleEnterRoom} />
   {:else}
@@ -819,12 +872,16 @@
     position: relative;
     background-color: var(--np-color-background);
     color: var(--np-color-on-background);
+    display: flex;
+    flex-direction: column;
   }
   .room-layout-container {
     width: 100%;
     height: 100%;
     display: flex;
     position: relative;
+    flex: 1;
+    min-height: 0;
   }
   .room-layout-container.landscape {
     flex-direction: row;
