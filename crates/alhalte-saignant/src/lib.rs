@@ -35,9 +35,10 @@
 //! assert!(html.contains("1970-01-01T00:00:00Z"));
 //! ```
 
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod abi;
 pub mod css;
 pub mod datetime;
 pub mod error;
