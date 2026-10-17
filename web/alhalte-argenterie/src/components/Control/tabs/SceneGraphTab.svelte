@@ -18,6 +18,7 @@
     onNavigateToScene,
     onOpenSceneLog,
     onDeleteScene,
+    onRequestDeleteScene,
   }: {
     movements?: SceneMovementEvent[];
     sceneNames?: Map<string, string>;
@@ -26,6 +27,7 @@
     onNavigateToScene?: (sceneId: string) => void;
     onOpenSceneLog?: (sceneId: string) => void;
     onDeleteScene?: (sceneId: string) => void;
+    onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
   } = $props();
 
   let graphData = $derived.by<SceneGraphResult>(() => {
@@ -102,10 +104,18 @@
 
   function openDeleteConfirm(e: MouseEvent, node: SceneGraphNode) {
     e.stopPropagation();
-    sceneToDelete = {
-      sceneId: node.sceneId,
-      sceneName: node.sceneName,
-    };
+    if (onRequestDeleteScene) {
+      activeActionNodeId = null;
+      onRequestDeleteScene({
+        id: node.sceneId,
+        name: node.sceneName,
+      });
+    } else {
+      sceneToDelete = {
+        sceneId: node.sceneId,
+        sceneName: node.sceneName,
+      };
+    }
   }
 
   function handleConfirmDelete() {
@@ -246,7 +256,13 @@
 
   <!-- Full-Screen Confirmation Dialog for Scene Deletion -->
   {#if sceneToDelete}
-    <div class="fullscreen-dialog-overlay" data-testid="graph-delete-confirm-dialog">
+    <div
+      class="fullscreen-dialog-overlay"
+      data-testid="graph-delete-confirm-dialog"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) handleCancelDelete();
+      }}
+    >
       <div class="dialog-box warning-box">
         <h2 class="dialog-title-centered warning-text" data-testid="graph-delete-dialog-title">
           シーン「{sceneToDelete.sceneName}」を削除しますか？
@@ -399,11 +415,8 @@
   }
   .fullscreen-dialog-overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: rgba(0, 0, 0, 0.5);
+    inset: 0;
+    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
     display: flex;
     align-items: center;
     justify-content: center;

@@ -9,6 +9,7 @@
   import { IconButton } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character, ExtensionItem, Scene } from '../../types/index.js';
+  import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
   import { ChunkLogManager } from '../../utils/log.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
   import CommonFooter, { type ActiveTab } from './CommonFooter.svelte';
@@ -44,6 +45,9 @@
     onUploadExtension,
     onExportZip,
     onCollapse,
+    onRequestDeleteScene,
+    onRequestDeleteCharacter,
+    onRequestAssetPicker,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -70,6 +74,13 @@
     onUploadExtension?: () => void;
     onExportZip?: () => void;
     onCollapse?: () => void;
+    onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
+    onRequestDeleteCharacter?: (char: { id: string; name: string }) => void;
+    onRequestAssetPicker?: (options: {
+      mediaType: AssetMediaType;
+      initialScope?: AssetScope;
+      onSelect: (dataUrl?: string, asset?: AssetItem) => void;
+    }) => void;
   } = $props();
 
   let activeTab = $state<ActiveTab>('log');
@@ -134,6 +145,7 @@
         onNavigateToScene={handleNavigateFromGraph}
         onOpenSceneLog={handleOpenSceneLog}
         {onDeleteScene}
+        {onRequestDeleteScene}
       />
     {:else if activeTab === 'settings'}
       <SceneSettingsTab
@@ -146,14 +158,19 @@
         {onCreateScene}
         {onDeleteScene}
         {onMoveMember}
+        {onRequestDeleteScene}
+        {onRequestAssetPicker}
       />
     {:else if activeTab === 'characters'}
       <CharacterManagementTab
         {characters}
+        {isAdmin}
         {onUpdateCharacter}
         {onCreateCharacter}
         {onDeleteCharacter}
         {onTogglePiece}
+        {onRequestDeleteCharacter}
+        {onRequestAssetPicker}
       />
     {:else if activeTab === 'extensions'}
       <ExtensionManagementTab

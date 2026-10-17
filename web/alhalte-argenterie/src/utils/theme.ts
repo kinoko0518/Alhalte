@@ -61,6 +61,7 @@ export const THEME_PALETTES: ThemePaletteDefinition[] = [
       '--np-color-surface-container-highest': 'light-dark(#dfe3e7, #313539)',
       '--np-color-outline': 'light-dark(#70787d, #8a9297)',
       '--np-color-outline-variant': 'light-dark(#c0c7cd, #40484d)',
+      '--np-color-scrim': 'rgba(0, 0, 0, 0.32)',
     },
   },
   {
@@ -96,6 +97,7 @@ export const THEME_PALETTES: ThemePaletteDefinition[] = [
       '--np-color-surface-container-highest': 'light-dark(#e6e0e9, #36343b)',
       '--np-color-outline': 'light-dark(#79747e, #938f99)',
       '--np-color-outline-variant': 'light-dark(#cac4d0, #49454f)',
+      '--np-color-scrim': 'rgba(0, 0, 0, 0.32)',
     },
   },
   {
@@ -131,6 +133,7 @@ export const THEME_PALETTES: ThemePaletteDefinition[] = [
       '--np-color-surface-container-highest': 'light-dark(#dee4df, #303632)',
       '--np-color-outline': 'light-dark(#707972, #8a938c)',
       '--np-color-outline-variant': 'light-dark(#bfc9c1, #404943)',
+      '--np-color-scrim': 'rgba(0, 0, 0, 0.32)',
     },
   },
   {
@@ -166,6 +169,7 @@ export const THEME_PALETTES: ThemePaletteDefinition[] = [
       '--np-color-surface-container-highest': 'light-dark(#efdfe1, #3c3234)',
       '--np-color-outline': 'light-dark(#847376, #9f8c8f)',
       '--np-color-outline-variant': 'light-dark(#d6c2c5, #514346)',
+      '--np-color-scrim': 'rgba(0, 0, 0, 0.32)',
     },
   },
   {
@@ -201,6 +205,7 @@ export const THEME_PALETTES: ThemePaletteDefinition[] = [
       '--np-color-surface-container-highest': 'light-dark(#ede0d4, #3b342b)',
       '--np-color-outline': 'light-dark(#817567, #9c8f80)',
       '--np-color-outline-variant': 'light-dark(#d3c4b4, #4f4539)',
+      '--np-color-scrim': 'rgba(0, 0, 0, 0.32)',
     },
   },
 ];

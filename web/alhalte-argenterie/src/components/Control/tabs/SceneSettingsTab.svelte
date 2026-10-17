@@ -27,6 +27,8 @@
     onCreateScene,
     onDeleteScene,
     onMoveMember,
+    onRequestDeleteScene,
+    onRequestAssetPicker,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -37,6 +39,12 @@
     onCreateScene?: (name: string, inheritJuice: boolean) => void;
     onDeleteScene?: (sceneId: string) => void;
     onMoveMember?: (characterId: string, targetSceneName: string) => void;
+    onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
+    onRequestAssetPicker?: (options: {
+      mediaType: AssetMediaType;
+      initialScope?: AssetScope;
+      onSelect: (dataUrl?: string, asset?: AssetItem) => void;
+    }) => void;
   } = $props();
 
   let isSceneSplitMenuOpen = $state(false);
@@ -103,13 +111,33 @@
   function handleBgImageSelect() {
     assetPickerTarget = 'bgImage';
     assetPickerMediaType = 'image';
-    isAssetPickerOpen = true;
+    if (onRequestAssetPicker) {
+      onRequestAssetPicker({
+        mediaType: 'image',
+        initialScope: 'personal',
+        onSelect: (dataUrl) => {
+          handleAssetPicked(dataUrl);
+        },
+      });
+    } else {
+      isAssetPickerOpen = true;
+    }
   }
 
   function handleBgmSelect(bgmKey: 'bgm1' | 'bgm2' | 'bgm3') {
     assetPickerTarget = bgmKey;
     assetPickerMediaType = 'audio';
-    isAssetPickerOpen = true;
+    if (onRequestAssetPicker) {
+      onRequestAssetPicker({
+        mediaType: 'audio',
+        initialScope: 'personal',
+        onSelect: (dataUrl) => {
+          handleAssetPicked(dataUrl);
+        },
+      });
+    } else {
+      isAssetPickerOpen = true;
+    }
   }
 
   function handleAssetPicked(dataUrl: string | undefined) {
@@ -153,6 +181,17 @@
     const targetName = memberTargetSceneNames[charId];
     if (!targetName) return;
     onMoveMember?.(charId, targetName);
+  }
+
+  function handleDeleteButtonClick() {
+    if (onRequestDeleteScene) {
+      onRequestDeleteScene({
+        id: currentScene.id,
+        name: currentScene.name,
+      });
+    } else {
+      isDeleteConfirmOpen = true;
+    }
   }
 
   function handleDeleteConfirm() {
@@ -406,7 +445,7 @@
           variant="tonal"
           size="s"
           class="delete-scene-tonal-btn"
-          onclick={() => (isDeleteConfirmOpen = true)}
+          onclick={handleDeleteButtonClick}
           data-testid="delete-scene-btn"
         >
           シーンを削除
@@ -417,7 +456,13 @@
 
   <!-- Overlay: シーンを新規作成 -->
   {#if isCreateSceneOpen}
-    <div class="fullscreen-dialog-overlay" data-testid="create-scene-overlay">
+    <div
+      class="fullscreen-dialog-overlay"
+      data-testid="create-scene-overlay"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) isCreateSceneOpen = false;
+      }}
+    >
       <div class="dialog-box">
         <h2 class="dialog-title-centered" data-testid="create-scene-title">シーンを新規作成</h2>
 
@@ -455,7 +500,13 @@
 
   <!-- Overlay: メンバーを移動 -->
   {#if isMoveMemberOpen}
-    <div class="fullscreen-dialog-overlay" data-testid="move-members-overlay">
+    <div
+      class="fullscreen-dialog-overlay"
+      data-testid="move-members-overlay"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) isMoveMemberOpen = false;
+      }}
+    >
       <div class="dialog-box large-dialog">
         <h2 class="dialog-title-centered" data-testid="move-members-title">メンバーを移動</h2>
 
@@ -531,7 +582,13 @@
 
   <!-- Overlay: シーンを削除 Full-Screen Confirmation Dialog -->
   {#if isDeleteConfirmOpen}
-    <div class="fullscreen-dialog-overlay" data-testid="delete-confirm-dialog">
+    <div
+      class="fullscreen-dialog-overlay"
+      data-testid="delete-confirm-dialog"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) isDeleteConfirmOpen = false;
+      }}
+    >
       <div class="dialog-box warning-box">
         <h2 class="dialog-title-centered warning-text" data-testid="delete-dialog-title">
           シーン「{currentScene.name}」を削除しますか？
@@ -751,11 +808,8 @@
   }
   .fullscreen-dialog-overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: color-mix(in srgb, var(--np-color-scrim) 50%, transparent);
+    inset: 0;
+    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
     display: flex;
     align-items: center;
     justify-content: center;

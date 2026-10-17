@@ -11,9 +11,10 @@
    * - GitHub Issue #32: Side sheets (landscape) & Bottom sheets (portrait)
    */
   import 'noph-ui/defaultTheme';
-  import { IconButton, Sheet } from 'noph-ui';
+  import { Button, IconButton, Sheet } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character, ExtensionItem, LogRecord, Scene, VisitedRoom } from '../types/index.js';
+  import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
   import { resolveRoomFromLocation } from '../utils/home.js';
   import { ChunkLogManager } from '../utils/log.js';
   import type { SceneMovementEvent } from '../utils/sceneGraph.js';
@@ -25,6 +26,7 @@
     loadDefaultExtensions,
     WasmExtensionInstance,
   } from '../wasm/runner.js';
+  import AssetPickerModal from './Control/AssetPickerModal.svelte';
   import ControlPanel from './Control/ControlPanel.svelte';
   import FieldPanel from './Field/FieldPanel.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
@@ -86,6 +88,57 @@
   let accessibleSceneIds = $derived.by(() => {
     return new Set(scenes.map((s) => s.id));
   });
+
+  // Full-screen overlay & dialog state at root viewport level
+  type ActiveOverlay =
+    | {
+        type: 'delete-scene';
+        sceneId: string;
+        sceneName: string;
+      }
+    | {
+        type: 'delete-character';
+        characterId: string;
+        characterName: string;
+      }
+    | {
+        type: 'asset-picker';
+        mediaType: AssetMediaType;
+        initialScope?: AssetScope;
+        onSelect: (dataUrl?: string, asset?: AssetItem) => void;
+      }
+    | null;
+
+  let activeOverlay = $state<ActiveOverlay>(null);
+
+  function handleRequestDeleteScene(scene: { id: string; name: string }) {
+    activeOverlay = {
+      type: 'delete-scene',
+      sceneId: scene.id,
+      sceneName: scene.name,
+    };
+  }
+
+  function handleRequestDeleteCharacter(char: { id: string; name: string }) {
+    activeOverlay = {
+      type: 'delete-character',
+      characterId: char.id,
+      characterName: char.name,
+    };
+  }
+
+  function handleRequestAssetPicker(options: {
+    mediaType: AssetMediaType;
+    initialScope?: AssetScope;
+    onSelect: (dataUrl?: string, asset?: AssetItem) => void;
+  }) {
+    activeOverlay = {
+      type: 'asset-picker',
+      mediaType: options.mediaType,
+      initialScope: options.initialScope,
+      onSelect: options.onSelect,
+    };
+  }
 
   const chunkManager = new ChunkLogManager();
   const extensionPipeline = new ExtensionPipeline();
@@ -380,6 +433,9 @@
               onUpdateExtensions={(exts) => (extensions = exts)}
               onUploadExtension={handleUploadExtension}
               onSendMessage={handleSendMessage}
+              onRequestDeleteScene={handleRequestDeleteScene}
+              onRequestDeleteCharacter={handleRequestDeleteCharacter}
+              onRequestAssetPicker={handleRequestAssetPicker}
             />
           </Sheet>
 
@@ -463,6 +519,9 @@
               onUpdateExtensions={(exts) => (extensions = exts)}
               onUploadExtension={handleUploadExtension}
               onSendMessage={handleSendMessage}
+              onRequestDeleteScene={handleRequestDeleteScene}
+              onRequestDeleteCharacter={handleRequestDeleteCharacter}
+              onRequestAssetPicker={handleRequestAssetPicker}
             />
           </Sheet>
 
@@ -480,6 +539,109 @@
           {/if}
         </div>
       {/if}
+    </div>
+  {/if}
+
+  <!-- Fullscreen Overlays / Dialogs Layer at Root Viewport Level -->
+  {#if activeOverlay?.type === 'delete-scene'}
+    <div
+      class="fullscreen-dialog-overlay"
+      data-testid="root-delete-scene-dialog"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) activeOverlay = null;
+      }}
+    >
+      <div
+        class="dialog-box warning-box"
+        data-testid="graph-delete-confirm-dialog"
+      >
+        <div data-testid="delete-confirm-dialog">
+          <h2 class="dialog-title-centered warning-text" data-testid="graph-delete-dialog-title">
+            <span data-testid="delete-dialog-title">シーン「{activeOverlay.sceneName}」を削除しますか？</span>
+          </h2>
+          <p class="warning-body" data-testid="graph-delete-dialog-warning">
+            <span data-testid="delete-dialog-warning">このシーンを削除すると、配置されたログやJuices設定は元に戻せません。</span>
+          </p>
+
+          <div class="dialog-footer-right">
+            <Button
+              variant="text"
+              onclick={() => (activeOverlay = null)}
+              data-testid="graph-cancel-delete-btn"
+            >
+              <span data-testid="cancel-delete-btn">キャンセル</span>
+            </Button>
+            <div class="confirm-delete-wrapper">
+              <Button
+                variant="filled"
+                class="delete-scene-tonal-btn"
+                onclick={() => {
+                  if (activeOverlay?.type === 'delete-scene') {
+                    handleDeleteScene(activeOverlay.sceneId);
+                    activeOverlay = null;
+                  }
+                }}
+                data-testid="graph-confirm-delete-btn"
+              >
+                <span data-testid="confirm-delete-button">削除する</span>
+              </Button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  {:else if activeOverlay?.type === 'delete-character'}
+    <div
+      class="fullscreen-warning-overlay"
+      data-testid="root-delete-char-dialog"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) activeOverlay = null;
+      }}
+    >
+      <div class="delete-warning-box" data-testid="char-delete-confirm-dialog">
+        <h2 class="warning-title-centered" data-testid="char-delete-warning-title">
+          キャラクター「{activeOverlay.characterName}」を削除しますか？
+        </h2>
+        <p class="warning-desc-centered" data-testid="char-delete-warning-desc">
+          このキャラクターを削除すると、チャットパレットやステータス情報を含め、すべて消去されます。元に戻すことはできません。
+        </p>
+
+        <div class="warning-actions">
+          <Button variant="text" onclick={() => (activeOverlay = null)} data-testid="char-cancel-delete-btn">キャンセル</Button>
+          <button
+            type="button"
+            class="danger-confirm-btn"
+            onclick={() => {
+              if (activeOverlay?.type === 'delete-character') {
+                handleDeleteCharacter(activeOverlay.characterId);
+                activeOverlay = null;
+              }
+            }}
+            data-testid="confirm-char-delete-button"
+          >
+            削除する
+          </button>
+        </div>
+      </div>
+    </div>
+  {:else if activeOverlay?.type === 'asset-picker'}
+    <div
+      class="root-asset-picker-wrapper"
+      data-testid="root-asset-picker-wrapper"
+    >
+      <AssetPickerModal
+        open={true}
+        initialMediaType={activeOverlay.mediaType}
+        initialScope={activeOverlay.initialScope}
+        isAdmin={isAdmin || (currentRoom ? currentRoom.isAdmin : false)}
+        onSelect={(url, asset) => {
+          activeOverlay?.onSelect(url, asset);
+          activeOverlay = null;
+        }}
+        onClose={() => {
+          activeOverlay = null;
+        }}
+      />
     </div>
   {/if}
 </div>
@@ -577,5 +739,91 @@
     bottom: 16px;
     right: 16px;
     z-index: 550;
+  }
+  .fullscreen-dialog-overlay,
+  .fullscreen-warning-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .dialog-box {
+    background: var(--np-color-surface-container-high, #ece6f0);
+    border-radius: var(--np-shape-corner-extra-large, 28px);
+    padding: 24px;
+    width: 90%;
+    max-width: 480px;
+    box-shadow: var(--np-elevation-3, 0 8px 24px rgba(0, 0, 0, 0.2));
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .dialog-title-centered {
+    margin: 0;
+    text-align: center;
+    font-size: 1.35rem;
+    font-weight: 600;
+    color: var(--np-color-on-surface, #1d1b20);
+  }
+  .warning-text {
+    color: var(--np-color-error, #b3261e);
+  }
+  .warning-body {
+    margin: 0;
+    text-align: center;
+    font-size: 0.92rem;
+    color: var(--np-color-on-surface-variant, #49454f);
+    line-height: 1.5;
+  }
+  .dialog-footer-right {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .confirm-delete-wrapper {
+    --np-button-container-color: var(--np-color-error, #b3261e);
+    --np-button-label-text-color: var(--np-color-on-error, #ffffff);
+  }
+  .delete-warning-box {
+    background: var(--np-color-surface-container-high);
+    border-radius: 28px;
+    padding: 24px;
+    width: 90%;
+    max-width: 480px;
+    box-shadow: var(--np-elevation-3);
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .warning-title-centered {
+    margin: 0;
+    text-align: center;
+    font-size: 1.25rem;
+    color: var(--np-color-error);
+  }
+  .warning-desc-centered {
+    margin: 0;
+    text-align: center;
+    font-size: 0.9rem;
+    color: var(--np-color-on-surface-variant);
+    line-height: 1.4;
+  }
+  .warning-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .danger-confirm-btn {
+    padding: 8px 18px;
+    border-radius: 20px;
+    border: none;
+    background: var(--np-color-error);
+    color: var(--np-color-on-error);
+    font-weight: 600;
+    cursor: pointer;
   }
 </style>
