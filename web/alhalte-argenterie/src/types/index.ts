@@ -116,6 +116,8 @@ export interface LogChunk {
 export interface ExtensionItem {
   id: string;
   name: string;
+  iconSvg?: string;
+  description?: string;
   enabled: boolean;
   priority: number; // Order index
   wasmBytes?: Uint8Array;

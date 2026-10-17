@@ -168,3 +168,26 @@ fn test_coc7_abi_exports() {
     let judge = extract_judgement(&tin).unwrap();
     assert_eq!(judge.subject.as_deref(), Some("心理学"));
 }
+
+// spec: extensions/coc-7 self-introduction metadata
+#[test]
+fn test_self_introduction() {
+    let (name, icon_svg, description) = coc_7::self_introduction_info();
+    assert_eq!(name, "新クトゥルフ神話TRPG (第7版)");
+    assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
+    assert_eq!(
+        description,
+        "CoC第7版のCC判定（レギュラー/ハード/イクストリーム）・ボーナス/ペナルティダイスを提供する公式拡張機能"
+    );
+
+    let bytes = coc_7::abi::encode_self_introduction();
+    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, name);
+    assert_eq!(decoded.1, icon_svg);
+    assert_eq!(decoded.2, description);
+
+    let packed = coc_7::abi::self_introduction();
+    assert_ne!(packed, 0);
+    let len = (packed & 0xffff_ffff) as usize;
+    assert_eq!(len, bytes.len());
+}

@@ -16,6 +16,84 @@ export interface WasmExtensionExports {
   alloc: (len: number) => number;
   dealloc: (ptr: number, len: number) => void;
   process_generast: (ptr: number, len: number) => bigint | number;
+  self_introduction?: () => bigint | number;
+}
+
+function encodeVarint(value: number): number[] {
+  const out: number[] = [];
+  let v = value >>> 0;
+  while (v >= 0x80) {
+    out.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  out.push(v);
+  return out;
+}
+
+function decodeVarint(bytes: Uint8Array, offset: number): { value: number; nextOffset: number } {
+  let result = 0;
+  let shift = 0;
+  let pos = offset;
+  while (pos < bytes.length) {
+    const byte = bytes[pos];
+    pos += 1;
+    result |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      return { value: result >>> 0, nextOffset: pos };
+    }
+    shift += 7;
+    if (shift > 35) {
+      throw new Error('Postcard varint overflow');
+    }
+  }
+  throw new Error('Unexpected EOF while decoding Postcard varint');
+}
+
+/**
+ * Encodes `(String, String, String)` in Postcard binary format.
+ */
+export function encodePostcardStringTuple3(
+  name: string,
+  iconSvg: string,
+  description: string,
+): Uint8Array {
+  const encoder = new TextEncoder();
+  const parts = [name, iconSvg, description].map((s) => encoder.encode(s));
+  const out: number[] = [];
+  for (const part of parts) {
+    out.push(...encodeVarint(part.length));
+    for (let i = 0; i < part.length; i++) {
+      out.push(part[i]);
+    }
+  }
+  return new Uint8Array(out);
+}
+
+/**
+ * Decodes `(String, String, String)` from Postcard binary format.
+ */
+export function decodePostcardStringTuple3(bytes: Uint8Array): {
+  name: string;
+  iconSvg: string;
+  description: string;
+} {
+  const decoder = new TextDecoder();
+  let offset = 0;
+  const values: string[] = [];
+  for (let i = 0; i < 3; i++) {
+    const { value: len, nextOffset } = decodeVarint(bytes, offset);
+    const end = nextOffset + len;
+    if (end > bytes.length) {
+      throw new Error('Unexpected EOF while decoding Postcard string');
+    }
+    values.push(decoder.decode(bytes.subarray(nextOffset, end)));
+    offset = end;
+  }
+  return {
+    name: values[0],
+    iconSvg: values[1],
+    description: values[2],
+  };
 }
 
 /**
@@ -60,6 +138,33 @@ export class WasmExtensionInstance {
     const compiled = await WebAssembly.compile(wasmBytes as unknown as BufferSource);
     const instance = await WebAssembly.instantiate(compiled, {});
     return new WasmExtensionInstance(instance);
+  }
+
+  /**
+   * Calls `self_introduction()` if exported by the extension module and decodes `(name, icon_svg, description)`.
+   */
+  public selfIntroduction(): { name: string; iconSvg: string; description: string } | null {
+    if (typeof this.exports.self_introduction !== 'function') {
+      return null;
+    }
+
+    const packedResult = this.exports.self_introduction();
+    const resBig = BigInt(packedResult);
+    if (resBig === 0n) {
+      return null;
+    }
+
+    const outPtr = Number(resBig >> 32n);
+    const outLen = Number(resBig & 0xffffffffn);
+    if (outLen <= 0 || outPtr <= 0) {
+      return null;
+    }
+
+    const outMemBuffer = new Uint8Array(this.exports.memory.buffer);
+    const output = new Uint8Array(outMemBuffer.subarray(outPtr, outPtr + outLen));
+    this.exports.dealloc(outPtr, outLen);
+
+    return decodePostcardStringTuple3(output);
   }
 
   /**

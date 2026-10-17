@@ -32,3 +32,12 @@ pub fn process_ast(ast: Generast, _speaker_id: u64) -> Generast {
         Generast::Element(e) => Generast::Element(e),
     }
 }
+
+/// Returns self-introduction metadata `(name, icon_svg, description)` for Aozora Bunko.
+pub fn self_introduction_info() -> (&'static str, &'static str, &'static str) {
+    (
+        "青空文庫ルビ・傍点",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 4h5v8l-2.5-1.5L6 12V4z"/></svg>"#,
+        "青空文庫形式のルビ（｜親文字《ルビ》）と傍点（［＃「…」に傍点］）を変換する公式拡張機能",
+    )
+}

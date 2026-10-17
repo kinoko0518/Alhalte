@@ -147,3 +147,26 @@ fn test_coc6_abi_exports() {
     let judge = extract_judgement(&tin).unwrap();
     assert_eq!(judge.subject.as_deref(), Some("図書館"));
 }
+
+// spec: extensions/coc-6 self-introduction metadata
+#[test]
+fn test_self_introduction() {
+    let (name, icon_svg, description) = coc_6::self_introduction_info();
+    assert_eq!(name, "クトゥルフ神話TRPG (第6版)");
+    assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
+    assert_eq!(
+        description,
+        "CoC第6版のCCB/CC判定・クリティカル/ファンブル・組み合わせロール・RESB対抗ロールを提供する公式拡張機能"
+    );
+
+    let bytes = coc_6::abi::encode_self_introduction();
+    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, name);
+    assert_eq!(decoded.1, icon_svg);
+    assert_eq!(decoded.2, description);
+
+    let packed = coc_6::abi::self_introduction();
+    assert_ne!(packed, 0);
+    let len = (packed & 0xffff_ffff) as usize;
+    assert_eq!(len, bytes.len());
+}

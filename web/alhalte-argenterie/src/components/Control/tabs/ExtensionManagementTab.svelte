@@ -145,10 +145,25 @@
                 title={isAdmin ? '有効/無効化' : '管理者のみ切り替え可能'}
               />
 
-              <!-- Extension Name -->
-              <span class="ext-name" data-testid="ext-name-{ext.id}">
-                {ext.name}
-              </span>
+              <!-- Extension Icon (if provided by self_introduction) -->
+              {#if ext.iconSvg}
+                <span class="ext-icon" data-testid="ext-icon-{ext.id}" aria-hidden="true">
+                  <!-- eslint-disable-next-line svelte/no-at-html-tags -->
+                  {@html ext.iconSvg}
+                </span>
+              {/if}
+
+              <!-- Extension Name & Description -->
+              <div class="ext-info">
+                <span class="ext-name" data-testid="ext-name-{ext.id}">
+                  {ext.name}
+                </span>
+                {#if ext.description}
+                  <span class="ext-description" data-testid="ext-description-{ext.id}">
+                    {ext.description}
+                  </span>
+                {/if}
+              </div>
 
               <span class="priority-badge">#{ext.priority + 1}</span>
 
@@ -181,7 +196,8 @@
     padding: 16px;
     box-sizing: border-box;
     overflow-y: auto;
-    background: var(--md-sys-color-surface, #fbf8fd);
+    background: var(--np-color-surface);
+    color: var(--np-color-on-surface);
     gap: 16px;
   }
   /*
@@ -212,7 +228,7 @@
   }
   .lock-indicator {
     font-size: 0.8rem;
-    color: var(--md-sys-color-error, #b3261e);
+    color: var(--np-color-error);
   }
   .extension-list {
     display: flex;
@@ -222,7 +238,7 @@
   .empty-notice {
     padding: 32px;
     text-align: center;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
+    color: var(--np-color-on-surface-variant);
     font-size: 0.9rem;
   }
   .ext-card-content {
@@ -242,10 +258,10 @@
     cursor: pointer;
     font-size: 0.65rem;
     padding: 2px 4px;
-    color: #555;
+    color: var(--np-color-on-surface-variant);
   }
   .reorder-btn:disabled {
-    color: #bbb;
+    color: var(--np-color-outline-variant);
     cursor: not-allowed;
   }
   .enable-checkbox {
@@ -256,17 +272,42 @@
   .enable-checkbox:disabled {
     cursor: not-allowed;
   }
-  .ext-name {
+  .ext-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    color: var(--np-color-primary);
+  }
+  .ext-icon :global(svg) {
+    width: 24px;
+    height: 24px;
+  }
+  .ext-info {
+    display: flex;
+    flex-direction: column;
     flex: 1;
+    min-width: 0;
+    gap: 2px;
+  }
+  .ext-name {
     font-weight: 600;
     font-size: 0.95rem;
+    color: var(--np-color-on-surface);
+  }
+  .ext-description {
+    font-size: 0.78rem;
+    color: var(--np-color-on-surface-variant);
+    line-height: 1.35;
   }
   .priority-badge {
     font-size: 0.75rem;
-    background: #e0e0e0;
+    background: var(--np-color-surface-container-highest);
     padding: 2px 6px;
     border-radius: 4px;
-    color: #555;
+    color: var(--np-color-on-surface-variant);
   }
   .right-delete {
     margin-left: auto;
@@ -276,11 +317,11 @@
     background: none;
     cursor: pointer;
     font-size: 1.1rem;
-    color: var(--md-sys-color-error, #b3261e);
+    color: var(--np-color-error);
     padding: 4px 6px;
   }
   .delete-btn:disabled {
-    color: #bbb;
+    color: var(--np-color-outline-variant);
     cursor: not-allowed;
   }
 </style>

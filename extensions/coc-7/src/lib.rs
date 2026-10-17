@@ -52,3 +52,12 @@ pub fn process_ast(ast: Generast, speaker_id: u64) -> Generast {
         Generast::Element(e) => Generast::Element(e),
     }
 }
+
+/// Returns self-introduction metadata `(name, icon_svg, description)` for CoC 7th edition.
+pub fn self_introduction_info() -> (&'static str, &'static str, &'static str) {
+    (
+        "新クトゥルフ神話TRPG (第7版)",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 2L4.5 6.5v11L12 22l7.5-4.5v-11L12 2zm0 2.3l5.5 3.3v8.8L12 19.7l-5.5-3.3V7.6L12 4.3zM9 9v2h3.5L9 16h2.2l3.5-5V9H9z"/></svg>"#,
+        "CoC第7版のCC判定（レギュラー/ハード/イクストリーム）・ボーナス/ペナルティダイスを提供する公式拡張機能",
+    )
+}
