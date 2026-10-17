@@ -80,6 +80,14 @@
             echo "Building Rust workspace binaries..."
             cargo build --bins
 
+            echo "Building official WASM extensions..."
+            for ext_manifest in extensions/*/Cargo.toml; do
+              cargo build --manifest-path "$ext_manifest" --target wasm32-unknown-unknown --release
+            done
+
+            target/debug/alhalte-bistrot --config "$CONFIG" stage-extensions \
+              --output-dir "$PWD/web/alhalte-argenterie/public/extensions"
+
             if [ ! -d "web/node_modules" ] || [ ! -d "web/alhalte-argenterie/node_modules" ]; then
               echo "Installing web workspace dependencies..."
               (cd web && pnpm install)

@@ -57,6 +57,10 @@ fn default_chunk_size_exponent() -> u8 {
     DEFAULT_CHUNK_SIZE_EXPONENT
 }
 
+fn default_extension_enabled() -> bool {
+    true
+}
+
 /// Root configuration for the entire Alhalte restaurant instance (`Bistrot.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -79,6 +83,10 @@ pub struct BistrotConfig {
     /// Configuration for `alhalte-argenterie` web frontend module.
     #[serde(default)]
     pub argenterie: ArgenterieConfig,
+
+    /// Default extensions list configured for the restaurant.
+    #[serde(default)]
+    pub extensions: Vec<ExtensionConfig>,
 }
 
 impl BistrotConfig {
@@ -112,6 +120,13 @@ impl BistrotConfig {
             return Err(BistrotError::ConfigValidation(
                 "argenterie port must not be 0".to_string(),
             ));
+        }
+        for ext in &self.extensions {
+            if ext.id.trim().is_empty() {
+                return Err(BistrotError::ConfigValidation(
+                    "extension id must not be empty".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -166,6 +181,82 @@ impl BistrotConfig {
             .socket_dir
             .clone()
             .unwrap_or_else(|| self.restaurant.socket_dir.clone())
+    }
+
+    /// Stages configured extensions into the specified target directory and generates `manifest.json`.
+    ///
+    /// Creates `output_dir` if it does not already exist.
+    /// For each extension in `self.extensions` (with 0-based priority index):
+    /// - If `ext.path` exists on disk, copies it to `<output_dir>/<ext.id>.wasm`.
+    /// - Adds an entry to `manifest.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BistrotError`] if filesystem operations or JSON serialization fail.
+    pub fn stage_extensions(
+        &self,
+        output_dir: impl AsRef<std::path::Path>,
+    ) -> Result<Vec<ExtensionManifestEntry>> {
+        self.stage_extensions_with_base(output_dir, None)
+    }
+
+    /// Stages configured extensions into the specified target directory, optionally resolving relative paths against `base_dir`.
+    ///
+    /// Creates `output_dir` if it does not already exist.
+    /// For each extension in `self.extensions` (with 0-based priority index):
+    /// - If `ext.path` exists on disk (or relative to `base_dir`), copies it to `<output_dir>/<ext.id>.wasm`.
+    /// - Adds an entry to `manifest.json`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BistrotError`] if filesystem operations or JSON serialization fail.
+    pub fn stage_extensions_with_base(
+        &self,
+        output_dir: impl AsRef<std::path::Path>,
+        base_dir: Option<&std::path::Path>,
+    ) -> Result<Vec<ExtensionManifestEntry>> {
+        let out_path = output_dir.as_ref();
+        if !out_path.exists() {
+            std::fs::create_dir_all(out_path)?;
+        }
+
+        let mut manifest = Vec::with_capacity(self.extensions.len());
+        for (priority, ext) in self.extensions.iter().enumerate() {
+            let dest_wasm_name = format!("{}.wasm", ext.id);
+            let dest_wasm_path = out_path.join(&dest_wasm_name);
+
+            let source_path = if ext.path.exists() {
+                Some(ext.path.clone())
+            } else if let Some(base) = base_dir {
+                let candidate = base.join(&ext.path);
+                if candidate.exists() {
+                    Some(candidate)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(src) = source_path {
+                std::fs::copy(&src, &dest_wasm_path)?;
+            }
+
+            let entry = ExtensionManifestEntry {
+                id: ext.id.clone(),
+                name: ext.name.clone().unwrap_or_else(|| ext.id.clone()),
+                url: format!("/extensions/{dest_wasm_name}"),
+                enabled: ext.enabled,
+                priority,
+            };
+            manifest.push(entry);
+        }
+
+        let manifest_path = out_path.join("manifest.json");
+        let json = serde_json::to_string_pretty(&manifest)?;
+        std::fs::write(&manifest_path, json)?;
+
+        Ok(manifest)
     }
 }
 
@@ -287,4 +378,43 @@ impl Default for ArgenterieConfig {
             port: default_argenterie_port(),
         }
     }
+}
+
+/// Default extension entry configured in `Bistrot.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ExtensionConfig {
+    /// Unique identifier for the extension (e.g. `"alhalte-dsl"`).
+    pub id: String,
+
+    /// Display name fallback if WASM self_introduction is not yet loaded.
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Path to the compiled `.wasm` binary (relative to working directory or absolute).
+    pub path: PathBuf,
+
+    /// Whether the extension is enabled by default in rooms.
+    #[serde(default = "default_extension_enabled")]
+    pub enabled: bool,
+}
+
+/// Extension manifest entry written into `manifest.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ExtensionManifestEntry {
+    /// Unique identifier for the extension (e.g. `"alhalte-dsl"`).
+    pub id: String,
+
+    /// Display name of the extension.
+    pub name: String,
+
+    /// URL to download the extension `.wasm` file (e.g. `"/extensions/alhalte-dsl.wasm"`).
+    pub url: String,
+
+    /// Whether the extension is enabled by default in rooms.
+    pub enabled: bool,
+
+    /// Execution priority order index.
+    pub priority: usize,
 }

@@ -7,7 +7,8 @@ use alhalte_bistrot::args::{
     generate_module_args,
 };
 use alhalte_bistrot::config::{
-    ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, MaitreDConfig, RestaurantConfig,
+    ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, ExtensionManifestEntry,
+    MaitreDConfig, RestaurantConfig,
 };
 use alhalte_bistrot::rops::{
     decrypt_rops_toml_with_key, encrypt_bistrot_toml, is_rops_encrypted, load_from_path,
@@ -306,6 +307,7 @@ fn test_generate_maitre_d_args() {
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
+        extensions: vec![],
     };
 
     let args = generate_maitre_d_args(&config);
@@ -351,6 +353,7 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
+        extensions: vec![],
     };
 
     let args_without = generate_cellar_args(&config);
@@ -417,6 +420,7 @@ fn test_generate_banquette_args() {
             socket_dir: None,
         },
         argenterie: ArgenterieConfig::default(),
+        extensions: vec![],
     };
 
     let args = generate_banquette_args(&config);
@@ -452,6 +456,7 @@ fn test_generate_all_args_and_module_args() {
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
+        extensions: vec![],
     };
 
     let all = generate_all_args(&config);
@@ -501,6 +506,7 @@ fn test_systemd_generator() {
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
+        extensions: vec![],
     };
 
     let options = SystemdOptions {
@@ -747,4 +753,215 @@ salt = "salt"
 port = 0
 "#;
     assert!(parse_bistrot_toml(toml_invalid_port).is_err());
+}
+
+// spec: alhalte-bistrot/extensions
+#[test]
+fn test_extensions_config_parsing_and_defaults() {
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[[extensions]]
+id = "alhalte-dsl"
+name = "Alhalte DSL"
+path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
+enabled = true
+
+[[extensions]]
+id = "custom-ext"
+path = "custom.wasm"
+"#;
+
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(config.extensions.len(), 2);
+    assert_eq!(config.extensions[0].id, "alhalte-dsl");
+    assert_eq!(config.extensions[0].name.as_deref(), Some("Alhalte DSL"));
+    assert_eq!(
+        config.extensions[0].path,
+        PathBuf::from("target/wasm32-unknown-unknown/release/alhalte_dsl.wasm")
+    );
+    assert!(config.extensions[0].enabled);
+
+    assert_eq!(config.extensions[1].id, "custom-ext");
+    assert_eq!(config.extensions[1].name, None);
+    assert_eq!(config.extensions[1].path, PathBuf::from("custom.wasm"));
+    assert!(config.extensions[1].enabled); // defaults to true
+}
+
+// spec: alhalte-bistrot/extensions
+#[test]
+fn test_extensions_validation_empty_id() {
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[[extensions]]
+id = "   "
+path = "dummy.wasm"
+"#;
+    assert!(parse_bistrot_toml(toml_str).is_err());
+}
+
+// spec: alhalte-bistrot/stage-extensions
+#[test]
+fn test_stage_extensions_files_and_manifest() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let src_dir = temp_dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let out_dir = temp_dir.path().join("staged");
+
+    let wasm1_path = src_dir.join("ext_1.wasm");
+    std::fs::write(&wasm1_path, b"\0asm\x01\0\0\0dummy1").unwrap();
+
+    let wasm2_path = src_dir.join("ext_2.wasm");
+    std::fs::write(&wasm2_path, b"\0asm\x01\0\0\0dummy2").unwrap();
+
+    let missing_wasm_path = src_dir.join("missing.wasm");
+
+    let toml_str = format!(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[[extensions]]
+id = "first-ext"
+name = "First Extension"
+path = "{}"
+enabled = true
+
+[[extensions]]
+id = "second-ext"
+path = "{}"
+enabled = false
+
+[[extensions]]
+id = "missing-ext"
+name = "Missing Ext"
+path = "{}"
+enabled = true
+"#,
+        wasm1_path.display(),
+        wasm2_path.display(),
+        missing_wasm_path.display(),
+    );
+
+    let config = parse_bistrot_toml(&toml_str).unwrap();
+    let manifest_entries = config.stage_extensions(&out_dir).unwrap();
+
+    assert_eq!(manifest_entries.len(), 3);
+
+    // Check entry 0
+    assert_eq!(manifest_entries[0].id, "first-ext");
+    assert_eq!(manifest_entries[0].name, "First Extension");
+    assert_eq!(manifest_entries[0].url, "/extensions/first-ext.wasm");
+    assert!(manifest_entries[0].enabled);
+    assert_eq!(manifest_entries[0].priority, 0);
+
+    // Check entry 1
+    assert_eq!(manifest_entries[1].id, "second-ext");
+    assert_eq!(manifest_entries[1].name, "second-ext"); // Fallback to id
+    assert_eq!(manifest_entries[1].url, "/extensions/second-ext.wasm");
+    assert!(!manifest_entries[1].enabled);
+    assert_eq!(manifest_entries[1].priority, 1);
+
+    // Check entry 2
+    assert_eq!(manifest_entries[2].id, "missing-ext");
+    assert_eq!(manifest_entries[2].name, "Missing Ext");
+    assert_eq!(manifest_entries[2].url, "/extensions/missing-ext.wasm");
+    assert!(manifest_entries[2].enabled);
+    assert_eq!(manifest_entries[2].priority, 2);
+
+    // Verify files copied
+    assert_eq!(
+        std::fs::read(out_dir.join("first-ext.wasm")).unwrap(),
+        b"\0asm\x01\0\0\0dummy1"
+    );
+    assert_eq!(
+        std::fs::read(out_dir.join("second-ext.wasm")).unwrap(),
+        b"\0asm\x01\0\0\0dummy2"
+    );
+    assert!(!out_dir.join("missing-ext.wasm").exists());
+
+    // Verify manifest.json on disk
+    let manifest_content = std::fs::read_to_string(out_dir.join("manifest.json")).unwrap();
+    let parsed_manifest: Vec<ExtensionManifestEntry> =
+        serde_json::from_str(&manifest_content).unwrap();
+    assert_eq!(parsed_manifest, manifest_entries);
+}
+
+// spec: alhalte-bistrot/extensions
+#[test]
+fn test_root_bistrot_toml_extensions_configuration() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root_bistrot = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("Bistrot.toml");
+    let content = std::fs::read_to_string(&root_bistrot).unwrap();
+    let config = parse_bistrot_toml(&content).unwrap();
+
+    assert_eq!(config.extensions.len(), 6);
+
+    let expected = [
+        (
+            "alhalte-dsl",
+            Some("Alhalte DSL"),
+            "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm",
+            true,
+        ),
+        (
+            "markdown",
+            Some("Markdown スタイル"),
+            "target/wasm32-unknown-unknown/release/markdown.wasm",
+            true,
+        ),
+        (
+            "aozora",
+            Some("青空文庫ルビ・傍点"),
+            "target/wasm32-unknown-unknown/release/aozora.wasm",
+            true,
+        ),
+        (
+            "coc-6",
+            Some("クトゥルフ神話TRPG (第6版)"),
+            "target/wasm32-unknown-unknown/release/coc_6.wasm",
+            false,
+        ),
+        (
+            "coc-7",
+            Some("新クトゥルフ神話TRPG (第7版)"),
+            "target/wasm32-unknown-unknown/release/coc_7.wasm",
+            false,
+        ),
+        (
+            "emoklore",
+            Some("エモクロアTRPG"),
+            "target/wasm32-unknown-unknown/release/emoklore.wasm",
+            false,
+        ),
+    ];
+
+    for (i, (expected_id, expected_name, expected_path, expected_enabled)) in
+        expected.iter().enumerate()
+    {
+        assert_eq!(&config.extensions[i].id, expected_id);
+        assert_eq!(config.extensions[i].name.as_deref(), *expected_name);
+        assert_eq!(config.extensions[i].path, PathBuf::from(*expected_path));
+        assert_eq!(config.extensions[i].enabled, *expected_enabled);
+    }
 }
