@@ -50,6 +50,7 @@ export interface Character {
   name: string;
   initiative: number;
   iconUrl?: string;
+  color?: string;
   description: string;
   reference?: string;
   statuses: CharacterStatus[];

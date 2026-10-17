@@ -762,6 +762,8 @@
                   onRequestDeleteSceneLogs={handleRequestDeleteSceneLogs}
                   onDeleteSceneLogs={handleDeleteSceneLogs}
                   onRequestDeleteCharacter={handleRequestDeleteCharacter}
+                  roomId={currentRoom.id || (currentRoom as any).roomId}
+                  onSetDone={(done) => roomSocket?.setDone(done)}
                   onRequestAssetPicker={handleRequestAssetPicker}
                 />
               </div>
@@ -839,6 +841,8 @@
                 onRequestDeleteSceneLogs={handleRequestDeleteSceneLogs}
                 onDeleteSceneLogs={handleDeleteSceneLogs}
                 onRequestDeleteCharacter={handleRequestDeleteCharacter}
+                roomId={currentRoom.id || (currentRoom as any).roomId}
+                onSetDone={(done) => roomSocket?.setDone(done)}
                 onRequestAssetPicker={handleRequestAssetPicker}
               />
             </div>

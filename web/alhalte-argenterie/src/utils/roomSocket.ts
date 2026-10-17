@@ -314,6 +314,7 @@ export function parseCharacter(id: string | number, raw: any): Character {
     name,
     initiative: typeof raw?.initiative === 'number' ? raw.initiative : 0,
     iconUrl: typeof raw?.iconUrl === 'string' ? raw.iconUrl : undefined,
+    color: typeof raw?.color === 'string' ? raw.color : undefined,
     description: typeof raw?.description === 'string' ? raw.description : '',
     reference: typeof raw?.reference === 'string' ? raw.reference : undefined,
     statuses: Array.isArray(raw?.statuses) ? raw.statuses : [],

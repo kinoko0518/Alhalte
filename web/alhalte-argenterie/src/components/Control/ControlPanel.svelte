@@ -45,6 +45,8 @@
     onUploadExtension,
     onExportZip,
     onCollapse,
+    roomId,
+    onSetDone,
     onRequestDeleteScene,
     onRequestDeleteSceneLogs,
     onDeleteSceneLogs,
@@ -74,8 +76,10 @@
     onTogglePiece?: (characterId: string) => void;
     onUpdateExtensions?: (extensions: ExtensionItem[]) => void;
     onUploadExtension?: () => void;
-    onExportZip?: () => void;
+    onExportZip?: (type: 'full' | 'logs') => void;
     onCollapse?: () => void;
+    roomId?: string;
+    onSetDone?: (done: boolean) => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
     onRequestDeleteSceneLogs?: (scene: { id: string; name: string }) => void;
     onDeleteSceneLogs?: (sceneId: string) => void;
@@ -132,10 +136,16 @@
     {#if activeTab === 'log'}
       <LogTab
         scene={currentScene}
+        {allScenes}
+        {characters}
+        {roomId}
         {isAdmin}
         {chunkManager}
         {onCollapse}
+        {onSelectScene}
         {onExportZip}
+        {onSetDone}
+        {onRequestAssetPicker}
         onRenameScene={() => (activeTab = 'settings')}
         onDeleteScene={() => (activeTab = 'settings')}
         onManageMembers={() => (activeTab = 'settings')}
