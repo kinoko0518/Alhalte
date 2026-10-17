@@ -167,7 +167,17 @@
     isDeleteConfirmOpen = false;
     onDeleteScene?.(currentScene.id);
   }
+
+  let sceneSplitContainer = $state<HTMLElement | null>(null);
+
+  function handleWindowClick(e: MouseEvent) {
+    if (isSceneSplitMenuOpen && sceneSplitContainer && !sceneSplitContainer.contains(e.target as Node)) {
+      isSceneSplitMenuOpen = false;
+    }
+  }
 </script>
+
+<svelte:window onclick={handleWindowClick} />
 
 <div class="scene-settings-container" data-testid="scene-settings-tab">
   <!-- Top Split Button / Scene Name Input:
@@ -175,7 +185,7 @@
       ほかのシーン名 ...※タップで設定中のシーンを切り替え
     ］）
   -->
-  <div class="split-button-container" data-testid="scene-split-container">
+  <div class="split-button-container" bind:this={sceneSplitContainer} data-testid="scene-split-container">
     <div class="scene-name-split-row">
       <input
         type="text"

@@ -435,4 +435,45 @@ describe('Scene Settings & Juices', () => {
     unmount(instanceAdmin);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/scene-settings シーン選択ドロップダウンの外側クリック閉じ (Issue #31)
+  it('closes scene split dropdown menu when clicking outside', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const currentScene: Scene = {
+      id: 'scene-dropdown-test',
+      name: 'メインシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene,
+        allScenes: [currentScene],
+        characters: [],
+      },
+    });
+
+    const toggleBtn = target.querySelector<HTMLButtonElement>(
+      '[data-testid="scene-split-dropdown-toggle"]',
+    );
+    expect(toggleBtn).toBeTruthy();
+    toggleBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="scene-split-menu"]')).toBeTruthy();
+
+    // Click outside on document.body
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="scene-split-menu"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
 });

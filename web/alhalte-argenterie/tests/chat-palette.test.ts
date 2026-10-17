@@ -105,8 +105,26 @@ describe('Chat Palette Suggestion & Common Footer', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-graph"]')?.click();
     expect(switchedTab).toBe('graph');
 
+    // Multi-line textarea with at least 5 rows (Issue #31)
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    expect(textarea).toBeTruthy();
+    expect(textarea?.tagName.toLowerCase()).toBe('textarea');
+    expect(Number(textarea?.rows)).toBeGreaterThanOrEqual(5);
+
+    // Character picker outside-click dismissal (Issue #31)
+    const charSelectBtn = target.querySelector<HTMLButtonElement>('[data-testid="character-select-button"]');
+    expect(charSelectBtn).toBeTruthy();
+    charSelectBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="character-picker-dropdown"]')).toBeTruthy();
+
+    // Click outside on document.body
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="character-picker-dropdown"]')).toBeNull();
+
     // Type partial match into input
-    const input = target.querySelector<HTMLInputElement>('[data-testid="chat-input-field"]');
+    const input = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
     expect(input).toBeTruthy();
     if (input) {
       input.value = '目星';

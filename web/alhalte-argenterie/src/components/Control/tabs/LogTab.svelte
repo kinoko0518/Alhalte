@@ -67,7 +67,17 @@
     const d = new Date(timestamp * 1000);
     return isNaN(d.getTime()) ? '1970/1/1 00:00:00' : d.toLocaleString();
   }
+
+  let gearMenuWrapper = $state<HTMLElement | null>(null);
+
+  function handleWindowClick(e: MouseEvent) {
+    if (isMenuOpen && gearMenuWrapper && !gearMenuWrapper.contains(e.target as Node)) {
+      isMenuOpen = false;
+    }
+  }
 </script>
+
+<svelte:window onclick={handleWindowClick} />
 
 <div class="log-tab-container" data-testid="log-tab">
   <!-- Header:
@@ -93,7 +103,7 @@
       {scene.name}
     </h2>
 
-    <div class="gear-menu-wrapper">
+    <div class="gear-menu-wrapper" bind:this={gearMenuWrapper}>
       <button
         type="button"
         class="header-btn gear-btn"
