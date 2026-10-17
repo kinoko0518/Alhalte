@@ -5,7 +5,8 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> キャラクタータブ`
    */
-  import { Button, Card, Carousel, CarouselItem, Switch } from 'noph-ui';
+  import { Button, Card, Carousel, CarouselItem, IconButton, Switch } from 'noph-ui';
+  import { Icon } from 'noph-ui/icons';
   import type { Character } from '../../../types/index.js';
   import {
     loadAssets,
@@ -140,9 +141,15 @@
 <div class="character-tab-container" data-testid="character-management-tab">
   <div class="tab-header">
     <h3 class="tab-title">キャラクター一覧</h3>
-    <Button variant="filled" onclick={handleCreateNewChar} data-testid="create-character-btn">
-      新規作成
-    </Button>
+    <IconButton
+      variant="filled"
+      onclick={handleCreateNewChar}
+      aria-label="新規作成"
+      title="新規作成"
+      data-testid="create-character-btn"
+    >
+      <Icon>person_add</Icon>
+    </IconButton>
   </div>
 
   <!-- Character list:
@@ -187,24 +194,28 @@
               </p>
             </div>
 
-            <!-- Action buttons: Delete & Place as Piece -->
+            <!-- Action buttons: Place as Piece & Delete -->
             <div class="char-actions">
-              <Button
-                variant={char.placedAsPiece ? 'filled' : 'outlined'}
+              <IconButton
+                variant={char.placedAsPiece ? 'filled' : 'tonal'}
+                toggle
+                selected={!!char.placedAsPiece}
                 onclick={() => onTogglePiece?.(char.id)}
-                data-testid="place-piece-btn-{char.id}"
+                aria-label={char.placedAsPiece ? '駒を解除' : '駒として配置'}
+                title={char.placedAsPiece ? '駒を解除' : '駒として配置'}
+                data-testid="piece-char-btn-{char.id}"
               >
-                {char.placedAsPiece ? '駒を戻す' : '駒として配置'}
-              </Button>
-              <button
-                type="button"
-                class="delete-icon-btn"
+                <Icon>{char.placedAsPiece ? 'person_pin_circle' : 'place_item'}</Icon>
+              </IconButton>
+              <IconButton
+                variant="text"
                 onclick={() => openDeleteConfirm(char)}
+                aria-label="削除"
+                title="削除"
                 data-testid="delete-char-btn-{char.id}"
-                title="キャラクター削除"
               >
-                🗑
-              </button>
+                <Icon>delete</Icon>
+              </IconButton>
             </div>
           </div>
         </Card>
@@ -563,18 +574,11 @@
     text-overflow: ellipsis;
   }
   .char-actions {
+    margin-left: auto;
     display: flex;
     align-items: center;
     gap: 8px;
     flex-shrink: 0;
-  }
-  .delete-icon-btn {
-    background: none;
-    border: none;
-    cursor: pointer;
-    font-size: 1.1rem;
-    color: var(--np-color-error);
-    padding: 6px;
   }
   .edit-panel-overlay {
     position: fixed;
@@ -664,18 +668,20 @@
   }
   .single-line-input {
     padding: 8px 12px;
-    border: 1px solid var(--md-sys-color-outline, #79747e);
+    border: 1px solid var(--np-color-outline);
     border-radius: 8px;
     font-size: 0.9rem;
-    background: #fff;
+    background: var(--np-color-surface-container-lowest);
+    color: var(--np-color-on-surface);
   }
   .multiline-input {
     padding: 8px 12px;
-    border: 1px solid var(--md-sys-color-outline, #79747e);
+    border: 1px solid var(--np-color-outline);
     border-radius: 8px;
     font-size: 0.9rem;
     font-family: inherit;
-    background: #fff;
+    background: var(--np-color-surface-container-lowest);
+    color: var(--np-color-on-surface);
   }
   .palette-area {
     font-family: monospace;
@@ -684,7 +690,7 @@
     display: flex;
     flex-direction: column;
     gap: 6px;
-    background: rgba(255, 255, 255, 0.5);
+    background: var(--np-color-surface-container);
     padding: 10px;
     border-radius: 10px;
   }
@@ -696,11 +702,12 @@
   .sub-section-title {
     font-weight: 600;
     font-size: 0.9rem;
+    color: var(--np-color-on-surface);
   }
   .add-mini-btn {
     border: none;
     background: transparent;
-    color: var(--md-sys-color-primary, #6750a4);
+    color: var(--np-color-primary);
     font-size: 0.8rem;
     cursor: pointer;
     font-weight: 600;
@@ -724,13 +731,13 @@
   }
   .slash-div {
     font-weight: 700;
-    color: #888;
+    color: var(--np-color-on-surface-variant);
   }
   .remove-mini-btn {
     border: none;
     background: none;
     cursor: pointer;
-    color: #888;
+    color: var(--np-color-on-surface-variant);
     padding: 4px;
   }
   .toggle-setting-row {
@@ -750,19 +757,19 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.6);
+    background: color-mix(in srgb, var(--np-color-scrim, var(--np-color-on-surface)) 60%, transparent);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 1200;
   }
   .delete-warning-box {
-    background: var(--md-sys-color-surface-container-high, #ece6f0);
+    background: var(--np-color-surface-container-high);
     border-radius: 28px;
     padding: 24px;
     width: 90%;
     max-width: 480px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--np-elevation-3);
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -771,13 +778,13 @@
     margin: 0;
     text-align: center;
     font-size: 1.25rem;
-    color: var(--md-sys-color-error, #b3261e);
+    color: var(--np-color-error);
   }
   .warning-desc-centered {
     margin: 0;
     text-align: center;
     font-size: 0.9rem;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
+    color: var(--np-color-on-surface-variant);
     line-height: 1.4;
   }
   .warning-actions {
@@ -789,8 +796,8 @@
     padding: 8px 18px;
     border-radius: 20px;
     border: none;
-    background: var(--md-sys-color-error, #b3261e);
-    color: #fff;
+    background: var(--np-color-error);
+    color: var(--np-color-on-error);
     font-weight: 600;
     cursor: pointer;
   }

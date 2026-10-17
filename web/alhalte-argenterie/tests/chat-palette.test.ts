@@ -79,13 +79,27 @@ describe('Chat Palette Suggestion & Common Footer', () => {
       },
     });
 
-    // Check 5 tab buttons (Scene Management Tab consolidated into Scene Tab in Issue #30)
-    expect(target.querySelector('[data-testid="tab-btn-log"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="tab-btn-graph"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="tab-btn-settings"]')).toBeTruthy();
+    // Check 5 M3 Tab buttons with Material Symbols icons and Tooltips (Issue #30 & Issue #33)
+    expect(target.querySelector('.np-tabs')).toBeTruthy();
+    const expectedTabs = [
+      { id: 'log', icon: 'forum', label: 'ログタブ' },
+      { id: 'graph', icon: 'account_tree', label: 'シーンタブ' },
+      { id: 'settings', icon: 'tune', label: 'シーン設定タブ' },
+      { id: 'characters', icon: 'group', label: 'キャラクター管理タブ' },
+      { id: 'extensions', icon: 'extension', label: '拡張機能管理タブ' },
+    ];
+    for (const tab of expectedTabs) {
+      const tabBtn = target.querySelector<HTMLButtonElement>(`[data-testid="tab-btn-${tab.id}"]`);
+      expect(tabBtn).toBeTruthy();
+      expect(tabBtn?.classList.contains('np-tab')).toBe(true);
+      expect(tabBtn?.getAttribute('aria-label')).toBe(tab.label);
+      expect(tabBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe(tab.icon);
+
+      const tooltip = target.querySelector(`#tooltip-tab-${tab.id}`);
+      expect(tooltip).toBeTruthy();
+      expect(tooltip?.textContent?.trim()).toBe(tab.label);
+    }
     expect(target.querySelector('[data-testid="tab-btn-scenes"]')).toBeNull();
-    expect(target.querySelector('[data-testid="tab-btn-characters"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="tab-btn-extensions"]')).toBeTruthy();
 
     // Click tab button
     target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-graph"]')?.click();
@@ -115,8 +129,12 @@ describe('Chat Palette Suggestion & Common Footer', () => {
 
     expect(input?.value).toBe('1D100<=50 【目星】');
 
-    // Send button
-    target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]')?.click();
+    // Send IconButton with 'send' icon (Issue #33)
+    const sendBtn = target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]');
+    expect(sendBtn).toBeTruthy();
+    expect(sendBtn?.classList.contains('np-icon-button')).toBe(true);
+    expect(sendBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('send');
+    sendBtn?.click();
     expect(sentMessage).toBe('1D100<=50 【目星】');
 
     unmount(instance);

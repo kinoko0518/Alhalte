@@ -77,8 +77,18 @@ describe('Character Management & Edit Panel', () => {
     expect(descEl?.textContent).toContain('……');
     expect(descEl?.textContent?.length).toBeLessThan(longDesc.length);
 
-    // Test "駒として配置" button
-    target.querySelector<HTMLButtonElement>('[data-testid="place-piece-btn-char-mage"]')?.click();
+    // Check "新規作成" button is an M3 IconButton with person_add icon
+    const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="create-character-btn"]');
+    expect(createBtn).toBeTruthy();
+    expect(createBtn?.classList.contains('np-icon-button')).toBe(true);
+    expect(createBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('person_add');
+
+    // Test "駒として配置" IconButton
+    const pieceBtn = target.querySelector<HTMLButtonElement>('[data-testid="piece-char-btn-char-mage"]');
+    expect(pieceBtn).toBeTruthy();
+    expect(pieceBtn?.classList.contains('np-icon-button')).toBe(true);
+    expect(pieceBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('place_item');
+    pieceBtn?.click();
     expect(pieceToggledId).toBe('char-mage');
 
     // Open Edit panel by clicking avatar
@@ -113,8 +123,12 @@ describe('Character Management & Edit Panel', () => {
     expect(updatedChar).toBeTruthy();
     expect(Number(updatedChar?.initiative)).toBe(18);
 
-    // Test Delete button -> opens full-screen warning dialog
-    target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-mage"]')?.click();
+    // Test Delete IconButton -> opens full-screen warning dialog
+    const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-mage"]');
+    expect(deleteBtn).toBeTruthy();
+    expect(deleteBtn?.classList.contains('np-icon-button')).toBe(true);
+    expect(deleteBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('delete');
+    deleteBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
     expect(target.querySelector('[data-testid="char-delete-confirm-dialog"]')).toBeTruthy();
