@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mount, unmount } from 'svelte';
 import {
   parseLogRecord,
@@ -8,10 +8,16 @@ import {
   LOG_FALLBACK_TIMESTAMP,
 } from '../src/utils/log.js';
 import LogTab from '../src/components/Control/tabs/LogTab.svelte';
-import type { Scene } from '../src/types/index.js';
+import App from '../src/components/App.svelte';
+import { DEFAULT_OFFICIAL_EXTENSIONS, loadDefaultExtensions } from '../src/wasm/runner.js';
+import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 
 describe('Log Tab & Chunk Lazy Loading', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
   // spec: alhalte-argenterie/log-tab フォールバック値
   it('applies fallback values when content, speaker, or timestamp are absent or empty', () => {
     // Missing all fields
@@ -137,4 +143,139 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     unmount(instanceAdmin);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/log-tab appendRecord によるリアクティブなログ描画更新
+  it('immediately renders appended log records in a mounted LogTab', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: '/',
+      name: 'メインシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const chunkManager = new ChunkLogManager();
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        chunkManager,
+      },
+    });
+
+    expect(target.querySelector('[data-testid="empty-log-notice"]')).toBeTruthy();
+
+    chunkManager.appendRecord({
+      id: 'msg-live-1',
+      sceneId: '/',
+      content: '2D6+3 攻撃ロール！',
+      speaker: '探索者A',
+      speakerId: 'char-1',
+      timestamp: 1700000123,
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="empty-log-notice"]')).toBeNull();
+    expect(target.querySelector('[data-testid="msg-speaker-msg-live-1"]')?.textContent).toBe(
+      '探索者A',
+    );
+    expect(
+      target.querySelector('[data-testid="msg-content-msg-live-1"]')?.textContent?.trim(),
+    ).toBe('2D6+3 攻撃ロール！');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/room コントロールパネル共通フッターからのメッセージ送信とログ表示
+  it('sends a message from App footer input and displays it in LogTab while populating default extensions', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testRoom: VisitedRoom = {
+      id: 'room-send-test',
+      name: 'メッセージ送信テスト部屋',
+      url: 'https://alhalte.example/rooms/room-send-test#key',
+      lastVisited: Date.now(),
+      isAdmin: true,
+    };
+
+    const testChars: Character[] = [
+      {
+        id: 'char-hero',
+        name: 'アルハルテ太郎',
+        initiative: 12,
+        description: 'テストPC',
+        statuses: [],
+        parameters: [],
+        chatPalette: '1D100<=50 【目星】',
+        hideStatus: false,
+      },
+    ];
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: testRoom,
+        initialCharacters: testChars,
+        isAdmin: true,
+      },
+    });
+
+    const inputEl = target.querySelector<HTMLInputElement>('[data-testid="chat-input-field"]');
+    const sendBtn = target.querySelector<HTMLElement>('[data-testid="send-message-button"]');
+    expect(inputEl).toBeTruthy();
+    expect(sendBtn).toBeTruthy();
+
+    // Type message and click send
+    inputEl!.value = 'こんにちは、世界！';
+    inputEl!.dispatchEvent(new Event('input', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    sendBtn!.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Input should be cleared and message rendered in LogTab
+    expect(inputEl!.value).toBe('');
+    const messagesList = target.querySelector('[data-testid="messages-list"]');
+    expect(messagesList?.textContent).toContain('こんにちは、世界！');
+    expect(messagesList?.textContent).toContain('アルハルテ太郎');
+
+    // Verify default official extensions are populated when switching to Extensions tab
+    expect(DEFAULT_OFFICIAL_EXTENSIONS).toHaveLength(6);
+    const fallbackExts = await loadDefaultExtensions(undefined);
+    expect(fallbackExts.map((e) => e.id)).toEqual([
+      'alhalte-dsl',
+      'markdown',
+      'aozora',
+      'coc-6',
+      'coc-7',
+      'emoklore',
+    ]);
+
+    const extTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-extensions"]');
+    extTabBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="ext-name-alhalte-dsl"]')?.textContent?.trim()).toBe(
+      'Alhalte DSL',
+    );
+    expect(target.querySelector('[data-testid="ext-name-markdown"]')?.textContent?.trim()).toBe(
+      'Markdown スタイル',
+    );
+    expect(target.querySelector('[data-testid="ext-name-aozora"]')?.textContent?.trim()).toBe(
+      '青空文庫ルビ・傍点',
+    );
+
+    unmount(instance);
+    target.remove();
+  });
 });
+

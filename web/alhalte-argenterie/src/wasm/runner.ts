@@ -341,3 +341,143 @@ export function deleteExtension(
     .filter((ext) => ext.id !== extensionId)
     .map((ext, idx) => ({ ...ext, priority: idx }));
 }
+
+/**
+ * Default official extensions configured in Bistrot.toml.
+ *
+ * Includes metadata matching `self_introduction_info()` in each official extension crate.
+ */
+export const DEFAULT_OFFICIAL_EXTENSIONS: ExtensionItem[] = [
+  {
+    id: 'alhalte-dsl',
+    name: 'Alhalte DSL',
+    iconSvg:
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM7.5 18c-.83 0-1.5-.67-1.5-1.5S6.67 15 7.5 15s1.5.67 1.5 1.5S8.33 18 7.5 18zm0-9C6.67 9 6 8.33 6 7.5S6.67 6 7.5 6 9 6.67 9 7.5 8.33 9 7.5 9zm4.5 4.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm4.5 4.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm0-9c-.83 0-1.5-.67-1.5-1.5S15.67 6 16.5 6s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>',
+    description:
+      'ダイスロール（xDy）・四則演算・比較判定・シークレットダイス・変数展開を処理する公式DSL拡張機能',
+    enabled: true,
+    priority: 0,
+  },
+  {
+    id: 'markdown',
+    name: 'Markdown スタイル',
+    iconSvg:
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M2.5 4v16h19V4H2.5zm2 2h15v12h-15V6zm2 2v8h2.5V11l2 2.5 2-2.5V16h2.5V8h-2.5l-2 2.5-2-2.5H6.5zm11 0l-2.5 3h1.5v5h2v-5h1.5l-2.5-3z"/></svg>',
+    description:
+      '太字（**）・斜体（*）・打ち消し線（~~）などのMarkdown記法を装飾ノードに変換する公式拡張機能',
+    enabled: true,
+    priority: 1,
+  },
+  {
+    id: 'aozora',
+    name: '青空文庫ルビ・傍点',
+    iconSvg:
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 4h5v8l-2.5-1.5L6 12V4z"/></svg>',
+    description:
+      '青空文庫形式のルビ（｜親文字《ルビ》）と傍点（［＃「…」に傍点］）を変換する公式拡張機能',
+    enabled: true,
+    priority: 2,
+  },
+  {
+    id: 'coc-6',
+    name: 'クトゥルフ神話TRPG (第6版)',
+    iconSvg:
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 2L4.5 6.5v11L12 22l7.5-4.5v-11L12 2zm0 2.3l5.5 3.3v8.8L12 19.7l-5.5-3.3V7.6L12 4.3zm0 3.7a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4z"/></svg>',
+    description:
+      'CoC第6版のCCB/CC判定・クリティカル/ファンブル・組み合わせロール・RESB対抗ロールを提供する公式拡張機能',
+    enabled: false,
+    priority: 3,
+  },
+  {
+    id: 'coc-7',
+    name: '新クトゥルフ神話TRPG (第7版)',
+    iconSvg:
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 2L4.5 6.5v11L12 22l7.5-4.5v-11L12 2zm0 2.3l5.5 3.3v8.8L12 19.7l-5.5-3.3V7.6L12 4.3zM9 9v2h3.5L9 16h2.2l3.5-5V9H9z"/></svg>',
+    description:
+      'CoC第7版のCC判定（レギュラー/ハード/イクストリーム）・ボーナス/ペナルティダイスを提供する公式拡張機能',
+    enabled: false,
+    priority: 4,
+  },
+  {
+    id: 'emoklore',
+    name: 'エモクロアTRPG',
+    iconSvg:
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>',
+    description:
+      'エモクロアTRPGのxDM<=y判定（共鳴判定・成功数カウント・ダブル/トリプル等）を提供する公式拡張機能',
+    enabled: false,
+    priority: 5,
+  },
+];
+
+export interface ExtensionManifestItem {
+  id: string;
+  name?: string;
+  url: string;
+  enabled?: boolean;
+  priority?: number;
+}
+
+/**
+ * Loads default official extensions from `/extensions/manifest.json` (staged by `alhalte-bistrot`),
+ * instantiating each `.wasm` binary to read `self_introduction()` metadata, and falling back
+ * gracefully to `DEFAULT_OFFICIAL_EXTENSIONS` when offline or in test environments.
+ */
+export async function loadDefaultExtensions(
+  fetchFn: typeof fetch | undefined = typeof globalThis.fetch === 'function'
+    ? globalThis.fetch.bind(globalThis)
+    : undefined,
+): Promise<ExtensionItem[]> {
+  if (!fetchFn) {
+    return DEFAULT_OFFICIAL_EXTENSIONS.map((ext) => ({ ...ext }));
+  }
+
+  try {
+    const res = await fetchFn('/extensions/manifest.json');
+    if (!res.ok) {
+      return DEFAULT_OFFICIAL_EXTENSIONS.map((ext) => ({ ...ext }));
+    }
+
+    const manifest = (await res.json()) as ExtensionManifestItem[];
+    if (!Array.isArray(manifest) || manifest.length === 0) {
+      return DEFAULT_OFFICIAL_EXTENSIONS.map((ext) => ({ ...ext }));
+    }
+
+    const items: ExtensionItem[] = [];
+    for (let idx = 0; idx < manifest.length; idx++) {
+      const entry = manifest[idx];
+      const fallback = DEFAULT_OFFICIAL_EXTENSIONS.find((d) => d.id === entry.id);
+
+      let wasmBytes: Uint8Array | undefined;
+      let intro: { name: string; iconSvg: string; description: string } | null = null;
+
+      if (entry.url) {
+        try {
+          const wasmRes = await fetchFn(entry.url);
+          if (wasmRes.ok) {
+            const buf = await wasmRes.arrayBuffer();
+            wasmBytes = new Uint8Array(buf);
+            const instance = await WasmExtensionInstance.instantiate(wasmBytes);
+            intro = instance.selfIntroduction();
+          }
+        } catch {
+          // Fall back to static metadata if wasm binary is not yet compiled or reachable
+        }
+      }
+
+      items.push({
+        id: entry.id,
+        name: intro?.name || entry.name || fallback?.name || entry.id,
+        iconSvg: intro?.iconSvg || fallback?.iconSvg,
+        description: intro?.description || fallback?.description,
+        enabled: entry.enabled ?? fallback?.enabled ?? true,
+        priority: entry.priority ?? idx,
+        wasmBytes,
+      });
+    }
+
+    return items.sort((a, b) => a.priority - b.priority);
+  } catch {
+    return DEFAULT_OFFICIAL_EXTENSIONS.map((ext) => ({ ...ext }));
+  }
+}

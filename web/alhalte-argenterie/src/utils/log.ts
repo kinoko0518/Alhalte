@@ -73,9 +73,27 @@ export class ChunkLogManager {
   private sceneChunks: Map<string, string[]> = new Map(); // sceneId -> ordered list of chunkIds
   private loadedChunkIds: Set<string> = new Set();
   private chunkFetchHandler?: (chunkId: string) => Promise<Record<string, unknown>[]>;
+  private listeners: Set<() => void> = new Set();
 
   constructor(fetchHandler?: (chunkId: string) => Promise<Record<string, unknown>[]>) {
     this.chunkFetchHandler = fetchHandler;
+  }
+
+  /**
+   * Subscribes a listener that is invoked whenever log chunks or records change.
+   * Returns an unsubscribe callback.
+   */
+  public subscribe(listener: () => void): () => void {
+    this.listeners.add(listener);
+    return () => {
+      this.listeners.delete(listener);
+    };
+  }
+
+  private notifyListeners(): void {
+    for (const listener of this.listeners) {
+      listener();
+    }
   }
 
   /**
@@ -93,6 +111,59 @@ export class ChunkLogManager {
         });
       }
     }
+    this.notifyListeners();
+  }
+
+  /**
+   * Appends a new log record to the latest loaded chunk for its scene (creating a live chunk if needed)
+   * and notifies all registered subscribers.
+   */
+  public appendRecord(record: LogRecord): void {
+    let chunkList = this.sceneChunks.get(record.sceneId);
+    if (!chunkList) {
+      chunkList = [];
+      this.sceneChunks.set(record.sceneId, chunkList);
+    }
+
+    let targetChunk: LogChunk | undefined;
+    for (let i = chunkList.length - 1; i >= 0; i--) {
+      const c = this.chunks.get(chunkList[i]);
+      if (c && c.isLoaded) {
+        targetChunk = c;
+        break;
+      }
+    }
+
+    if (!targetChunk) {
+      const liveChunkId = `chunk-${record.sceneId}-live`;
+      targetChunk = this.chunks.get(liveChunkId);
+      if (!targetChunk) {
+        targetChunk = {
+          chunkId: liveChunkId,
+          sceneId: record.sceneId,
+          entries: [],
+          isLoaded: true,
+        };
+        this.chunks.set(liveChunkId, targetChunk);
+      } else {
+        targetChunk.isLoaded = true;
+      }
+      if (!chunkList.includes(liveChunkId)) {
+        chunkList.push(liveChunkId);
+      }
+      this.loadedChunkIds.add(liveChunkId);
+    }
+
+    if (targetChunk.entries.some((e) => e.id === record.id)) {
+      return;
+    }
+
+    const normalizedRecord: LogRecord = {
+      ...record,
+      chunkId: record.chunkId ?? targetChunk.chunkId,
+    };
+    targetChunk.entries.push(normalizedRecord);
+    this.notifyListeners();
   }
 
   /**
@@ -127,6 +198,7 @@ export class ChunkLogManager {
     chunk.entries = entries;
     chunk.isLoaded = true;
     this.loadedChunkIds.add(chunkId);
+    this.notifyListeners();
 
     return entries;
   }
