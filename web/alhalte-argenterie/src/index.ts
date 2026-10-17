@@ -10,6 +10,7 @@ export * from './types/index.js';
 
 // Utilities
 export * from './utils/home.js';
+export * from './utils/recentRooms.js';
 export * from './utils/field.js';
 export * from './utils/chatPalette.js';
 export * from './utils/log.js';
