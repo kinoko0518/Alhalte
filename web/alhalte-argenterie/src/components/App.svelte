@@ -54,6 +54,9 @@
     typeof window !== 'undefined' ? window.innerWidth >= window.innerHeight : true,
   );
   let isControlSheetOpen = $state(true);
+  let isControlSheetExpanded = $state(false);
+  let sideSheetWidth = $state(440);
+  let isResizing = $state(false);
 
   // Default scenes if none provided
   let scenes = $state<Scene[]>(
@@ -182,6 +185,54 @@
   function updateOrientation() {
     if (typeof window !== 'undefined') {
       isLandscape = window.innerWidth >= window.innerHeight;
+      const minWidth = window.innerWidth * 0.1;
+      if (sideSheetWidth < minWidth) {
+        sideSheetWidth = minWidth;
+      }
+    }
+  }
+
+  function handleSideResizeDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    isResizing = true;
+    const startX = e.clientX;
+    const startWidth = sideSheetWidth;
+
+    const onPointerMove = (ev: PointerEvent) => {
+      if (!isResizing) return;
+      const deltaX = startX - ev.clientX;
+      const minWidth = typeof window !== 'undefined' ? window.innerWidth * 0.1 : 120;
+      const maxWidth = typeof window !== 'undefined' ? window.innerWidth * 0.9 : 1000;
+      let newWidth = startWidth + deltaX;
+      if (newWidth < minWidth) newWidth = minWidth;
+      if (newWidth > maxWidth) newWidth = maxWidth;
+      sideSheetWidth = newWidth;
+    };
+
+    const onPointerUp = (ev: PointerEvent) => {
+      isResizing = false;
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('pointermove', onPointerMove);
+        window.removeEventListener('pointerup', onPointerUp);
+        window.removeEventListener('pointercancel', onPointerUp);
+      }
+      try {
+        (e.currentTarget as HTMLElement)?.releasePointerCapture(e.pointerId);
+      } catch {
+        // ignore
+      }
+    };
+
+    try {
+      (e.currentTarget as HTMLElement)?.setPointerCapture(e.pointerId);
+    } catch {
+      // ignore
+    }
+
+    if (typeof window !== 'undefined') {
+      window.addEventListener('pointermove', onPointerMove);
+      window.addEventListener('pointerup', onPointerUp);
+      window.addEventListener('pointercancel', onPointerUp);
     }
   }
 
@@ -394,60 +445,92 @@
             bind:open={isControlSheetOpen}
             placement="end"
             modal={false}
-            class="landscape-side-sheet"
-            --np-sheet-size="440px"
+            class={['landscape-side-sheet', isResizing && 'is-resizing']}
+            style="--np-sheet-size: {sideSheetWidth}px; width: {isControlSheetOpen ? `${sideSheetWidth}px` : '0px'}; min-width: {isControlSheetOpen ? '10vw' : '0'};"
             data-testid="landscape-side-sheet"
           >
-            <ControlPanel
-              {currentScene}
-              allScenes={scenes}
-              {characters}
-              {extensions}
-              {movements}
-              {accessibleSceneIds}
-              {selectedCharacterId}
-              isAdmin={isAdmin || currentRoom.isAdmin}
-              {chunkManager}
-              onCollapse={() => (isControlSheetOpen = false)}
-              onSelectScene={handleSelectScene}
-              onSelectCharacter={(id) => (selectedCharacterId = id)}
-              onCreateScene={handleCreateScene}
-              onDeleteScene={handleDeleteScene}
-              onMoveMember={handleMoveMember}
-              onUpdateCharacter={(char) => {
-                characters = characters.map((c) => (c.id === char.id ? char : c));
-              }}
-              onCreateCharacter={(char) => {
-                characters.push(char);
-                if (!currentScene.members.includes(char.id)) {
-                  currentScene.members.push(char.id);
-                }
-              }}
-              onDeleteCharacter={(charId) => {
-                characters = characters.filter((c) => c.id !== charId);
-                for (const sc of scenes) {
-                  sc.members = sc.members.filter((id) => id !== charId);
-                }
-              }}
-              onTogglePiece={handleTogglePiece}
-              onUpdateExtensions={(exts) => (extensions = exts)}
-              onUploadExtension={handleUploadExtension}
-              onSendMessage={handleSendMessage}
-              onRequestDeleteScene={handleRequestDeleteScene}
-              onRequestDeleteCharacter={handleRequestDeleteCharacter}
-              onRequestAssetPicker={handleRequestAssetPicker}
-            />
+            <div class="side-sheet-inner-container" class:resizing={isResizing}>
+              <!-- Stepless Resize Bar / Drag Handle on the left edge of the side sheet -->
+              <div
+                class="side-sheet-resize-bar"
+                data-testid="side-sheet-resize-handle"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="サイドシート幅リサイズ"
+                onpointerdown={handleSideResizeDown}
+              >
+                <div class="side-sheet-resize-pill"></div>
+                <div class="side-sheet-toggle-wrapper">
+                  <IconButton
+                    variant="tonal"
+                    size="xs"
+                    class="side-sheet-toggle-btn"
+                    data-testid="side-sheet-toggle-button"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      isControlSheetOpen = false;
+                    }}
+                    aria-label="コントロールパネルを閉じる"
+                  >
+                    <Icon>chevron_right</Icon>
+                  </IconButton>
+                </div>
+              </div>
+
+              <!-- Main Control Panel -->
+              <div class="side-sheet-content-wrapper">
+                <ControlPanel
+                  {currentScene}
+                  allScenes={scenes}
+                  {characters}
+                  {extensions}
+                  {movements}
+                  {accessibleSceneIds}
+                  {selectedCharacterId}
+                  isAdmin={isAdmin || currentRoom.isAdmin}
+                  {chunkManager}
+                  onCollapse={() => (isControlSheetOpen = false)}
+                  onSelectScene={handleSelectScene}
+                  onSelectCharacter={(id) => (selectedCharacterId = id)}
+                  onCreateScene={handleCreateScene}
+                  onDeleteScene={handleDeleteScene}
+                  onMoveMember={handleMoveMember}
+                  onUpdateCharacter={(char) => {
+                    characters = characters.map((c) => (c.id === char.id ? char : c));
+                  }}
+                  onCreateCharacter={(char) => {
+                    characters.push(char);
+                    if (!currentScene.members.includes(char.id)) {
+                      currentScene.members.push(char.id);
+                    }
+                  }}
+                  onDeleteCharacter={(charId) => {
+                    characters = characters.filter((c) => c.id !== charId);
+                    for (const sc of scenes) {
+                      sc.members = sc.members.filter((id) => id !== charId);
+                    }
+                  }}
+                  onTogglePiece={handleTogglePiece}
+                  onUpdateExtensions={(exts) => (extensions = exts)}
+                  onUploadExtension={handleUploadExtension}
+                  onSendMessage={handleSendMessage}
+                  onRequestDeleteScene={handleRequestDeleteScene}
+                  onRequestDeleteCharacter={handleRequestDeleteCharacter}
+                  onRequestAssetPicker={handleRequestAssetPicker}
+                />
+              </div>
+            </div>
           </Sheet>
 
           {#if !isControlSheetOpen}
-            <div class="reopen-sheet-floating landscape-reopen">
+            <div class="reopen-sheet-floating landscape-reopen" data-testid="side-sheet-toggle-button">
               <IconButton
                 variant="tonal"
                 onclick={() => (isControlSheetOpen = true)}
                 data-testid="reopen-sheet-button"
                 aria-label="コントロールパネルを開く"
               >
-                <Icon>left_panel_open</Icon>
+                <Icon>chevron_left</Icon>
               </IconButton>
             </div>
           {/if}
@@ -477,6 +560,7 @@
         >
           <Sheet
             bind:open={isControlSheetOpen}
+            bind:expanded={isControlSheetExpanded}
             placement="bottom"
             modal={false}
             handle={true}
@@ -484,52 +568,57 @@
             class="portrait-bottom-sheet"
             data-testid="portrait-sheet-dialog"
           >
-            <ControlPanel
-              {currentScene}
-              allScenes={scenes}
-              {characters}
-              {extensions}
-              {movements}
-              {accessibleSceneIds}
-              {selectedCharacterId}
-              isAdmin={isAdmin || currentRoom.isAdmin}
-              {chunkManager}
-              onCollapse={() => (isControlSheetOpen = false)}
-              onSelectScene={handleSelectScene}
-              onSelectCharacter={(id) => (selectedCharacterId = id)}
-              onCreateScene={handleCreateScene}
-              onDeleteScene={handleDeleteScene}
-              onMoveMember={handleMoveMember}
-              onUpdateCharacter={(char) => {
-                characters = characters.map((c) => (c.id === char.id ? char : c));
-              }}
-              onCreateCharacter={(char) => {
-                characters.push(char);
-                if (!currentScene.members.includes(char.id)) {
-                  currentScene.members.push(char.id);
-                }
-              }}
-              onDeleteCharacter={(charId) => {
-                characters = characters.filter((c) => c.id !== charId);
-                for (const sc of scenes) {
-                  sc.members = sc.members.filter((id) => id !== charId);
-                }
-              }}
-              onTogglePiece={handleTogglePiece}
-              onUpdateExtensions={(exts) => (extensions = exts)}
-              onUploadExtension={handleUploadExtension}
-              onSendMessage={handleSendMessage}
-              onRequestDeleteScene={handleRequestDeleteScene}
-              onRequestDeleteCharacter={handleRequestDeleteCharacter}
-              onRequestAssetPicker={handleRequestAssetPicker}
-            />
+            <div class="bottom-sheet-content-wrapper">
+              <ControlPanel
+                {currentScene}
+                allScenes={scenes}
+                {characters}
+                {extensions}
+                {movements}
+                {accessibleSceneIds}
+                {selectedCharacterId}
+                isAdmin={isAdmin || currentRoom.isAdmin}
+                {chunkManager}
+                onCollapse={() => (isControlSheetOpen = false)}
+                onSelectScene={handleSelectScene}
+                onSelectCharacter={(id) => (selectedCharacterId = id)}
+                onCreateScene={handleCreateScene}
+                onDeleteScene={handleDeleteScene}
+                onMoveMember={handleMoveMember}
+                onUpdateCharacter={(char) => {
+                  characters = characters.map((c) => (c.id === char.id ? char : c));
+                }}
+                onCreateCharacter={(char) => {
+                  characters.push(char);
+                  if (!currentScene.members.includes(char.id)) {
+                    currentScene.members.push(char.id);
+                  }
+                }}
+                onDeleteCharacter={(charId) => {
+                  characters = characters.filter((c) => c.id !== charId);
+                  for (const sc of scenes) {
+                    sc.members = sc.members.filter((id) => id !== charId);
+                  }
+                }}
+                onTogglePiece={handleTogglePiece}
+                onUpdateExtensions={(exts) => (extensions = exts)}
+                onUploadExtension={handleUploadExtension}
+                onSendMessage={handleSendMessage}
+                onRequestDeleteScene={handleRequestDeleteScene}
+                onRequestDeleteCharacter={handleRequestDeleteCharacter}
+                onRequestAssetPicker={handleRequestAssetPicker}
+              />
+            </div>
           </Sheet>
 
           {#if !isControlSheetOpen}
             <div class="reopen-sheet-floating portrait-reopen">
               <IconButton
                 variant="tonal"
-                onclick={() => (isControlSheetOpen = true)}
+                onclick={() => {
+                  isControlSheetOpen = true;
+                  isControlSheetExpanded = false;
+                }}
                 data-testid="reopen-sheet-button"
                 aria-label="コントロールパネルを開く"
               >
@@ -683,18 +772,84 @@
     z-index: 200;
   }
   .landscape-control :global(.landscape-side-sheet) {
-    --np-sheet-size: 440px;
-    max-width: 45vw;
+    min-width: 10vw !important;
     height: 100%;
     border-left: 1px solid var(--np-color-outline-variant);
     box-shadow: var(--np-elevation-2);
+  }
+  .landscape-control :global(.landscape-side-sheet.is-resizing) {
+    transition: none !important;
   }
   .landscape-control :global(.landscape-side-sheet .np-sheet-content) {
     padding: 0;
     overflow: hidden;
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
     height: 100%;
+    width: 100%;
+  }
+  .side-sheet-inner-container {
+    display: flex;
+    flex-direction: row;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    position: relative;
+  }
+  .side-sheet-inner-container.resizing {
+    user-select: none;
+  }
+  .side-sheet-inner-container.resizing :global(*) {
+    user-select: none !important;
+  }
+  .side-sheet-resize-bar {
+    width: 20px;
+    height: 100%;
+    position: relative;
+    cursor: col-resize;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: var(--np-color-surface-container);
+    border-right: 1px solid var(--np-color-outline-variant);
+    flex-shrink: 0;
+    touch-action: none;
+    user-select: none;
+    z-index: 10;
+    transition: background var(--np-motion-expressive-fast-effects, 150ms ease);
+  }
+  .side-sheet-resize-bar:hover,
+  .side-sheet-inner-container.resizing .side-sheet-resize-bar {
+    background: var(--np-color-surface-container-high);
+  }
+  .side-sheet-resize-pill {
+    width: 4px;
+    height: 32px;
+    border-radius: var(--np-shape-corner-full, 9999px);
+    background: var(--np-color-on-surface-variant);
+    opacity: 0.6;
+    transition: opacity 150ms ease, height 150ms ease;
+  }
+  .side-sheet-resize-bar:hover .side-sheet-resize-pill,
+  .side-sheet-inner-container.resizing .side-sheet-resize-pill {
+    opacity: 1;
+    height: 48px;
+    background: var(--np-color-primary);
+  }
+  .side-sheet-toggle-wrapper {
+    position: absolute;
+    top: 8px;
+    left: 50%;
+    transform: translateX(-50%);
+  }
+  .side-sheet-content-wrapper {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
   .reopen-sheet-floating.landscape-reopen {
     position: fixed;
@@ -722,17 +877,36 @@
     z-index: 500;
   }
   .bottom-sheet-container :global(.portrait-bottom-sheet) {
-    --np-sheet-size: 65dvh;
+    --np-sheet-size: 50vh;
     --np-sheet-max-width: 100%;
-    height: 65dvh;
+    width: 100% !important;
+    max-width: 100% !important;
+    inset-inline: 0 !important;
+    margin-inline: 0 !important;
     box-shadow: var(--np-elevation-3);
+    transition:
+      translate var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
+      max-height var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
+      display var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete,
+      overlay var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete;
+  }
+  .bottom-sheet-container :global(.portrait-bottom-sheet.np-sheet-expanded) {
+    max-height: calc(100dvh - 3.5rem);
   }
   .bottom-sheet-container :global(.portrait-bottom-sheet .np-sheet-content) {
     padding: 0;
     overflow: hidden;
     display: flex;
     flex-direction: column;
+    flex: 1;
+    min-height: 0;
+  }
+  .bottom-sheet-content-wrapper {
     height: 100%;
+    min-height: calc(100vh - 56px);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
   .reopen-sheet-floating.portrait-reopen {
     position: fixed;
