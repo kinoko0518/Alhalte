@@ -61,6 +61,17 @@ export interface Character {
 }
 
 /**
+ * BGM Slot item for multi-track audio control (Issue #53).
+ */
+export interface BgmSlot {
+  slot: number; // u32, 1-based index (e.g. 1, 2, 3...)
+  tinId?: string | null; // Option<string>: null or undefined means None (stopped)
+  volume: number; // Volume from 0.0 to 1.0 (represented as 0 to 100 on Slider)
+  isPlaying: boolean; // Playback toggle state
+  name?: string; // Optional track name / description
+}
+
+/**
  * Juices (sound and visual atmosphere settings) for a scene.
  */
 export interface Juices {
@@ -74,6 +85,7 @@ export interface Juices {
   bgm2Volume: number;
   bgm3?: string;
   bgm3Volume: number;
+  bgmSlots?: BgmSlot[];
 }
 
 /**

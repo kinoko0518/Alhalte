@@ -173,13 +173,13 @@ describe('Scene Settings & Juices', () => {
     expect(target.querySelector('[data-testid="bg-width-input"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="bg-height-input"]')).toBeTruthy();
 
-    // Check BGM buttons 1 to 3 use noph-ui Button (.np-button) and Sliders use noph-ui Slider (.np-slider)
-    const pill1 = target.querySelector('[data-testid="bgm-pill-1"]');
-    const pill2 = target.querySelector('[data-testid="bgm-pill-2"]');
-    const pill3 = target.querySelector('[data-testid="bgm-pill-3"]');
-    expect(pill1?.classList.contains('np-button')).toBe(true);
-    expect(pill2?.classList.contains('np-button')).toBe(true);
-    expect(pill3?.classList.contains('np-button')).toBe(true);
+    // Check BGM buttons 1 to 3 use noph-ui IconButton (.np-icon-button) and Sliders use noph-ui Slider (.np-slider) (Issue #53)
+    const select1 = target.querySelector('[data-testid="bgm-select-btn-1"]');
+    const select2 = target.querySelector('[data-testid="bgm-select-btn-2"]');
+    const select3 = target.querySelector('[data-testid="bgm-select-btn-3"]');
+    expect(select1?.classList.contains('np-icon-button')).toBe(true);
+    expect(select2?.classList.contains('np-icon-button')).toBe(true);
+    expect(select3?.classList.contains('np-icon-button')).toBe(true);
 
     const slider1 = target.querySelector('[data-testid="bgm-slider-1"]');
     const slider2 = target.querySelector('[data-testid="bgm-slider-2"]');
@@ -357,7 +357,7 @@ describe('Scene Settings & Juices', () => {
     expect(lastUpdatedScene?.juices.bgImage).toBeUndefined();
 
     // Open BGM1 picker -> initialMediaType is 'audio'
-    target.querySelector<HTMLButtonElement>('[data-testid="bgm-pill-1"]')?.click();
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-select-btn-1"]')?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
     expect(

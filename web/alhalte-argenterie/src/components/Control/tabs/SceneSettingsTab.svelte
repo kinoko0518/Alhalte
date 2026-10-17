@@ -7,10 +7,11 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    */
-  import { Button, Carousel, CarouselItem, Slider, Switch, TextField } from 'noph-ui';
+  import { Button, Carousel, CarouselItem, IconButton, Slider, Switch, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import GenericImagePicker from '../GenericImagePicker.svelte';
-  import type { Character, Scene } from '../../../types/index.js';
+  import type { BgmSlot, Character, Scene } from '../../../types/index.js';
+  import { getNormalizedBgmSlots } from '../../../utils/sceneSettings.js';
   import {
     loadAssets,
     subscribeAssets,
@@ -132,15 +133,84 @@
     }
   }
 
-  function handleBgmSelect(bgmKey: 'bgm1' | 'bgm2' | 'bgm3') {
-    assetPickerTarget = bgmKey;
+  // BGM Slots state & synchronization (Issue #53)
+  let bgmSlots = $state<BgmSlot[]>(getNormalizedBgmSlots(currentScene.juices));
+  let activeBgmSlotPicking = $state<number | null>(null);
+  let lastTinIds = $state<Record<number, string>>({});
+
+  $effect(() => {
+    bgmSlots = getNormalizedBgmSlots(currentScene.juices);
+  });
+
+  function syncSlotToLegacy(slot: BgmSlot) {
+    if (slot.slot === 1) {
+      currentScene.juices.bgm1 = slot.tinId ?? undefined;
+      currentScene.juices.bgm1Volume = slot.volume;
+    } else if (slot.slot === 2) {
+      currentScene.juices.bgm2 = slot.tinId ?? undefined;
+      currentScene.juices.bgm2Volume = slot.volume;
+    } else if (slot.slot === 3) {
+      currentScene.juices.bgm3 = slot.tinId ?? undefined;
+      currentScene.juices.bgm3Volume = slot.volume;
+    }
+  }
+
+  function handleToggleBgmPlay(slotNum: number) {
+    const slot = bgmSlots.find((s) => s.slot === slotNum);
+    if (!slot) return;
+
+    if (slot.isPlaying && slot.tinId) {
+      // 再生中 -> 停止 (None / null)
+      lastTinIds[slotNum] = slot.tinId;
+      bgmSlots = bgmSlots.map((s) =>
+        s.slot === slotNum ? { ...s, tinId: null, isPlaying: false } : s,
+      );
+    } else {
+      // 停止中 -> 再生
+      const prev =
+        lastTinIds[slotNum] ||
+        (slotNum === 1
+          ? currentScene.juices.bgm1
+          : slotNum === 2
+            ? currentScene.juices.bgm2
+            : slotNum === 3
+              ? currentScene.juices.bgm3
+              : undefined);
+      if (prev) {
+        bgmSlots = bgmSlots.map((s) =>
+          s.slot === slotNum ? { ...s, tinId: prev, isPlaying: true } : s,
+        );
+      } else {
+        // 音源がなければアセット選択を開く
+        handleBgmSelect(slotNum);
+        return;
+      }
+    }
+
+    const updated = bgmSlots.find((s) => s.slot === slotNum)!;
+    syncSlotToLegacy(updated);
+    currentScene.juices.bgmSlots = [...bgmSlots];
+    onUpdateScene?.(currentScene);
+  }
+
+  function handleBgmSelect(slotOrKey: number | 'bgm1' | 'bgm2' | 'bgm3') {
+    const slotNum =
+      typeof slotOrKey === 'number'
+        ? slotOrKey
+        : slotOrKey === 'bgm1'
+          ? 1
+          : slotOrKey === 'bgm2'
+            ? 2
+            : 3;
+    activeBgmSlotPicking = slotNum;
+    assetPickerTarget = `bgm${slotNum}` as any;
     assetPickerMediaType = 'audio';
     if (onRequestAssetPicker) {
       onRequestAssetPicker({
         mediaType: 'audio',
         initialScope: 'personal',
         onSelect: (dataUrl) => {
-          handleAssetPicked(dataUrl);
+          handleSlotAssetPicked(slotNum, dataUrl);
         },
       });
     } else {
@@ -148,9 +218,54 @@
     }
   }
 
+  function handleSlotAssetPicked(slotNum: number, dataUrl: string | undefined) {
+    if (dataUrl) {
+      lastTinIds[slotNum] = dataUrl;
+    }
+    bgmSlots = bgmSlots.map((s) =>
+      s.slot === slotNum
+        ? { ...s, tinId: dataUrl ?? null, isPlaying: Boolean(dataUrl) }
+        : s,
+    );
+    const updated = bgmSlots.find((s) => s.slot === slotNum);
+    if (updated) {
+      syncSlotToLegacy(updated);
+    }
+    currentScene.juices.bgmSlots = [...bgmSlots];
+    onUpdateScene?.(currentScene);
+  }
+
+  function handleSlotVolumeInput(slotNum: number, volumeHundred: number) {
+    const vol = Math.max(0, Math.min(100, volumeHundred)) / 100;
+    bgmSlots = bgmSlots.map((s) => (s.slot === slotNum ? { ...s, volume: vol } : s));
+    const updated = bgmSlots.find((s) => s.slot === slotNum);
+    if (updated) {
+      syncSlotToLegacy(updated);
+    }
+    currentScene.juices.bgmSlots = [...bgmSlots];
+    onUpdateScene?.(currentScene);
+  }
+
+  function handleAddBgmSlot() {
+    const maxSlot = bgmSlots.reduce((m, s) => Math.max(m, s.slot), 0);
+    const newSlotNum = (maxSlot || 0) + 1;
+    const newSlot: BgmSlot = {
+      slot: newSlotNum,
+      tinId: null,
+      volume: 0.8,
+      isPlaying: false,
+    };
+    bgmSlots = [...bgmSlots, newSlot];
+    currentScene.juices.bgmSlots = [...bgmSlots];
+    onUpdateScene?.(currentScene);
+  }
+
   function handleAssetPicked(dataUrl: string | undefined) {
     if (assetPickerTarget === 'bgImage') {
       currentScene.juices.bgImage = dataUrl;
+    } else if (activeBgmSlotPicking !== null) {
+      handleSlotAssetPicked(activeBgmSlotPicking, dataUrl);
+      activeBgmSlotPicking = null;
     } else {
       currentScene.juices[assetPickerTarget] = dataUrl;
     }
@@ -340,85 +455,85 @@
       </div>
     </div>
 
-    <!-- BGM Pills and Sliders -->
-    <div class="bgm-controls">
-      <!-- BGM 1 -->
-      <div class="bgm-row" data-testid="bgm-row-1">
-        <Button
-          variant="tonal"
-          size="s"
-          shape="round"
-          onclick={() => handleBgmSelect('bgm1')}
-          data-testid="bgm-pill-1"
+    <!-- BGM Controls (Issue #53: Reconstructed with slot u32, toggle play/stop, narrow button, 1:1 select button, volume slider) -->
+    <div class="bgm-controls" data-testid="bgm-controls">
+      <div class="bgm-section-header">
+        <span class="bgm-header-label">BGMスロット設定</span>
+        <button
+          type="button"
+          class="add-slot-text-btn"
+          onclick={handleAddBgmSlot}
+          data-testid="add-bgm-slot-btn"
+          aria-label="スロットを追加"
         >
-          BGM1
-        </Button>
-        <div class="slider-wrapper">
-          <Slider
-            min={0}
-            max={1}
-            step={0.05}
-            bind:value={currentScene.juices.bgm1Volume}
-            oninput={() => onUpdateScene?.(currentScene)}
-            onchange={() => onUpdateScene?.(currentScene)}
-            aria-label="BGM1音量"
-            data-testid="bgm-slider-1"
-          />
-          <span class="vol-label">{Math.round(currentScene.juices.bgm1Volume * 100)}%</span>
-        </div>
+          <Icon>add</Icon>
+          <span>スロット追加</span>
+        </button>
       </div>
 
-      <!-- BGM 2 -->
-      <div class="bgm-row" data-testid="bgm-row-2">
-        <Button
-          variant="tonal"
-          size="s"
-          shape="round"
-          onclick={() => handleBgmSelect('bgm2')}
-          data-testid="bgm-pill-2"
-        >
-          BGM2
-        </Button>
-        <div class="slider-wrapper">
-          <Slider
-            min={0}
-            max={1}
-            step={0.05}
-            bind:value={currentScene.juices.bgm2Volume}
-            oninput={() => onUpdateScene?.(currentScene)}
-            onchange={() => onUpdateScene?.(currentScene)}
-            aria-label="BGM2音量"
-            data-testid="bgm-slider-2"
-          />
-          <span class="vol-label">{Math.round(currentScene.juices.bgm2Volume * 100)}%</span>
-        </div>
-      </div>
+      {#each bgmSlots as slot (slot.slot)}
+        <div class="bgm-row" data-testid="bgm-row-{slot.slot}">
+          <!-- 1. 停止/再生ボタン: M3 IconButton, width="narrow", toggle play/stop -->
+          <IconButton
+            variant="tonal"
+            size="s"
+            width="narrow"
+            shape="round"
+            aria-label={slot.isPlaying && slot.tinId ? 'BGM停止' : 'BGM再生'}
+            onclick={() => handleToggleBgmPlay(slot.slot)}
+            data-testid="bgm-play-btn-{slot.slot}"
+            class="bgm-play-btn narrow-btn"
+            title={slot.isPlaying && slot.tinId ? `スロット${slot.slot}: 停止` : `スロット${slot.slot}: 再生`}
+          >
+            <Icon>{slot.isPlaying && slot.tinId ? 'stop' : 'play_arrow'}</Icon>
+          </IconButton>
 
-      <!-- BGM 3 -->
-      <div class="bgm-row" data-testid="bgm-row-3">
-        <Button
-          variant="tonal"
-          size="s"
-          shape="round"
-          onclick={() => handleBgmSelect('bgm3')}
-          data-testid="bgm-pill-3"
-        >
-          BGM3
-        </Button>
-        <div class="slider-wrapper">
-          <Slider
-            min={0}
-            max={1}
-            step={0.05}
-            bind:value={currentScene.juices.bgm3Volume}
-            oninput={() => onUpdateScene?.(currentScene)}
-            onchange={() => onUpdateScene?.(currentScene)}
-            aria-label="BGM3音量"
-            data-testid="bgm-slider-3"
-          />
-          <span class="vol-label">{Math.round(currentScene.juices.bgm3Volume * 100)}%</span>
+          <!-- 2. 選択ボタン: 縦横比 1:1 の M3 IconButton, library_music アイコン -->
+          <IconButton
+            variant="tonal"
+            size="s"
+            width="default"
+            shape="round"
+            aria-label="BGM選択"
+            onclick={() => handleBgmSelect(slot.slot)}
+            data-testid="bgm-select-btn-{slot.slot}"
+            class="bgm-select-btn square-btn"
+            title={`スロット${slot.slot}: BGM選択`}
+          >
+            <Icon>library_music</Icon>
+          </IconButton>
+
+          <!-- 3. 音量バー: M3 Slider (0〜100) -->
+          <div class="slider-wrapper" data-testid="bgm-slider-wrapper-{slot.slot}">
+            <Slider
+              min={0}
+              max={100}
+              step={1}
+              value={Math.round((slot.volume ?? 0.8) * 100)}
+              oninput={(e: Event) => {
+                const target = e.target as HTMLInputElement;
+                const val = (e as any).detail?.value ?? Number(target.value);
+                handleSlotVolumeInput(slot.slot, val);
+              }}
+              onchange={(e: Event) => {
+                const target = e.target as HTMLInputElement;
+                const val = (e as any).detail?.value ?? Number(target.value);
+                handleSlotVolumeInput(slot.slot, val);
+              }}
+              aria-label="BGM音量"
+              data-testid="bgm-slider-{slot.slot}"
+            />
+            <span class="vol-label" data-testid="bgm-vol-label-{slot.slot}">
+              {Math.round((slot.volume ?? 0.8) * 100)}%
+            </span>
+          </div>
+
+          <!-- スロット番号バッジ (u32) -->
+          <span class="slot-badge" data-testid="bgm-slot-badge-{slot.slot}">
+            #{slot.slot}
+          </span>
         </div>
-      </div>
+      {/each}
     </div>
 
     <!-- Heading 管理 -->
@@ -843,16 +958,62 @@
     flex-direction: column;
     gap: 12px;
   }
-  .bgm-row {
+  .bgm-section-header {
     display: flex;
     align-items: center;
-    gap: 12px;
+    justify-content: space-between;
+    margin-top: 4px;
+  }
+  .bgm-header-label {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--np-color-on-surface);
+  }
+  .add-slot-text-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: none;
+    border: none;
+    font-size: 0.82rem;
+    font-weight: 600;
+    color: var(--np-color-primary);
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: var(--np-shape-corner-small);
+  }
+  .add-slot-text-btn:hover {
+    background: var(--np-color-surface-container-highest);
+  }
+  .bgm-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+  /* 停止/再生ボタン: 選択ボタン（1:1）に対してより細い幅 (narrow) */
+  :global(.bgm-play-btn.narrow-btn) {
+    width: 2rem !important;
+    min-width: 2rem !important;
+    max-width: 2rem !important;
+    height: 2.5rem !important;
+    flex-shrink: 0;
+  }
+  /* 選択ボタン: 縦横比 1:1 */
+  :global(.bgm-select-btn.square-btn) {
+    width: 2.5rem !important;
+    min-width: 2.5rem !important;
+    max-width: 2.5rem !important;
+    height: 2.5rem !important;
+    aspect-ratio: 1 / 1;
+    flex-shrink: 0;
   }
   .slider-wrapper {
     flex: 1;
     display: flex;
     align-items: center;
     gap: 8px;
+    min-width: 0;
   }
   .slider-wrapper :global(.np-slider) {
     flex: 1;
@@ -862,6 +1023,16 @@
     width: 36px;
     text-align: right;
     color: var(--np-color-on-surface-variant);
+    flex-shrink: 0;
+  }
+  .slot-badge {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--np-color-on-surface-variant);
+    background: var(--np-color-surface-container-high);
+    padding: 2px 6px;
+    border-radius: var(--np-shape-corner-extra-small);
+    flex-shrink: 0;
   }
   .management-buttons {
     display: flex;
