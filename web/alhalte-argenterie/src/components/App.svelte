@@ -226,6 +226,18 @@
     });
   }
 
+  function handlePieceMove(characterId: string, position: { x: number; y: number }) {
+    characters = characters.map((c) => {
+      if (c.id === characterId) {
+        return {
+          ...c,
+          piecePosition: { ...position },
+        };
+      }
+      return c;
+    });
+  }
+
   function handleUploadExtension() {
     extensionFileInput?.click();
   }
@@ -316,6 +328,7 @@
               const sc = scenes.find((s) => s.id === id);
               if (sc) sc.viewTransform = t;
             }}
+            onPieceMove={handlePieceMove}
           />
         </div>
 
@@ -396,6 +409,7 @@
               const sc = scenes.find((s) => s.id === id);
               if (sc) sc.viewTransform = t;
             }}
+            onPieceMove={handlePieceMove}
           />
         </div>
 

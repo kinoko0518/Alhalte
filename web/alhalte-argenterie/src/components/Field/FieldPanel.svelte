@@ -16,6 +16,7 @@
     sortCharactersByInitiative,
   } from '../../utils/field.js';
   import { calculateBackgroundDimensions } from '../../utils/backgroundDimension.js';
+  import FieldPiece from './FieldPiece.svelte';
 
   let {
     roomName = 'Alhalte Room',
@@ -24,6 +25,7 @@
     origW: propOrigW,
     origH: propOrigH,
     onTransformChange,
+    onPieceMove,
   }: {
     roomName?: string;
     scene: Scene;
@@ -31,7 +33,21 @@
     origW?: number;
     origH?: number;
     onTransformChange?: (sceneId: string, transform: ViewTransform) => void;
+    onPieceMove?: (characterId: string, position: { x: number; y: number }) => void;
   } = $props();
+
+  function handlePieceMove(characterId: string, position: { x: number; y: number }) {
+    const target = characters.find((c) => c.id === characterId);
+    if (target) {
+      if (!target.piecePosition) {
+        target.piecePosition = { ...position };
+      } else {
+        target.piecePosition.x = position.x;
+        target.piecePosition.y = position.y;
+      }
+    }
+    onPieceMove?.(characterId, position);
+  }
 
   let isDragging = $state(false);
   let dragStart = $state({ x: 0, y: 0 });
@@ -204,18 +220,11 @@
     <!-- Pieces placed on map -->
     {#each sceneCharacters as char (char.id)}
       {#if char.placedAsPiece}
-        <div
-          class="field-piece"
-          data-testid="piece-{char.id}"
-          style="left: {char.piecePosition?.x ?? 100}px; top: {char.piecePosition?.y ?? 100}px;"
-        >
-          <img
-            class="piece-avatar"
-            src={char.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
-            alt={char.name}
-          />
-          <span class="piece-label">{char.name}</span>
-        </div>
+        <FieldPiece
+          character={char}
+          scale={scene.viewTransform.scale}
+          onMove={(pos) => handlePieceMove(char.id, pos)}
+        />
       {/if}
     {/each}
   </div>
@@ -297,30 +306,6 @@
   }
   .field-bg-loader {
     display: none;
-  }
-  .field-piece {
-    position: absolute;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    cursor: grab;
-  }
-  .piece-avatar {
-    width: 48px;
-    height: 48px;
-    border-radius: var(--np-shape-corner-full);
-    border: 2px solid var(--np-color-primary);
-    box-shadow: var(--np-elevation-2);
-    background: var(--np-color-surface-container-highest);
-  }
-  .piece-label {
-    font-size: 0.75rem;
-    color: var(--np-color-on-surface);
-    background: color-mix(in srgb, var(--np-color-surface-container-high) 90%, transparent);
-    padding: 2px 8px;
-    border-radius: var(--np-shape-corner-extra-small);
-    margin-top: 4px;
-    box-shadow: var(--np-elevation-1);
   }
   .field-top-left-layer {
     position: absolute;
