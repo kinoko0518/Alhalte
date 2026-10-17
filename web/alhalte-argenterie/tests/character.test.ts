@@ -83,9 +83,15 @@ describe('Character Management & Edit Panel', () => {
     expect(createBtn?.classList.contains('np-icon-button')).toBe(true);
     expect(createBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('person_add');
 
-    // Test "駒として配置" IconButton
+    // Test "駒として配置" and "削除" IconButtons are inside right-aligned .char-actions container (Issue #31)
+    const actionsContainer = target.querySelector('[data-testid="character-card-char-mage"] .char-actions');
+    expect(actionsContainer).toBeTruthy();
     const pieceBtn = target.querySelector<HTMLButtonElement>('[data-testid="piece-char-btn-char-mage"]');
+    const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-mage"]');
     expect(pieceBtn).toBeTruthy();
+    expect(deleteBtn).toBeTruthy();
+    expect(actionsContainer?.contains(pieceBtn)).toBe(true);
+    expect(actionsContainer?.contains(deleteBtn)).toBe(true);
     expect(pieceBtn?.classList.contains('np-icon-button')).toBe(true);
     expect(pieceBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('place_item');
     pieceBtn?.click();
@@ -124,7 +130,6 @@ describe('Character Management & Edit Panel', () => {
     expect(Number(updatedChar?.initiative)).toBe(18);
 
     // Test Delete IconButton -> opens full-screen warning dialog
-    const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-mage"]');
     expect(deleteBtn).toBeTruthy();
     expect(deleteBtn?.classList.contains('np-icon-button')).toBe(true);
     expect(deleteBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('delete');

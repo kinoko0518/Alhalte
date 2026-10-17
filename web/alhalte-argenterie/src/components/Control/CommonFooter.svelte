@@ -96,9 +96,18 @@
   function dismissSuggestions() {
     isSuggestDismissed = true;
   }
+
+  let charPickerWrapper = $state<HTMLElement | null>(null);
+
+  function handleWindowClick(e: MouseEvent) {
+    dismissSuggestions();
+    if (isCharPickerOpen && charPickerWrapper && !charPickerWrapper.contains(e.target as Node)) {
+      isCharPickerOpen = false;
+    }
+  }
 </script>
 
-<svelte:window onclick={dismissSuggestions} />
+<svelte:window onclick={handleWindowClick} />
 
 {#snippet logIcon()}<Icon>forum</Icon>{/snippet}
 {#snippet graphIcon()}<Icon>account_tree</Icon>{/snippet}
@@ -163,7 +172,7 @@
 
   <!-- Character selection button and Send button -->
   <div class="character-action-row" data-testid="character-action-row">
-    <div class="char-picker-wrapper">
+    <div class="char-picker-wrapper" bind:this={charPickerWrapper}>
       <button
         type="button"
         class="char-select-btn"
@@ -233,8 +242,8 @@
       </div>
     {/if}
 
-    <input
-      type="text"
+    <textarea
+      rows="5"
       class="chat-input-field"
       placeholder="メッセージを入力..."
       bind:value={messageInput}
@@ -243,7 +252,7 @@
       }}
       onkeydown={handleKeyDown}
       data-testid="chat-input-field"
-    />
+    ></textarea>
   </div>
 </footer>
 
@@ -334,12 +343,16 @@
   }
   .chat-input-field {
     width: 100%;
+    min-height: 5.5rem;
     padding: 10px 14px;
     border: 1px solid var(--np-color-outline);
     border-radius: var(--np-shape-corner-medium, 12px);
     background: var(--np-color-surface-container-lowest);
     color: var(--np-color-on-surface);
     font-size: 0.95rem;
+    font-family: inherit;
+    line-height: 1.4;
+    resize: vertical;
     box-sizing: border-box;
   }
   /* Suggestion box:

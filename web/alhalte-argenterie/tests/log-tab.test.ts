@@ -277,5 +277,43 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     unmount(instance);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/log-tab 歯車メニューの外側クリック閉じ (Issue #31)
+  it('closes gear dropdown menu when clicking outside', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: 'scene-gear-test',
+      name: 'テストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        isAdmin: true,
+      },
+    });
+
+    const gearBtn = target.querySelector<HTMLButtonElement>('[data-testid="gear-menu-button"]');
+    expect(gearBtn).toBeTruthy();
+    gearBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="gear-dropdown-menu"]')).toBeTruthy();
+
+    // Click outside on document.body
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="gear-dropdown-menu"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
 });
 
