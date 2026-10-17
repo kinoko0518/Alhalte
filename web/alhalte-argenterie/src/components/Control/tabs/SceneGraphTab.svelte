@@ -27,11 +27,26 @@
   const LANE_WIDTH = 32;
   const ROW_HEIGHT = 44;
 
-  // Colors for branches
-  const BRANCH_COLORS = ['#6750a4', '#006a6a', '#b3261e', '#795548', '#2e7d32', '#c2185b'];
+  // Colors for branches (M3 Expressive compatible)
+  const BRANCH_COLORS = [
+    'var(--np-color-primary, #6750a4)',
+    'var(--np-color-secondary, #625b71)',
+    'var(--np-color-tertiary, #7d5260)',
+    '#006a6a',
+    '#b3261e',
+    '#2e7d32',
+  ];
 
   function getBranchColor(branchIndex: number): string {
     return BRANCH_COLORS[branchIndex % BRANCH_COLORS.length];
+  }
+
+  function getEdgePath(x1: number, y1: number, x2: number, y2: number): string {
+    if (x1 === x2) {
+      return `M ${x1} ${y1} L ${x2} ${y2}`;
+    }
+    const midY = (y1 + y2) / 2;
+    return `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
   }
 
   function handleNodeClick(sceneId: string, isUnknown?: boolean) {
@@ -58,7 +73,7 @@
           style="width: {Math.max(120, graphData.branchCount * LANE_WIDTH + 20)}px; height: {graphData.nodes.length * ROW_HEIGHT + 20}px;"
           data-testid="graph-svg-layer"
         >
-          {#each graphData.edges as edge (edge.fromNodeId + '-' + edge.toNodeId)}
+          {#each graphData.edges as edge (edge.fromNodeId + '-' + edge.toNodeId + '-' + edge.characterId)}
             {@const fromIdx = graphData.nodes.findIndex((n) => n.id === edge.fromNodeId)}
             {@const toIdx = graphData.nodes.findIndex((n) => n.id === edge.toNodeId)}
             {#if fromIdx !== -1 && toIdx !== -1}
@@ -68,12 +83,17 @@
               {@const y1 = fromIdx * ROW_HEIGHT + 22}
               {@const x2 = toNode.branchIndex * LANE_WIDTH + 20}
               {@const y2 = toIdx * ROW_HEIGHT + 22}
-              <line
-                {x1}
-                {y1}
-                {x2}
-                {y2}
-                stroke={edge.isDotted ? '#999' : getBranchColor(fromNode.branchIndex)}
+              {@const edgeColor = edge.isDotted
+                ? 'var(--np-color-outline, #79747e)'
+                : getBranchColor(
+                    fromNode.branchIndex === toNode.branchIndex
+                      ? fromNode.branchIndex
+                      : Math.max(fromNode.branchIndex, toNode.branchIndex),
+                  )}
+              <path
+                d={getEdgePath(x1, y1, x2, y2)}
+                fill="none"
+                stroke={edgeColor}
                 stroke-width="2.5"
                 stroke-dasharray={edge.isDotted ? '4,4' : undefined}
                 data-testid="edge-{edge.fromNodeId}-{edge.toNodeId}"
@@ -97,7 +117,7 @@
                 type="button"
                 class="graph-commit-dot"
                 class:unknown-dot={node.isUnknown}
-                style="left: {x - 8}px; border-color: {node.isUnknown ? '#999' : getBranchColor(node.branchIndex)};"
+                style="left: {x - 8}px; border-color: {node.isUnknown ? 'var(--np-color-outline, #79747e)' : getBranchColor(node.branchIndex)};"
                 onclick={() => handleNodeClick(node.sceneId, node.isUnknown)}
                 data-testid="node-dot-{node.id}"
                 title={node.isUnknown ? 'アクセス権のないシーン' : `${node.sceneName} へ移動`}
@@ -107,7 +127,7 @@
                 {/if}
               </button>
 
-              <!-- Scene name label and character indicator -->
+              <!-- Scene name label without character indicator -->
               <div
                 class="node-labels"
                 style="left: {graphData.branchCount * LANE_WIDTH + 24}px;"
@@ -120,7 +140,6 @@
                   data-testid="node-label-{node.id}"
                 >
                   <span class="scene-title">{node.sceneName}</span>
-                  <span class="character-mention">({node.characterName})</span>
                   <span class="node-time">{new Date(node.timestamp * 1000).toLocaleTimeString()}</span>
                 </button>
               </div>
@@ -137,7 +156,7 @@
     width: 100%;
     height: 100%;
     overflow: hidden;
-    background: var(--md-sys-color-surface, #fbf8fd);
+    background: var(--np-color-surface, #fbf8fd);
     display: flex;
     flex-direction: column;
   }
@@ -150,7 +169,7 @@
   .empty-graph-notice {
     padding: 48px;
     text-align: center;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
+    color: var(--np-color-on-surface-variant, #49454f);
     font-size: 0.95rem;
   }
   .graph-canvas-container {
@@ -181,9 +200,9 @@
     position: absolute;
     width: 16px;
     height: 16px;
-    border-radius: 50%;
-    background: #fff;
-    border: 3px solid #6750a4;
+    border-radius: var(--np-shape-corner-full, 50%);
+    background: var(--np-color-surface, #fff);
+    border: 3px solid var(--np-color-primary, #6750a4);
     cursor: pointer;
     display: flex;
     align-items: center;
@@ -196,10 +215,11 @@
     transform: scale(1.3);
   }
   .graph-commit-dot.unknown-dot {
-    background: #e0e0e0;
+    background: var(--np-color-surface-container-high, #e6e0e9);
     font-size: 10px;
     font-weight: 700;
-    color: #666;
+    color: var(--np-color-on-surface-variant, #49454f);
+    border-color: var(--np-color-outline, #79747e) !important;
     border-style: dashed;
     cursor: default;
   }
@@ -213,31 +233,28 @@
   .scene-name-button {
     background: none;
     border: none;
-    padding: 2px 6px;
-    border-radius: 6px;
+    padding: 2px 8px;
+    border-radius: var(--np-shape-corner-small, 8px);
     cursor: pointer;
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     font-size: 0.88rem;
-    color: var(--md-sys-color-on-surface, #1b1b1f);
+    color: var(--np-color-on-surface, #1d1b20);
+    transition: background-color 0.15s;
   }
   .scene-name-button:hover:not(.disabled-label) {
-    background: rgba(103, 80, 164, 0.08);
+    background: var(--np-color-surface-container-high, rgba(103, 80, 164, 0.08));
   }
   .scene-name-button.disabled-label {
     cursor: default;
-    color: #888;
+    color: var(--np-color-on-surface-variant, #79747e);
   }
   .scene-title {
     font-weight: 600;
   }
-  .character-mention {
-    font-size: 0.78rem;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
-  }
   .node-time {
     font-size: 0.72rem;
-    color: #888;
+    color: var(--np-color-on-surface-variant, #79747e);
   }
 </style>

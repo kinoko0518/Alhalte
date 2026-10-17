@@ -13,6 +13,20 @@ describe('Scene Graph Algorithm & View', () => {
 
   const accessibleScenes = new Set<string>(['scene-a', 'scene-b', 'scene-c', 'scene-d']);
 
+  // spec: alhalte-argenterie/scene-graph 初期メインシーン表示 (Issue #29 Problem 1)
+  it('displays initial root node for "/" (メインシーン) even when movements is empty', () => {
+    const rootSceneNames = new Map<string, string>([['/', 'メインシーン']]);
+    const rootAccessibleScenes = new Set<string>(['/']);
+
+    const result = buildSceneGraph([], rootSceneNames, rootAccessibleScenes);
+    expect(result.nodes).toHaveLength(1);
+    expect(result.nodes[0].sceneId).toBe('/');
+    expect(result.nodes[0].sceneName).toBe('メインシーン');
+    expect(result.nodes[0].branchIndex).toBe(0);
+    expect(result.edges).toHaveLength(0);
+    expect(result.branchCount).toBe(1);
+  });
+
   // spec: alhalte-argenterie/scene-graph 時系列早い順（上→下）
   it('orders nodes chronologically with earlier at top and later at bottom', () => {
     const movements: SceneMovementEvent[] = [
@@ -28,6 +42,120 @@ describe('Scene Graph Algorithm & View', () => {
     expect(result.nodes[2].sceneId).toBe('scene-c');
     expect(result.nodes[0].timestamp).toBeLessThan(result.nodes[1].timestamp);
     expect(result.nodes[1].timestamp).toBeLessThan(result.nodes[2].timestamp);
+  });
+
+  // spec: alhalte-argenterie/scene-graph Y軸平行レイアウト (Issue #29 Problem 3)
+  it('keeps single linear path A -> B -> C on branchIndex 0 (parallel to Y-axis)', () => {
+    const movements: SceneMovementEvent[] = [
+      { characterId: 'c1', characterName: '勇者', toSceneId: 'scene-a', timestamp: 100 },
+      {
+        characterId: 'c1',
+        characterName: '勇者',
+        fromSceneId: 'scene-a',
+        toSceneId: 'scene-b',
+        timestamp: 200,
+      },
+      {
+        characterId: 'c1',
+        characterName: '勇者',
+        fromSceneId: 'scene-b',
+        toSceneId: 'scene-c',
+        timestamp: 300,
+      },
+    ];
+
+    const result = buildSceneGraph(movements, sceneNames, accessibleScenes);
+    expect(result.nodes).toHaveLength(3);
+    expect(result.nodes.every((n) => n.branchIndex === 0)).toBe(true);
+    expect(result.branchCount).toBe(1);
+
+    // Edges are strictly vertical (both fromNode and toNode on branchIndex 0)
+    for (const edge of result.edges) {
+      const fromNode = result.nodes.find((n) => n.id === edge.fromNodeId);
+      const toNode = result.nodes.find((n) => n.id === edge.toNodeId);
+      expect(fromNode?.branchIndex).toBe(0);
+      expect(toNode?.branchIndex).toBe(0);
+    }
+  });
+
+  // spec: alhalte-argenterie/scene-graph 分岐と合流 (Issue #29 Problem 2 & 3)
+  it('branches A -> B, A -> C and correctly merges B -> D, C -> D into a single D node on lane 0 without A -> D edge', () => {
+    const scenesWithD = new Map([
+      ['scene-a', '街頭'],
+      ['scene-b', '地下迷宮'],
+      ['scene-c', '神殿'],
+      ['scene-d', '決戦場'],
+    ]);
+    const accessible = new Set(['scene-a', 'scene-b', 'scene-c', 'scene-d']);
+
+    const movements: SceneMovementEvent[] = [
+      {
+        characterId: 'c1',
+        characterName: '勇者',
+        fromSceneId: 'scene-a',
+        toSceneId: 'scene-b',
+        timestamp: 100,
+      },
+      {
+        characterId: 'c2',
+        characterName: '魔法使い',
+        fromSceneId: 'scene-a',
+        toSceneId: 'scene-c',
+        timestamp: 110,
+      },
+      {
+        characterId: 'c1',
+        characterName: '勇者',
+        fromSceneId: 'scene-b',
+        toSceneId: 'scene-d',
+        timestamp: 120,
+      },
+      {
+        characterId: 'c2',
+        characterName: '魔法使い',
+        fromSceneId: 'scene-c',
+        toSceneId: 'scene-d',
+        timestamp: 130,
+      },
+    ];
+
+    const result = buildSceneGraph(movements, scenesWithD, accessible);
+
+    // Should have nodes: scene-a, scene-b, scene-c, scene-d (exactly 1 node for scene-d)
+    const nodeA = result.nodes.find((n) => n.sceneId === 'scene-a');
+    const nodeB = result.nodes.find((n) => n.sceneId === 'scene-b');
+    const nodeC = result.nodes.find((n) => n.sceneId === 'scene-c');
+    const dNodes = result.nodes.filter((n) => n.sceneId === 'scene-d');
+
+    expect(nodeA).toBeDefined();
+    expect(nodeB).toBeDefined();
+    expect(nodeC).toBeDefined();
+    expect(dNodes).toHaveLength(1);
+    const nodeD = dNodes[0];
+
+    // Node A and B on lane 0, C branches to lane 1, D merges back onto lane 0
+    expect(nodeA!.branchIndex).toBe(0);
+    expect(nodeB!.branchIndex).toBe(0);
+    expect(nodeC!.branchIndex).toBe(1);
+    expect(nodeD.branchIndex).toBe(0);
+
+    // Chronological order: A, B, C, D (D at the bottom)
+    expect(result.nodes[result.nodes.length - 1].id).toBe(nodeD.id);
+
+    // Verify edges: A -> B, A -> C, B -> D, C -> D
+    const edgeAB = result.edges.find((e) => e.fromNodeId === nodeA!.id && e.toNodeId === nodeB!.id);
+    const edgeAC = result.edges.find((e) => e.fromNodeId === nodeA!.id && e.toNodeId === nodeC!.id);
+    const edgeBD = result.edges.find((e) => e.fromNodeId === nodeB!.id && e.toNodeId === nodeD.id);
+    const edgeCD = result.edges.find((e) => e.fromNodeId === nodeC!.id && e.toNodeId === nodeD.id);
+
+    expect(edgeAB).toBeDefined();
+    expect(edgeAC).toBeDefined();
+    expect(edgeBD).toBeDefined();
+    expect(edgeCD).toBeDefined();
+
+    // MUST NOT have direct edge A -> D!
+    const edgeAD = result.edges.find((e) => e.fromNodeId === nodeA!.id && e.toNodeId === nodeD.id);
+    expect(edgeAD).toBeUndefined();
   });
 
   // spec: alhalte-argenterie/scene-graph 無相関シーン別ブランチ
@@ -129,8 +257,8 @@ describe('Scene Graph Algorithm & View', () => {
     expect(aNodes[1].isDuplicate).toBe(true);
   });
 
-  // spec: alhalte-argenterie/scene-graph SceneGraphTab コンポーネント描画
-  it('renders SceneGraphTab and triggers scene navigation on clicking a node', async () => {
+  // spec: alhalte-argenterie/scene-graph SceneGraphTab コンポーネント描画 & キャラクター名非表示 (Issue #29 Problem 4)
+  it('renders SceneGraphTab without character name and triggers scene navigation on clicking a node', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -158,14 +286,49 @@ describe('Scene Graph Algorithm & View', () => {
       },
     });
 
-    // Check SVG lines and nodes are rendered
+    // Check SVG lines (paths) and nodes are rendered
     expect(target.querySelector('[data-testid="graph-svg-layer"]')).toBeTruthy();
 
+    // Check SVG path exists
+    const svgPath = target.querySelector<SVGPathElement>('[data-testid^="edge-"]');
+    expect(svgPath).toBeTruthy();
+    expect(svgPath?.getAttribute('d')).toContain('M');
+
+    // Issue #29 Problem 4: character name must NOT be rendered next to scene title
+    expect(target.querySelector('.character-mention')).toBeNull();
     const nodeBtn = target.querySelector<HTMLButtonElement>('[data-testid^="node-label-"]');
     expect(nodeBtn).toBeTruthy();
-    nodeBtn?.click();
+    expect(nodeBtn?.textContent).not.toContain('探検家');
 
+    // Navigation trigger
+    nodeBtn?.click();
     expect(navigatedSceneId).toBe('scene-a');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/scene-graph 空の履歴時のメインシーン表示 (Issue #29 Problem 1)
+  it('renders SceneGraphTab with initial メインシーン when movements is empty', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(SceneGraphTab, {
+      target,
+      props: {
+        movements: [],
+        sceneNames: new Map([['/', 'メインシーン']]),
+        accessibleSceneIds: new Set(['/']),
+      },
+    });
+
+    // Empty notice must NOT be rendered because main scene exists
+    expect(target.querySelector('[data-testid="empty-graph-notice"]')).toBeNull();
+
+    // Main scene label should be rendered
+    const nodeBtn = target.querySelector<HTMLButtonElement>('[data-testid^="node-label-"]');
+    expect(nodeBtn).toBeTruthy();
+    expect(nodeBtn?.textContent).toContain('メインシーン');
 
     unmount(instance);
     target.remove();
