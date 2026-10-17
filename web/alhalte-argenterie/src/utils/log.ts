@@ -115,6 +115,25 @@ export class ChunkLogManager {
   }
 
   /**
+   * Clears all log records for a scene across all chunks and notifies subscribers.
+   */
+  public clearSceneRecords(sceneId: string): void {
+    const chunkList = this.sceneChunks.get(sceneId) || [];
+    for (const chunkId of chunkList) {
+      const chunk = this.chunks.get(chunkId);
+      if (chunk) {
+        chunk.entries = [];
+      }
+    }
+    const liveChunkId = `chunk-${sceneId}-live`;
+    const liveChunk = this.chunks.get(liveChunkId);
+    if (liveChunk) {
+      liveChunk.entries = [];
+    }
+    this.notifyListeners();
+  }
+
+  /**
    * Appends a new log record to the latest loaded chunk for its scene (creating a live chunk if needed)
    * and notifies all registered subscribers.
    */

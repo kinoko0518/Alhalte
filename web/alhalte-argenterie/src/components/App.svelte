@@ -100,6 +100,11 @@
         sceneName: string;
       }
     | {
+        type: 'delete-scene-logs';
+        sceneId: string;
+        sceneName: string;
+      }
+    | {
         type: 'delete-character';
         characterId: string;
         characterName: string;
@@ -120,6 +125,21 @@
       sceneId: scene.id,
       sceneName: scene.name,
     };
+  }
+
+  function handleRequestDeleteSceneLogs(scene: { id: string; name: string }) {
+    activeOverlay = {
+      type: 'delete-scene-logs',
+      sceneId: scene.id,
+      sceneName: scene.name,
+    };
+  }
+
+  function handleDeleteSceneLogs(sceneId: string) {
+    chunkManager.clearSceneRecords(sceneId);
+    if (currentRoom?.id) {
+      persistRoomLogs(currentRoom.id);
+    }
   }
 
   function handleRequestDeleteCharacter(char: { id: string; name: string }) {
@@ -515,6 +535,8 @@
                   onUploadExtension={handleUploadExtension}
                   onSendMessage={handleSendMessage}
                   onRequestDeleteScene={handleRequestDeleteScene}
+                  onRequestDeleteSceneLogs={handleRequestDeleteSceneLogs}
+                  onDeleteSceneLogs={handleDeleteSceneLogs}
                   onRequestDeleteCharacter={handleRequestDeleteCharacter}
                   onRequestAssetPicker={handleRequestAssetPicker}
                 />
@@ -605,6 +627,8 @@
                 onUploadExtension={handleUploadExtension}
                 onSendMessage={handleSendMessage}
                 onRequestDeleteScene={handleRequestDeleteScene}
+                onRequestDeleteSceneLogs={handleRequestDeleteSceneLogs}
+                onDeleteSceneLogs={handleDeleteSceneLogs}
                 onRequestDeleteCharacter={handleRequestDeleteCharacter}
                 onRequestAssetPicker={handleRequestAssetPicker}
               />
@@ -675,6 +699,51 @@
                 <span data-testid="confirm-delete-button">削除する</span>
               </Button>
             </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  {:else if activeOverlay?.type === 'delete-scene-logs'}
+    <div
+      class="fullscreen-dialog-overlay"
+      data-testid="root-delete-logs-dialog"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) activeOverlay = null;
+      }}
+    >
+      <div
+        class="dialog-box warning-box"
+        data-testid="delete-logs-confirm-dialog"
+      >
+        <h2 class="dialog-title-centered warning-text" data-testid="delete-logs-dialog-title">
+          シーン「{activeOverlay.sceneName}」のログを削除しますか？
+        </h2>
+        <p class="warning-body" data-testid="delete-logs-dialog-warning">
+          このシーンのすべての会話ログを削除します。この操作は元に戻せません。
+        </p>
+
+        <div class="dialog-footer-right">
+          <Button
+            variant="text"
+            onclick={() => (activeOverlay = null)}
+            data-testid="cancel-delete-logs-btn"
+          >
+            キャンセル
+          </Button>
+          <div class="confirm-delete-wrapper">
+            <Button
+              variant="filled"
+              class="delete-scene-tonal-btn"
+              onclick={() => {
+                if (activeOverlay?.type === 'delete-scene-logs') {
+                  handleDeleteSceneLogs(activeOverlay.sceneId);
+                  activeOverlay = null;
+                }
+              }}
+              data-testid="confirm-delete-logs-button"
+            >
+              削除する
+            </Button>
           </div>
         </div>
       </div>

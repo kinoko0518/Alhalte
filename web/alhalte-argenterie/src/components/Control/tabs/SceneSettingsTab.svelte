@@ -8,6 +8,7 @@
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    */
   import { Button, Carousel, CarouselItem, Slider, Switch, TextField } from 'noph-ui';
+  import { Icon } from 'noph-ui/icons';
   import GenericImagePicker from '../GenericImagePicker.svelte';
   import type { Character, Scene } from '../../../types/index.js';
   import {
@@ -29,6 +30,8 @@
     onDeleteScene,
     onMoveMember,
     onRequestDeleteScene,
+    onRequestDeleteSceneLogs,
+    onDeleteSceneLogs,
     onRequestAssetPicker,
   }: {
     currentScene: Scene;
@@ -41,6 +44,8 @@
     onDeleteScene?: (sceneId: string) => void;
     onMoveMember?: (characterId: string, targetSceneName: string) => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
+    onRequestDeleteSceneLogs?: (scene: { id: string; name: string }) => void;
+    onDeleteSceneLogs?: (sceneId: string) => void;
     onRequestAssetPicker?: (options: {
       mediaType: AssetMediaType;
       initialScope?: AssetScope;
@@ -75,6 +80,8 @@
 
   let isMoveMemberOpen = $state(false);
   let isDeleteConfirmOpen = $state(false);
+  let isDeleteLogsConfirmOpen = $state(false);
+  let hoveredAction = $state<'create' | 'delete-logs' | 'delete-scene' | null>(null);
 
   // Per-character member move target names: characterId -> sceneName
   let memberTargetSceneNames = $state<Record<string, string>>({});
@@ -198,6 +205,22 @@
   function handleDeleteConfirm() {
     isDeleteConfirmOpen = false;
     onDeleteScene?.(currentScene.id);
+  }
+
+  function handleDeleteLogsButtonClick() {
+    if (onRequestDeleteSceneLogs) {
+      onRequestDeleteSceneLogs({
+        id: currentScene.id,
+        name: currentScene.name,
+      });
+    } else {
+      isDeleteLogsConfirmOpen = true;
+    }
+  }
+
+  function handleDeleteLogsConfirm() {
+    isDeleteLogsConfirmOpen = false;
+    onDeleteSceneLogs?.(currentScene.id);
   }
 
   let sceneSplitContainer = $state<HTMLElement | null>(null);
@@ -403,36 +426,106 @@
 
     <!-- Management buttons in 1 row with 7 : 5 : 3 ratio and soft Material Color for delete -->
     <div class="management-buttons" data-testid="management-buttons">
-      <div class="mgmt-btn-col mgmt-col-7" style="flex: 7;" data-testid="mgmt-col-7">
+      <!-- メンバーを移動: M3 Button size="l" -->
+      <div class="move-members-row" data-testid="move-members-row">
         <Button
           variant="filled"
-          size="s"
+          size="l"
+          class="move-members-btn"
           onclick={openMoveMembersDialog}
           data-testid="open-move-members-btn"
         >
+          {#snippet start()}
+            <Icon>group</Icon>
+          {/snippet}
           メンバーを移動
         </Button>
       </div>
-      <div class="mgmt-btn-col mgmt-col-5" style="flex: 5;" data-testid="mgmt-col-5">
-        <Button
-          variant="tonal"
-          size="s"
-          onclick={() => (isCreateSceneOpen = true)}
-          data-testid="open-create-scene-btn"
+
+      <!-- 3つのアクション「シーンを新規作成」「シーンのログを削除」「シーンを削除」:
+           横並びの Square L ボタン群として配置。
+           初期状態では左ほど大きく、右ほど小さい square の比率。
+           マウスホバー時に行全体における自身の占有率がスムーズに拡大し、アイコンの右横にラベル文字が展開表示される。
+      -->
+      <div
+        class="scene-actions-row"
+        class:has-hover={hoveredAction !== null}
+        data-testid="scene-actions-row"
+      >
+        <!-- シーンを新規作成 -->
+        <div
+          class="action-btn-col action-col-create"
+          class:hovered={hoveredAction === 'create'}
+          style="flex: {hoveredAction === 'create' ? '10 1 0%' : hoveredAction ? '1.5 1 0%' : '5 1 0%'};"
+          onmouseenter={() => (hoveredAction = 'create')}
+          onmouseleave={() => (hoveredAction = null)}
+          data-testid="action-col-create"
         >
-          シーンを新規作成
-        </Button>
-      </div>
-      <div class="mgmt-btn-col mgmt-col-3" style="flex: 3;" data-testid="mgmt-col-3">
-        <Button
-          variant="tonal"
-          size="s"
-          class="delete-scene-tonal-btn"
-          onclick={handleDeleteButtonClick}
-          data-testid="delete-scene-btn"
+          <Button
+            variant="tonal"
+            shape="square"
+            size="l"
+            class="action-square-btn create-scene-btn"
+            onclick={() => (isCreateSceneOpen = true)}
+            aria-label="シーンを新規作成"
+            data-testid="open-create-scene-btn"
+          >
+            {#snippet start()}
+              <Icon>add</Icon>
+            {/snippet}
+            <span class="action-btn-label" data-testid="create-scene-label">シーンを新規作成</span>
+          </Button>
+        </div>
+
+        <!-- シーンのログを削除 -->
+        <div
+          class="action-btn-col action-col-delete-logs"
+          class:hovered={hoveredAction === 'delete-logs'}
+          style="flex: {hoveredAction === 'delete-logs' ? '10 1 0%' : hoveredAction ? '1.5 1 0%' : '3.2 1 0%'};"
+          onmouseenter={() => (hoveredAction = 'delete-logs')}
+          onmouseleave={() => (hoveredAction = null)}
+          data-testid="action-col-delete-logs"
         >
-          シーンを削除
-        </Button>
+          <Button
+            variant="tonal"
+            shape="square"
+            size="l"
+            class="action-square-btn delete-logs-btn destructive-tonal-btn"
+            onclick={handleDeleteLogsButtonClick}
+            aria-label="シーンのログを削除"
+            data-testid="delete-logs-btn"
+          >
+            {#snippet start()}
+              <Icon>delete_sweep</Icon>
+            {/snippet}
+            <span class="action-btn-label" data-testid="delete-logs-label">ログを削除</span>
+          </Button>
+        </div>
+
+        <!-- シーンを削除 -->
+        <div
+          class="action-btn-col action-col-delete-scene"
+          class:hovered={hoveredAction === 'delete-scene'}
+          style="flex: {hoveredAction === 'delete-scene' ? '10 1 0%' : hoveredAction ? '1.5 1 0%' : '2.2 1 0%'};"
+          onmouseenter={() => (hoveredAction = 'delete-scene')}
+          onmouseleave={() => (hoveredAction = null)}
+          data-testid="action-col-delete-scene"
+        >
+          <Button
+            variant="tonal"
+            shape="square"
+            size="l"
+            class="action-square-btn delete-scene-btn delete-scene-tonal-btn destructive-tonal-btn"
+            onclick={handleDeleteButtonClick}
+            aria-label="シーンを削除"
+            data-testid="delete-scene-btn"
+          >
+            {#snippet start()}
+              <Icon>delete</Icon>
+            {/snippet}
+            <span class="action-btn-label" data-testid="delete-scene-label">シーンを削除</span>
+          </Button>
+        </div>
       </div>
     </div>
   </div>
@@ -596,6 +689,40 @@
     </div>
   {/if}
 
+  <!-- Overlay: シーンのログを削除 Full-Screen Confirmation Dialog -->
+  {#if isDeleteLogsConfirmOpen}
+    <div
+      class="fullscreen-dialog-overlay"
+      data-testid="delete-logs-confirm-dialog"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) isDeleteLogsConfirmOpen = false;
+      }}
+    >
+      <div class="dialog-box warning-box">
+        <h2 class="dialog-title-centered warning-text" data-testid="delete-logs-dialog-title">
+          シーン「{currentScene.name}」のログを削除しますか？
+        </h2>
+        <p class="warning-body" data-testid="delete-logs-dialog-warning">
+          このシーンのすべての会話ログを削除します。この操作は元に戻せません。
+        </p>
+
+        <div class="dialog-footer-right">
+          <Button variant="text" onclick={() => (isDeleteLogsConfirmOpen = false)} data-testid="cancel-delete-logs-btn">
+            キャンセル
+          </Button>
+          <Button
+            variant="tonal"
+            class="delete-scene-tonal-btn destructive-tonal-btn"
+            onclick={handleDeleteLogsConfirm}
+            data-testid="confirm-delete-logs-button"
+          >
+            削除する
+          </Button>
+        </div>
+      </div>
+    </div>
+  {/if}
+
   <!-- Overlay: アセット選択 (AssetPickerModal) -->
   {#if isAssetPickerOpen}
     <AssetPickerModal
@@ -738,26 +865,92 @@
   }
   .management-buttons {
     display: flex;
-    flex-direction: row;
-    align-items: stretch;
-    gap: 8px;
+    flex-direction: column;
+    gap: 12px;
   }
-  .mgmt-btn-col {
+  .move-members-row {
+    width: 100%;
+  }
+  .move-members-row :global(.move-members-btn) {
+    width: 100%;
+    min-height: 48px;
+  }
+  .scene-actions-row {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    overflow: hidden;
+  }
+  .action-btn-col {
     display: flex;
     min-width: 0;
+    transition: flex var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
+                flex-grow var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1));
   }
-  .mgmt-btn-col :global(.np-button) {
+  .action-col-create {
+    flex: 5 1 0%;
+  }
+  .action-col-delete-logs {
+    flex: 3.2 1 0%;
+  }
+  .action-col-delete-scene {
+    flex: 2.2 1 0%;
+  }
+  .action-btn-col:hover,
+  .action-btn-col.hovered,
+  .action-btn-col:focus-within {
+    flex: 10 1 0% !important;
+  }
+  .scene-actions-row.has-hover .action-btn-col:not(.hovered):not(:focus-within),
+  .scene-actions-row:hover .action-btn-col:not(:hover):not(:focus-within) {
+    flex: 1.5 1 0%;
+  }
+  :global(.action-square-btn) {
     width: 100%;
-    min-width: 0;
+    min-width: 0 !important;
     --_button-min-width: 0;
-    --np-button-padding: 8px;
-    --_button-label-overflow: hidden;
+    --np-button-padding: 0.5rem;
+    padding-inline: 0.5rem !important;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: clip;
+    transition: all var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1));
   }
-  :global(.delete-scene-tonal-btn) {
-    --np-tonal-button-container-color: var(--np-color-tertiary-container);
-    --np-tonal-button-label-text-color: var(--np-color-on-tertiary-container);
-    --np-button-container-color: var(--np-color-tertiary-container);
-    --np-button-label-text-color: var(--np-color-on-tertiary-container);
+  :global(.action-square-btn .children-wrapper) {
+    min-width: 0;
+    overflow: hidden;
+    display: inline-flex;
+    align-items: center;
+  }
+  .action-btn-label {
+    display: inline-block;
+    max-width: 0;
+    opacity: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    margin-left: 0;
+    font-size: 0.95rem;
+    font-weight: 600;
+    vertical-align: middle;
+    transition: max-width var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
+                opacity var(--np-motion-expressive-fast-effects, 150ms ease),
+                margin-left var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1));
+  }
+  .action-btn-col:hover .action-btn-label,
+  .action-btn-col.hovered .action-btn-label,
+  .action-btn-col:focus-within .action-btn-label {
+    max-width: 180px;
+    opacity: 1;
+    margin-left: 6px;
+  }
+  :global(.delete-scene-tonal-btn),
+  :global(.destructive-tonal-btn) {
+    --np-tonal-button-container-color: var(--np-color-error-container, #ffdad6);
+    --np-tonal-button-label-text-color: var(--np-color-on-error-container, #410002);
+    --np-button-container-color: var(--np-color-error-container, #ffdad6);
+    --np-button-label-text-color: var(--np-color-on-error-container, #410002);
   }
   .fullscreen-dialog-overlay {
     position: fixed;
