@@ -7,7 +7,6 @@ import {
   removeVisitedRoom,
   parseRoomUrl,
   resolveRoomFromLocation,
-  LOCAL_STORAGE_VISITED_ROOMS_KEY,
 } from '../src/utils/home.js';
 import HomeScreen from '../src/components/Home/HomeScreen.svelte';
 import App from '../src/components/App.svelte';
@@ -128,8 +127,8 @@ describe('Home Screen & Room URL', () => {
     expect(getVisitedRooms().map((r) => r.id)).toEqual(['room-3']);
   });
 
-  // spec: alhalte-argenterie/home HomeScreen コンポーネント描画とオーバーレイ
-  it('renders HomeScreen, displays visited cards, and opens creation dialog with warning', async () => {
+  // spec: alhalte-argenterie/home HomeScreen コンポーネント描画・テーマ選択・オーバーレイ (Issue #32)
+  it('renders rich M3 Expressive HomeScreen, supports theme palette/mode switching, displays visited cards, and opens creation dialog', async () => {
     const testRoom: VisitedRoom = {
       id: 'visited-room-1',
       name: '冒険者ギルド',
@@ -153,13 +152,40 @@ describe('Home Screen & Room URL', () => {
       },
     });
 
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Check M3 AppBar, Hero Banner, and ExtendedFab are rendered
+    expect(target.querySelector('.np-app-bar')).toBeTruthy();
+    expect(target.querySelector('[data-testid="home-hero-banner"]')).toBeTruthy();
+
+    // Check theme palette and mode switching updates document.documentElement semantic tokens
+    const violetPaletteBtn = target.querySelector<HTMLButtonElement>(
+      '[data-testid="theme-palette-violet"]',
+    );
+    expect(violetPaletteBtn).toBeTruthy();
+    violetPaletteBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(document.documentElement.dataset.themePalette).toBe('violet');
+    expect(document.documentElement.style.getPropertyValue('--np-color-primary')).toContain(
+      '#6750a4',
+    );
+
+    const modeToggleBtn = target.querySelector<HTMLButtonElement>(
+      '[data-testid="theme-mode-toggle"]',
+    );
+    expect(modeToggleBtn).toBeTruthy();
+    modeToggleBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(document.documentElement.dataset.theme).toBe('light');
+
     // Check visited room card is rendered
     expect(target.querySelector('[data-testid="room-card-visited-room-1"]')).toBeTruthy();
     expect(target.textContent).toContain('冒険者ギルド');
 
-    // Click "部屋の新規作成" button
+    // Click "部屋の新規作成" ExtendedFab button
     const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]');
     expect(createBtn).toBeTruthy();
+    expect(createBtn?.classList.contains('np-extended-fab')).toBe(true);
     createBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
@@ -218,4 +244,3 @@ describe('Home Screen & Room URL', () => {
     target.remove();
   });
 });
-

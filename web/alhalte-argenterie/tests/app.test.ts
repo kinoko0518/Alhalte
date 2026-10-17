@@ -11,8 +11,8 @@ describe('App Layout (Material 3 Expressive)', () => {
     lastVisited: Date.now(),
   };
 
-  // spec: alhalte-argenterie/layout 横長画面（landscape）
-  it('renders field panel on left and control panel on right in landscape mode', () => {
+  // spec: alhalte-argenterie/layout 横長画面（landscape）& Side Sheet (Issue #32)
+  it('renders field panel on left and M3 Side Sheet control panel on right in landscape mode, supporting collapse and reopen', async () => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1200 });
     Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
 
@@ -26,6 +26,8 @@ describe('App Layout (Material 3 Expressive)', () => {
       },
     });
 
+    await new Promise((r) => setTimeout(r, 20));
+
     const roomLayout = target.querySelector('[data-testid="room-layout"]');
     expect(roomLayout?.classList.contains('landscape')).toBe(true);
 
@@ -35,12 +37,32 @@ describe('App Layout (Material 3 Expressive)', () => {
     expect(fieldWrapper).toBeTruthy();
     expect(controlWrapper).toBeTruthy();
 
+    // Verify noph-ui Side Sheet (.np-sheet-end) is used
+    const sideSheet = controlWrapper?.querySelector('.np-sheet.np-sheet-end');
+    expect(sideSheet).toBeTruthy();
+    expect(sideSheet?.hasAttribute('open')).toBe(true);
+
+    // Click collapse button in LogTab to collapse the Side Sheet
+    const collapseBtn = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
+    expect(collapseBtn).toBeTruthy();
+    collapseBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(sideSheet?.hasAttribute('open')).toBe(false);
+    const reopenBtn = target.querySelector<HTMLButtonElement>('[data-testid="reopen-sheet-button"]');
+    expect(reopenBtn).toBeTruthy();
+
+    // Reopen the Side Sheet
+    reopenBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sideSheet?.hasAttribute('open')).toBe(true);
+
     unmount(instance);
     target.remove();
   });
 
-  // spec: alhalte-argenterie/layout 縦長画面（portrait）
-  it('renders full field with bottom sheet control panel in portrait mode', () => {
+  // spec: alhalte-argenterie/layout 縦長画面（portrait）& Bottom Sheet (Issue #32)
+  it('renders full field with M3 Bottom Sheet control panel in portrait mode', async () => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
     Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
 
@@ -54,6 +76,8 @@ describe('App Layout (Material 3 Expressive)', () => {
       },
     });
 
+    await new Promise((r) => setTimeout(r, 20));
+
     const roomLayout = target.querySelector('[data-testid="room-layout"]');
     expect(roomLayout?.classList.contains('portrait')).toBe(true);
 
@@ -62,6 +86,11 @@ describe('App Layout (Material 3 Expressive)', () => {
 
     expect(portraitField).toBeTruthy();
     expect(bottomSheet).toBeTruthy();
+
+    // Verify noph-ui Bottom Sheet (.np-sheet-bottom) with drag handle is used
+    const sheetDialog = bottomSheet?.querySelector('.np-sheet.np-sheet-bottom');
+    expect(sheetDialog).toBeTruthy();
+    expect(sheetDialog?.querySelector('.np-sheet-handle')).toBeTruthy();
 
     unmount(instance);
     target.remove();

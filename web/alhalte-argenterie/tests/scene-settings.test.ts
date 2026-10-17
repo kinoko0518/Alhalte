@@ -116,8 +116,8 @@ describe('Scene Settings & Juices', () => {
     expect(updatedOld?.members).not.toContain('char-hero');
   });
 
-  // spec: alhalte-argenterie/scene-settings SceneSettingsTab コンポーネント描画
-  it('renders SceneSettingsTab with split button, Juices controls, and delete confirmation dialog', async () => {
+  // spec: alhalte-argenterie/scene-settings SceneSettingsTab コンポーネント描画 & M3 Expressive UI (Issue #32)
+  it('renders SceneSettingsTab with M3 Switch, Slider, 7:5:3 management row, and tonal delete button', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -143,12 +143,16 @@ describe('Scene Settings & Juices', () => {
     ];
 
     let deletedSceneId: string | null = null;
+    let createdSceneData: { name: string; inheritJuice: boolean } | null = null;
     const instance = mount(SceneSettingsTab, {
       target,
       props: {
         currentScene,
         allScenes: [currentScene],
         characters,
+        onCreateScene: (name, inheritJuice) => {
+          createdSceneData = { name, inheritJuice };
+        },
         onDeleteScene: (id) => {
           deletedSceneId = id;
         },
@@ -169,19 +173,61 @@ describe('Scene Settings & Juices', () => {
     expect(target.querySelector('[data-testid="bg-width-input"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="bg-height-input"]')).toBeTruthy();
 
-    // Check BGM pills 1 to 3
-    expect(target.querySelector('[data-testid="bgm-pill-1"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="bgm-pill-2"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="bgm-pill-3"]')).toBeTruthy();
+    // Check BGM buttons 1 to 3 use noph-ui Button (.np-button) and Sliders use noph-ui Slider (.np-slider)
+    const pill1 = target.querySelector('[data-testid="bgm-pill-1"]');
+    const pill2 = target.querySelector('[data-testid="bgm-pill-2"]');
+    const pill3 = target.querySelector('[data-testid="bgm-pill-3"]');
+    expect(pill1?.classList.contains('np-button')).toBe(true);
+    expect(pill2?.classList.contains('np-button')).toBe(true);
+    expect(pill3?.classList.contains('np-button')).toBe(true);
 
-    // Check Management heading and buttons
+    const slider1 = target.querySelector('[data-testid="bgm-slider-1"]');
+    const slider2 = target.querySelector('[data-testid="bgm-slider-2"]');
+    const slider3 = target.querySelector('[data-testid="bgm-slider-3"]');
+    expect(slider1?.closest('.np-slider')).toBeTruthy();
+    expect(slider2?.closest('.np-slider')).toBeTruthy();
+    expect(slider3?.closest('.np-slider')).toBeTruthy();
+
+    // Check Management heading and 7:5:3 1-row layout with M3 Button components
     expect(target.querySelector('[data-testid="heading-management"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="open-move-members-btn"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="open-create-scene-btn"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="delete-scene-btn"]')).toBeTruthy();
+    const col7 = target.querySelector<HTMLElement>('[data-testid="mgmt-col-7"]');
+    const col5 = target.querySelector<HTMLElement>('[data-testid="mgmt-col-5"]');
+    const col3 = target.querySelector<HTMLElement>('[data-testid="mgmt-col-3"]');
+    expect(col7?.style.flex).toContain('7');
+    expect(col5?.style.flex).toContain('5');
+    expect(col3?.style.flex).toContain('3');
 
-    // Click red "シーンを削除" button -> opens full-screen confirmation dialog
-    target.querySelector<HTMLButtonElement>('[data-testid="delete-scene-btn"]')?.click();
+    const moveBtn = target.querySelector('[data-testid="open-move-members-btn"]');
+    const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-create-scene-btn"]');
+    const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-scene-btn"]');
+    expect(moveBtn?.classList.contains('np-button')).toBe(true);
+    expect(createBtn?.classList.contains('np-button')).toBe(true);
+    expect(deleteBtn?.classList.contains('np-button')).toBe(true);
+    expect(deleteBtn?.classList.contains('delete-scene-tonal-btn')).toBe(true);
+
+    // Open "シーンを新規作成" overlay and verify M3 Switch (.np-switch) is used for "Juicesを継承"
+    createBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    const inheritSwitchInput = target.querySelector<HTMLInputElement>(
+      '[data-testid="inherit-juices-toggle"]',
+    );
+    expect(inheritSwitchInput).toBeTruthy();
+    expect(inheritSwitchInput?.getAttribute('role')).toBe('switch');
+    expect(inheritSwitchInput?.closest('.np-switch')).toBeTruthy();
+
+    const newSceneInput = target.querySelector<HTMLInputElement>(
+      '[data-testid="new-scene-name-input"]',
+    );
+    if (newSceneInput) {
+      newSceneInput.value = '派生シーン';
+      newSceneInput.dispatchEvent(new Event('input'));
+    }
+    target.querySelector<HTMLButtonElement>('[data-testid="submit-create-scene-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(createdSceneData).toEqual({ name: '派生シーン', inheritJuice: true });
+
+    // Click tonal "シーンを削除" button -> opens full-screen confirmation dialog
+    deleteBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
     expect(target.querySelector('[data-testid="delete-confirm-dialog"]')).toBeTruthy();

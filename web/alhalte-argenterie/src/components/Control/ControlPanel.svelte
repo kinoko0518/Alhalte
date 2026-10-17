@@ -4,7 +4,10 @@
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> コントロールパネル共通フッター`
+   * - GitHub Issue #32: Material 3 semantic tokens & sheet collapse support across tabs
    */
+  import { IconButton } from 'noph-ui';
+  import { Icon } from 'noph-ui/icons';
   import type { Character, ExtensionItem, Scene } from '../../types/index.js';
   import { ChunkLogManager } from '../../utils/log.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
@@ -95,6 +98,20 @@
 </script>
 
 <div class="control-panel-container" data-testid="control-panel">
+  {#if activeTab !== 'log' && onCollapse}
+    <div class="sheet-collapse-strip" data-testid="sheet-collapse-strip">
+      <IconButton
+        variant="text"
+        size="xs"
+        onclick={onCollapse}
+        data-testid="sheet-collapse-button"
+        aria-label="コントロールパネルをしまう"
+      >
+        <Icon>right_panel_close</Icon>
+      </IconButton>
+    </div>
+  {/if}
+
   <!-- Active Tab Body -->
   <div class="tab-content-area" data-testid="tab-content-area">
     {#if activeTab === 'log'}
@@ -123,6 +140,7 @@
         {currentScene}
         {allScenes}
         {characters}
+        {isAdmin}
         {onUpdateScene}
         {onSelectScene}
         {onCreateScene}
@@ -165,8 +183,16 @@
     height: 100%;
     width: 100%;
     overflow: hidden;
-    background: var(--md-sys-color-surface, #fbf8fd);
-    border-left: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+    background: var(--np-color-surface);
+    color: var(--np-color-on-surface);
+    border-left: 1px solid var(--np-color-outline-variant);
+  }
+  .sheet-collapse-strip {
+    display: flex;
+    align-items: center;
+    padding: 4px 8px;
+    background: var(--np-color-surface-container);
+    border-bottom: 1px solid var(--np-color-outline-variant);
   }
   .tab-content-area {
     flex: 1;

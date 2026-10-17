@@ -5,8 +5,9 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーン設定タブ`
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
+   * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    */
-  import { Button, Card, Carousel, CarouselItem, Slider, Switch } from 'noph-ui';
+  import { Button, Carousel, CarouselItem, Slider, Switch } from 'noph-ui';
   import type { Character, Scene } from '../../../types/index.js';
   import {
     loadAssets,
@@ -14,11 +15,7 @@
     type AssetItem,
     type AssetMediaType,
   } from '../../../utils/assets.js';
-  import {
-    calculateDimensionsAndCrop,
-    inheritJuices,
-    moveMemberToScene,
-  } from '../../../utils/sceneSettings.js';
+  import { calculateDimensionsAndCrop } from '../../../utils/sceneSettings.js';
   import AssetPickerModal from '../AssetPickerModal.svelte';
 
   let {
@@ -300,25 +297,24 @@
     <div class="bgm-controls">
       <!-- BGM 1 -->
       <div class="bgm-row" data-testid="bgm-row-1">
-        <button
-          type="button"
-          class="pill-button"
+        <Button
+          variant="tonal"
+          size="s"
+          shape="round"
           onclick={() => handleBgmSelect('bgm1')}
           data-testid="bgm-pill-1"
         >
           BGM1
-        </button>
+        </Button>
         <div class="slider-wrapper">
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            value={currentScene.juices.bgm1Volume}
-            oninput={(e) => {
-              currentScene.juices.bgm1Volume = Number((e.target as HTMLInputElement).value);
-              onUpdateScene?.(currentScene);
-            }}
+          <Slider
+            min={0}
+            max={1}
+            step={0.05}
+            bind:value={currentScene.juices.bgm1Volume}
+            oninput={() => onUpdateScene?.(currentScene)}
+            onchange={() => onUpdateScene?.(currentScene)}
+            aria-label="BGM1音量"
             data-testid="bgm-slider-1"
           />
           <span class="vol-label">{Math.round(currentScene.juices.bgm1Volume * 100)}%</span>
@@ -327,25 +323,24 @@
 
       <!-- BGM 2 -->
       <div class="bgm-row" data-testid="bgm-row-2">
-        <button
-          type="button"
-          class="pill-button"
+        <Button
+          variant="tonal"
+          size="s"
+          shape="round"
           onclick={() => handleBgmSelect('bgm2')}
           data-testid="bgm-pill-2"
         >
           BGM2
-        </button>
+        </Button>
         <div class="slider-wrapper">
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            value={currentScene.juices.bgm2Volume}
-            oninput={(e) => {
-              currentScene.juices.bgm2Volume = Number((e.target as HTMLInputElement).value);
-              onUpdateScene?.(currentScene);
-            }}
+          <Slider
+            min={0}
+            max={1}
+            step={0.05}
+            bind:value={currentScene.juices.bgm2Volume}
+            oninput={() => onUpdateScene?.(currentScene)}
+            onchange={() => onUpdateScene?.(currentScene)}
+            aria-label="BGM2音量"
             data-testid="bgm-slider-2"
           />
           <span class="vol-label">{Math.round(currentScene.juices.bgm2Volume * 100)}%</span>
@@ -354,25 +349,24 @@
 
       <!-- BGM 3 -->
       <div class="bgm-row" data-testid="bgm-row-3">
-        <button
-          type="button"
-          class="pill-button"
+        <Button
+          variant="tonal"
+          size="s"
+          shape="round"
           onclick={() => handleBgmSelect('bgm3')}
           data-testid="bgm-pill-3"
         >
           BGM3
-        </button>
+        </Button>
         <div class="slider-wrapper">
-          <input
-            type="range"
-            min="0"
-            max="1"
-            step="0.05"
-            value={currentScene.juices.bgm3Volume}
-            oninput={(e) => {
-              currentScene.juices.bgm3Volume = Number((e.target as HTMLInputElement).value);
-              onUpdateScene?.(currentScene);
-            }}
+          <Slider
+            min={0}
+            max={1}
+            step={0.05}
+            bind:value={currentScene.juices.bgm3Volume}
+            oninput={() => onUpdateScene?.(currentScene)}
+            onchange={() => onUpdateScene?.(currentScene)}
+            aria-label="BGM3音量"
             data-testid="bgm-slider-3"
           />
           <span class="vol-label">{Math.round(currentScene.juices.bgm3Volume * 100)}%</span>
@@ -383,25 +377,39 @@
     <!-- Heading 管理 -->
     <h3 class="section-heading" data-testid="heading-management">管理</h3>
 
+    <!-- Management buttons in 1 row with 7 : 5 : 3 ratio and soft Material Color for delete -->
     <div class="management-buttons" data-testid="management-buttons">
-      <Button variant="outlined" onclick={openMoveMembersDialog} data-testid="open-move-members-btn">
-        メンバーを移動
-      </Button>
-      <Button
-        variant="outlined"
-        onclick={() => (isCreateSceneOpen = true)}
-        data-testid="open-create-scene-btn"
-      >
-        シーンを新規作成
-      </Button>
-      <button
-        type="button"
-        class="delete-scene-red-btn"
-        onclick={() => (isDeleteConfirmOpen = true)}
-        data-testid="delete-scene-btn"
-      >
-        シーンを削除
-      </button>
+      <div class="mgmt-btn-col mgmt-col-7" style="flex: 7;" data-testid="mgmt-col-7">
+        <Button
+          variant="filled"
+          size="s"
+          onclick={openMoveMembersDialog}
+          data-testid="open-move-members-btn"
+        >
+          メンバーを移動
+        </Button>
+      </div>
+      <div class="mgmt-btn-col mgmt-col-5" style="flex: 5;" data-testid="mgmt-col-5">
+        <Button
+          variant="tonal"
+          size="s"
+          onclick={() => (isCreateSceneOpen = true)}
+          data-testid="open-create-scene-btn"
+        >
+          シーンを新規作成
+        </Button>
+      </div>
+      <div class="mgmt-btn-col mgmt-col-3" style="flex: 3;" data-testid="mgmt-col-3">
+        <Button
+          variant="tonal"
+          size="s"
+          class="delete-scene-tonal-btn"
+          onclick={() => (isDeleteConfirmOpen = true)}
+          data-testid="delete-scene-btn"
+        >
+          シーンを削除
+        </Button>
+      </div>
     </div>
   </div>
 
@@ -425,9 +433,10 @@
 
         <div class="toggle-row">
           <span class="label-text">Juicesを継承</span>
-          <input
-            type="checkbox"
-            bind:checked={inheritJuiceToggle}
+          <Switch
+            bind:selected={inheritJuiceToggle}
+            icons="selected"
+            aria-label="Juicesを継承"
             data-testid="inherit-juices-toggle"
           />
         </div>
@@ -531,14 +540,14 @@
 
         <div class="dialog-footer-right">
           <Button variant="text" onclick={() => (isDeleteConfirmOpen = false)}>キャンセル</Button>
-          <button
-            type="button"
-            class="delete-confirm-btn"
+          <Button
+            variant="tonal"
+            class="delete-scene-tonal-btn"
             onclick={handleDeleteConfirm}
             data-testid="confirm-delete-button"
           >
             削除する
-          </button>
+          </Button>
         </div>
       </div>
     </div>
@@ -563,6 +572,7 @@
     height: 100%;
     overflow: hidden;
     background: var(--np-color-surface);
+    color: var(--np-color-on-surface);
   }
   .split-button-container {
     position: relative;
@@ -575,7 +585,7 @@
     align-items: center;
     background: var(--np-color-surface-container-lowest);
     border: 1px solid var(--np-color-outline);
-    border-radius: 12px;
+    border-radius: var(--np-shape-corner-medium);
     overflow: hidden;
   }
   .scene-name-input-centered {
@@ -606,7 +616,7 @@
     margin-top: 4px;
     background: var(--np-color-surface-container-high);
     border: 1px solid var(--np-color-outline-variant);
-    border-radius: 12px;
+    border-radius: var(--np-shape-corner-medium);
     box-shadow: var(--np-elevation-2);
     z-index: 250;
     max-height: 200px;
@@ -663,7 +673,7 @@
   .description-text {
     margin: 0;
     font-size: 0.82rem;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
+    color: var(--np-color-on-surface-variant);
     line-height: 1.4;
   }
   .dimensions-row {
@@ -679,12 +689,15 @@
   .dim-field label {
     font-size: 0.85rem;
     font-weight: 500;
+    color: var(--np-color-on-surface-variant);
   }
   .num-input {
     padding: 8px 12px;
-    border: 1px solid var(--md-sys-color-outline, #79747e);
-    border-radius: 8px;
+    border: 1px solid var(--np-color-outline);
+    border-radius: var(--np-shape-corner-small);
     font-size: 0.95rem;
+    background: var(--np-color-surface-container-lowest);
+    color: var(--np-color-on-surface);
   }
   .bgm-controls {
     display: flex;
@@ -696,47 +709,43 @@
     align-items: center;
     gap: 12px;
   }
-  .pill-button {
-    padding: 6px 16px;
-    border-radius: 20px;
-    border: 1px solid var(--md-sys-color-outline, #79747e);
-    background: var(--md-sys-color-surface-container-high, #ece6f0);
-    cursor: pointer;
-    font-size: 0.85rem;
-    font-weight: 600;
-  }
   .slider-wrapper {
     flex: 1;
     display: flex;
     align-items: center;
     gap: 8px;
   }
-  .slider-wrapper input {
+  .slider-wrapper :global(.np-slider) {
     flex: 1;
   }
   .vol-label {
     font-size: 0.8rem;
     width: 36px;
     text-align: right;
+    color: var(--np-color-on-surface-variant);
   }
   .management-buttons {
     display: flex;
-    flex-direction: column;
-    gap: 10px;
+    flex-direction: row;
+    align-items: stretch;
+    gap: 8px;
   }
-  .delete-scene-red-btn {
-    padding: 10px 16px;
-    border-radius: 20px;
-    border: none;
-    background: var(--md-sys-color-error, #b3261e);
-    color: #fff;
-    font-size: 0.95rem;
-    font-weight: 600;
-    cursor: pointer;
-    transition: opacity 0.2s;
+  .mgmt-btn-col {
+    display: flex;
+    min-width: 0;
   }
-  .delete-scene-red-btn:hover {
-    opacity: 0.9;
+  .mgmt-btn-col :global(.np-button) {
+    width: 100%;
+    min-width: 0;
+    --_button-min-width: 0;
+    --np-button-padding: 8px;
+    --_button-label-overflow: hidden;
+  }
+  :global(.delete-scene-tonal-btn) {
+    --np-tonal-button-container-color: var(--np-color-tertiary-container);
+    --np-tonal-button-label-text-color: var(--np-color-on-tertiary-container);
+    --np-button-container-color: var(--np-color-tertiary-container);
+    --np-button-label-text-color: var(--np-color-on-tertiary-container);
   }
   .fullscreen-dialog-overlay {
     position: fixed;
@@ -744,19 +753,20 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: color-mix(in srgb, var(--np-color-scrim) 50%, transparent);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 1000;
   }
   .dialog-box {
-    background: var(--md-sys-color-surface-container-high, #ece6f0);
-    border-radius: 28px;
+    background: var(--np-color-surface-container-high);
+    color: var(--np-color-on-surface);
+    border-radius: var(--np-shape-corner-extra-large);
     padding: 24px;
     width: 90%;
     max-width: 480px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    box-shadow: var(--np-elevation-3);
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -769,6 +779,7 @@
     text-align: center;
     font-size: 1.35rem;
     font-weight: 600;
+    color: var(--np-color-on-surface);
   }
   .dialog-input-row {
     display: flex;
@@ -778,12 +789,15 @@
   .label-text {
     font-size: 0.9rem;
     font-weight: 500;
+    color: var(--np-color-on-surface);
   }
   .text-input {
     padding: 10px 14px;
-    border: 1px solid var(--md-sys-color-outline, #79747e);
-    border-radius: 10px;
+    border: 1px solid var(--np-color-outline);
+    border-radius: var(--np-shape-corner-small);
     font-size: 0.95rem;
+    background: var(--np-color-surface-container-lowest);
+    color: var(--np-color-on-surface);
   }
   .toggle-row {
     display: flex;
@@ -808,8 +822,8 @@
     align-items: center;
     gap: 8px;
     padding: 8px 12px;
-    background: var(--md-sys-color-surface, #fff);
-    border-radius: 12px;
+    background: var(--np-color-surface);
+    border-radius: var(--np-shape-corner-medium);
   }
   .member-info {
     display: flex;
@@ -820,14 +834,14 @@
   .member-avatar {
     width: 32px;
     height: 32px;
-    border-radius: 50%;
+    border-radius: var(--np-shape-corner-full);
   }
   .member-name {
     font-size: 0.9rem;
     font-weight: 500;
   }
   .arrow-symbol {
-    color: var(--md-sys-color-primary, #6750a4);
+    color: var(--np-color-primary);
     font-weight: 700;
   }
   .split-select-wrapper {
@@ -839,9 +853,11 @@
   .scene-target-input {
     width: 100%;
     padding: 6px 10px;
-    border: 1px solid var(--md-sys-color-outline, #79747e);
-    border-radius: 8px;
+    border: 1px solid var(--np-color-outline);
+    border-radius: var(--np-shape-corner-small);
     font-size: 0.88rem;
+    background: var(--np-color-surface-container-lowest);
+    color: var(--np-color-on-surface);
   }
   .inline-arrow-btn {
     position: absolute;
@@ -851,6 +867,7 @@
     cursor: pointer;
     font-size: 0.75rem;
     padding: 4px;
+    color: var(--np-color-on-surface-variant);
   }
   .inline-scene-dropdown {
     position: absolute;
@@ -858,10 +875,10 @@
     left: 0;
     right: 0;
     margin-top: 2px;
-    background: #fff;
-    border: 1px solid #ccc;
-    border-radius: 8px;
-    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+    background: var(--np-color-surface-container-high);
+    border: 1px solid var(--np-color-outline-variant);
+    border-radius: var(--np-shape-corner-small);
+    box-shadow: var(--np-elevation-2);
     z-index: 300;
     max-height: 150px;
     overflow-y: auto;
@@ -875,26 +892,18 @@
     text-align: left;
     font-size: 0.85rem;
     cursor: pointer;
+    color: var(--np-color-on-surface);
   }
   .dropdown-scene-opt:hover {
-    background: #eee;
+    background: var(--np-color-surface-container-highest);
   }
   .warning-text {
-    color: var(--md-sys-color-error, #b3261e);
+    color: var(--np-color-tertiary);
   }
   .warning-body {
     margin: 0;
     font-size: 0.92rem;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
+    color: var(--np-color-on-surface-variant);
     text-align: center;
-  }
-  .delete-confirm-btn {
-    padding: 8px 18px;
-    border-radius: 20px;
-    border: none;
-    background: var(--md-sys-color-error, #b3261e);
-    color: #fff;
-    font-weight: 600;
-    cursor: pointer;
   }
 </style>
