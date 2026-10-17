@@ -35,4 +35,7 @@ export { default as SceneSettingsTab } from './components/Control/tabs/SceneSett
 export { default as SceneManagementTab } from './components/Control/tabs/SceneManagementTab.svelte';
 export { default as CharacterManagementTab } from './components/Control/tabs/CharacterManagementTab.svelte';
 export { default as ExtensionManagementTab } from './components/Control/tabs/ExtensionManagementTab.svelte';
+export { default as GenericImagePicker } from './components/Control/GenericImagePicker.svelte';
+export { default as IconImagePicker } from './components/Control/IconImagePicker.svelte';
+export { default as AssetPickerModal } from './components/Control/AssetPickerModal.svelte';
 

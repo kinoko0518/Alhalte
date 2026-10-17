@@ -278,7 +278,7 @@ export async function addAssetFromFile(
   // Also cache raw encoded bytes in Pantry cache adapter when possible
   try {
     const encoder = new TextEncoder();
-    await pantryCache.put(item.id, encoder.encode(dataUrl));
+    await (pantryCache as any).put?.(item.id, encoder.encode(dataUrl));
   } catch {
     // Non-fatal if cache adapter fails
   }
