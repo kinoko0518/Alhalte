@@ -68,7 +68,7 @@
 
   function addStatusRow() {
     if (!editingCharacter) return;
-    editingCharacter.statuses.push({ label: 'HP', current: 10, max: 10 });
+    editingCharacter.statuses.push({ label: '', current: 0, max: 0 });
   }
 
   function removeStatusRow(index: number) {
@@ -78,7 +78,7 @@
 
   function addParamRow() {
     if (!editingCharacter) return;
-    editingCharacter.parameters.push({ label: 'STR', value: 10 });
+    editingCharacter.parameters.push({ label: '', value: 0 });
   }
 
   function removeParamRow(index: number) {
@@ -100,12 +100,9 @@
       initiative: 0,
       description: '',
       reference: '',
-      statuses: [
-        { label: 'HP', current: 10, max: 10 },
-        { label: 'MP', current: 5, max: 5 },
-      ],
-      parameters: [{ label: 'SAN', value: 50 }],
-      chatPalette: '1D100<=50 【SANチェック】\n1D6 探索',
+      statuses: [],
+      parameters: [],
+      chatPalette: '',
       hideStatus: false,
       placedAsPiece: false,
     };
@@ -288,7 +285,7 @@
         <div class="sub-section">
           <div class="sub-section-header">
             <span class="sub-section-title">ステータス</span>
-            <button type="button" class="add-mini-btn" onclick={addStatusRow}>＋追加</button>
+            <button type="button" class="add-mini-btn" onclick={addStatusRow} data-testid="add-status-btn">＋追加</button>
           </div>
           <div class="rows-list" data-testid="edit-status-list">
             {#each editingCharacter.statuses as st, sIdx (sIdx)}
@@ -331,7 +328,7 @@
         <div class="sub-section">
           <div class="sub-section-header">
             <span class="sub-section-title">パラメータ</span>
-            <button type="button" class="add-mini-btn" onclick={addParamRow}>＋追加</button>
+            <button type="button" class="add-mini-btn" onclick={addParamRow} data-testid="add-param-btn">＋追加</button>
           </div>
           <div class="rows-list" data-testid="edit-param-list">
             {#each editingCharacter.parameters as param, pIdx (pIdx)}
