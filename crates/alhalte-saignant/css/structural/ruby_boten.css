@@ -1,0 +1,21 @@
+/* Structural CSS: Ruby annotations and boten emphasis dots */
+
+.saignant-ruby {
+  ruby-align: space-around;
+  ruby-position: over;
+}
+
+.saignant-rt {
+  display: ruby-text;
+  font-size: 0.5em;
+  line-height: 1;
+  text-align: center;
+  user-select: none;
+}
+
+.saignant-boten {
+  text-emphasis: filled circle;
+  text-emphasis-position: over;
+  -webkit-text-emphasis: filled circle;
+  -webkit-text-emphasis-position: over;
+}

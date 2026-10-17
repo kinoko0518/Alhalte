@@ -1,0 +1,13 @@
+/* Structural CSS: Syntax error and evaluation error indicators */
+
+.saignant-syntax-error {
+  display: inline-block;
+  box-sizing: border-box;
+  vertical-align: baseline;
+}
+
+.saignant-diceroll--error {
+  display: inline-block;
+  box-sizing: border-box;
+  vertical-align: baseline;
+}

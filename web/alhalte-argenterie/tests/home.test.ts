@@ -1,0 +1,134 @@
+import { describe, it, expect, beforeEach } from 'vitest';
+import { mount, unmount } from 'svelte';
+import {
+  generateRoomUrl,
+  getVisitedRooms,
+  saveVisitedRoom,
+  removeVisitedRoom,
+  LOCAL_STORAGE_VISITED_ROOMS_KEY,
+} from '../src/utils/home.js';
+import HomeScreen from '../src/components/Home/HomeScreen.svelte';
+import type { VisitedRoom } from '../src/types/index.js';
+
+describe('Home Screen & Room URL', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  // spec: alhalte-argenterie/home 招待URL生成・URLフラグメント
+  it('generates room URL with 64-bit ID and 256-bit key in URL fragment', () => {
+    const origin = 'https://alhalte.example';
+    const result = generateRoomUrl(origin);
+
+    expect(result.roomId).toMatch(/^[0-9a-f]{16}$/);
+    expect(result.roomKeyHex).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.roomUrl).toBe(`${origin}/rooms/${result.roomId}#${result.roomKeyHex}`);
+  });
+
+  // spec: alhalte-argenterie/home localStorage保存・取得・管理者除外
+  it('saves visited rooms and excludes rooms where user is admin from display', () => {
+    const room1: VisitedRoom = {
+      id: 'room-1',
+      name: 'Player Room',
+      url: 'https://alhalte.example/rooms/room-1#key1',
+      lastVisited: 1000,
+      isAdmin: false,
+    };
+    const room2: VisitedRoom = {
+      id: 'room-2',
+      name: 'Admin Room',
+      url: 'https://alhalte.example/rooms/room-2#key2',
+      lastVisited: 2000,
+      isAdmin: true, // Should be excluded from visited list display
+    };
+    const room3: VisitedRoom = {
+      id: 'room-3',
+      name: 'Another Player Room',
+      url: 'https://alhalte.example/rooms/room-3#key3',
+      lastVisited: 3000,
+      isAdmin: false,
+    };
+
+    saveVisitedRoom(room1);
+    saveVisitedRoom(room2);
+    saveVisitedRoom(room3);
+
+    const visited = getVisitedRooms();
+    expect(visited).toHaveLength(2);
+    expect(visited.map((r) => r.id)).toEqual(['room-3', 'room-1']);
+    expect(visited.some((r) => r.isAdmin)).toBe(false);
+
+    removeVisitedRoom('room-1');
+    expect(getVisitedRooms().map((r) => r.id)).toEqual(['room-3']);
+  });
+
+  // spec: alhalte-argenterie/home HomeScreen コンポーネント描画とオーバーレイ
+  it('renders HomeScreen, displays visited cards, and opens creation dialog with warning', async () => {
+    const testRoom: VisitedRoom = {
+      id: 'visited-room-1',
+      name: '冒険者ギルド',
+      url: 'https://alhalte.example/rooms/visited-room-1#abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
+      lastVisited: Date.now(),
+      isAdmin: false,
+    };
+    saveVisitedRoom(testRoom);
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    let enteredRoom: VisitedRoom | null = null;
+    const instance = mount(HomeScreen, {
+      target,
+      props: {
+        baseUrl: 'https://alhalte.example',
+        onEnterRoom: (r) => {
+          enteredRoom = r;
+        },
+      },
+    });
+
+    // Check visited room card is rendered
+    expect(target.querySelector('[data-testid="room-card-visited-room-1"]')).toBeTruthy();
+    expect(target.textContent).toContain('冒険者ギルド');
+
+    // Click "部屋の新規作成" button
+    const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]');
+    expect(createBtn).toBeTruthy();
+    createBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Verify overlay appears with required elements
+    const overlay = target.querySelector('[data-testid="create-room-overlay"]');
+    expect(overlay).toBeTruthy();
+
+    const title = target.querySelector('[data-testid="dialog-title"]');
+    expect(title?.textContent?.trim()).toBe('部屋の作成');
+
+    const warning = target.querySelector('[data-testid="dialog-warning"]');
+    expect(warning?.textContent?.trim()).toBe(
+      'このリンクを紛失した場合、部屋へのアクセスは永久に失われます！',
+    );
+
+    const urlInput = target.querySelector<HTMLInputElement>('[data-testid="room-url-input"]');
+    expect(urlInput?.readOnly).toBe(true);
+    expect(urlInput?.value).toContain('https://alhalte.example/rooms/');
+    expect(urlInput?.value).toContain('#');
+
+    // Enter room name and click "入室する"
+    const nameInput = target.querySelector<HTMLInputElement>('[data-testid="room-name-input"]');
+    if (nameInput) {
+      nameInput.value = '新セッション部屋';
+      nameInput.dispatchEvent(new Event('input'));
+    }
+
+    const joinBtn = target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]');
+    joinBtn?.click();
+
+    expect(enteredRoom).toBeTruthy();
+    expect(enteredRoom?.name).toBe('新セッション部屋');
+    expect(enteredRoom?.isAdmin).toBe(true);
+
+    unmount(instance);
+    target.remove();
+  });
+});

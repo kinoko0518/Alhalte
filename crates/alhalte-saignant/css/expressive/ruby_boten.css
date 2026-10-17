@@ -1,0 +1,12 @@
+/* Expressive CSS: Ruby and boten Material 3 colors and styling */
+
+.saignant-rt {
+  color: var(--md-sys-color-secondary, #625b71);
+  font-weight: 600;
+  letter-spacing: 0.05em;
+}
+
+.saignant-boten {
+  text-emphasis-color: var(--md-sys-color-tertiary, #7d5260);
+  -webkit-text-emphasis-color: var(--md-sys-color-tertiary, #7d5260);
+}

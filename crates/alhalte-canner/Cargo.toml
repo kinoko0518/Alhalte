@@ -1,0 +1,13 @@
+[package]
+name = "alhalte-canner"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tin = { path = "../tin-rs" }
+thiserror = "2.0"
+getrandom = { version = "0.2", features = ["js"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+oxideav-webp = { version = "0.3", default-features = false }
+opus-pure = "0.2"
+symphonia = { version = "0.6", default-features = false, features = ["wav", "ogg", "vorbis", "pcm"] }

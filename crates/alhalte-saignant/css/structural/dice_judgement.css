@@ -1,0 +1,62 @@
+/* Structural CSS: Diceroll trace and Judgement badges */
+
+.saignant-diceroll {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  vertical-align: baseline;
+  box-sizing: border-box;
+}
+
+.saignant-diceroll-trace {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.saignant-diceroll-die {
+  display: inline-block;
+  box-sizing: border-box;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.saignant-diceroll-separator {
+  display: inline;
+  user-select: none;
+}
+
+.saignant-diceroll-result {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.saignant-judgement {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  flex-wrap: wrap;
+  vertical-align: baseline;
+  box-sizing: border-box;
+}
+
+.saignant-judgement-level {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.saignant-judgement-subject {
+  display: inline-block;
+}
+
+.saignant-judgement-target {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.saignant-judgement-roll {
+  display: inline-flex;
+  align-items: center;
+}

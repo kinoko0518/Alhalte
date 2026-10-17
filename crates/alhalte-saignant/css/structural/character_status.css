@@ -1,0 +1,25 @@
+/* Structural CSS: Mentions, status fluctuation, and assignment */
+
+.saignant-mention {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  vertical-align: baseline;
+  box-sizing: border-box;
+}
+
+.saignant-fluct {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  vertical-align: baseline;
+  box-sizing: border-box;
+}
+
+.saignant-assign {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+  vertical-align: baseline;
+  box-sizing: border-box;
+}

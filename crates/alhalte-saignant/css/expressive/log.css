@@ -1,0 +1,57 @@
+/* Expressive CSS: Material 3 Expressive log entry styling */
+
+.saignant-log-entry {
+  background-color: var(--md-sys-color-surface-container-low, #f7f2fa);
+  color: var(--md-sys-color-on-surface, #1d1b20);
+  border-radius: var(--md-sys-shape-corner-medium, 12px);
+  padding: 10px 14px;
+  gap: 12px;
+  box-shadow: var(--md-sys-elevation-0, none);
+  transition: background-color var(--md-sys-motion-duration-short2, 100ms) var(--md-sys-motion-easing-standard, cubic-bezier(0.2, 0, 0, 1)),
+              box-shadow var(--md-sys-motion-duration-short2, 100ms) var(--md-sys-motion-easing-standard, cubic-bezier(0.2, 0, 0, 1));
+}
+
+.saignant-log-entry:hover {
+  background-color: var(--md-sys-color-surface-container, #f3edf7);
+  box-shadow: var(--md-sys-elevation-1, 0px 1px 3px 1px rgba(0, 0, 0, 0.15));
+}
+
+.saignant-log-avatar {
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  border: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+  box-shadow: var(--md-sys-elevation-1, 0px 1px 2px 0px rgba(0, 0, 0, 0.1));
+}
+
+.saignant-log-avatar-placeholder {
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  background-color: var(--md-sys-color-primary-container, #eaddff);
+  color: var(--md-sys-color-on-primary-container, #21005d);
+  font-weight: 700;
+  font-size: 16px;
+  border: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+}
+
+.saignant-log-header {
+  gap: 8px;
+  margin-block-end: 4px;
+}
+
+.saignant-log-speaker {
+  font-weight: 700;
+  font-size: 14px;
+  color: var(--md-sys-color-on-surface, #1d1b20);
+  letter-spacing: 0.1px;
+}
+
+.saignant-log-timestamp {
+  font-size: 11px;
+  color: var(--md-sys-color-on-surface-variant, #49454f);
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+.saignant-log-content {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--md-sys-color-on-surface, #1d1b20);
+}
