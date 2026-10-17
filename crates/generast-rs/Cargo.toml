@@ -1,0 +1,17 @@
+[package]
+name = "generast"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tin = { path = "../tin-rs" }
+serde = { version = "1.0", features = ["derive", "alloc"] }
+postcard = { version = "1.0", features = ["alloc"] }
+thiserror = "2.0"
+rand_chacha = "0.3"
+rand_core = "0.6"
+num-rational = { version = "0.4", features = ["serde", "num-bigint"] }
+num-bigint = { version = "0.4", features = ["serde"] }
+num-traits = "0.2"
+num-integer = "0.1"
+xxhash-rust = { version = "0.8", features = ["const_xxh64"] }
