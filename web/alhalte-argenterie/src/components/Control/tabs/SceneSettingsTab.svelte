@@ -8,6 +8,7 @@
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    */
   import { Button, Carousel, CarouselItem, Slider, Switch, TextField } from 'noph-ui';
+  import GenericImagePicker from '../GenericImagePicker.svelte';
   import type { Character, Scene } from '../../../types/index.js';
   import {
     loadAssets,
@@ -263,46 +264,23 @@
     <h3 class="section-heading" data-testid="heading-juices">Juices</h3>
 
     <div class="setting-item">
-      <div class="bg-carousel-wrapper" data-testid="bg-image-carousel">
-        <Carousel variant="uncontained" label="背景画像アセット">
-          <CarouselItem
-            type="button"
-            label="NONE"
-            aspectRatio={16 / 9}
-            onclick={() => handleQuickSelectBgImage(undefined)}
-            data-testid="bg-carousel-item-none"
-          />
-          {#each imageAssets as asset (asset.id)}
-            <CarouselItem
-              type="button"
-              image={asset.dataUrl}
-              label={asset.name}
-              aspectRatio={16 / 9}
-              onclick={() => handleQuickSelectBgImage(asset.dataUrl)}
-              data-testid="bg-carousel-item-{asset.id}"
-            />
-          {/each}
-        </Carousel>
-      </div>
-
-      <!-- svelte-ignore a11y_click_events_have_key_events -->
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div
-        class="bg-picker-trigger"
-        data-testid="bg-image-card"
-        onclick={handleBgImageSelect}
-      >
-        <Button
-          variant="tonal"
-          onclick={(e: MouseEvent) => {
-            e.stopPropagation();
-            handleBgImageSelect();
-          }}
-          data-testid="open-bg-picker-btn"
-        >
-          画像選択 ({currentScene.juices.bgImage ? '設定済み' : '未設定'})
-        </Button>
-      </div>
+      <GenericImagePicker
+        label="背景画像アセット"
+        aspectRatio={16 / 9}
+        showNone={true}
+        {isAdmin}
+        imageAssets={imageAssets}
+        onSelect={handleQuickSelectBgImage}
+        onOpenPicker={handleBgImageSelect}
+        onRequestAssetPicker={onRequestAssetPicker}
+        dataTestId="bg-generic-image-picker"
+        dataCarouselTestId="bg-image-carousel"
+        noneTestId="bg-carousel-item-none"
+        itemTestIdPrefix="bg-carousel-item"
+        moreButtonTestId="more-images-btn"
+        cardTestId="bg-image-card"
+        legacyOpenBtnTestId="open-bg-picker-btn"
+      />
       <p class="description-text" data-testid="bg-description-text">
         画像は一方を指定すればもう一方を自動で計算します。もう一方も入力した場合、端を切り落として揃えます。
       </p>
@@ -713,17 +691,7 @@
     flex-direction: column;
     gap: 8px;
   }
-  .bg-carousel-wrapper {
-    --np-carousel-item-height: 96px;
-    --np-carousel-item-width: 140px;
-    --np-carousel-item-container-color: var(--np-color-surface-container-high);
-    --np-carousel-item-outline-width: 1px;
-    --np-carousel-item-outline-color: var(--np-color-outline-variant);
-  }
-  .bg-picker-trigger {
-    display: flex;
-    align-items: center;
-  }
+
   .description-text {
     margin: 0;
     font-size: 0.82rem;

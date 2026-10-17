@@ -164,5 +164,24 @@ if (typeof window !== 'undefined') {
       window.ResizeObserver = PolyfilledResizeObserver;
     }
   }
+
+  // Polyfill adoptedStyleSheets for jsdom (used by Noph UI Carousel multi-browse morph)
+  if (typeof Document !== 'undefined') {
+    const adoptedStyleSheetsMap = new WeakMap<Document, CSSStyleSheet[]>();
+    Object.defineProperty(Document.prototype, 'adoptedStyleSheets', {
+      configurable: true,
+      get() {
+        let sheets = adoptedStyleSheetsMap.get(this);
+        if (!sheets) {
+          sheets = [];
+          adoptedStyleSheetsMap.set(this, sheets);
+        }
+        return sheets;
+      },
+      set(sheets: CSSStyleSheet[]) {
+        adoptedStyleSheetsMap.set(this, Array.isArray(sheets) ? [...sheets] : []);
+      },
+    });
+  }
 }
 

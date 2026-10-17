@@ -15,6 +15,7 @@
   } from '../../../utils/assets.js';
   import { truncateDescription } from '../../../utils/character.js';
   import AssetPickerModal from '../AssetPickerModal.svelte';
+  import IconImagePicker from '../IconImagePicker.svelte';
 
   let {
     characters = [],
@@ -277,7 +278,7 @@
         <!-- Quick-select Image Asset Carousel -->
         <div class="char-carousel-section">
           <div class="char-carousel-wrapper" data-testid="char-image-carousel">
-            <Carousel variant="uncontained" label="キャラクター画像アセット">
+            <Carousel variant="multi-browse" label="キャラクター画像アセット">
               <CarouselItem
                 type="button"
                 label="NONE"
@@ -302,20 +303,17 @@
         <!-- Avatar, Name, Initiative row -->
         <div class="edit-top-row">
           <div class="avatar-picker-column">
-            <button
-              type="button"
-              class="avatar-picker-btn"
-              onclick={handleIconFileSelect}
+            <IconImagePicker
+              src={editingCharacter.iconUrl}
+              alt={editingCharacter.name}
+              size={64}
               title="クリックでファイル選択"
-              data-testid="edit-avatar-picker"
-            >
-              <img
-                class="edit-avatar"
-                src={editingCharacter.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
-                alt={editingCharacter.name}
-                data-testid="edit-avatar-img"
-              />
-            </button>
+              dataTestId="edit-avatar-picker"
+              imgTestId="edit-avatar-img"
+              {isAdmin}
+              onRequestAssetPicker={onRequestAssetPicker}
+              onSelect={handleIconPicked}
+            />
             <Button
               variant="tonal"
               size="xs"
@@ -600,6 +598,12 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    border-radius: 50%;
+  }
+  .char-avatar-btn:hover .char-list-avatar,
+  .char-avatar-btn:focus-visible .char-list-avatar {
+    transform: scale(1.1);
+    box-shadow: var(--np-elevation-2);
   }
   .char-list-avatar {
     width: 100%;
@@ -607,6 +611,10 @@
     border-radius: 50%;
     object-fit: cover;
     background: var(--np-color-surface-container-highest);
+    transition: transform var(--np-motion-expressive-fast-spatial, 200ms ease),
+                box-shadow var(--np-motion-expressive-fast-spatial, 200ms ease);
+    transform: scale(1);
+    will-change: transform;
   }
   .char-name-label {
     font-weight: 600;
@@ -680,23 +688,7 @@
     align-items: center;
     gap: 6px;
   }
-  .avatar-picker-btn {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 4px;
-    background: none;
-    border: none;
-    cursor: pointer;
-    padding: 0;
-  }
-  .edit-avatar {
-    width: 64px;
-    height: 64px;
-    border-radius: 12px;
-    object-fit: cover;
-    background: var(--np-color-surface-container-highest);
-  }
+
   .name-init-fields {
     flex: 1;
     display: flex;

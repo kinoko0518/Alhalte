@@ -116,12 +116,17 @@ Import `Sheet` from `'noph-ui'`:
   - Props: `bind:value={number}`, `min={0}`, `max={100}`, `step={1}`, `size?: 'xs' | 's' | 'm' | 'l' | 'xl'`, `labeled?: boolean`.
   - Use for all BGM volume controls (`0`–`100`).
 
-### E. Carousel (`Carousel`, `CarouselItem`)
-- Import `{ Carousel, CarouselItem } from 'noph-ui'`.
-- Props:
-  - `<Carousel variant="multi-browse" label="...">` (or `variant="uncontained"`)
-  - `<CarouselItem type="button" image={url} label={name} onclick={() => selectImage(id)} />`
-- Use in Scene Settings (Background image selection) and Character Management (Standing picture / icon selection) to allow quick 1-click selection of available image assets (including `"NONE"`), with an `"画像選択"` `<Button variant="tonal">` directly below the Carousel to open the full Asset Picker overlay.
+### E. Image Pickers: Generic Image Picker (`Carousel`) & Icon Image Picker (`IconImagePicker`)
+- **Generic Image Picker (`GenericImagePicker` / `Carousel`, `CarouselItem`)**:
+  - Used for background images (`SceneSettingsTab.svelte`), etc.
+  - Import `{ Carousel, CarouselItem } from 'noph-ui'`.
+  - Props: `<Carousel variant="multi-browse" label="...">`
+  - Items rendered as `<CarouselItem type="button" image={url} label={name} onclick={() => selectImage(id)} />`
+  - Placed at the bottom-right of the carousel is a primary color (`var(--np-color-primary)`) clickable text/button "+ その他の画像", which opens the full-screen `AssetPickerModal`.
+- **Icon Image Picker (`IconImagePicker`)**:
+  - Used for character avatars/icons (`CharacterManagementTab.svelte`), etc.
+  - Smooth hover zoom: `transform: scale(1.1)` with M3 Expressive motion `transition: transform var(--np-motion-expressive-fast-spatial, 200ms ease)`.
+  - Click opens the full-screen `AssetPickerModal`.
 
 ### F. Menus (`Menu`, `MenuItem`) & Outside-Click Dismissal
 - Import `{ Menu, MenuItem } from 'noph-ui'`.
