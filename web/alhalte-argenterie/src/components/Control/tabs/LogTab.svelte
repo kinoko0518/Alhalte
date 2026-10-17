@@ -35,10 +35,19 @@
 
   function refreshLogs() {
     messages = chunkManager.getLoadedRecords(scene.id);
+    queueMicrotask(() => {
+      if (listElement) {
+        listElement.scrollTop = listElement.scrollHeight;
+      }
+    });
   }
 
   $effect(() => {
-    refreshLogs();
+    const activeSceneId = scene.id;
+    messages = chunkManager.getLoadedRecords(activeSceneId);
+    return chunkManager.subscribe(() => {
+      refreshLogs();
+    });
   });
 
   async function handleScroll(e: Event) {

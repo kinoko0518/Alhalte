@@ -10,11 +10,17 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie`
    */
   import { Sheet } from 'noph-ui';
-  import type { Character, ExtensionItem, Scene, VisitedRoom } from '../types/index.js';
+  import type { Character, ExtensionItem, LogRecord, Scene, VisitedRoom } from '../types/index.js';
   import { resolveRoomFromLocation } from '../utils/home.js';
   import { ChunkLogManager } from '../utils/log.js';
   import type { SceneMovementEvent } from '../utils/sceneGraph.js';
   import { createDefaultJuices, inheritJuices, moveMemberToScene } from '../utils/sceneSettings.js';
+  import {
+    DEFAULT_OFFICIAL_EXTENSIONS,
+    ExtensionPipeline,
+    loadDefaultExtensions,
+    WasmExtensionInstance,
+  } from '../wasm/runner.js';
   import ControlPanel from './Control/ControlPanel.svelte';
   import FieldPanel from './Field/FieldPanel.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
@@ -64,15 +70,56 @@
   });
 
   let characters = $state<Character[]>(initialCharacters);
-  let extensions = $state<ExtensionItem[]>(initialExtensions);
+  let extensions = $state<ExtensionItem[]>(
+    initialExtensions.length > 0
+      ? initialExtensions
+      : DEFAULT_OFFICIAL_EXTENSIONS.map((ext) => ({ ...ext })),
+  );
   let movements = $state<SceneMovementEvent[]>(initialMovements);
   let selectedCharacterId = $state<string | undefined>(characters[0]?.id);
+  let extensionFileInput: HTMLInputElement | null = $state(null);
 
   let accessibleSceneIds = $derived.by(() => {
     return new Set(scenes.map((s) => s.id));
   });
 
   const chunkManager = new ChunkLogManager();
+  const extensionPipeline = new ExtensionPipeline();
+
+  function getRoomLogsStorageKey(roomId: string): string {
+    return `alhalte:room-logs:${roomId}`;
+  }
+
+  function restoreRoomLogs(roomId: string) {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const raw = localStorage.getItem(getRoomLogsStorageKey(roomId));
+      if (!raw) return;
+      const savedRecords = JSON.parse(raw) as LogRecord[];
+      if (Array.isArray(savedRecords)) {
+        for (const rec of savedRecords) {
+          if (rec && typeof rec.id === 'string' && typeof rec.sceneId === 'string') {
+            chunkManager.appendRecord(rec);
+          }
+        }
+      }
+    } catch {
+      // Ignore storage read errors
+    }
+  }
+
+  function persistRoomLogs(roomId: string) {
+    if (typeof localStorage === 'undefined') return;
+    try {
+      const allRecords: LogRecord[] = [];
+      for (const sc of scenes) {
+        allRecords.push(...chunkManager.getLoadedRecords(sc.id));
+      }
+      localStorage.setItem(getRoomLogsStorageKey(roomId), JSON.stringify(allRecords));
+    } catch {
+      // Ignore storage write errors
+    }
+  }
 
   // Orientation listener
   function updateOrientation() {
@@ -88,6 +135,13 @@
 
   $effect(() => {
     updateOrientation();
+    if (initialExtensions.length === 0) {
+      loadDefaultExtensions().then((loaded) => {
+        if (loaded.length > 0) {
+          extensions = loaded;
+        }
+      });
+    }
     if (typeof window !== 'undefined') {
       window.addEventListener('resize', updateOrientation);
       window.addEventListener('popstate', syncRoomFromLocation);
@@ -97,6 +151,12 @@
         window.removeEventListener('popstate', syncRoomFromLocation);
         window.removeEventListener('hashchange', syncRoomFromLocation);
       };
+    }
+  });
+
+  $effect(() => {
+    if (currentRoom?.id) {
+      restoreRoomLogs(currentRoom.id);
     }
   });
 
@@ -161,22 +221,74 @@
     });
   }
 
+  function handleUploadExtension() {
+    extensionFileInput?.click();
+  }
+
+  async function handleExtensionFileChange(e: Event) {
+    const input = e.currentTarget as HTMLInputElement;
+    const file = input.files?.[0];
+    if (!file) return;
+
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const instance = await WasmExtensionInstance.instantiate(bytes);
+      const intro = instance.selfIntroduction();
+      const id = `ext-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      extensionPipeline.registerInstance(id, instance);
+
+      const newExt: ExtensionItem = {
+        id,
+        name: intro?.name || file.name.replace(/\.wasm$/i, ''),
+        iconSvg: intro?.iconSvg,
+        description: intro?.description,
+        enabled: true,
+        priority: extensions.length,
+        wasmBytes: bytes,
+      };
+      extensions = [...extensions, newExt];
+    } catch (err) {
+      console.error('Failed to load uploaded extension wasm:', err);
+    } finally {
+      input.value = '';
+    }
+  }
+
   function handleSendMessage(text: string, characterId?: string) {
-    const speaker = characters.find((c) => c.id === characterId)?.name || 'Anonymous';
-    // Append to scene logs
-    const record = {
-      id: `msg-${Date.now()}`,
+    const char = characters.find((c) => c.id === characterId);
+    const speaker = char?.name || 'Anonymous';
+    const record: LogRecord = {
+      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       sceneId: currentScene.id,
       content: text,
       speaker,
       speakerId: characterId,
       timestamp: Math.floor(Date.now() / 1000),
     };
-    // If scene chunks registered, we can append; also chunk manager gets loaded record
+
+    chunkManager.appendRecord(record);
+    if (currentRoom?.id) {
+      persistRoomLogs(currentRoom.id);
+    }
+
+    if (extensions.some((ext) => ext.enabled && ext.wasmBytes)) {
+      const initialBytes = new TextEncoder().encode(text);
+      extensionPipeline.executePipeline(extensions, initialBytes).catch(() => {
+        // Keep raw message displayed if extension pipeline fails
+      });
+    }
   }
 </script>
 
 <div class="alhalte-app-root" data-testid="alhalte-app">
+  <input
+    type="file"
+    accept=".wasm,application/wasm"
+    bind:this={extensionFileInput}
+    onchange={handleExtensionFileChange}
+    style="display: none;"
+    data-testid="extension-file-input"
+  />
   {#if !currentRoom}
     <HomeScreen onEnterRoom={handleEnterRoom} />
   {:else}
@@ -233,8 +345,9 @@
                 sc.members = sc.members.filter((id) => id !== charId);
               }
             }}
-            {handleTogglePiece}
+            onTogglePiece={handleTogglePiece}
             onUpdateExtensions={(exts) => (extensions = exts)}
+            onUploadExtension={handleUploadExtension}
             onSendMessage={handleSendMessage}
           />
         </div>
@@ -296,8 +409,9 @@
                     sc.members = sc.members.filter((id) => id !== charId);
                   }
                 }}
-                {handleTogglePiece}
+                onTogglePiece={handleTogglePiece}
                 onUpdateExtensions={(exts) => (extensions = exts)}
+                onUploadExtension={handleUploadExtension}
                 onSendMessage={handleSendMessage}
               />
             </div>
