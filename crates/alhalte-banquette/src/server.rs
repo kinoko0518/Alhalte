@@ -232,6 +232,22 @@ impl BanquetteServer {
                     )
                     .await?;
                 }
+                MaitreDToBanquette::ExportRoom {
+                    request_id,
+                    caller_account,
+                } => {
+                    let room_guard = room.read().await;
+                    let res = room_guard
+                        .export_snapshot(cellar.as_ref(), caller_account)
+                        .await
+                        .map_err(|e| e.to_string());
+                    let _ = out_tx
+                        .send(BanquetteToMaitreD::ExportRoomResponse {
+                            request_id,
+                            result: res,
+                        })
+                        .await;
+                }
             }
         }
 

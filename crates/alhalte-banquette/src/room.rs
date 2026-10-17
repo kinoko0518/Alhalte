@@ -4,13 +4,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use tin::{Compression, Tin};
+use tin::{Compression, Tin, TinId};
 
 use crate::cellar_sink::CellarSink;
 use crate::character::{CharacterBiblio, get_character_owner};
 use crate::error::{BanquetteError, Result};
 use crate::labels::{KEY_STD_ADMINS, LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID};
-use crate::log::{LogBiblio, LogOperationEvent, SceneLog};
+use crate::log::{LogBiblio, LogChunk, LogOperationEvent, SceneLog};
 use crate::scene::{Scene, SceneData};
 use crate::state::SceneState;
 
@@ -560,5 +560,67 @@ impl Room {
             missed_heartbeats: 0,
             client_activity_in_cycle: true,
         })
+    }
+
+    /// Exports the room data and associated log chunks for permitted scenes.
+    pub async fn export_snapshot(
+        &self,
+        cellar: &dyn CellarSink,
+        caller_account: Option<u64>,
+    ) -> Result<(RoomData, Vec<(TinId, LogChunk)>)> {
+        let mut scenes_data = HashMap::new();
+        let mut all_chunks = Vec::new();
+
+        for (sid, scene) in &self.scene_biblio {
+            let can_access = match caller_account {
+                Some(acc) => self.can_access_scene(acc, sid),
+                None => self.done || sid == "/",
+            };
+            if !can_access {
+                continue;
+            }
+
+            let mut biblio = scene.log.biblio.clone();
+
+            // 1. Read all sealed chunks
+            for (idx, &tid) in scene.log.biblio.chunks.iter().enumerate() {
+                let entries = scene
+                    .log
+                    .read_chunk(idx as u32, cellar, caller_account)
+                    .await?;
+                all_chunks.push((tid, LogChunk::new(entries)));
+            }
+
+            // 2. If there are active unsealed entries, seal them for the export snapshot
+            if !scene.log.active_chunk.is_empty() {
+                let active_chunk = LogChunk::new(scene.log.active_chunk.clone());
+                let chunk_tin = active_chunk.to_tin()?;
+                let (_, active_tid) = chunk_tin
+                    .encode_plaintext(Compression::Zstd)
+                    .map_err(BanquetteError::Tin)?;
+                biblio.chunks.push(active_tid);
+                all_chunks.push((active_tid, active_chunk));
+            }
+
+            scenes_data.insert(
+                sid.clone(),
+                SceneData {
+                    id: scene.id.clone(),
+                    states: scene.state.as_map().clone(),
+                    biblio,
+                    present_characters: scene.present_characters.iter().copied().collect(),
+                },
+            );
+        }
+
+        let room_data = RoomData {
+            room_id: self.room_id,
+            done: self.done,
+            chunk_exponent: self.chunk_exponent,
+            character_biblio: self.character_biblio.clone(),
+            scenes: scenes_data,
+        };
+
+        Ok((room_data, all_chunks))
     }
 }
