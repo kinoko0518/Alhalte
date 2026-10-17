@@ -123,3 +123,40 @@ pub extern "C" fn process_generast(ptr: i32, len: i32) -> i64 {
 
     ((out_ptr as i64) << 32) | (out_len as i64 & 0xffff_ffff)
 }
+
+/// Encodes the self-introduction metadata `(name, icon_svg, description)` using Postcard.
+pub fn encode_self_introduction() -> Vec<u8> {
+    let (name, icon_svg, description) = crate::self_introduction_info();
+    postcard::to_allocvec(&(
+        name.to_string(),
+        icon_svg.to_string(),
+        description.to_string(),
+    ))
+    .unwrap_or_default()
+}
+
+/// WebAssembly entry point returning self-introduction metadata `(name, icon_svg, description)` as Postcard bytes.
+///
+/// Output memory format is packed `(ptr << 32) | len`.
+#[unsafe(no_mangle)]
+pub extern "C" fn self_introduction() -> i64 {
+    let out_bytes = encode_self_introduction();
+    let out_len = out_bytes.len();
+    if out_len == 0 {
+        return 0;
+    }
+    let out_layout = match std::alloc::Layout::from_size_align(out_len, 1) {
+        Ok(l) => l,
+        Err(_) => return 0,
+    };
+    let out_ptr = unsafe {
+        let p = std::alloc::alloc(out_layout);
+        if p.is_null() {
+            return 0;
+        }
+        std::ptr::copy_nonoverlapping(out_bytes.as_ptr(), p, out_len);
+        p as i32
+    };
+
+    ((out_ptr as i64) << 32) | (out_len as i64 & 0xffff_ffff)
+}

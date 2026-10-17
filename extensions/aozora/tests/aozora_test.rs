@@ -162,3 +162,26 @@ fn test_aozora_abi() {
         other => panic!("expected nested bold, got {:?}", other),
     }
 }
+
+// spec: extensions/aozora self-introduction metadata
+#[test]
+fn test_self_introduction() {
+    let (name, icon_svg, description) = aozora::self_introduction_info();
+    assert_eq!(name, "青空文庫ルビ・傍点");
+    assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
+    assert_eq!(
+        description,
+        "青空文庫形式のルビ（｜親文字《ルビ》）と傍点（［＃「…」に傍点］）を変換する公式拡張機能"
+    );
+
+    let bytes = aozora::abi::encode_self_introduction();
+    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, name);
+    assert_eq!(decoded.1, icon_svg);
+    assert_eq!(decoded.2, description);
+
+    let packed = aozora::abi::self_introduction();
+    assert_ne!(packed, 0);
+    let len = (packed & 0xffff_ffff) as usize;
+    assert_eq!(len, bytes.len());
+}

@@ -205,3 +205,26 @@ fn test_emoklore_abi_exports() {
     let judge = extract_judgement(&tin).unwrap();
     assert_eq!(judge.subject.as_deref(), Some("観察眼"));
 }
+
+// spec: extensions/emoklore self-introduction metadata
+#[test]
+fn test_self_introduction() {
+    let (name, icon_svg, description) = emoklore::self_introduction_info();
+    assert_eq!(name, "エモクロアTRPG");
+    assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
+    assert_eq!(
+        description,
+        "エモクロアTRPGのxDM<=y判定（共鳴判定・成功数カウント・ダブル/トリプル等）を提供する公式拡張機能"
+    );
+
+    let bytes = emoklore::abi::encode_self_introduction();
+    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, name);
+    assert_eq!(decoded.1, icon_svg);
+    assert_eq!(decoded.2, description);
+
+    let packed = emoklore::abi::self_introduction();
+    assert_ne!(packed, 0);
+    let len = (packed & 0xffff_ffff) as usize;
+    assert_eq!(len, bytes.len());
+}

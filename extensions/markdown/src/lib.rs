@@ -32,3 +32,12 @@ pub fn process_ast(ast: Generast, _speaker_id: u64) -> Generast {
         Generast::Element(e) => Generast::Element(e),
     }
 }
+
+/// Returns self-introduction metadata `(name, icon_svg, description)` for Markdown.
+pub fn self_introduction_info() -> (&'static str, &'static str, &'static str) {
+    (
+        "Markdown スタイル",
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M2.5 4v16h19V4H2.5zm2 2h15v12h-15V6zm2 2v8h2.5V11l2 2.5 2-2.5V16h2.5V8h-2.5l-2 2.5-2-2.5H6.5zm11 0l-2.5 3h1.5v5h2v-5h1.5l-2.5-3z"/></svg>"#,
+        "太字（**）・斜体（*）・打ち消し線（~~）などのMarkdown記法を装飾ノードに変換する公式拡張機能",
+    )
+}

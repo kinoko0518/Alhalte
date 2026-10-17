@@ -8,6 +8,8 @@ import {
   reorderExtensions,
   toggleExtension,
   deleteExtension,
+  encodePostcardStringTuple3,
+  decodePostcardStringTuple3,
 } from '../src/wasm/runner.js';
 import ExtensionManagementTab from '../src/components/Control/tabs/ExtensionManagementTab.svelte';
 import type { ExtensionItem } from '../src/types/index.js';
@@ -24,6 +26,99 @@ const VALID_WASM_HEX =
 // Invalid version WebAssembly binary (alhalte_abi_version returns 2)
 const INVALID_VERSION_WASM_HEX =
   '0061736d010000000115046000017f60017f017f60027f7f0060027f7f017e030504000102030503010001074505066d656d6f7279020013616c68616c74655f6162695f76657273696f6e000005616c6c6f630001076465616c6c6f6300021070726f636573735f67656e657261737400030a1304040041020b040041000b02000b0400422a0b';
+
+function uleb128(value: number): number[] {
+  const out: number[] = [];
+  let v = value >>> 0;
+  while (v >= 0x80) {
+    out.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  out.push(v);
+  return out;
+}
+
+function sleb128(value: number): number[] {
+  const out: number[] = [];
+  let v = value | 0;
+  while (true) {
+    const byte = v & 0x7f;
+    v >>= 7;
+    if ((v === 0 && (byte & 0x40) === 0) || (v === -1 && (byte & 0x40) !== 0)) {
+      out.push(byte);
+      return out;
+    }
+    out.push(byte | 0x80);
+  }
+}
+
+function section(id: number, payload: number[]): number[] {
+  return [id, ...uleb128(payload.length), ...payload];
+}
+
+function exportEntry(name: string, kind: number, index: number): number[] {
+  const nameBytes = Array.from(new TextEncoder().encode(name));
+  return [...uleb128(nameBytes.length), ...nameBytes, kind, ...uleb128(index)];
+}
+
+function buildWasmWithSelfIntro(introBytes: Uint8Array): Uint8Array {
+  const typeSec = section(1, [
+    5,
+    0x60, 0x00, 0x01, 0x7f, // () -> i32
+    0x60, 0x01, 0x7f, 0x01, 0x7f, // (i32) -> i32
+    0x60, 0x02, 0x7f, 0x7f, 0x00, // (i32, i32) -> ()
+    0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e, // (i32, i32) -> i64
+    0x60, 0x00, 0x01, 0x7e, // () -> i64
+  ]);
+  const funcSec = section(3, [5, 0, 1, 2, 3, 4]);
+  const memSec = section(5, [1, 0x00, 1]);
+  const expPayload = [
+    6,
+    ...exportEntry('memory', 2, 0),
+    ...exportEntry('alhalte_abi_version', 0, 0),
+    ...exportEntry('alloc', 0, 1),
+    ...exportEntry('dealloc', 0, 2),
+    ...exportEntry('process_generast', 0, 3),
+    ...exportEntry('self_introduction', 0, 4),
+  ];
+  const expSec = section(7, expPayload);
+
+  const fn0 = [0x00, 0x41, 0x01, 0x0b];
+  const fn1 = [0x00, 0x41, 0x00, 0x0b];
+  const fn2 = [0x00, 0x0b];
+  const fn3 = [0x00, 0x42, 0x00, 0x0b];
+  // (2048n << 32n) | BigInt(introBytes.length)
+  const fn4 = [
+    0x00,
+    0x42, ...sleb128(2048),
+    0x42, 0x20,
+    0x86, // i64.shl
+    0x41, ...sleb128(introBytes.length),
+    0xad, // i64.extend_i32_u
+    0x84, // i64.or
+    0x0b,
+  ];
+  const bodies = [fn0, fn1, fn2, fn3, fn4].flatMap((b) => [...uleb128(b.length), ...b]);
+  const codeSec = section(10, [5, ...bodies]);
+
+  const dataSeg = [
+    0x00,
+    0x41, ...sleb128(2048), 0x0b,
+    ...uleb128(introBytes.length),
+    ...Array.from(introBytes),
+  ];
+  const dataSec = section(11, [1, ...dataSeg]);
+
+  return new Uint8Array([
+    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+    ...typeSec,
+    ...funcSec,
+    ...memSec,
+    ...expSec,
+    ...codeSec,
+    ...dataSec,
+  ]);
+}
 
 describe('Extensions Tab & WASM ABI Host Runner', () => {
   // spec: alhalte-argenterie/extensions-abi 管理者権限ロック（非管理者グレーアウト）
@@ -141,4 +236,64 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     const resultText = new TextDecoder().decode(resultBytes);
     expect(resultText).toBe('Dice!!');
   });
+
+  // spec: extensions/self_introduction Postcard (String, String, String) デコードと UI 表示
+  it('decodes self_introduction Postcard metadata from WASM and renders iconSvg & description in UI', async () => {
+    const name = 'クトゥルフ神話TRPG (第6版)';
+    const iconSvg =
+      '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><circle cx="12" cy="12" r="10"/></svg>';
+    const description =
+      'CoC第6版のCCB/CC判定・クリティカル/ファンブル・組み合わせロール・RESB対抗ロールを提供する公式拡張機能';
+
+    const encoded = encodePostcardStringTuple3(name, iconSvg, description);
+    const decoded = decodePostcardStringTuple3(encoded);
+    expect(decoded).toEqual({ name, iconSvg, description });
+
+    // Module without self_introduction returns null
+    const legacyInstance = await WasmExtensionInstance.instantiate(hexToBytes(VALID_WASM_HEX));
+    expect(legacyInstance.selfIntroduction()).toBeNull();
+
+    // Module with self_introduction returns decoded metadata
+    const introWasmBytes = buildWasmWithSelfIntro(encoded);
+    const introInstance = await WasmExtensionInstance.instantiate(introWasmBytes);
+    const intro = introInstance.selfIntroduction();
+    expect(intro).toEqual({ name, iconSvg, description });
+
+    // UI renders iconSvg, name, and description
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const extensions: ExtensionItem[] = [
+      {
+        id: 'coc-6',
+        name: intro!.name,
+        iconSvg: intro!.iconSvg,
+        description: intro!.description,
+        enabled: true,
+        priority: 0,
+      },
+    ];
+
+    const mounted = mount(ExtensionManagementTab, {
+      target,
+      props: {
+        extensions,
+        isAdmin: true,
+      },
+    });
+
+    const iconEl = target.querySelector('[data-testid="ext-icon-coc-6"]');
+    expect(iconEl).toBeTruthy();
+    expect(iconEl?.querySelector('svg')).toBeTruthy();
+
+    const nameEl = target.querySelector('[data-testid="ext-name-coc-6"]');
+    expect(nameEl?.textContent?.trim()).toBe(name);
+
+    const descEl = target.querySelector('[data-testid="ext-description-coc-6"]');
+    expect(descEl?.textContent?.trim()).toBe(description);
+
+    unmount(mounted);
+    target.remove();
+  });
 });
+

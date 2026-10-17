@@ -251,3 +251,26 @@ fn test_abi_exports() {
     };
     assert!(extract_diceroll(&tin).is_ok());
 }
+
+// spec: extensions/alhalte-dsl self-introduction metadata
+#[test]
+fn test_self_introduction() {
+    let (name, icon_svg, description) = alhalte_dsl::self_introduction_info();
+    assert_eq!(name, "Alhalte DSL");
+    assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
+    assert_eq!(
+        description,
+        "ダイスロール（xDy）・四則演算・比較判定・シークレットダイス・変数展開を処理する公式DSL拡張機能"
+    );
+
+    let bytes = alhalte_dsl::abi::encode_self_introduction();
+    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, name);
+    assert_eq!(decoded.1, icon_svg);
+    assert_eq!(decoded.2, description);
+
+    let packed = alhalte_dsl::abi::self_introduction();
+    assert_ne!(packed, 0);
+    let len = (packed & 0xffff_ffff) as usize;
+    assert_eq!(len, bytes.len());
+}

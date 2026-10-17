@@ -185,3 +185,26 @@ fn test_markdown_abi() {
         other => panic!("expected nested root, got {:?}", other),
     }
 }
+
+// spec: extensions/markdown self-introduction metadata
+#[test]
+fn test_self_introduction() {
+    let (name, icon_svg, description) = markdown::self_introduction_info();
+    assert_eq!(name, "Markdown スタイル");
+    assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
+    assert_eq!(
+        description,
+        "太字（**）・斜体（*）・打ち消し線（~~）などのMarkdown記法を装飾ノードに変換する公式拡張機能"
+    );
+
+    let bytes = markdown::abi::encode_self_introduction();
+    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, name);
+    assert_eq!(decoded.1, icon_svg);
+    assert_eq!(decoded.2, description);
+
+    let packed = markdown::abi::self_introduction();
+    assert_ne!(packed, 0);
+    let len = (packed & 0xffff_ffff) as usize;
+    assert_eq!(len, bytes.len());
+}
