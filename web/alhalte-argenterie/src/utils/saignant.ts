@@ -195,7 +195,9 @@ export async function loadSaignantWasm(): Promise<WebAssembly.Instance> {
       wasmBuffer = await response.arrayBuffer();
     }
 
-    const { instance } = await WebAssembly.instantiate(wasmBuffer);
+    const result = await WebAssembly.instantiate(wasmBuffer as BufferSource);
+    const instance: WebAssembly.Instance =
+      'instance' in result ? (result as { instance: WebAssembly.Instance }).instance : result;
     cachedInstance = instance;
     return instance;
   })();
