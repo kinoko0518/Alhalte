@@ -15,17 +15,21 @@
     formatStatusItem,
     sortCharactersByInitiative,
   } from '../../utils/field.js';
-  import { calculateDimensionsAndCrop } from '../../utils/sceneSettings.js';
+  import { calculateBackgroundDimensions } from '../../utils/backgroundDimension.js';
 
   let {
     roomName = 'Alhalte Room',
     scene,
     characters = [],
+    origW: propOrigW,
+    origH: propOrigH,
     onTransformChange,
   }: {
     roomName?: string;
     scene: Scene;
     characters?: Character[];
+    origW?: number;
+    origH?: number;
     onTransformChange?: (sceneId: string, transform: ViewTransform) => void;
   } = $props();
 
@@ -33,23 +37,53 @@
   let dragStart = $state({ x: 0, y: 0 });
   let initialPinchDistance = $state<number | null>(null);
 
+  // Original image dimensions (origW, origH)
+  let origW = $state<number>(1920);
+  let origH = $state<number>(1080);
+
+  $effect(() => {
+    if (propOrigW && propOrigW > 0) origW = propOrigW;
+    if (propOrigH && propOrigH > 0) origH = propOrigH;
+  });
+
+  $effect(() => {
+    const src = scene.juices.bgImage;
+    if (!src) return;
+
+    if (typeof Image !== 'undefined') {
+      const img = new Image();
+      img.onload = () => {
+        if (img.naturalWidth > 0 && img.naturalHeight > 0) {
+          origW = img.naturalWidth;
+          origH = img.naturalHeight;
+        }
+      };
+      img.src = src;
+    }
+  });
+
   // Characters in this scene, sorted by initiative descending
   let sceneCharacters = $derived.by(() => {
     const present = characters.filter((c) => scene.members.includes(c.id));
     return sortCharactersByInitiative(present);
   });
 
-  // Background styling from Juices
-  let bgStyle = $derived.by(() => {
-    if (!scene.juices.bgImage) return '';
-    const crop = calculateDimensionsAndCrop({
-      naturalWidth: scene.juices.bgWidth || 1920,
-      naturalHeight: scene.juices.bgHeight || 1080,
+  // Background dimension and crop calculation from Juices
+  let bgDimensions = $derived.by(() => {
+    if (!scene.juices.bgImage) return null;
+    return calculateBackgroundDimensions({
+      origW,
+      origH,
       width: scene.juices.bgWidth,
       height: scene.juices.bgHeight,
     });
-    return `width: ${crop.width}px; height: ${crop.height}px; background-image: url('${scene.juices.bgImage}'); background-size: cover;`;
   });
+
+  let bgStyle = $derived.by(() => {
+    if (!scene.juices.bgImage || !bgDimensions) return '';
+    return `width: ${bgDimensions.width}px; height: ${bgDimensions.height}px; background-image: url('${scene.juices.bgImage}'); background-size: cover; background-position: center;`;
+  });
+
 
   function handleWheel(e: WheelEvent) {
     e.preventDefault();
@@ -145,7 +179,26 @@
     style="transform: translate({scene.viewTransform.x}px, {scene.viewTransform.y}px) scale({scene.viewTransform.scale});"
   >
     {#if scene.juices.bgImage}
-      <div class="field-background" style={bgStyle} data-testid="field-background"></div>
+      <div
+        class="field-background"
+        style={bgStyle}
+        data-testid="field-background"
+        data-bg-width={bgDimensions?.width}
+        data-bg-height={bgDimensions?.height}
+      >
+        <img
+          src={scene.juices.bgImage}
+          alt=""
+          class="field-bg-loader"
+          onload={(e) => {
+            const el = e.currentTarget as HTMLImageElement;
+            if (el.naturalWidth > 0 && el.naturalHeight > 0) {
+              origW = el.naturalWidth;
+              origH = el.naturalHeight;
+            }
+          }}
+        />
+      </div>
     {/if}
 
     <!-- Pieces placed on map -->
@@ -241,6 +294,9 @@
     left: 0;
     background-repeat: no-repeat;
     box-shadow: var(--np-elevation-3);
+  }
+  .field-bg-loader {
+    display: none;
   }
   .field-piece {
     position: absolute;

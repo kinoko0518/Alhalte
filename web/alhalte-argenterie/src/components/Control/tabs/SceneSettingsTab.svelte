@@ -15,7 +15,6 @@
     type AssetItem,
     type AssetMediaType,
   } from '../../../utils/assets.js';
-  import { calculateDimensionsAndCrop } from '../../../utils/sceneSettings.js';
   import AssetPickerModal from '../AssetPickerModal.svelte';
 
   let {
@@ -83,30 +82,23 @@
   });
 
   function handleWidthChange(e: Event) {
-    const val = (e.target as HTMLInputElement).valueAsNumber;
-    inputWidth = Number.isNaN(val) ? undefined : val;
-    applyDimensions();
+    const raw = (e.target as HTMLInputElement).value.trim();
+    const num = raw === '' ? NaN : Number(raw);
+    const parsed = Number.isNaN(num) || num <= 0 ? undefined : num;
+    inputWidth = parsed;
+    currentScene.juices.bgWidth = parsed;
+    onUpdateScene?.(currentScene);
   }
 
   function handleHeightChange(e: Event) {
-    const val = (e.target as HTMLInputElement).valueAsNumber;
-    inputHeight = Number.isNaN(val) ? undefined : val;
-    applyDimensions();
-  }
-
-  function applyDimensions() {
-    const naturalWidth = currentScene.juices.bgWidth || 1920;
-    const naturalHeight = currentScene.juices.bgHeight || 1080;
-    const res = calculateDimensionsAndCrop({
-      naturalWidth,
-      naturalHeight,
-      width: inputWidth,
-      height: inputHeight,
-    });
-    currentScene.juices.bgWidth = res.width;
-    currentScene.juices.bgHeight = res.height;
+    const raw = (e.target as HTMLInputElement).value.trim();
+    const num = raw === '' ? NaN : Number(raw);
+    const parsed = Number.isNaN(num) || num <= 0 ? undefined : num;
+    inputHeight = parsed;
+    currentScene.juices.bgHeight = parsed;
     onUpdateScene?.(currentScene);
   }
+
 
   function handleBgImageSelect() {
     assetPickerTarget = 'bgImage';
