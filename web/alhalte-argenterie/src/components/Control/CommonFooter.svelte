@@ -88,7 +88,7 @@
   class="common-footer-container"
   data-testid="common-footer"
 >
-  <!-- 6 tab buttons -->
+  <!-- 5 tab buttons (Scene Management merged into Scene Tab per Issue #30) -->
   <div class="tabs-row" data-testid="tab-buttons-row">
     <button
       type="button"
@@ -106,7 +106,7 @@
       onclick={() => onTabChange?.('graph')}
       data-testid="tab-btn-graph"
     >
-      シーングラフタブ
+      シーンタブ
     </button>
     <button
       type="button"
@@ -116,15 +116,6 @@
       data-testid="tab-btn-settings"
     >
       シーン設定タブ
-    </button>
-    <button
-      type="button"
-      class="tab-btn"
-      class:active={activeTab === 'scenes'}
-      onclick={() => onTabChange?.('scenes')}
-      data-testid="tab-btn-scenes"
-    >
-      シーン管理タブ
     </button>
     <button
       type="button"

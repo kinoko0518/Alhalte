@@ -330,6 +330,129 @@ describe('Scene Graph Algorithm & View', () => {
     expect(nodeBtn).toBeTruthy();
     expect(nodeBtn?.textContent).toContain('メインシーン');
 
+    // Clicking main scene "/" should NOT reveal a delete button
+    nodeBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid^="node-delete-btn-"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/scene-graph シーンタブ統合・左クリックで削除ボタン表示と全画面確認ダイアログ (Issue #30)
+  it('reveals delete button on left-clicking a scene node and deletes after full-screen confirmation dialog', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const movements: SceneMovementEvent[] = [
+      { characterId: 'c1', characterName: '探検家', toSceneId: 'scene-a', timestamp: 100 },
+      {
+        characterId: 'c1',
+        characterName: '探検家',
+        fromSceneId: 'scene-a',
+        toSceneId: 'scene-b',
+        timestamp: 120,
+      },
+    ];
+
+    let deletedSceneId: string | null = null;
+    const instance = mount(SceneGraphTab, {
+      target,
+      props: {
+        movements,
+        sceneNames,
+        accessibleSceneIds: accessibleScenes,
+        isAdmin: true,
+        onDeleteScene: (id) => {
+          deletedSceneId = id;
+        },
+      },
+    });
+
+    // Initially delete button and confirmation dialog are not shown
+    expect(target.querySelector('[data-testid="node-delete-btn-node-scene-a-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="graph-delete-confirm-dialog"]')).toBeNull();
+
+    // Left-click node 0 ('scene-a' / '街頭')
+    const nodeDot = target.querySelector<HTMLButtonElement>('[data-testid="node-dot-node-scene-a-1"]');
+    expect(nodeDot).toBeTruthy();
+    nodeDot?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Delete button appears on node-scene-a-1
+    const deleteBtn = target.querySelector<HTMLElement>('[data-testid="node-delete-btn-node-scene-a-1"]');
+    expect(deleteBtn).toBeTruthy();
+
+    // Click delete button -> opens full-screen confirmation dialog
+    deleteBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const dialog = target.querySelector('[data-testid="graph-delete-confirm-dialog"]');
+    expect(dialog).toBeTruthy();
+    expect(target.querySelector('[data-testid="graph-delete-dialog-title"]')?.textContent).toContain(
+      'シーン「街頭」を削除しますか？',
+    );
+
+    // Confirm deletion
+    const confirmBtn = target.querySelector<HTMLElement>('[data-testid="graph-confirm-delete-btn"]');
+    expect(confirmBtn).toBeTruthy();
+    confirmBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(deletedSceneId).toBe('scene-a');
+    expect(target.querySelector('[data-testid="graph-delete-confirm-dialog"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/scene-graph シーンタブ統合・長押しで削除ボタン表示とキャンセル操作 (Issue #30)
+  it('reveals delete button on long-pressing a scene node and allows canceling confirmation dialog', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const movements: SceneMovementEvent[] = [
+      { characterId: 'c1', characterName: '探検家', toSceneId: 'scene-b', timestamp: 100 },
+    ];
+
+    let deletedSceneId: string | null = null;
+    const instance = mount(SceneGraphTab, {
+      target,
+      props: {
+        movements,
+        sceneNames,
+        accessibleSceneIds: accessibleScenes,
+        isAdmin: true,
+        onDeleteScene: (id) => {
+          deletedSceneId = id;
+        },
+      },
+    });
+
+    const nodeLabel = target.querySelector<HTMLButtonElement>('[data-testid="node-label-node-scene-b-1"]');
+    expect(nodeLabel).toBeTruthy();
+
+    // Long-press via pointerdown for > 450ms
+    nodeLabel?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 480));
+    nodeLabel?.dispatchEvent(new PointerEvent('pointerup', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    const deleteBtn = target.querySelector<HTMLElement>('[data-testid="node-delete-btn-node-scene-b-1"]');
+    expect(deleteBtn).toBeTruthy();
+
+    // Open confirmation dialog and cancel
+    deleteBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="graph-delete-confirm-dialog"]')).toBeTruthy();
+
+    const cancelBtn = target.querySelector<HTMLElement>('[data-testid="graph-cancel-delete-btn"]');
+    cancelBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(deletedSceneId).toBeNull();
+    expect(target.querySelector('[data-testid="graph-delete-confirm-dialog"]')).toBeNull();
+
     unmount(instance);
     target.remove();
   });

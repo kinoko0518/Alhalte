@@ -13,7 +13,6 @@
   import ExtensionManagementTab from './tabs/ExtensionManagementTab.svelte';
   import LogTab from './tabs/LogTab.svelte';
   import SceneGraphTab from './tabs/SceneGraphTab.svelte';
-  import SceneManagementTab from './tabs/SceneManagementTab.svelte';
   import SceneSettingsTab from './tabs/SceneSettingsTab.svelte';
 
   let {
@@ -24,7 +23,7 @@
     movements = [],
     accessibleSceneIds = new Set<string>(),
     selectedCharacterId,
-    isAdmin = false,
+    isAdmin = true,
     chunkManager = new ChunkLogManager(),
     onTabChange,
     onSelectScene,
@@ -87,7 +86,11 @@
 
   function handleNavigateFromGraph(sceneId: string) {
     onSelectScene?.(sceneId);
-    activeTab = 'log'; // Transitions to log tab per specification
+  }
+
+  function handleOpenSceneLog(sceneId: string) {
+    onSelectScene?.(sceneId);
+    activeTab = 'log';
   }
 </script>
 
@@ -110,7 +113,10 @@
         {movements}
         sceneNames={sceneNamesMap}
         {accessibleSceneIds}
+        {isAdmin}
         onNavigateToScene={handleNavigateFromGraph}
+        onOpenSceneLog={handleOpenSceneLog}
+        {onDeleteScene}
       />
     {:else if activeTab === 'settings'}
       <SceneSettingsTab
@@ -122,15 +128,6 @@
         {onCreateScene}
         {onDeleteScene}
         {onMoveMember}
-      />
-    {:else if activeTab === 'scenes'}
-      <SceneManagementTab
-        scenes={allScenes}
-        currentSceneId={currentScene.id}
-        {isAdmin}
-        {onSelectScene}
-        onCreateScene={() => (activeTab = 'settings')}
-        {onDeleteScene}
       />
     {:else if activeTab === 'characters'}
       <CharacterManagementTab

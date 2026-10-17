@@ -1,28 +1,42 @@
 <script lang="ts">
   /**
-   * Scene Graph Tab (VSCode Git Graph-like view).
+   * Scene Tab (VSCode Git Graph-like view with scene management actions).
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーングラフタブ`
+   * - Issue #30: シーン管理タブをシーングラフタブに統合（シーンタブへ改名、左クリック・長押しで削除ボタン表示＋全画面警告ダイアログ）
    */
-  import type { SceneGraphResult } from '../../../types/index.js';
+  import { Button } from 'noph-ui';
+  import type { SceneGraphNode, SceneGraphResult } from '../../../types/index.js';
   import { buildSceneGraph, type SceneMovementEvent } from '../../../utils/sceneGraph.js';
 
   let {
     movements = [],
     sceneNames = new Map<string, string>(),
     accessibleSceneIds = new Set<string>(),
+    isAdmin = true,
     onNavigateToScene,
+    onOpenSceneLog,
+    onDeleteScene,
   }: {
     movements?: SceneMovementEvent[];
     sceneNames?: Map<string, string>;
     accessibleSceneIds?: Set<string>;
+    isAdmin?: boolean;
     onNavigateToScene?: (sceneId: string) => void;
+    onOpenSceneLog?: (sceneId: string) => void;
+    onDeleteScene?: (sceneId: string) => void;
   } = $props();
 
   let graphData = $derived.by<SceneGraphResult>(() => {
     return buildSceneGraph(movements, sceneNames, accessibleSceneIds);
   });
+
+  let activeActionNodeId = $state<string | null>(null);
+  let sceneToDelete = $state<{ sceneId: string; sceneName: string } | null>(null);
+
+  const LONG_PRESS_DURATION_MS = 450;
+  let longPressTimer: ReturnType<typeof setTimeout> | null = null;
 
   const LANE_WIDTH = 32;
   const ROW_HEIGHT = 44;
@@ -32,9 +46,9 @@
     'var(--np-color-primary, #6750a4)',
     'var(--np-color-secondary, #625b71)',
     'var(--np-color-tertiary, #7d5260)',
-    '#006a6a',
-    '#b3261e',
-    '#2e7d32',
+    'var(--np-color-primary-container, #4f378b)',
+    'var(--np-color-error, #b3261e)',
+    'var(--np-color-secondary-container, #4a4458)',
   ];
 
   function getBranchColor(branchIndex: number): string {
@@ -49,9 +63,61 @@
     return `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
   }
 
-  function handleNodeClick(sceneId: string, isUnknown?: boolean) {
-    if (isUnknown) return; // Cannot navigate to inaccessible scenes
-    onNavigateToScene?.(sceneId);
+  function clearLongPressTimer() {
+    if (longPressTimer !== null) {
+      clearTimeout(longPressTimer);
+      longPressTimer = null;
+    }
+  }
+
+  function handleNodeClick(node: SceneGraphNode) {
+    clearLongPressTimer();
+    if (node.isUnknown) return; // Cannot navigate to or manage inaccessible scenes
+    activeActionNodeId = node.id;
+    onNavigateToScene?.(node.sceneId);
+  }
+
+  function handleNodeDoubleClick(node: SceneGraphNode) {
+    clearLongPressTimer();
+    if (node.isUnknown) return;
+    onNavigateToScene?.(node.sceneId);
+    onOpenSceneLog?.(node.sceneId);
+  }
+
+  function handleNodePointerDown(node: SceneGraphNode) {
+    clearLongPressTimer();
+    if (node.isUnknown) return;
+    longPressTimer = setTimeout(() => {
+      activeActionNodeId = node.id;
+      longPressTimer = null;
+    }, LONG_PRESS_DURATION_MS);
+  }
+
+  function handleNodeContextMenu(e: MouseEvent, node: SceneGraphNode) {
+    e.preventDefault();
+    clearLongPressTimer();
+    if (node.isUnknown) return;
+    activeActionNodeId = node.id;
+  }
+
+  function openDeleteConfirm(e: MouseEvent, node: SceneGraphNode) {
+    e.stopPropagation();
+    sceneToDelete = {
+      sceneId: node.sceneId,
+      sceneName: node.sceneName,
+    };
+  }
+
+  function handleConfirmDelete() {
+    if (!sceneToDelete) return;
+    const targetId = sceneToDelete.sceneId;
+    sceneToDelete = null;
+    activeActionNodeId = null;
+    onDeleteScene?.(targetId);
+  }
+
+  function handleCancelDelete() {
+    sceneToDelete = null;
   }
 </script>
 
@@ -118,7 +184,13 @@
                 class="graph-commit-dot"
                 class:unknown-dot={node.isUnknown}
                 style="left: {x - 8}px; border-color: {node.isUnknown ? 'var(--np-color-outline, #79747e)' : getBranchColor(node.branchIndex)};"
-                onclick={() => handleNodeClick(node.sceneId, node.isUnknown)}
+                onclick={() => handleNodeClick(node)}
+                ondblclick={() => handleNodeDoubleClick(node)}
+                onpointerdown={() => handleNodePointerDown(node)}
+                onpointerup={clearLongPressTimer}
+                onpointerleave={clearLongPressTimer}
+                onpointercancel={clearLongPressTimer}
+                oncontextmenu={(e) => handleNodeContextMenu(e, node)}
                 data-testid="node-dot-{node.id}"
                 title={node.isUnknown ? 'アクセス権のないシーン' : `${node.sceneName} へ移動`}
               >
@@ -127,7 +199,7 @@
                 {/if}
               </button>
 
-              <!-- Scene name label without character indicator -->
+              <!-- Scene name label and revealed node actions -->
               <div
                 class="node-labels"
                 style="left: {graphData.branchCount * LANE_WIDTH + 24}px;"
@@ -136,12 +208,34 @@
                   type="button"
                   class="scene-name-button"
                   class:disabled-label={node.isUnknown}
-                  onclick={() => handleNodeClick(node.sceneId, node.isUnknown)}
+                  class:active-node={activeActionNodeId === node.id}
+                  onclick={() => handleNodeClick(node)}
+                  ondblclick={() => handleNodeDoubleClick(node)}
+                  onpointerdown={() => handleNodePointerDown(node)}
+                  onpointerup={clearLongPressTimer}
+                  onpointerleave={clearLongPressTimer}
+                  onpointercancel={clearLongPressTimer}
+                  oncontextmenu={(e) => handleNodeContextMenu(e, node)}
                   data-testid="node-label-{node.id}"
                 >
                   <span class="scene-title">{node.sceneName}</span>
                   <span class="node-time">{new Date(node.timestamp * 1000).toLocaleTimeString()}</span>
                 </button>
+
+                {#if activeActionNodeId === node.id && !node.isUnknown && isAdmin && node.sceneId !== '/'}
+                  <div class="node-actions" data-testid="node-actions-{node.id}">
+                    <div class="delete-btn-wrapper">
+                      <Button
+                        variant="tonal"
+                        size="xs"
+                        onclick={(e: MouseEvent) => openDeleteConfirm(e, node)}
+                        data-testid="node-delete-btn-{node.id}"
+                      >
+                        削除
+                      </Button>
+                    </div>
+                  </div>
+                {/if}
               </div>
             </div>
           {/each}
@@ -149,6 +243,39 @@
       </div>
     {/if}
   </div>
+
+  <!-- Full-Screen Confirmation Dialog for Scene Deletion -->
+  {#if sceneToDelete}
+    <div class="fullscreen-dialog-overlay" data-testid="graph-delete-confirm-dialog">
+      <div class="dialog-box warning-box">
+        <h2 class="dialog-title-centered warning-text" data-testid="graph-delete-dialog-title">
+          シーン「{sceneToDelete.sceneName}」を削除しますか？
+        </h2>
+        <p class="warning-body" data-testid="graph-delete-dialog-warning">
+          このシーンを削除すると、配置されたログやJuices設定は元に戻せません。
+        </p>
+
+        <div class="dialog-footer-right">
+          <Button
+            variant="text"
+            onclick={handleCancelDelete}
+            data-testid="graph-cancel-delete-btn"
+          >
+            キャンセル
+          </Button>
+          <div class="confirm-delete-wrapper">
+            <Button
+              variant="filled"
+              onclick={handleConfirmDelete}
+              data-testid="graph-confirm-delete-btn"
+            >
+              削除する
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  {/if}
 </div>
 
 <style>
@@ -229,6 +356,9 @@
   .node-labels {
     position: absolute;
     white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
   .scene-name-button {
     background: none;
@@ -243,8 +373,9 @@
     color: var(--np-color-on-surface, #1d1b20);
     transition: background-color 0.15s;
   }
-  .scene-name-button:hover:not(.disabled-label) {
-    background: var(--np-color-surface-container-high, rgba(103, 80, 164, 0.08));
+  .scene-name-button:hover:not(.disabled-label),
+  .scene-name-button.active-node:not(.disabled-label) {
+    background: var(--np-color-surface-container-high, #e6e0e9);
   }
   .scene-name-button.disabled-label {
     cursor: default;
@@ -256,5 +387,64 @@
   .node-time {
     font-size: 0.72rem;
     color: var(--np-color-on-surface-variant, #79747e);
+  }
+  .node-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .delete-btn-wrapper {
+    --np-button-container-color: var(--np-color-error-container, #f9dedc);
+    --np-button-label-text-color: var(--np-color-on-error-container, #410e0b);
+  }
+  .fullscreen-dialog-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+  }
+  .dialog-box {
+    background: var(--np-color-surface-container-high, #ece6f0);
+    border-radius: var(--np-shape-corner-extra-large, 28px);
+    padding: 24px;
+    width: 90%;
+    max-width: 480px;
+    box-shadow: var(--np-elevation-3, 0 8px 24px rgba(0, 0, 0, 0.2));
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+  .dialog-title-centered {
+    margin: 0;
+    text-align: center;
+    font-size: 1.35rem;
+    font-weight: 600;
+    color: var(--np-color-on-surface, #1d1b20);
+  }
+  .warning-text {
+    color: var(--np-color-error, #b3261e);
+  }
+  .warning-body {
+    margin: 0;
+    text-align: center;
+    font-size: 0.92rem;
+    color: var(--np-color-on-surface-variant, #49454f);
+    line-height: 1.5;
+  }
+  .dialog-footer-right {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 8px;
+  }
+  .confirm-delete-wrapper {
+    --np-button-container-color: var(--np-color-error, #b3261e);
+    --np-button-label-text-color: var(--np-color-on-error, #ffffff);
   }
 </style>

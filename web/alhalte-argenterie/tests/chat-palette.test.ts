@@ -79,11 +79,11 @@ describe('Chat Palette Suggestion & Common Footer', () => {
       },
     });
 
-    // Check 6 tab buttons
+    // Check 5 tab buttons (Scene Management Tab consolidated into Scene Tab in Issue #30)
     expect(target.querySelector('[data-testid="tab-btn-log"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="tab-btn-graph"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="tab-btn-settings"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="tab-btn-scenes"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="tab-btn-scenes"]')).toBeNull();
     expect(target.querySelector('[data-testid="tab-btn-characters"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="tab-btn-extensions"]')).toBeTruthy();
 
