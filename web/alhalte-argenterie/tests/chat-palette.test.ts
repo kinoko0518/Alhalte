@@ -105,11 +105,12 @@ describe('Chat Palette Suggestion & Common Footer', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-graph"]')?.click();
     expect(switchedTab).toBe('graph');
 
-    // Multi-line textarea with at least 5 rows (Issue #31)
+    // Multi-line textarea with at least 4 rows (Issue #54: minLines=4, rows=4)
     const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
     expect(textarea).toBeTruthy();
     expect(textarea?.tagName.toLowerCase()).toBe('textarea');
-    expect(Number(textarea?.rows)).toBeGreaterThanOrEqual(5);
+    expect(Number(textarea?.rows)).toBeGreaterThanOrEqual(4);
+
 
     // Character picker outside-click dismissal (Issue #31)
     const charSelectBtn = target.querySelector<HTMLButtonElement>('[data-testid="character-select-button"]');
@@ -147,10 +148,10 @@ describe('Chat Palette Suggestion & Common Footer', () => {
 
     expect(input?.value).toBe('1D100<=50 【目星】');
 
-    // Send IconButton with 'send' icon (Issue #33)
+    // Send Button with 'send' icon and label (Issue #54)
     const sendBtn = target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]');
     expect(sendBtn).toBeTruthy();
-    expect(sendBtn?.classList.contains('np-icon-button')).toBe(true);
+    expect(sendBtn?.classList.contains('np-button')).toBe(true);
     expect(sendBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('send');
     sendBtn?.click();
     expect(sentMessage).toBe('1D100<=50 【目星】');

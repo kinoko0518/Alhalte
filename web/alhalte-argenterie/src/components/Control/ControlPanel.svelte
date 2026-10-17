@@ -192,6 +192,7 @@
   <CommonFooter
     {activeTab}
     {characters}
+    {extensions}
     {selectedCharacterId}
     onTabChange={handleTabChange}
     {onSelectCharacter}

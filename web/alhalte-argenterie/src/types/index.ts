@@ -183,3 +183,11 @@ export interface CropCalculationResult {
   cropWidth: number;
   cropHeight: number;
 }
+
+export type {
+  GenerastAST,
+  GenerastStringNode,
+  GenerastElementNode,
+  GenerastNestedNode,
+} from '../utils/generast.js';
+

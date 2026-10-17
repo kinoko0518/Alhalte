@@ -17,6 +17,7 @@ export * from './utils/sceneGraph.js';
 export * from './utils/sceneSettings.js';
 export * from './utils/backgroundDimension.js';
 export * from './utils/character.js';
+export * from './utils/generast.js';
 
 // WebAssembly ABI Host Runner
 export * from './wasm/runner.js';
