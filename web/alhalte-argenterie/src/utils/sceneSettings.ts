@@ -6,7 +6,7 @@
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
  */
 
-import type { CropCalculationResult, Juices, Scene } from '../types/index.js';
+import type { Juices, Scene } from '../types/index.js';
 
 /**
  * Creates a default Juices object.
@@ -46,111 +46,13 @@ export function inheritJuices(source: Juices): Juices {
   };
 }
 
-/**
- * Calculates dimensions and edge crop for a background image.
- *
- * ARCHITECTURE.md:
- * "画像は一方を指定すればもう一方を自動で計算します。もう一方も入力した場合、端を切り落として揃えます。"
- */
-export function calculateDimensionsAndCrop(params: {
-  naturalWidth: number;
-  naturalHeight: number;
-  width?: number;
-  height?: number;
-}): CropCalculationResult {
-  const { naturalWidth, naturalHeight, width, height } = params;
+export {
+  calculateBackgroundDimensions,
+  calculateDimensionsAndCrop,
+  type BackgroundDimensionParams,
+  type BackgroundDimensionResult,
+} from './backgroundDimension.js';
 
-  if (naturalWidth <= 0 || naturalHeight <= 0) {
-    return {
-      width: width ?? 0,
-      height: height ?? 0,
-      aspectRatio: 1,
-      cropped: false,
-      cropX: 0,
-      cropY: 0,
-      cropWidth: 0,
-      cropHeight: 0,
-    };
-  }
-
-  const naturalAspect = naturalWidth / naturalHeight;
-
-  // Case 1: Only width is provided -> auto calculate height from natural aspect ratio
-  if (width !== undefined && width > 0 && (height === undefined || height <= 0)) {
-    const computedHeight = Math.round(width / naturalAspect);
-    return {
-      width,
-      height: computedHeight,
-      aspectRatio: naturalAspect,
-      cropped: false,
-      cropX: 0,
-      cropY: 0,
-      cropWidth: naturalWidth,
-      cropHeight: naturalHeight,
-    };
-  }
-
-  // Case 2: Only height is provided -> auto calculate width from natural aspect ratio
-  if (height !== undefined && height > 0 && (width === undefined || width <= 0)) {
-    const computedWidth = Math.round(height * naturalAspect);
-    return {
-      width: computedWidth,
-      height,
-      aspectRatio: naturalAspect,
-      cropped: false,
-      cropX: 0,
-      cropY: 0,
-      cropWidth: naturalWidth,
-      cropHeight: naturalHeight,
-    };
-  }
-
-  // Case 3: Both width and height are provided -> crop edges to fit requested aspect ratio
-  if (width !== undefined && width > 0 && height !== undefined && height > 0) {
-    const targetAspect = width / height;
-    let cropWidth = naturalWidth;
-    let cropHeight = naturalHeight;
-    let cropX = 0;
-    let cropY = 0;
-    let isCropped = false;
-
-    if (Math.abs(targetAspect - naturalAspect) > 1e-4) {
-      isCropped = true;
-      if (targetAspect > naturalAspect) {
-        // Target is wider: crop top and bottom edges
-        cropHeight = Math.round(naturalWidth / targetAspect);
-        cropY = Math.round((naturalHeight - cropHeight) / 2);
-      } else {
-        // Target is taller: crop left and right edges
-        cropWidth = Math.round(naturalHeight * targetAspect);
-        cropX = Math.round((naturalWidth - cropWidth) / 2);
-      }
-    }
-
-    return {
-      width,
-      height,
-      aspectRatio: targetAspect,
-      cropped: isCropped,
-      cropX,
-      cropY,
-      cropWidth,
-      cropHeight,
-    };
-  }
-
-  // Case 4: Neither is provided -> use natural dimensions
-  return {
-    width: naturalWidth,
-    height: naturalHeight,
-    aspectRatio: naturalAspect,
-    cropped: false,
-    cropX: 0,
-    cropY: 0,
-    cropWidth: naturalWidth,
-    cropHeight: naturalHeight,
-  };
-}
 
 /**
  * Moves a member to target scene. If the target scene name does not exist,
