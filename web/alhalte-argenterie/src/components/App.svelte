@@ -13,7 +13,7 @@
   import 'noph-ui/defaultTheme';
   import { Button, IconButton, Sheet } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { Character, ExtensionItem, LogRecord, Scene, VisitedRoom } from '../types/index.js';
+  import type { Character, ExtensionItem, LogRecord, Scene, ViewTransform, VisitedRoom } from '../types/index.js';
   import { saveRecentRoom, type RecentRoom } from '../utils/recentRooms.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
   import { resolveRoomFromLocation } from '../utils/home.js';
@@ -37,6 +37,7 @@
     ConnectionManager,
     type ConnectionState,
   } from '../utils/connection.js';
+  import { RoomSocket, parseCharacter } from '../utils/roomSocket.js';
 
   let {
     initialRoom,
@@ -50,6 +51,7 @@
     onReconnect,
     debugMode,
     debugAlwaysShow = false,
+    roomSocket: customRoomSocket,
   }: {
     initialRoom?: VisitedRoom | null;
     initialScenes?: Scene[];
@@ -62,6 +64,7 @@
     onReconnect?: () => Promise<void> | void;
     debugMode?: boolean;
     debugAlwaysShow?: boolean;
+    roomSocket?: RoomSocket;
   } = $props();
 
   let activeConnectionManager = $derived(customConnectionManager ?? defaultConnectionManager);
@@ -83,7 +86,7 @@
 
   $effect(() => {
     const unsubscribe = activeConnectionManager.subscribe((st) => {
-      currentConnectionState = st;
+      currentConnectionState = connectionState !== undefined ? connectionState : st;
     });
     return unsubscribe;
   });
@@ -344,6 +347,113 @@
     }
   });
 
+  let roomSocket = $state<RoomSocket | null>(customRoomSocket ?? null);
+
+  $effect(() => {
+    if (customRoomSocket) {
+      roomSocket = customRoomSocket;
+      return;
+    }
+
+    const roomId = currentRoom?.id || (currentRoom as any)?.roomId;
+    if (roomId) {
+      const socket = new RoomSocket({
+        roomId,
+        url: currentRoom?.url || (currentRoom as any)?.roomUrl,
+        connectionManager: activeConnectionManager,
+        chunkLogManager: chunkManager,
+        initialSceneId: currentSceneId,
+        autoConnect: true,
+      });
+      roomSocket = socket;
+
+      return () => {
+        socket.disconnect();
+        if (roomSocket === socket) {
+          roomSocket = null;
+        }
+      };
+    } else {
+      if (roomSocket && !customRoomSocket) {
+        roomSocket.disconnect();
+        roomSocket = null;
+      }
+    }
+  });
+
+  $effect(() => {
+    if (!roomSocket) return;
+    roomSocket.setChunkLogManager(chunkManager);
+    const unsubscribe = roomSocket.subscribe((frame) => {
+      if (typeof frame !== 'object' || frame === null) return;
+      if ('SceneList' in frame) {
+        const sceneIds = frame.SceneList.scenes;
+        const existingIds = new Set(scenes.map((s) => s.id));
+        const newScenes = [...scenes];
+        let changed = false;
+        for (const sId of sceneIds) {
+          if (!existingIds.has(sId)) {
+            newScenes.push({
+              id: sId,
+              name: sId === '/' ? 'メインシーン' : sId,
+              juices: createDefaultJuices(),
+              viewTransform: { x: 0, y: 0, scale: 1 },
+              members: [],
+            });
+            changed = true;
+          }
+        }
+        if (changed) scenes = newScenes;
+      }
+      if ('CharacterList' in frame) {
+        const charList: Character[] = [];
+        if (frame.CharacterList?.characters) {
+          for (const [id, raw] of Object.entries(frame.CharacterList.characters)) {
+            charList.push(parseCharacter(id, raw));
+          }
+        }
+        if (charList.length > 0) {
+          characters = charList;
+          if (!selectedCharacterId && characters.length > 0) {
+            selectedCharacterId = characters[0].id;
+          }
+        }
+      }
+      if ('CharacterDeleted' in frame) {
+        const idStr = String(frame.CharacterDeleted.character_id);
+        characters = characters.filter((c) => c.id !== idStr);
+        for (const sc of scenes) {
+          sc.members = sc.members.filter((id) => id !== idStr);
+        }
+      }
+      if ('StateUpdated' in frame) {
+        const { scene_id, key, value } = frame.StateUpdated;
+        const targetScene = scenes.find((s) => s.id === scene_id);
+        if (targetScene) {
+          if (key === 'std::bgm') {
+            targetScene.juices.bgm1 = typeof value === 'string' ? value : undefined;
+          } else if (key === 'std::b-img') {
+            targetScene.juices.bgImage = typeof value === 'string' ? value : undefined;
+          } else if (key === 'view::transform' && value && typeof value === 'object') {
+            targetScene.viewTransform = { ...targetScene.viewTransform, ...value };
+          }
+        }
+      }
+      if ('StateDeleted' in frame) {
+        const { scene_id, key } = frame.StateDeleted;
+        const targetScene = scenes.find((s) => s.id === scene_id);
+        if (targetScene) {
+          if (key === 'std::bgm') {
+            targetScene.juices.bgm1 = undefined;
+          } else if (key === 'std::b-img') {
+            targetScene.juices.bgImage = undefined;
+          }
+        }
+      }
+    });
+    return unsubscribe;
+  });
+
   function handleEnterRoom(room: VisitedRoom | RecentRoom) {
     const roomId = (room as any).roomId || room.id;
     const roomName = (room as any).roomName || room.name;
@@ -373,6 +483,7 @@
   function handleSelectScene(sceneId: string) {
     if (scenes.some((s) => s.id === sceneId)) {
       currentSceneId = sceneId;
+      roomSocket?.enterScene(sceneId);
     }
   }
 
@@ -387,6 +498,7 @@
     };
     scenes.push(newScene);
     currentSceneId = newId;
+    roomSocket?.createScene(newId, inheritJuice);
   }
 
   function handleDeleteScene(sceneId: string) {
@@ -395,6 +507,7 @@
     if (currentSceneId === sceneId) {
       currentSceneId = scenes[0].id;
     }
+    roomSocket?.deleteScene(sceneId);
   }
 
   function handleMoveMember(characterId: string, targetSceneName: string) {
@@ -412,14 +525,22 @@
       toSceneId: res.targetScene.id,
       timestamp: Math.floor(Date.now() / 1000),
     });
+
+    const numericCharId = Number(characterId);
+    if (!Number.isNaN(numericCharId)) {
+      roomSocket?.moveCharacter(numericCharId, res.targetScene.id);
+    }
+    roomSocket?.updateState(res.targetScene.id, `character::${characterId}::scene`, res.targetScene.id);
   }
 
   function handleTogglePiece(characterId: string) {
     characters = characters.map((c) => {
       if (c.id === characterId) {
+        const nextPlaced = !c.placedAsPiece;
+        roomSocket?.updateState(currentScene.id, `piece::${characterId}::placed`, nextPlaced);
         return {
           ...c,
-          placedAsPiece: !c.placedAsPiece,
+          placedAsPiece: nextPlaced,
           piecePosition: c.piecePosition || { x: 200, y: 200 },
         };
       }
@@ -437,6 +558,37 @@
       }
       return c;
     });
+    roomSocket?.updateState(currentScene.id, `piece::${characterId}::pos`, position);
+  }
+
+  function handleCreateCharacter(char: Character) {
+    characters.push(char);
+    if (!currentScene.members.includes(char.id)) {
+      currentScene.members.push(char.id);
+    }
+    const numId = Number(char.id);
+    roomSocket?.createCharacter(Number.isNaN(numId) ? Date.now() : numId, char);
+  }
+
+  function handleUpdateCharacter(char: Character) {
+    characters = characters.map((c) => (c.id === char.id ? char : c));
+    const numId = Number(char.id);
+    roomSocket?.updateCharacter(Number.isNaN(numId) ? 0 : numId, char);
+  }
+
+  function handleDeleteCharacter(charId: string) {
+    characters = characters.filter((c) => c.id !== charId);
+    for (const sc of scenes) {
+      sc.members = sc.members.filter((id) => id !== charId);
+    }
+    const numId = Number(charId);
+    roomSocket?.deleteCharacter(Number.isNaN(numId) ? 0 : numId);
+  }
+
+  function handleTransformChange(id: string, t: ViewTransform) {
+    const sc = scenes.find((s) => s.id === id);
+    if (sc) sc.viewTransform = t;
+    roomSocket?.updateState(id, 'view::transform', t);
   }
 
   function handleUploadExtension() {
@@ -488,6 +640,7 @@
     if (currentRoom?.id) {
       persistRoomLogs(currentRoom.id);
     }
+    roomSocket?.appendLog(currentScene.id, record);
 
     if (extensions.some((ext) => ext.enabled && ext.wasmBytes)) {
       const initialBytes = new TextEncoder().encode(text);
@@ -534,10 +687,7 @@
             roomName={currentRoom.name}
             scene={currentScene}
             {characters}
-            onTransformChange={(id, t) => {
-              const sc = scenes.find((s) => s.id === id);
-              if (sc) sc.viewTransform = t;
-            }}
+            onTransformChange={handleTransformChange}
             onPieceMove={handlePieceMove}
           />
         </div>
@@ -601,21 +751,9 @@
                   onCreateScene={handleCreateScene}
                   onDeleteScene={handleDeleteScene}
                   onMoveMember={handleMoveMember}
-                  onUpdateCharacter={(char) => {
-                    characters = characters.map((c) => (c.id === char.id ? char : c));
-                  }}
-                  onCreateCharacter={(char) => {
-                    characters.push(char);
-                    if (!currentScene.members.includes(char.id)) {
-                      currentScene.members.push(char.id);
-                    }
-                  }}
-                  onDeleteCharacter={(charId) => {
-                    characters = characters.filter((c) => c.id !== charId);
-                    for (const sc of scenes) {
-                      sc.members = sc.members.filter((id) => id !== charId);
-                    }
-                  }}
+                  onUpdateCharacter={handleUpdateCharacter}
+                  onCreateCharacter={handleCreateCharacter}
+                  onDeleteCharacter={handleDeleteCharacter}
                   onTogglePiece={handleTogglePiece}
                   onUpdateExtensions={(exts) => (extensions = exts)}
                   onUploadExtension={handleUploadExtension}
@@ -652,10 +790,7 @@
             roomName={currentRoom.name}
             scene={currentScene}
             {characters}
-            onTransformChange={(id, t) => {
-              const sc = scenes.find((s) => s.id === id);
-              if (sc) sc.viewTransform = t;
-            }}
+            onTransformChange={handleTransformChange}
             onPieceMove={handlePieceMove}
           />
         </div>
@@ -693,21 +828,9 @@
                 onCreateScene={handleCreateScene}
                 onDeleteScene={handleDeleteScene}
                 onMoveMember={handleMoveMember}
-                onUpdateCharacter={(char) => {
-                  characters = characters.map((c) => (c.id === char.id ? char : c));
-                }}
-                onCreateCharacter={(char) => {
-                  characters.push(char);
-                  if (!currentScene.members.includes(char.id)) {
-                    currentScene.members.push(char.id);
-                  }
-                }}
-                onDeleteCharacter={(charId) => {
-                  characters = characters.filter((c) => c.id !== charId);
-                  for (const sc of scenes) {
-                    sc.members = sc.members.filter((id) => id !== charId);
-                  }
-                }}
+                onUpdateCharacter={handleUpdateCharacter}
+                onCreateCharacter={handleCreateCharacter}
+                onDeleteCharacter={handleDeleteCharacter}
                 onTogglePiece={handleTogglePiece}
                 onUpdateExtensions={(exts) => (extensions = exts)}
                 onUploadExtension={handleUploadExtension}

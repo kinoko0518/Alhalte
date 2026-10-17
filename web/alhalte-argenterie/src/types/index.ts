@@ -198,4 +198,10 @@ export type {
 
 export type { RecentRoom } from '../utils/recentRooms.js';
 
+export type {
+  ClientFrame,
+  ServerFrame,
+  RoomSocketOptions,
+} from '../utils/roomSocket.js';
+
 
