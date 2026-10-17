@@ -10,6 +10,13 @@
   import { AppBar, Button, Card, ExtendedFab, IconButton, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { VisitedRoom } from '../../types/index.js';
+  import type { RecentRoom } from '../../utils/recentRooms.js';
+  import {
+    getRecentRooms,
+    recordRoomVisit,
+    removeRecentRoom,
+    saveRecentRoom,
+  } from '../../utils/recentRooms.js';
   import {
     generateRoomUrl,
     getVisitedRooms,
@@ -29,12 +36,15 @@
   let {
     baseUrl = typeof window !== 'undefined' ? window.location.origin : 'https://example.com',
     onEnterRoom,
+    onSelectRoom,
   }: {
     baseUrl?: string;
-    onEnterRoom?: (room: VisitedRoom) => void;
+    onEnterRoom?: (room: RecentRoom | VisitedRoom) => void;
+    onSelectRoom?: (room: RecentRoom | VisitedRoom) => void;
   } = $props();
 
-  let visitedRooms = $state<VisitedRoom[]>(getVisitedRooms());
+  let recentRooms = $state<RecentRoom[]>(getRecentRooms());
+  let visitedRooms = $derived(recentRooms);
   let isCreateDialogOpen = $state(false);
   let newRoomName = $state('');
   let nickname = $state('');
@@ -44,7 +54,7 @@
   let themeSettings = $state(getThemeSettings());
 
   function loadRooms() {
-    visitedRooms = getVisitedRooms();
+    recentRooms = getRecentRooms();
   }
 
   $effect(() => {
@@ -86,15 +96,17 @@
     }
   }
 
-  function pushRoomToHistory(room: VisitedRoom) {
+  function pushRoomToHistory(room: RecentRoom | VisitedRoom) {
     if (typeof window === 'undefined' || !window.history?.pushState) return;
     try {
-      const parsed = new URL(room.url, window.location.origin);
+      const urlStr = room.url || (room as any).roomUrl;
+      if (!urlStr) return;
+      const parsed = new URL(urlStr, window.location.origin);
       const targetUrl =
         parsed.origin === window.location.origin
           ? parsed.href
           : `${parsed.pathname}${parsed.search}${parsed.hash}`;
-      window.history.pushState({ roomId: room.id }, '', targetUrl);
+      window.history.pushState({ roomId: room.roomId || room.id }, '', targetUrl);
     } catch {
       // Ignore history errors in restricted environments
     }
@@ -102,27 +114,37 @@
 
   function handleJoinRoom() {
     if (!generatedUrlData) return;
-    const room: VisitedRoom = {
+    const room: RecentRoom = {
+      roomId: generatedUrlData.roomId,
+      roomName: newRoomName.trim() || '名称未設定',
+      url: generatedUrlData.roomUrl,
+      roomUrl: generatedUrlData.roomUrl,
+      visitedAt: Date.now(),
+      isAdmin: true, // The creator is the initial admin
       id: generatedUrlData.roomId,
       name: newRoomName.trim() || '名称未設定',
-      url: generatedUrlData.roomUrl,
       lastVisited: Date.now(),
-      isAdmin: true, // The creator is the initial admin
     };
-    saveVisitedRoom(room);
+    saveRecentRoom(room);
+    saveVisitedRoom(room as any);
     loadRooms();
     isCreateDialogOpen = false;
     pushRoomToHistory(room);
+    onSelectRoom?.(room);
     onEnterRoom?.(room);
   }
 
-  function handleSelectRoom(room: VisitedRoom) {
-    saveVisitedRoom(room);
-    pushRoomToHistory(room);
-    onEnterRoom?.(room);
+  function handleSelectRoom(room: RecentRoom | VisitedRoom) {
+    const updated = recordRoomVisit(room as RecentRoom);
+    saveVisitedRoom(room as any);
+    loadRooms();
+    pushRoomToHistory(updated);
+    onSelectRoom?.(updated);
+    onEnterRoom?.(updated);
   }
 
   function handleRemoveRoom(roomId: string) {
+    removeRecentRoom(roomId);
     removeVisitedRoom(roomId);
     loadRooms();
   }
@@ -219,7 +241,7 @@
     </div>
 
     <main class="rooms-grid" data-testid="visited-rooms-list">
-      {#if visitedRooms.length === 0}
+      {#if recentRooms.length === 0}
         <div class="no-rooms-card" data-testid="no-rooms-message">
           <div class="empty-icon-circle">
             <Icon>meeting_room</Icon>
@@ -230,24 +252,48 @@
           </p>
         </div>
       {:else}
-        {#each visitedRooms as room (room.id)}
-          <div class="room-card-wrapper" data-testid="room-card-{room.id}">
+        {#each recentRooms as room (room.roomId || room.id)}
+          <div
+            class="room-card-wrapper"
+            data-testid="room-card-{room.roomId || room.id}"
+            role="button"
+            tabindex="0"
+            onclick={() => handleSelectRoom(room)}
+            onkeydown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handleSelectRoom(room);
+              }
+            }}
+          >
             <Card variant="elevated">
               <div class="room-card-body">
                 <div class="room-card-top">
                   <div class="room-avatar" aria-hidden="true">
-                    <Icon>fort</Icon>
+                    {#if room.thumbnailUrl}
+                      <img src={room.thumbnailUrl} alt="" class="room-avatar-img" />
+                    {:else}
+                      <Icon>fort</Icon>
+                    {/if}
                   </div>
                   <div class="room-title-group">
-                    <h3 class="room-card-name">{room.name}</h3>
-                    <span class="room-id-chip">ID: {room.id.slice(0, 8)}</span>
+                    <h3 class="room-card-name">{room.roomName || room.name}</h3>
+                    <div class="room-meta-chips">
+                      <span class="room-id-chip">ID: {(room.roomId || room.id || '').slice(0, 8)}</span>
+                      {#if room.ownerAccountId}
+                        <span class="room-owner-chip">Owner: {room.ownerAccountId}</span>
+                      {/if}
+                    </div>
                   </div>
                   <IconButton
                     variant="text"
                     size="xs"
                     aria-label="履歴から削除"
-                    onclick={() => handleRemoveRoom(room.id)}
-                    data-testid="remove-room-{room.id}"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      handleRemoveRoom(room.roomId || room.id || '');
+                    }}
+                    data-testid="remove-room-{room.roomId || room.id}"
                   >
                     <Icon>delete</Icon>
                   </IconButton>
@@ -256,12 +302,20 @@
                 <div class="room-meta-row">
                   <Icon>schedule</Icon>
                   <p class="room-card-date">
-                    最終アクセス: {new Date(room.lastVisited).toLocaleString()}
+                    最終アクセス: {new Date(room.visitedAt || room.lastVisited || Date.now()).toLocaleString()}
                   </p>
                 </div>
 
                 <div class="room-card-actions">
-                  <Button variant="filled" size="s" onclick={() => handleSelectRoom(room)}>
+                  <Button
+                    variant="filled"
+                    size="s"
+                    data-testid="enter-room-{room.roomId || room.id}"
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      handleSelectRoom(room);
+                    }}
+                  >
                     入室する
                   </Button>
                 </div>
@@ -537,6 +591,18 @@
     font-size: 0.88rem;
     line-height: 1.5;
   }
+  .room-card-wrapper {
+    cursor: pointer;
+    transition: transform var(--np-motion-expressive-fast-spatial, 200ms ease);
+    outline: none;
+    border-radius: var(--np-shape-corner-large, 16px);
+  }
+  .room-card-wrapper:hover {
+    transform: translateY(-2px);
+  }
+  .room-card-wrapper:focus-visible {
+    box-shadow: 0 0 0 3px var(--np-color-primary);
+  }
   .room-card-body {
     padding: 18px;
     display: flex;
@@ -558,6 +624,26 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
+    overflow: hidden;
+  }
+  .room-avatar-img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+  .room-meta-chips {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+  .room-owner-chip {
+    font-size: 0.72rem;
+    padding: 1px 6px;
+    border-radius: var(--np-shape-corner-full);
+    background: var(--np-color-surface-container-high);
+    color: var(--np-color-on-surface-variant);
+    font-family: monospace;
   }
   .room-title-group {
     flex: 1;

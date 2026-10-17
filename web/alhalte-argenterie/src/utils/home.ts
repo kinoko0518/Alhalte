@@ -9,6 +9,7 @@
 
 import { bytesToHex } from '@alhalte/pantry';
 import type { VisitedRoom } from '../types/index.js';
+import { removeRecentRoom, saveRecentRoom } from './recentRooms.js';
 
 export const LOCAL_STORAGE_VISITED_ROOMS_KEY = 'alhalte:visited-rooms';
 
@@ -106,6 +107,17 @@ export function saveVisitedRoom(room: VisitedRoom, storage?: Storage): void {
   }
 
   store.setItem(LOCAL_STORAGE_VISITED_ROOMS_KEY, JSON.stringify(list));
+
+  saveRecentRoom(
+    {
+      roomId: room.id,
+      roomName: room.name,
+      url: room.url,
+      visitedAt: room.lastVisited || Date.now(),
+      isAdmin: room.isAdmin,
+    },
+    store,
+  );
 }
 
 /**
@@ -116,17 +128,19 @@ export function removeVisitedRoom(roomId: string, storage?: Storage): void {
   if (!store) return;
 
   const raw = store.getItem(LOCAL_STORAGE_VISITED_ROOMS_KEY);
-  if (!raw) return;
-
-  try {
-    const list = JSON.parse(raw) as VisitedRoom[];
-    if (Array.isArray(list)) {
-      const filtered = list.filter((item) => item.id !== roomId);
-      store.setItem(LOCAL_STORAGE_VISITED_ROOMS_KEY, JSON.stringify(filtered));
+  if (raw) {
+    try {
+      const list = JSON.parse(raw) as VisitedRoom[];
+      if (Array.isArray(list)) {
+        const filtered = list.filter((item) => item.id !== roomId);
+        store.setItem(LOCAL_STORAGE_VISITED_ROOMS_KEY, JSON.stringify(filtered));
+      }
+    } catch {
+      // Ignore corrupt store
     }
-  } catch {
-    // Ignore corrupt store
   }
+
+  removeRecentRoom(roomId, store);
 }
 
 /**

@@ -196,4 +196,6 @@ export type {
   ConnectionManagerOptions,
 } from '../utils/connection.js';
 
+export type { RecentRoom } from '../utils/recentRooms.js';
+
 

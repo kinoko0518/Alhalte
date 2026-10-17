@@ -14,6 +14,7 @@
   import { Button, IconButton, Sheet } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character, ExtensionItem, LogRecord, Scene, VisitedRoom } from '../types/index.js';
+  import { saveRecentRoom, type RecentRoom } from '../utils/recentRooms.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
   import { resolveRoomFromLocation } from '../utils/home.js';
   import { ChunkLogManager } from '../utils/log.js';
@@ -330,11 +331,43 @@
   $effect(() => {
     if (currentRoom?.id) {
       restoreRoomLogs(currentRoom.id);
+      saveRecentRoom({
+        roomId: currentRoom.id || (currentRoom as any).roomId,
+        roomName: currentRoom.name || (currentRoom as any).roomName || '名称未設定',
+        url: currentRoom.url || (currentRoom as any).roomUrl,
+        roomUrl: currentRoom.url || (currentRoom as any).roomUrl,
+        visitedAt: (currentRoom as any).visitedAt || currentRoom.lastVisited || Date.now(),
+        thumbnailUrl: (currentRoom as any).thumbnailUrl,
+        ownerAccountId: (currentRoom as any).ownerAccountId,
+        isAdmin: currentRoom.isAdmin,
+      });
     }
   });
 
-  function handleEnterRoom(room: VisitedRoom) {
-    currentRoom = room;
+  function handleEnterRoom(room: VisitedRoom | RecentRoom) {
+    const roomId = (room as any).roomId || room.id;
+    const roomName = (room as any).roomName || room.name;
+    const roomUrl = (room as any).url || (room as any).roomUrl;
+    const visitedAt = (room as any).visitedAt || room.lastVisited || Date.now();
+    const normalizedRoom: VisitedRoom = {
+      id: roomId,
+      name: roomName,
+      url: roomUrl,
+      lastVisited: visitedAt,
+      isAdmin: room.isAdmin,
+      ...room,
+    };
+    saveRecentRoom({
+      roomId,
+      roomName,
+      url: roomUrl,
+      roomUrl,
+      visitedAt,
+      thumbnailUrl: (room as any).thumbnailUrl,
+      ownerAccountId: (room as any).ownerAccountId,
+      isAdmin: room.isAdmin,
+    });
+    currentRoom = normalizedRoom;
   }
 
   function handleSelectScene(sceneId: string) {
@@ -484,7 +517,7 @@
   />
 
   {#if !currentRoom}
-    <HomeScreen onEnterRoom={handleEnterRoom} />
+    <HomeScreen onEnterRoom={handleEnterRoom} onSelectRoom={handleEnterRoom} />
   {:else}
     <div
       class="room-layout-container"
