@@ -119,5 +119,20 @@ if (typeof window !== 'undefined') {
       window.DragEvent = PolyfilledDragEvent;
     }
   }
+
+  // Mock ResizeObserver for jsdom (used by Svelte bind:clientWidth / bind:clientHeight in TextField)
+  if (typeof globalThis !== 'undefined' && !globalThis.ResizeObserver) {
+    class PolyfilledResizeObserver {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    }
+    // @ts-expect-error fallback ResizeObserver for jsdom
+    globalThis.ResizeObserver = PolyfilledResizeObserver;
+    if (typeof window !== 'undefined') {
+      // @ts-expect-error fallback ResizeObserver for jsdom
+      window.ResizeObserver = PolyfilledResizeObserver;
+    }
+  }
 }
 

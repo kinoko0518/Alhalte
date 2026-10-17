@@ -26,7 +26,7 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> コントロールパネル共通フッター`
    */
-  import { IconButton, Tabs, Tab, Tooltip } from 'noph-ui';
+  import { IconButton, Tabs, Tab, Tooltip, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character } from '../../types/index.js';
   import {
@@ -242,9 +242,12 @@
       </div>
     {/if}
 
-    <textarea
-      rows="5"
-      class="chat-input-field"
+    <TextField
+      variant="outlined"
+      type="textarea"
+      minLines={4}
+      maxLines={10}
+      rows={5}
       placeholder="メッセージを入力..."
       bind:value={messageInput}
       oninput={() => {
@@ -252,7 +255,8 @@
       }}
       onkeydown={handleKeyDown}
       data-testid="chat-input-field"
-    ></textarea>
+      class="chat-text-field"
+    />
   </div>
 </footer>
 
@@ -341,19 +345,8 @@
     position: relative;
     width: 100%;
   }
-  .chat-input-field {
+  .input-wrapper :global(.chat-text-field) {
     width: 100%;
-    min-height: 5.5rem;
-    padding: 10px 14px;
-    border: 1px solid var(--np-color-outline);
-    border-radius: var(--np-shape-corner-medium, 12px);
-    background: var(--np-color-surface-container-lowest);
-    color: var(--np-color-on-surface);
-    font-size: 0.95rem;
-    font-family: inherit;
-    line-height: 1.4;
-    resize: vertical;
-    box-sizing: border-box;
   }
   /* Suggestion box:
    * "それを入力フィールドの直上に、下側が繋がり、入力フィールドと同じ背景色で、区切り線を挟んで部分一致しているもののリスト、上側は角丸で、他のUI要素を覆いかぶせる形でサジェストする。"

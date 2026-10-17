@@ -7,7 +7,7 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### ホーム画面`
    * - GitHub Issue #32: Rich Material 3 Expressive HomeScreen & theme selection
    */
-  import { AppBar, Button, Card, ExtendedFab, IconButton } from 'noph-ui';
+  import { AppBar, Button, Card, ExtendedFab, IconButton, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { VisitedRoom } from '../../types/index.js';
   import {
@@ -37,6 +37,7 @@
   let visitedRooms = $state<VisitedRoom[]>(getVisitedRooms());
   let isCreateDialogOpen = $state(false);
   let newRoomName = $state('');
+  let nickname = $state('');
   let generatedUrlData = $state<{ roomId: string; roomKeyHex: string; roomUrl: string } | null>(null);
   let copyNotice = $state('');
 
@@ -294,25 +295,34 @@
       <div class="dialog-content">
         <h2 class="dialog-header-centered" data-testid="dialog-title">部屋の作成</h2>
 
-        <div class="dialog-field">
-          <label for="room-name-input" class="field-label">ルーム名</label>
-          <input
-            id="room-name-input"
-            class="single-line-input"
-            type="text"
-            placeholder="ルーム名"
-            bind:value={newRoomName}
-            data-testid="room-name-input"
-          />
-        </div>
+        <TextField
+          id="room-name-input"
+          variant="outlined"
+          label="ルーム名"
+          placeholder="ルーム名"
+          bind:value={newRoomName}
+          data-testid="room-name-input"
+          class="dialog-text-field"
+        />
 
-        <div class="dialog-field url-copy-row">
-          <input
-            class="single-line-input readonly-input"
-            type="text"
+        <TextField
+          id="nickname-input"
+          variant="outlined"
+          label="ニックネーム"
+          placeholder="ニックネーム（任意）"
+          bind:value={nickname}
+          data-testid="user-nickname-input"
+          class="dialog-text-field"
+        />
+
+        <div class="url-copy-row">
+          <TextField
+            variant="outlined"
+            label="部屋URL"
             readonly
             value={generatedUrlData?.roomUrl ?? ''}
             data-testid="room-url-input"
+            class="url-text-field"
           />
           <Button variant="tonal" onclick={handleCopyLink} data-testid="copy-link-button">
             リンクをコピー
@@ -619,38 +629,17 @@
     font-weight: 700;
     color: var(--np-color-on-surface);
   }
-  .dialog-field {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-  .field-label {
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: var(--np-color-on-surface-variant);
-  }
-  .single-line-input {
+  .dialog-content :global(.dialog-text-field) {
     width: 100%;
-    padding: 12px 16px;
-    border: 1px solid var(--np-color-outline);
-    border-radius: var(--np-shape-corner-medium);
-    font-size: 1rem;
-    background: var(--np-color-surface-container-lowest);
-    color: var(--np-color-on-surface);
-    box-sizing: border-box;
-  }
-  .readonly-input {
-    background: var(--np-color-surface-container);
-    color: var(--np-color-on-surface-variant);
-    cursor: default;
   }
   .url-copy-row {
     display: flex;
     flex-direction: row;
     gap: 8px;
     align-items: center;
+    width: 100%;
   }
-  .url-copy-row input {
+  .url-copy-row :global(.url-text-field) {
     flex: 1;
   }
   .copy-notice {

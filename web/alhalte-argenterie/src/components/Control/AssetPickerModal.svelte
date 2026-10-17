@@ -12,7 +12,7 @@
    *     （右寄せボタン”キャンセル”）
    *   ］
    */
-  import { Button, Card, IconButton, SegmentedButton } from 'noph-ui';
+  import { Button, Card, IconButton, SegmentedButton, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import {
     addAssetFromFile,
@@ -46,6 +46,8 @@
   let mediaType = $state<AssetMediaType>(initialMediaType);
   let allAssets = $state<AssetItem[]>(loadAssets());
   let fileInputEl = $state<HTMLInputElement | null>(null);
+  let searchQuery = $state('');
+  let directUrl = $state('');
 
   // Sync initialMediaType when modal opens or prop changes
   $effect(() => {
@@ -69,7 +71,13 @@
   });
 
   let filteredAssets = $derived(
-    allAssets.filter((item) => item.scope === scope && item.mediaType === mediaType),
+    allAssets.filter((item) => {
+      if (item.scope !== scope || item.mediaType !== mediaType) return false;
+      if (searchQuery.trim() && !item.name.toLowerCase().includes(searchQuery.trim().toLowerCase())) {
+        return false;
+      }
+      return true;
+    }),
   );
 
   let scopeOptions = $derived([
@@ -120,6 +128,12 @@
 
   function handleSelectAsset(asset: AssetItem) {
     onSelect?.(asset.dataUrl, asset);
+    onClose?.();
+  }
+
+  function handleSelectDirectUrl() {
+    if (!directUrl.trim()) return;
+    onSelect?.(directUrl.trim(), undefined);
     onClose?.();
   }
 
@@ -207,6 +221,38 @@
             multiple
             data-testid="asset-file-input"
           />
+        </div>
+      </div>
+
+      <!-- Search & Direct URL Row -->
+      <div class="asset-picker-inputs-row" data-testid="asset-inputs-row">
+        <TextField
+          variant="outlined"
+          type="search"
+          label="アセット検索"
+          placeholder="アセット名で検索"
+          bind:value={searchQuery}
+          data-testid="asset-search-input"
+          class="asset-search-field"
+        />
+        <div class="direct-url-group">
+          <TextField
+            variant="outlined"
+            type="url"
+            label="URL直接指定"
+            placeholder="https://... または data:..."
+            bind:value={directUrl}
+            data-testid="asset-url-input"
+            class="asset-url-field"
+          />
+          <Button
+            variant="tonal"
+            disabled={!directUrl.trim()}
+            onclick={handleSelectDirectUrl}
+            data-testid="asset-apply-url-btn"
+          >
+            URLを適用
+          </Button>
         </div>
       </div>
 
@@ -346,6 +392,30 @@
 
   .hidden-file-input {
     display: none;
+  }
+
+  .asset-picker-inputs-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-items: center;
+  }
+
+  .asset-picker-inputs-row :global(.asset-search-field) {
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .direct-url-group {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex: 2;
+    min-width: 280px;
+  }
+
+  .direct-url-group :global(.asset-url-field) {
+    flex: 1;
   }
 
   .asset-cards-grid {
