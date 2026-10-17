@@ -25,6 +25,7 @@ export * from './wasm/runner.js';
 export { default as App } from './components/App.svelte';
 export { default as HomeScreen } from './components/Home/HomeScreen.svelte';
 export { default as FieldPanel } from './components/Field/FieldPanel.svelte';
+export { default as FieldPiece } from './components/Field/FieldPiece.svelte';
 export { default as BoardCanvas } from './components/Field/FieldPanel.svelte';
 export { default as ControlPanel } from './components/Control/ControlPanel.svelte';
 export { default as CommonFooter } from './components/Control/CommonFooter.svelte';
