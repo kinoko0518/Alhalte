@@ -1,0 +1,40 @@
+/* Expressive CSS: Mentions, status fluctuations, and assignments */
+
+.saignant-mention {
+  color: var(--md-sys-color-primary, #6750a4);
+  background-color: var(--md-sys-color-primary-container, #eaddff);
+  border-radius: var(--md-sys-shape-corner-full, 9999px);
+  padding: 1px 8px;
+  font-weight: 600;
+  font-size: 13px;
+  cursor: pointer;
+  text-decoration: none;
+  border: 1px solid transparent;
+  transition: background-color var(--md-sys-motion-duration-short2, 100ms) var(--md-sys-motion-easing-standard, cubic-bezier(0.2, 0, 0, 1)),
+              border-color var(--md-sys-motion-duration-short2, 100ms) var(--md-sys-motion-easing-standard, cubic-bezier(0.2, 0, 0, 1));
+}
+
+.saignant-mention:hover {
+  background-color: color-mix(in srgb, var(--md-sys-color-primary-container, #eaddff) 80%, var(--md-sys-color-primary, #6750a4));
+  border-color: var(--md-sys-color-primary, #6750a4);
+}
+
+.saignant-fluct {
+  background-color: var(--md-sys-color-surface-container, #f3edf7);
+  color: var(--md-sys-color-on-surface, #1d1b20);
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  padding: 1px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  border: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+}
+
+.saignant-assign {
+  background-color: var(--md-sys-color-surface-container, #f3edf7);
+  color: var(--md-sys-color-on-surface, #1d1b20);
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  padding: 1px 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  border: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+}

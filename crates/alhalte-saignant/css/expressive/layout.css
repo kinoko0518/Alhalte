@@ -1,0 +1,23 @@
+/* Expressive CSS: Layout transitions, grounded borders, and subtle spacing */
+
+.saignant-indent {
+  transition: margin-inline-start var(--md-sys-motion-duration-medium1, 250ms) var(--md-sys-motion-easing-standard, cubic-bezier(0.2, 0, 0, 1));
+}
+
+.saignant-hanging {
+  transition: padding-inline-start var(--md-sys-motion-duration-medium1, 250ms) var(--md-sys-motion-easing-standard, cubic-bezier(0.2, 0, 0, 1));
+}
+
+.saignant-grounded {
+  border-block-end: 1px dashed var(--md-sys-color-outline-variant, #cac4d0);
+  padding-block-end: 2px;
+}
+
+.saignant-kerning {
+  font-feature-settings: "palt" 1;
+}
+
+.saignant-h-in-v {
+  font-weight: 600;
+  letter-spacing: -0.05em;
+}
