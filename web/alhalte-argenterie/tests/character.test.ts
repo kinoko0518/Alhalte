@@ -1,10 +1,15 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { mount, unmount } from 'svelte';
 import { truncateDescription, MAX_DESCRIPTION_LENGTH, DESCRIPTION_ELLIPSIS } from '../src/utils/character.js';
+import { addAsset, clearAssets } from '../src/utils/assets.js';
 import CharacterManagementTab from '../src/components/Control/tabs/CharacterManagementTab.svelte';
 import type { Character } from '../src/types/index.js';
 
 describe('Character Management & Edit Panel', () => {
+  beforeEach(() => {
+    clearAssets();
+  });
+
   // spec: alhalte-argenterie/character 説明120文字……省略
   it('truncates descriptions exceeding 120 characters with …… and preserves <= 120 chars', () => {
     // 50 chars - no truncation
@@ -178,6 +183,91 @@ describe('Character Management & Edit Panel', () => {
     const paramValue = target.querySelector<HTMLInputElement>('[data-testid="param-value-0"]');
     expect(paramLabel?.value).toBe('');
     expect(Number(paramValue?.value)).toBe(0);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/character アセット選択オーバーレイとカルーセルによる立ち絵・アイコン選択 (Issue #28)
+  it('selects and clears character icon via AssetPickerModal and M3 Carousel', async () => {
+    const heroIcon = addAsset({
+      id: 'char-img-1',
+      name: 'hero.webp',
+      scope: 'personal',
+      mediaType: 'image',
+      dataUrl: 'data:image/webp;base64,aGVybw==',
+      mimeType: 'image/webp',
+      createdAt: 1000,
+    });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testChar: Character = {
+      id: 'char-knight',
+      name: '騎士',
+      initiative: 10,
+      description: '前衛',
+      statuses: [],
+      parameters: [],
+      chatPalette: '',
+      hideStatus: false,
+    };
+
+    let savedChar: Character | null = null;
+
+    const instance = mount(CharacterManagementTab, {
+      target,
+      props: {
+        characters: [testChar],
+        isAdmin: false,
+        onUpdateCharacter: (c) => {
+          savedChar = c;
+        },
+      },
+    });
+
+    // Open character edit panel
+    target.querySelector<HTMLButtonElement>('[data-testid="edit-char-btn-char-knight"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="char-image-carousel"]')).toBeTruthy();
+
+    // Open AssetPickerModal by clicking edit-avatar-picker
+    target.querySelector<HTMLButtonElement>('[data-testid="edit-avatar-picker"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="asset-card-none"]')).toBeTruthy();
+    expect(target.querySelector(`[data-testid="asset-card-${heroIcon.id}"]`)).toBeTruthy();
+
+    // Select heroIcon card in modal
+    target.querySelector<HTMLElement>(`[data-testid="asset-card-${heroIcon.id}"]`)?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeNull();
+
+    const avatarImg = target.querySelector<HTMLImageElement>('[data-testid="edit-avatar-img"]');
+    expect(avatarImg?.getAttribute('src')).toBe(heroIcon.dataUrl);
+
+    // Clear via NONE card in AssetPickerModal
+    target.querySelector<HTMLButtonElement>('[data-testid="open-char-image-picker-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLElement>('[data-testid="asset-card-none"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(avatarImg?.getAttribute('src')).toContain('data:image/svg+xml');
+
+    // Quick-select via M3 Carousel item
+    target
+      .querySelector<HTMLButtonElement>(`[data-testid="char-carousel-item-${heroIcon.id}"]`)
+      ?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(avatarImg?.getAttribute('src')).toBe(heroIcon.dataUrl);
+
+    // Save character and verify iconUrl was updated
+    target.querySelector<HTMLButtonElement>('[data-testid="save-character-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(savedChar?.iconUrl).toBe(heroIcon.dataUrl);
 
     unmount(instance);
     target.remove();

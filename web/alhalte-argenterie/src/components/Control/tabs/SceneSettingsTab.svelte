@@ -6,18 +6,26 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーン設定タブ`
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
    */
-  import { Button, Card, Slider, Switch } from 'noph-ui';
+  import { Button, Card, Carousel, CarouselItem, Slider, Switch } from 'noph-ui';
   import type { Character, Scene } from '../../../types/index.js';
+  import {
+    loadAssets,
+    subscribeAssets,
+    type AssetItem,
+    type AssetMediaType,
+  } from '../../../utils/assets.js';
   import {
     calculateDimensionsAndCrop,
     inheritJuices,
     moveMemberToScene,
   } from '../../../utils/sceneSettings.js';
+  import AssetPickerModal from '../AssetPickerModal.svelte';
 
   let {
     currentScene,
     allScenes = [],
     characters = [],
+    isAdmin = false,
     onUpdateScene,
     onSelectScene,
     onCreateScene,
@@ -27,6 +35,7 @@
     currentScene: Scene;
     allScenes?: Scene[];
     characters?: Character[];
+    isAdmin?: boolean;
     onUpdateScene?: (scene: Scene) => void;
     onSelectScene?: (sceneId: string) => void;
     onCreateScene?: (name: string, inheritJuice: boolean) => void;
@@ -35,6 +44,24 @@
   } = $props();
 
   let isSceneSplitMenuOpen = $state(false);
+
+  // Asset picker state
+  let isAssetPickerOpen = $state(false);
+  let assetPickerTarget = $state<'bgImage' | 'bgm1' | 'bgm2' | 'bgm3'>('bgImage');
+  let assetPickerMediaType = $state<AssetMediaType>('image');
+  let allAssets = $state<AssetItem[]>(loadAssets());
+
+  $effect(() => {
+    allAssets = loadAssets();
+    const unsubscribe = subscribeAssets((updated) => {
+      allAssets = updated;
+    });
+    return unsubscribe;
+  });
+
+  let imageAssets = $derived(
+    allAssets.filter((a) => a.mediaType === 'image' && (isAdmin || a.scope === 'personal')),
+  );
 
   // Overlays
   let isCreateSceneOpen = $state(false);
@@ -85,20 +112,29 @@
   }
 
   function handleBgImageSelect() {
-    // In real browser this opens file dialog; here we prompt or set placeholder
-    const url = prompt('背景画像URLを入力またはファイル指定:', currentScene.juices.bgImage || '');
-    if (url !== null) {
-      currentScene.juices.bgImage = url;
-      onUpdateScene?.(currentScene);
-    }
+    assetPickerTarget = 'bgImage';
+    assetPickerMediaType = 'image';
+    isAssetPickerOpen = true;
   }
 
   function handleBgmSelect(bgmKey: 'bgm1' | 'bgm2' | 'bgm3') {
-    const url = prompt(`${bgmKey.toUpperCase()} 音声URLまたはファイル指定:`, currentScene.juices[bgmKey] || '');
-    if (url !== null) {
-      currentScene.juices[bgmKey] = url;
-      onUpdateScene?.(currentScene);
+    assetPickerTarget = bgmKey;
+    assetPickerMediaType = 'audio';
+    isAssetPickerOpen = true;
+  }
+
+  function handleAssetPicked(dataUrl: string | undefined) {
+    if (assetPickerTarget === 'bgImage') {
+      currentScene.juices.bgImage = dataUrl;
+    } else {
+      currentScene.juices[assetPickerTarget] = dataUrl;
     }
+    onUpdateScene?.(currentScene);
+  }
+
+  function handleQuickSelectBgImage(dataUrl: string | undefined) {
+    currentScene.juices.bgImage = dataUrl;
+    onUpdateScene?.(currentScene);
   }
 
   function handleSceneNameInput(e: Event) {
@@ -187,15 +223,47 @@
     <!-- Heading Juices -->
     <h3 class="section-heading" data-testid="heading-juices">Juices</h3>
 
-    <div class="setting-item" data-testid="bg-image-card">
-      <button type="button" class="card-button" onclick={handleBgImageSelect}>
-        <Card variant="outlined">
-          <div class="card-inner">
-            <span class="card-label">背景画像</span>
-            <span class="card-value">{currentScene.juices.bgImage ? '設定済み' : '未設定 (クリックで選択)'}</span>
-          </div>
-        </Card>
-      </button>
+    <div class="setting-item">
+      <div class="bg-carousel-wrapper" data-testid="bg-image-carousel">
+        <Carousel variant="uncontained" label="背景画像アセット">
+          <CarouselItem
+            type="button"
+            label="NONE"
+            aspectRatio={16 / 9}
+            onclick={() => handleQuickSelectBgImage(undefined)}
+            data-testid="bg-carousel-item-none"
+          />
+          {#each imageAssets as asset (asset.id)}
+            <CarouselItem
+              type="button"
+              image={asset.dataUrl}
+              label={asset.name}
+              aspectRatio={16 / 9}
+              onclick={() => handleQuickSelectBgImage(asset.dataUrl)}
+              data-testid="bg-carousel-item-{asset.id}"
+            />
+          {/each}
+        </Carousel>
+      </div>
+
+      <!-- svelte-ignore a11y_click_events_have_key_events -->
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div
+        class="bg-picker-trigger"
+        data-testid="bg-image-card"
+        onclick={handleBgImageSelect}
+      >
+        <Button
+          variant="tonal"
+          onclick={(e: MouseEvent) => {
+            e.stopPropagation();
+            handleBgImageSelect();
+          }}
+          data-testid="open-bg-picker-btn"
+        >
+          画像選択 ({currentScene.juices.bgImage ? '設定済み' : '未設定'})
+        </Button>
+      </div>
       <p class="description-text" data-testid="bg-description-text">
         画像は一方を指定すればもう一方を自動で計算します。もう一方も入力した場合、端を切り落として揃えます。
       </p>
@@ -475,6 +543,17 @@
       </div>
     </div>
   {/if}
+
+  <!-- Overlay: アセット選択 (AssetPickerModal) -->
+  {#if isAssetPickerOpen}
+    <AssetPickerModal
+      open={isAssetPickerOpen}
+      initialMediaType={assetPickerMediaType}
+      {isAdmin}
+      onSelect={handleAssetPicked}
+      onClose={() => (isAssetPickerOpen = false)}
+    />
+  {/if}
 </div>
 
 <style>
@@ -483,19 +562,19 @@
     flex-direction: column;
     height: 100%;
     overflow: hidden;
-    background: var(--md-sys-color-surface, #fbf8fd);
+    background: var(--np-color-surface);
   }
   .split-button-container {
     position: relative;
     padding: 12px 16px;
-    background: var(--md-sys-color-surface-container, #f3edf7);
-    border-bottom: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+    background: var(--np-color-surface-container);
+    border-bottom: 1px solid var(--np-color-outline-variant);
   }
   .scene-name-split-row {
     display: flex;
     align-items: center;
-    background: #fff;
-    border: 1px solid var(--md-sys-color-outline, #79747e);
+    background: var(--np-color-surface-container-lowest);
+    border: 1px solid var(--np-color-outline);
     border-radius: 12px;
     overflow: hidden;
   }
@@ -507,15 +586,17 @@
     font-weight: 600;
     padding: 10px 14px;
     outline: none;
+    background: transparent;
+    color: var(--np-color-on-surface);
   }
   .split-arrow-btn {
     border: none;
     background: transparent;
     padding: 10px 14px;
     cursor: pointer;
-    border-left: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+    border-left: 1px solid var(--np-color-outline-variant);
     font-size: 0.8rem;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
+    color: var(--np-color-on-surface-variant);
   }
   .split-dropdown-menu {
     position: absolute;
@@ -523,10 +604,10 @@
     left: 16px;
     right: 16px;
     margin-top: 4px;
-    background: var(--md-sys-color-surface-container-high, #ece6f0);
-    border: 1px solid var(--md-sys-color-outline-variant, #cac4d0);
+    background: var(--np-color-surface-container-high);
+    border: 1px solid var(--np-color-outline-variant);
     border-radius: 12px;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+    box-shadow: var(--np-elevation-2);
     z-index: 250;
     max-height: 200px;
     overflow-y: auto;
@@ -540,13 +621,14 @@
     text-align: left;
     font-size: 0.95rem;
     cursor: pointer;
+    color: var(--np-color-on-surface);
   }
   .split-menu-item:hover {
-    background: rgba(103, 80, 164, 0.08);
+    background: var(--np-color-surface-container-highest);
   }
   .split-menu-item.active-scene {
     font-weight: 700;
-    color: var(--md-sys-color-primary, #6750a4);
+    color: var(--np-color-primary);
   }
   .settings-scroll-content {
     flex: 1;
@@ -560,34 +642,23 @@
     margin: 8px 0 0;
     font-size: 1.1rem;
     font-weight: 700;
-    color: var(--md-sys-color-on-surface, #1b1b1f);
+    color: var(--np-color-on-surface);
   }
   .setting-item {
     display: flex;
     flex-direction: column;
     gap: 8px;
   }
-  .card-button {
-    background: none;
-    border: none;
-    padding: 0;
-    text-align: left;
-    cursor: pointer;
-    width: 100%;
+  .bg-carousel-wrapper {
+    --np-carousel-item-height: 96px;
+    --np-carousel-item-width: 140px;
+    --np-carousel-item-container-color: var(--np-color-surface-container-high);
+    --np-carousel-item-outline-width: 1px;
+    --np-carousel-item-outline-color: var(--np-color-outline-variant);
   }
-  .card-inner {
-    padding: 16px;
+  .bg-picker-trigger {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-  }
-  .card-label {
-    font-weight: 600;
-    font-size: 1rem;
-  }
-  .card-value {
-    color: var(--md-sys-color-primary, #6750a4);
-    font-size: 0.88rem;
   }
   .description-text {
     margin: 0;
