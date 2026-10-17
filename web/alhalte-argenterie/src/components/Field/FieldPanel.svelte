@@ -4,6 +4,7 @@
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### フィールド画面`
+   * - GitHub Issue #32: Material 3 semantic color tokens (`--np-color-*`)
    */
   import type { Character, Scene, ViewTransform } from '../../types/index.js';
   import {
@@ -222,7 +223,7 @@
     width: 100%;
     height: 100%;
     overflow: hidden;
-    background: #1e1e24;
+    background: var(--np-color-surface-dim);
     user-select: none;
     touch-action: none;
   }
@@ -239,7 +240,7 @@
     top: 0;
     left: 0;
     background-repeat: no-repeat;
-    box-shadow: 0 0 20px rgba(0, 0, 0, 0.5);
+    box-shadow: var(--np-elevation-3);
   }
   .field-piece {
     position: absolute;
@@ -251,18 +252,19 @@
   .piece-avatar {
     width: 48px;
     height: 48px;
-    border-radius: 50%;
-    border: 2px solid #fff;
-    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.4);
-    background: #444;
+    border-radius: var(--np-shape-corner-full);
+    border: 2px solid var(--np-color-primary);
+    box-shadow: var(--np-elevation-2);
+    background: var(--np-color-surface-container-highest);
   }
   .piece-label {
     font-size: 0.75rem;
-    color: #fff;
-    background: rgba(0, 0, 0, 0.7);
-    padding: 2px 6px;
-    border-radius: 4px;
+    color: var(--np-color-on-surface);
+    background: color-mix(in srgb, var(--np-color-surface-container-high) 90%, transparent);
+    padding: 2px 8px;
+    border-radius: var(--np-shape-corner-extra-small);
     margin-top: 4px;
+    box-shadow: var(--np-elevation-1);
   }
   .field-top-left-layer {
     position: absolute;
@@ -280,12 +282,13 @@
     font-size: 1.1rem;
     font-weight: 700;
     padding: 8px 16px;
-    border-radius: 12px;
-    background: rgba(28, 27, 31, 0.85);
-    color: #fff;
+    border-radius: var(--np-shape-corner-medium);
+    background: color-mix(in srgb, var(--np-color-surface-container-high) 88%, transparent);
+    color: var(--np-color-on-surface);
     backdrop-filter: blur(8px);
     width: fit-content;
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--np-elevation-2);
+    border: 1px solid var(--np-color-outline-variant);
   }
   .initiative-character-list {
     pointer-events: auto;
@@ -298,10 +301,11 @@
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
-    border-radius: 12px;
-    background: rgba(28, 27, 31, 0.85);
+    border-radius: var(--np-shape-corner-medium);
+    background: color-mix(in srgb, var(--np-color-surface-container-high) 88%, transparent);
     backdrop-filter: blur(8px);
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--np-elevation-1);
+    border: 1px solid var(--np-color-outline-variant);
   }
   .char-icon-wrapper {
     position: relative;
@@ -312,21 +316,21 @@
   .char-icon {
     width: 40px;
     height: 40px;
-    border-radius: 8px;
+    border-radius: var(--np-shape-corner-small);
     object-fit: cover;
-    background: #555;
+    background: var(--np-color-surface-container-highest);
   }
   .char-initiative-badge {
     position: absolute;
     right: -4px;
     bottom: -4px;
-    background: #6750a4;
-    color: #fff;
+    background: var(--np-color-primary);
+    color: var(--np-color-on-primary);
     font-size: 0.7rem;
     font-weight: 700;
     padding: 1px 5px;
-    border-radius: 6px;
-    border: 1px solid #fff;
+    border-radius: var(--np-shape-corner-extra-small);
+    border: 1px solid var(--np-color-surface);
   }
   .char-info-and-statuses {
     flex: 1;
@@ -338,7 +342,7 @@
   .char-name {
     font-size: 0.85rem;
     font-weight: 600;
-    color: #fff;
+    color: var(--np-color-on-surface);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -356,8 +360,8 @@
     position: relative;
     flex: 1;
     height: 18px;
-    background: rgba(255, 255, 255, 0.15);
-    border-radius: 4px;
+    background: var(--np-color-surface-container-highest);
+    border-radius: var(--np-shape-corner-extra-small);
     overflow: hidden;
     display: flex;
     align-items: center;
@@ -368,17 +372,15 @@
     left: 0;
     top: 0;
     bottom: 0;
-    background: #4caf50;
-    opacity: 0.6;
-    transition: width 0.2s ease;
+    background: var(--np-color-primary-container);
+    transition: width var(--np-motion-expressive-fast-effects);
   }
   .status-label-text {
     position: relative;
     z-index: 1;
     font-size: 0.68rem;
     font-weight: 600;
-    color: #fff;
-    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.8);
+    color: var(--np-color-on-surface);
     white-space: nowrap;
     padding: 0 4px;
   }
