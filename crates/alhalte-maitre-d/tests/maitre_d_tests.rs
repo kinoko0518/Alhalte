@@ -653,3 +653,182 @@ async fn test_websocket_demux_and_banquette_spawner() {
     // Close WebSocket
     ws_stream.close(None).await.unwrap();
 }
+
+// spec: alhalte-maitre-d/export zip
+#[tokio::test]
+async fn test_room_zip_export_endpoints() {
+    let temp_dir = tempdir().unwrap();
+    let socket_dir = temp_dir.path().to_path_buf();
+
+    let db = Database::new_in_memory().unwrap();
+    let acc = db
+        .get_or_create_account("sub-export", "Henry", None, 1000)
+        .unwrap();
+    let session = db.create_session(acc.account_id, 1000).unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        socket_dir, 8,
+    ));
+    let room_manager = RoomBridgeManager::new(spawner);
+    let oauth = Arc::new(MockOAuthProvider::new());
+    let state = AppState::new(db, "salt", oauth, room_manager);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let room_id: u64 = 888;
+    let client = reqwest::Client::new();
+
+    // Populate data via WebSocket connection
+    let ws_url = format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
+        acc.account_id, session.session_id
+    );
+    let (mut ws_stream, _) = connect_async(&ws_url).await.unwrap();
+
+    // 1. Create character
+    let mut char_map = std::collections::HashMap::new();
+    alhalte_banquette::character::set_character_name(&mut char_map, "Hero");
+    alhalte_banquette::character::set_character_owner(&mut char_map, acc.account_id);
+    let create_char_frame =
+        serde_json::to_string(&ClientFrame::CreateCharacter { data: char_map }).unwrap();
+    ws_stream
+        .send(WsMessage::Text(create_char_frame.into()))
+        .await
+        .unwrap();
+
+    // 2. Create scene "dungeon"
+    let create_scene_frame = serde_json::to_string(&ClientFrame::CreateScene {
+        scene_id: "dungeon".to_string(),
+        inherit_juices: true,
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(create_scene_frame.into()))
+        .await
+        .unwrap();
+
+    // 3. Update scene state in "dungeon"
+    let state_tin = tin::Tin::from_string("Dark and damp");
+    let update_state_frame = serde_json::to_string(&ClientFrame::UpdateState {
+        scene_id: "dungeon".to_string(),
+        key: "atmosphere::desc".to_string(),
+        value: state_tin,
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(update_state_frame.into()))
+        .await
+        .unwrap();
+
+    // 4. Append a log entry in "dungeon"
+    let log_tin = tin::Tin::from_string("A torch flickers on the stone wall.");
+    let append_log_frame = serde_json::to_string(&ClientFrame::AppendLog {
+        scene_id: "dungeon".to_string(),
+        entry: Some(log_tin),
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(append_log_frame.into()))
+        .await
+        .unwrap();
+
+    // Wait a brief moment for frames to be processed by banquette
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Test 1: Full export via GET /api/room/{room_id}/export/zip
+    let full_url = format!(
+        "http://{addr}/api/room/{room_id}/export/zip?type=full&account_id={}&session_id={}",
+        acc.account_id, session.session_id
+    );
+    let resp = client.get(&full_url).send().await.unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/zip"
+    );
+    assert_eq!(
+        resp.headers().get("content-disposition").unwrap(),
+        &format!("attachment; filename=\"room_{room_id}_full.zip\"")
+    );
+
+    let body = resp.bytes().await.unwrap();
+    // Validate ZIP magic header: PK\x03\x04
+    assert!(body.len() >= 4);
+    assert_eq!(&body[0..4], b"PK\x03\x04");
+
+    // Load and verify with RoomArchive::load_from_slice
+    let archive = alhalte_kitchen::RoomArchive::load_from_slice(&body, None)
+        .expect("Failed to load archive from slice");
+    assert_eq!(archive.room_id, Some(room_id));
+    assert!(archive.scenes.contains_key("dungeon"));
+    let dungeon_scene = archive.scenes.get("dungeon").unwrap();
+    // In full export, scene states must NOT be empty
+    assert!(!dungeon_scene.states.is_empty());
+    assert!(dungeon_scene.states.contains_key("atmosphere::desc"));
+    assert!(!archive.characters.is_empty());
+
+    // Test 2: Logs export via GET /room/{room_id}/export/zip (alternative path)
+    let logs_url = format!(
+        "http://{addr}/room/{room_id}/export/zip?type=logs&account_id={}&session_id={}",
+        acc.account_id, session.session_id
+    );
+    let logs_resp = client.get(&logs_url).send().await.unwrap();
+    assert_eq!(logs_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        logs_resp.headers().get("content-type").unwrap(),
+        "application/zip"
+    );
+    assert_eq!(
+        logs_resp.headers().get("content-disposition").unwrap(),
+        &format!("attachment; filename=\"room_{room_id}_logs.zip\"")
+    );
+
+    let logs_body = logs_resp.bytes().await.unwrap();
+    assert_eq!(&logs_body[0..4], b"PK\x03\x04");
+
+    let logs_archive = alhalte_kitchen::RoomArchive::load_from_slice(&logs_body, None)
+        .expect("Failed to load logs archive from slice");
+    assert_eq!(logs_archive.room_id, Some(room_id));
+    assert!(logs_archive.scenes.contains_key("dungeon"));
+    let logs_dungeon = logs_archive.scenes.get("dungeon").unwrap();
+    // In logs export, scene states MUST be empty!
+    assert!(logs_dungeon.states.is_empty());
+    // Characters repository must be retained
+    assert!(!logs_archive.characters.is_empty());
+
+    // Test 3: Default type is "full" when type query param is omitted
+    let default_url = format!(
+        "http://{addr}/api/room/{room_id}/export/zip?account_id={}&session_id={}",
+        acc.account_id, session.session_id
+    );
+    let default_resp = client.get(&default_url).send().await.unwrap();
+    assert_eq!(default_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        default_resp.headers().get("content-disposition").unwrap(),
+        &format!("attachment; filename=\"room_{room_id}_full.zip\"")
+    );
+
+    // Test 4: Invalid type query parameter returns 400 Bad Request
+    let invalid_type_url = format!(
+        "http://{addr}/api/room/{room_id}/export/zip?type=invalid&account_id={}&session_id={}",
+        acc.account_id, session.session_id
+    );
+    let bad_type_resp = client.get(&invalid_type_url).send().await.unwrap();
+    assert_eq!(bad_type_resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Test 5: Invalid session returns 401 Unauthorized
+    let bad_session_url = format!(
+        "http://{addr}/api/room/{room_id}/export/zip?type=full&account_id={}&session_id=999999",
+        acc.account_id
+    );
+    let unauth_resp = client.get(&bad_session_url).send().await.unwrap();
+    assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Clean up
+    ws_stream.close(None).await.unwrap();
+}

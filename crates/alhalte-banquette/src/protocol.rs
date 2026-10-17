@@ -6,12 +6,12 @@ use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder};
 
-use tin::Tin;
+use tin::{Tin, TinId};
 
 use crate::character::Character;
 use crate::error::{BanquetteError, Result};
-use crate::log::LogBiblio;
-use crate::room::SceneSummary;
+use crate::log::{LogBiblio, LogChunk};
+use crate::room::{RoomData, SceneSummary};
 
 /// WebRTC signaling payloads exchanged between clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -332,6 +332,13 @@ pub enum MaitreDToBanquette {
     },
     /// Keep-alive ping from `maitre-d`.
     Ping,
+    /// Request export snapshot of room data and log chunks.
+    ExportRoom {
+        /// Request correlation ID.
+        request_id: u64,
+        /// Calling account ID, if authenticated.
+        caller_account: Option<u64>,
+    },
 }
 
 /// Outgoing responses and broadcasts from `banquette` to `maitre-d`.
@@ -362,6 +369,13 @@ pub enum BanquetteToMaitreD {
     RoomTerminated {
         /// Reason for termination (e.g. idle timeout).
         reason: String,
+    },
+    /// Response containing exported room data and log chunks.
+    ExportRoomResponse {
+        /// Request correlation ID.
+        request_id: u64,
+        /// Exported room snapshot and log chunks, or an error description.
+        result: std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>,
     },
 }
 

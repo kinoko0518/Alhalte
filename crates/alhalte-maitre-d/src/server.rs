@@ -157,6 +157,17 @@ pub struct WsQuery {
     pub session_id: Option<u64>,
 }
 
+/// Query parameters for room ZIP archive export.
+#[derive(Debug, Deserialize, Default)]
+pub struct ExportZipQuery {
+    /// Export type: "full" (default) or "logs".
+    pub r#type: Option<String>,
+    /// Optional authenticated account ID.
+    pub account_id: Option<u64>,
+    /// Optional authenticated session ID.
+    pub session_id: Option<u64>,
+}
+
 /// Creates the Axum router for `alhalte-maitre-d`.
 pub fn create_router(state: AppState) -> Router {
     let mut router = Router::new()
@@ -176,7 +187,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/ws", get(ws_handler))
         .route("/ws/room/{room_id}", get(ws_room_handler))
         .route("/room/{room_id}", get(ws_room_handler))
-        .route("/room/{room_id}/ws", get(ws_room_handler));
+        .route("/room/{room_id}/ws", get(ws_room_handler))
+        // ZIP export endpoints
+        .route(
+            "/api/room/{room_id}/export/zip",
+            get(export_room_zip_handler),
+        )
+        .route("/room/{room_id}/export/zip", get(export_room_zip_handler));
 
     #[cfg(debug_assertions)]
     {
@@ -739,4 +756,102 @@ async fn handle_websocket(
 
     outgoing_task.abort();
     bridge.unregister_client(client_id).await;
+}
+
+/// Handles `GET /api/room/{room_id}/export/zip` and `GET /room/{room_id}/export/zip`.
+async fn export_room_zip_handler(
+    State(state): State<AppState>,
+    AxumPath(room_id): AxumPath<u64>,
+    Query(q): Query<ExportZipQuery>,
+) -> Response {
+    let export_type = q.r#type.as_deref().unwrap_or("full");
+    if export_type != "full" && export_type != "logs" {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "Invalid export type. Must be 'full' or 'logs'"
+            })),
+        )
+            .into_response();
+    }
+
+    let caller_account = match (q.account_id, q.session_id) {
+        (Some(account_id), Some(session_id)) => {
+            match state.db.is_session_valid(account_id, session_id) {
+                Ok(true) => Some(account_id),
+                Ok(false) => {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({ "error": "Invalid session or account" })),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+        (None, None) => None,
+        _ => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({
+                    "error": "Both account_id and session_id must be provided together"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let admin_account = caller_account.unwrap_or(1);
+    let bridge = state
+        .room_manager
+        .get_or_create_room(room_id, admin_account)
+        .await;
+
+    let (mut room_data, chunks) = match bridge.export_room(caller_account).await {
+        Ok(data) => data,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    if export_type == "logs" {
+        for scene in room_data.scenes.values_mut() {
+            scene.states.clear();
+        }
+    }
+
+    let zip_bytes = match alhalte_kitchen::export_room_to_zip(&room_data, &chunks, None) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let filename = format!("room_{room_id}_{export_type}.zip");
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/zip"),
+    );
+    if let Ok(cd) =
+        axum::http::HeaderValue::try_from(format!("attachment; filename=\"{filename}\""))
+    {
+        headers.insert(axum::http::header::CONTENT_DISPOSITION, cd);
+    }
+
+    (StatusCode::OK, headers, zip_bytes).into_response()
 }

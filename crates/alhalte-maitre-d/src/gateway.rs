@@ -3,18 +3,24 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alhalte_banquette::{
-    BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
+    BanquetteToMaitreD, ClientFrame, LogChunk, MaitreDToBanquette, ProtocolCodec, RoomData,
+    ServerFrame,
 };
 use futures_util::{SinkExt, StreamExt};
+use tin::TinId;
 use tokio::net::UnixStream;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::codec::Framed;
 
 use crate::error::{MaitreDError, Result};
 use crate::spawner::BanquetteSpawner;
+
+type ExportResponseSender =
+    oneshot::Sender<std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>>;
 
 /// Active bidirectional bridge connecting WebSocket clients in a room with a `banquette` process.
 pub struct RoomBridge {
@@ -26,6 +32,10 @@ pub struct RoomBridge {
     client_scenes: Arc<RwLock<HashMap<u64, String>>>,
     /// Unbounded sender queue into the banquette UNIX socket.
     to_banquette_tx: mpsc::UnboundedSender<MaitreDToBanquette>,
+    /// Pending export snapshot response senders.
+    pending_exports: Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
+    /// Monotonic counter for export request IDs.
+    export_counter: Arc<AtomicU64>,
 }
 
 impl RoomBridge {
@@ -40,11 +50,14 @@ impl RoomBridge {
     ) -> Self {
         let clients = Arc::new(RwLock::new(HashMap::new()));
         let client_scenes = Arc::new(RwLock::new(HashMap::new()));
+        let pending_exports = Arc::new(RwLock::new(HashMap::new()));
+        let export_counter = Arc::new(AtomicU64::new(1));
         let (to_banquette_tx, mut to_banquette_rx) =
             mpsc::unbounded_channel::<MaitreDToBanquette>();
 
         let bridge_clients = Arc::clone(&clients);
         let bridge_scenes = Arc::clone(&client_scenes);
+        let bridge_exports = Arc::clone(&pending_exports);
 
         tokio::spawn(async move {
             tracing::info!("Launching banquette for room {room_id}...");
@@ -95,8 +108,13 @@ impl RoomBridge {
             while let Some(item) = reader.next().await {
                 match item {
                     Ok(frame) => {
-                        Self::dispatch_banquette_frame(frame, &bridge_clients, &bridge_scenes)
-                            .await;
+                        Self::dispatch_banquette_frame(
+                            frame,
+                            &bridge_clients,
+                            &bridge_scenes,
+                            &bridge_exports,
+                        )
+                        .await;
                     }
                     Err(e) => {
                         tracing::error!(
@@ -109,6 +127,10 @@ impl RoomBridge {
 
             write_task.abort();
             tracing::info!("Banquette bridge for room {room_id} terminated");
+            {
+                let mut pending = bridge_exports.write().await;
+                pending.clear();
+            }
             on_terminated(room_id);
         });
 
@@ -117,6 +139,8 @@ impl RoomBridge {
             clients,
             client_scenes,
             to_banquette_tx,
+            pending_exports,
+            export_counter,
         }
     }
 
@@ -140,11 +164,12 @@ impl RoomBridge {
         )))
     }
 
-    /// Dispatches frames received from `banquette` to connected WebSocket clients.
+    /// Dispatches frames received from `banquette` to connected WebSocket clients and pending queries.
     async fn dispatch_banquette_frame(
         frame: BanquetteToMaitreD,
         clients: &Arc<RwLock<HashMap<u64, mpsc::Sender<ServerFrame>>>>,
         client_scenes: &Arc<RwLock<HashMap<u64, String>>>,
+        pending_exports: &Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
     ) {
         match frame {
             BanquetteToMaitreD::SendToClient { client_id, frame } => {
@@ -183,6 +208,12 @@ impl RoomBridge {
                             message: reason.clone(),
                         })
                         .await;
+                }
+            }
+            BanquetteToMaitreD::ExportRoomResponse { request_id, result } => {
+                let mut pending = pending_exports.write().await;
+                if let Some(tx) = pending.remove(&request_id) {
+                    let _ = tx.send(result);
                 }
             }
         }
@@ -251,6 +282,45 @@ impl RoomBridge {
         let _ = self
             .to_banquette_tx
             .send(MaitreDToBanquette::ClientMessage { client_id, frame });
+    }
+
+    /// Requests an export snapshot from the room's `banquette` process.
+    pub async fn export_room(
+        &self,
+        caller_account: Option<u64>,
+    ) -> Result<(RoomData, Vec<(TinId, LogChunk)>)> {
+        let req_id = self.export_counter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_exports.write().await;
+            pending.insert(req_id, tx);
+        }
+
+        if let Err(e) = self.to_banquette_tx.send(MaitreDToBanquette::ExportRoom {
+            request_id: req_id,
+            caller_account,
+        }) {
+            let mut pending = self.pending_exports.write().await;
+            pending.remove(&req_id);
+            return Err(MaitreDError::Banquette(format!(
+                "Failed to send ExportRoom to banquette: {e}"
+            )));
+        }
+
+        match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Err(err_msg))) => Err(MaitreDError::Banquette(err_msg)),
+            Ok(Err(_)) => Err(MaitreDError::Banquette(
+                "Export response channel dropped".to_string(),
+            )),
+            Err(_) => {
+                let mut pending = self.pending_exports.write().await;
+                pending.remove(&req_id);
+                Err(MaitreDError::Banquette(
+                    "Export request timed out".to_string(),
+                ))
+            }
+        }
     }
 }
 
