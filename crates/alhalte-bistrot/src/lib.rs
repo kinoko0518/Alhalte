@@ -58,7 +58,7 @@ pub use args::{
 pub use config::{
     ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, DEFAULT_ARGENTERIE_PORT,
     DEFAULT_CHUNK_SIZE_EXPONENT, DEFAULT_DATA_DIR, DEFAULT_DOMAIN, DEFAULT_HOST,
-    DEFAULT_SOCKET_DIR, MaitreDConfig, RestaurantConfig,
+    DEFAULT_SOCKET_DIR, ExtensionConfig, ExtensionManifestEntry, MaitreDConfig, RestaurantConfig,
 };
 pub use error::{BistrotError, Result};
 pub use rops::{

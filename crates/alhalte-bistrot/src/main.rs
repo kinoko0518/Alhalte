@@ -80,6 +80,13 @@ enum Commands {
     /// Validate configuration and print parsed summary.
     Validate,
 
+    /// Stage compiled extensions into output directory and generate manifest.json.
+    StageExtensions {
+        /// Target directory to copy .wasm files and write manifest.json.
+        #[arg(short, long)]
+        output_dir: PathBuf,
+    },
+
     /// Encrypt a plain Bistrot.toml using an age public recipient key.
     Encrypt {
         /// Age recipient public key (e.g. `age1...`).
@@ -197,6 +204,26 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
                 "  banquette N:   {} (chunk size: {})",
                 config.banquette.chunk_size_exponent,
                 1 << config.banquette.chunk_size_exponent
+            );
+            println!("  Extensions:    {} configured", config.extensions.len());
+            for ext in &config.extensions {
+                println!(
+                    "    - [{}] {} (path: {}, enabled: {})",
+                    ext.id,
+                    ext.name.as_deref().unwrap_or(&ext.id),
+                    ext.path.display(),
+                    ext.enabled
+                );
+            }
+        }
+        Commands::StageExtensions { output_dir } => {
+            let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
+            let base_dir = cli.config.parent();
+            let entries = config.stage_extensions_with_base(&output_dir, base_dir)?;
+            println!(
+                "Successfully staged {} extension(s) to {}",
+                entries.len(),
+                output_dir.display()
             );
         }
         Commands::Encrypt { recipient, output } => {

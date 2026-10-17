@@ -20,6 +20,10 @@ pub enum BistrotError {
     #[error("TOML serialization error: {0}")]
     TomlSer(#[from] toml::ser::Error),
 
+    /// Error during JSON serialization or deserialization.
+    #[error("JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+
     /// Error during rops decryption.
     #[error("ROPS decryption error: {0}")]
     RopsDecrypt(String),
