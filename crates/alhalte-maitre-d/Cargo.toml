@@ -1,0 +1,40 @@
+[package]
+name = "alhalte-maitre-d"
+version = "0.1.0"
+edition = "2024"
+description = "Authentication, SQLite account/session management, and WebSocket room demuxer for Alhalte"
+repository = "https://github.com/kinoko0518/Alhalte"
+
+[dependencies]
+tin = { path = "../tin-rs" }
+alhalte-banquette = { path = "../alhalte-banquette" }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "http2", "json", "query", "ws"] }
+tokio = { version = "1.43", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+postcard = { version = "1.0", features = ["alloc"] }
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+xxhash-rust = { version = "0.8", features = ["xxh64", "const_xxh64"] }
+bytes = "1.10"
+hex = "0.4"
+futures-util = { version = "0.3", features = ["sink"] }
+chrono = { version = "0.4", features = ["serde"] }
+aes-gcm-siv = "0.11"
+blake3 = "1.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rand = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+http = "1.2"
+
+[dev-dependencies]
+alhalte-cellar = { path = "../alhalte-cellar" }
+tempfile = "3"
+tokio-tungstenite = "0.26"
+http-body-util = "0.1"
