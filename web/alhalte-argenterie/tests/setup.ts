@@ -52,6 +52,36 @@ if (typeof window !== 'undefined') {
     }
   }
 
+  // Mock HTMLElement Popover API methods (used by Noph UI Menu)
+  if (typeof HTMLElement !== 'undefined') {
+    const popoverOpenSet = new WeakSet<Element>();
+    const originalMatches = HTMLElement.prototype.matches;
+    HTMLElement.prototype.matches = function (selector: string) {
+      if (selector === ':popover-open') {
+        return popoverOpenSet.has(this);
+      }
+      return originalMatches.call(this, selector);
+    };
+    if (!HTMLElement.prototype.showPopover) {
+      HTMLElement.prototype.showPopover = function () {
+        popoverOpenSet.add(this);
+        const event = new Event('toggle') as any;
+        event.newState = 'open';
+        event.oldState = 'closed';
+        this.dispatchEvent(event);
+      };
+    }
+    if (!HTMLElement.prototype.hidePopover) {
+      HTMLElement.prototype.hidePopover = function () {
+        popoverOpenSet.delete(this);
+        const event = new Event('toggle') as any;
+        event.newState = 'closed';
+        event.oldState = 'open';
+        this.dispatchEvent(event);
+      };
+    }
+  }
+
   // Mock Element pointer capture methods
   if (typeof Element !== 'undefined') {
     if (!Element.prototype.setPointerCapture) {

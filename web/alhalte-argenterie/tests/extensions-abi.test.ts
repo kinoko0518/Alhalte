@@ -166,8 +166,11 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     const checkbox = target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-ext-1"]');
     expect(checkbox?.disabled).toBe(true);
 
-    const delBtn = target.querySelector<HTMLButtonElement>('[data-testid="ext-delete-btn-ext-1"]');
-    expect(delBtn?.disabled).toBe(true);
+    const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="ext-more-btn-ext-1"]');
+    expect(moreBtn?.disabled).toBe(true);
+
+    const delBtn = target.querySelector('[data-testid="ext-delete-btn-ext-1"]');
+    expect(delBtn?.getAttribute('aria-disabled') === 'true' || delBtn?.classList.contains('disabled')).toBe(true);
 
     unmount(instanceNonAdmin);
     target.remove();

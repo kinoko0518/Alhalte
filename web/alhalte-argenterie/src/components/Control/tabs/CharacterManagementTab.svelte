@@ -5,7 +5,7 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> キャラクタータブ`
    */
-  import { Button, Card, Carousel, CarouselItem, IconButton, Switch, TextField } from 'noph-ui';
+  import { Button, Carousel, CarouselItem, IconButton, List, ListItem, Switch, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character } from '../../../types/index.js';
   import {
@@ -182,68 +182,66 @@
       ...
     ］
   -->
-  <div class="character-list" data-testid="character-list">
+  <List class="character-list" data-testid="character-list">
     {#each characters as char (char.id)}
-      <div class="character-card-wrapper" data-testid="character-card-{char.id}">
-        <Card variant="outlined">
-          <div class="char-card-body">
-            <!-- Icon -->
-            <button
-              type="button"
-              class="char-avatar-btn"
-              onclick={() => openEdit(char)}
-              title="キャラクター編集"
-              data-testid="edit-char-btn-{char.id}"
-            >
-              <img
-                class="char-list-avatar"
-                src={char.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
-                alt={char.name}
-              />
-            </button>
+      <ListItem
+        type="text"
+        onclick={() => openEdit(char)}
+        class="character-card-wrapper"
+        data-testid="character-card-{char.id}"
+      >
+        {#snippet avatar()}
+          <button
+            type="button"
+            class="char-avatar-btn"
+            onclick={(e) => {
+              e.stopPropagation();
+              openEdit(char);
+            }}
+            title="キャラクター編集"
+            data-testid="edit-char-btn-{char.id}"
+          >
+            <img
+              class="char-list-avatar"
+              src={char.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
+              alt={char.name}
+            />
+          </button>
+        {/snippet}
 
-            <!-- Name and 120-char truncated description -->
-            <div
-              class="char-text-block"
-              onclick={() => openEdit(char)}
-              role="button"
-              tabindex="0"
-              onkeydown={(e) => e.key === 'Enter' && openEdit(char)}
-            >
-              <span class="char-name-label" data-testid="char-name-{char.id}">{char.name}</span>
-              <p class="char-desc-label" data-testid="char-desc-{char.id}">
-                {truncateDescription(char.description)}
-              </p>
-            </div>
+        <span class="char-name-label" data-testid="char-name-{char.id}">{char.name}</span>
 
-            <!-- Action buttons: Place as Piece & Delete -->
-            <div class="char-actions">
-              <IconButton
-                variant={char.placedAsPiece ? 'filled' : 'tonal'}
-                toggle
-                selected={!!char.placedAsPiece}
-                onclick={() => onTogglePiece?.(char.id)}
-                aria-label={char.placedAsPiece ? '駒を解除' : '駒として配置'}
-                title={char.placedAsPiece ? '駒を解除' : '駒として配置'}
-                data-testid="piece-char-btn-{char.id}"
-              >
-                <Icon>{char.placedAsPiece ? 'person_pin_circle' : 'place_item'}</Icon>
-              </IconButton>
-              <IconButton
-                variant="text"
-                onclick={() => openDeleteConfirm(char)}
-                aria-label="削除"
-                title="削除"
-                data-testid="delete-char-btn-{char.id}"
-              >
-                <Icon>delete</Icon>
-              </IconButton>
-            </div>
+        {#snippet supportingText()}
+          <span class="char-desc-label" data-testid="char-desc-{char.id}">
+            {truncateDescription(char.description)}
+          </span>
+        {/snippet}
+
+        {#snippet end()}
+          <div class="char-actions" onclick={(e) => e.stopPropagation()}>
+            <IconButton
+              variant="tonal"
+              onclick={() => onTogglePiece?.(char.id)}
+              aria-label="駒として配置"
+              title="駒として配置"
+              data-testid="piece-char-btn-{char.id}"
+            >
+              <Icon>person_pin_circle</Icon>
+            </IconButton>
+            <IconButton
+              variant="text"
+              onclick={() => openDeleteConfirm(char)}
+              aria-label="駒を削除"
+              title="駒を削除"
+              data-testid="delete-char-btn-{char.id}"
+            >
+              <Icon>delete</Icon>
+            </IconButton>
           </div>
-        </Card>
-      </div>
+        {/snippet}
+      </ListItem>
     {/each}
-  </div>
+  </List>
 
   <!-- Character Edit Panel Overlay:
     ［
@@ -575,35 +573,40 @@
   .character-list {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 8px;
+    width: 100%;
+    padding: 0;
+    margin: 0;
+    list-style: none;
   }
-  .char-card-body {
-    padding: 12px;
-    display: flex;
-    align-items: center;
-    gap: 12px;
+  :global(.character-card-wrapper.np-item) {
+    width: 100%;
+    border-radius: var(--np-shape-corner-medium, 12px);
+    background: var(--np-color-surface-container-low);
+    box-sizing: border-box;
+    cursor: pointer;
+    transition: background-color var(--np-motion-expressive-fast-effects, 150ms ease);
+  }
+  :global(.character-card-wrapper.np-item:hover) {
+    background: var(--np-color-surface-container);
   }
   .char-avatar-btn {
     background: none;
     border: none;
     padding: 0;
     cursor: pointer;
-    flex-shrink: 0;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
   }
   .char-list-avatar {
-    width: 48px;
-    height: 48px;
-    border-radius: 10px;
+    width: 100%;
+    height: 100%;
+    border-radius: 50%;
     object-fit: cover;
     background: var(--np-color-surface-container-highest);
-  }
-  .char-text-block {
-    flex: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    cursor: pointer;
   }
   .char-name-label {
     font-weight: 600;
@@ -622,7 +625,7 @@
     margin-left: auto;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 4px;
     flex-shrink: 0;
   }
   .edit-panel-overlay {

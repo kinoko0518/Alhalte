@@ -93,7 +93,7 @@ describe('Character Management & Edit Panel', () => {
     expect(actionsContainer?.contains(pieceBtn)).toBe(true);
     expect(actionsContainer?.contains(deleteBtn)).toBe(true);
     expect(pieceBtn?.classList.contains('np-icon-button')).toBe(true);
-    expect(pieceBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('place_item');
+    expect(pieceBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('person_pin_circle');
     pieceBtn?.click();
     expect(pieceToggledId).toBe('char-mage');
 
