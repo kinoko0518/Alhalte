@@ -20,6 +20,7 @@ export * from './utils/backgroundDimension.js';
 export * from './utils/character.js';
 export * from './utils/generast.js';
 export * from './utils/connection.js';
+export * from './utils/roomSocket.js';
 
 // WebAssembly ABI Host Runner
 export * from './wasm/runner.js';
