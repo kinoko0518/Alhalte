@@ -1,0 +1,29 @@
+[package]
+name = "alhalte-cellar"
+version = "0.1.0"
+edition = "2024"
+description = "Content-addressable deduplicated storage service and GC for Alhalte"
+repository = "https://github.com/kinoko0518/Alhalte"
+
+[dependencies]
+tin = { path = "../tin-rs" }
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1", "json", "query"] }
+tokio = { version = "1.43", features = ["full"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+hex = "0.4"
+async-trait = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+http = "1.2"
+bytes = "1.10"
+futures-util = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+http-body-util = "0.1"
