@@ -128,3 +128,97 @@ export function removeVisitedRoom(roomId: string, storage?: Storage): void {
     // Ignore corrupt store
   }
 }
+
+/**
+ * Parses a room invitation URL or path and extracts `roomId`, `roomKeyHex`, and `roomUrl`.
+ *
+ * Supports:
+ * - `/rooms/<roomId>#<roomKeyHex>`
+ * - `/room/<roomId>#<roomKeyHex>`
+ * - `/?room=<roomId>#<roomKeyHex>`
+ */
+export function parseRoomUrl(urlStr: string): {
+  roomId: string;
+  roomKeyHex: string;
+  roomUrl: string;
+} | null {
+  if (!urlStr || typeof urlStr !== 'string') return null;
+
+  try {
+    const url = new URL(urlStr, 'https://alhalte.local');
+    let roomId: string | null = null;
+
+    const pathMatch = url.pathname.match(/^\/rooms?\/([^/?#]+)\/?$/);
+    if (pathMatch && pathMatch[1]) {
+      roomId = decodeURIComponent(pathMatch[1]);
+    } else {
+      const queryRoom = url.searchParams.get('room');
+      if (queryRoom && queryRoom.trim().length > 0) {
+        roomId = queryRoom.trim();
+      }
+    }
+
+    if (!roomId) return null;
+
+    const roomKeyHex = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
+    const isAbsolute = /^https?:\/\//i.test(urlStr);
+
+    return {
+      roomId,
+      roomKeyHex,
+      roomUrl: isAbsolute ? url.href : `${url.pathname}${url.search}${url.hash}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Inspects the current browser Location (or supplied Location), parses any room URL,
+ * restores or registers the VisitedRoom entry in localStorage, and returns it.
+ */
+export function resolveRoomFromLocation(
+  loc?: Pick<Location, 'href'>,
+  storage?: Storage,
+): VisitedRoom | null {
+  const targetLoc = loc ?? (typeof window !== 'undefined' ? window.location : undefined);
+  if (!targetLoc || !targetLoc.href) return null;
+
+  const parsed = parseRoomUrl(targetLoc.href);
+  if (!parsed) return null;
+
+  const store = storage ?? (typeof localStorage !== 'undefined' ? localStorage : undefined);
+  let existing: VisitedRoom | undefined;
+
+  if (store) {
+    const raw = store.getItem(LOCAL_STORAGE_VISITED_ROOMS_KEY);
+    if (raw) {
+      try {
+        const list = JSON.parse(raw) as VisitedRoom[];
+        if (Array.isArray(list)) {
+          existing = list.find((item) => item.id === parsed.roomId);
+        }
+      } catch {
+        // Ignore corrupt store
+      }
+    }
+  }
+
+  const resolvedRoom: VisitedRoom = existing
+    ? {
+        ...existing,
+        url: targetLoc.href,
+        lastVisited: Date.now(),
+      }
+    : {
+        id: parsed.roomId,
+        name: `Room ${parsed.roomId.slice(0, 8)}`,
+        url: targetLoc.href,
+        lastVisited: Date.now(),
+        isAdmin: false,
+      };
+
+  saveVisitedRoom(resolvedRoom, store);
+  return resolvedRoom;
+}
+

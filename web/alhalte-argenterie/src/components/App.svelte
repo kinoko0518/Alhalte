@@ -11,6 +11,7 @@
    */
   import { Sheet } from 'noph-ui';
   import type { Character, ExtensionItem, Scene, VisitedRoom } from '../types/index.js';
+  import { resolveRoomFromLocation } from '../utils/home.js';
   import { ChunkLogManager } from '../utils/log.js';
   import type { SceneMovementEvent } from '../utils/sceneGraph.js';
   import { createDefaultJuices, inheritJuices, moveMemberToScene } from '../utils/sceneSettings.js';
@@ -34,7 +35,9 @@
     isAdmin?: boolean;
   } = $props();
 
-  let currentRoom = $state<VisitedRoom | null>(initialRoom ?? null);
+  let currentRoom = $state<VisitedRoom | null>(
+    initialRoom !== undefined ? initialRoom : resolveRoomFromLocation(),
+  );
   let isLandscape = $state(
     typeof window !== 'undefined' ? window.innerWidth >= window.innerHeight : true,
   );
@@ -78,11 +81,22 @@
     }
   }
 
+  function syncRoomFromLocation() {
+    if (initialRoom !== undefined) return;
+    currentRoom = resolveRoomFromLocation();
+  }
+
   $effect(() => {
     updateOrientation();
     if (typeof window !== 'undefined') {
       window.addEventListener('resize', updateOrientation);
-      return () => window.removeEventListener('resize', updateOrientation);
+      window.addEventListener('popstate', syncRoomFromLocation);
+      window.addEventListener('hashchange', syncRoomFromLocation);
+      return () => {
+        window.removeEventListener('resize', updateOrientation);
+        window.removeEventListener('popstate', syncRoomFromLocation);
+        window.removeEventListener('hashchange', syncRoomFromLocation);
+      };
     }
   });
 
@@ -118,6 +132,7 @@
   }
 
   function handleMoveMember(characterId: string, targetSceneName: string) {
+    const prevScene = scenes.find((s) => s.members.includes(characterId)) || currentScene;
     const res = moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
     scenes = res.updatedScenes;
     currentSceneId = res.targetScene.id;
@@ -127,7 +142,7 @@
     movements.push({
       characterId,
       characterName: char?.name || 'Unknown',
-      fromSceneId: currentScene.id,
+      fromSceneId: prevScene.id,
       toSceneId: res.targetScene.id,
       timestamp: Math.floor(Date.now() / 1000),
     });

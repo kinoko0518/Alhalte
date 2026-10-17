@@ -60,6 +60,20 @@
     }
   }
 
+  function pushRoomToHistory(room: VisitedRoom) {
+    if (typeof window === 'undefined' || !window.history?.pushState) return;
+    try {
+      const parsed = new URL(room.url, window.location.origin);
+      const targetUrl =
+        parsed.origin === window.location.origin
+          ? parsed.href
+          : `${parsed.pathname}${parsed.search}${parsed.hash}`;
+      window.history.pushState({ roomId: room.id }, '', targetUrl);
+    } catch {
+      // Ignore history errors in restricted environments
+    }
+  }
+
   function handleJoinRoom() {
     if (!generatedUrlData) return;
     const room: VisitedRoom = {
@@ -72,10 +86,13 @@
     saveVisitedRoom(room);
     loadRooms();
     isCreateDialogOpen = false;
+    pushRoomToHistory(room);
     onEnterRoom?.(room);
   }
 
   function handleSelectRoom(room: VisitedRoom) {
+    saveVisitedRoom(room);
+    pushRoomToHistory(room);
     onEnterRoom?.(room);
   }
 </script>
