@@ -23,7 +23,41 @@ export function createDefaultJuices(): Juices {
     bgm2Volume: 0.8,
     bgm3: undefined,
     bgm3Volume: 0.8,
+    bgmSlots: [
+      { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
+      { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
+      { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+    ],
   };
+}
+
+/**
+ * Returns normalized BgmSlot array from Juices, generating slots from legacy bgm1..3 if needed.
+ */
+export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
+  if (juices.bgmSlots && juices.bgmSlots.length > 0) {
+    return juices.bgmSlots;
+  }
+  return [
+    {
+      slot: 1,
+      tinId: juices.bgm1 ?? null,
+      volume: juices.bgm1Volume ?? 0.8,
+      isPlaying: Boolean(juices.bgm1),
+    },
+    {
+      slot: 2,
+      tinId: juices.bgm2 ?? null,
+      volume: juices.bgm2Volume ?? 0.8,
+      isPlaying: Boolean(juices.bgm2),
+    },
+    {
+      slot: 3,
+      tinId: juices.bgm3 ?? null,
+      volume: juices.bgm3Volume ?? 0.8,
+      isPlaying: Boolean(juices.bgm3),
+    },
+  ];
 }
 
 /**
@@ -32,7 +66,7 @@ export function createDefaultJuices(): Juices {
  * ARCHITECTURE.md: "トグル”Juicesを継承”" / "存在しないシーン名が割り振られていた場合、Juicesを継承して新規作成する。"
  */
 export function inheritJuices(source: Juices): Juices {
-  return {
+  const result: Juices = {
     bgImage: source.bgImage,
     bgWidth: source.bgWidth,
     bgHeight: source.bgHeight,
@@ -44,6 +78,10 @@ export function inheritJuices(source: Juices): Juices {
     bgm3: source.bgm3,
     bgm3Volume: source.bgm3Volume,
   };
+  if (source.bgmSlots) {
+    result.bgmSlots = source.bgmSlots.map((s) => ({ ...s }));
+  }
+  return result;
 }
 
 export {
