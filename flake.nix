@@ -44,9 +44,19 @@
             pkgs.curl
             pkgs.xdg-utils
             pkgs.coreutils
+            llvm.clang-unwrapped
+            llvm.llvm
           ];
           text = ''
             export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.sqlite.dev}/lib/pkgconfig:''${PKG_CONFIG_PATH:-}"
+            export WASI_SYSROOT="${wasiSysroot}"
+            export WASI_LIBDIR="${wasiSysroot}/lib/wasm32-wasip1"
+            export CC_wasm32_unknown_unknown="${llvm.clang-unwrapped}/bin/clang"
+            export AR_wasm32_unknown_unknown="${llvm.llvm}/bin/llvm-ar"
+            export CFLAGS_wasm32_unknown_unknown="${wasiCflags}"
+            export CC_wasm32_wasip1="${llvm.clang-unwrapped}/bin/clang"
+            export AR_wasm32_wasip1="${llvm.llvm}/bin/llvm-ar"
+            export CFLAGS_wasm32_wasip1="${wasiCflags}"
 
             CONFIG="./Bistrot.toml"
             NO_BROWSER=false
@@ -60,6 +70,10 @@
                 --no-browser)
                   NO_BROWSER=true
                   shift
+                  ;;
+                --help|-h)
+                  echo "Usage: nix run .#bistrot -- [--config <path>] [--no-browser]"
+                  exit 0
                   ;;
                 *)
                   echo "Unknown option: $1" >&2
