@@ -1,0 +1,21 @@
+/* Expressive CSS: Syntax error and evaluation error indicators */
+
+.saignant-syntax-error {
+  color: var(--md-sys-color-on-error-container, #410002);
+  background-color: var(--md-sys-color-error-container, #ffdad6);
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  padding: 1px 8px;
+  border-inline-start: 3px solid var(--md-sys-color-error, #ba1a1a);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}
+
+.saignant-diceroll--error {
+  color: var(--md-sys-color-on-error-container, #410002);
+  background-color: var(--md-sys-color-error-container, #ffdad6);
+  border-radius: var(--md-sys-shape-corner-extra-small, 4px);
+  padding: 1px 8px;
+  border-inline-start: 3px solid var(--md-sys-color-error, #ba1a1a);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+}

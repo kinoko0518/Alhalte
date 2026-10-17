@@ -1,0 +1,38 @@
+/* Structural CSS: Indent, hanging indent, grounded alignment, kerning, and horizontal-in-vertical layout */
+
+.saignant-indent {
+  display: block;
+  box-sizing: border-box;
+  margin-inline-start: var(--saignant-indent, 0em);
+}
+
+.saignant-hanging {
+  display: block;
+  box-sizing: border-box;
+  padding-inline-start: var(--saignant-hanging-indent, 0em);
+  text-indent: calc(-1 * var(--saignant-hanging-wrap, 0em));
+}
+
+.saignant-grounded {
+  display: block;
+  box-sizing: border-box;
+  margin-block-start: auto;
+  align-self: flex-end;
+  vertical-align: bottom;
+}
+
+.saignant-kerning {
+  display: block;
+  box-sizing: border-box;
+  line-break: anywhere;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  max-inline-size: calc(var(--saignant-kerning-chars, 80) * 1em);
+}
+
+.saignant-h-in-v {
+  display: inline-block;
+  text-combine-upright: all;
+  -webkit-text-combine: horizontal;
+  writing-mode: horizontal-tb;
+}

@@ -1,0 +1,28 @@
+/* Structural CSS: Color pills and spoiler hidden text */
+
+.saignant-pill {
+  display: inline-block;
+  vertical-align: baseline;
+  box-sizing: border-box;
+}
+
+.saignant-text-color {
+  display: inline;
+}
+
+.saignant-hidden {
+  display: inline;
+  cursor: pointer;
+}
+
+.saignant-hidden[data-spoiler="true"] {
+  filter: blur(4px);
+  user-select: none;
+}
+
+.saignant-hidden[data-spoiler="true"]:hover,
+.saignant-hidden[data-spoiler="true"]:focus-visible,
+.saignant-hidden[data-spoiler="true"].is-revealed {
+  filter: none;
+  user-select: auto;
+}

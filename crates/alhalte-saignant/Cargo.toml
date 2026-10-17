@@ -1,0 +1,15 @@
+[package]
+name = "alhalte-saignant"
+version = "0.1.0"
+edition = "2024"
+description = "Log-to-HTML renderer and Material 3 Expressive styling for Alhalte"
+repository = "https://github.com/kinoko0518/Alhalte"
+
+[dependencies]
+tin = { path = "../tin-rs" }
+generast = { path = "../generast-rs" }
+thiserror = "2.0"
+serde = { version = "1.0", features = ["derive", "alloc"] }
+postcard = { version = "1.0", features = ["alloc"] }
+
+[dev-dependencies]

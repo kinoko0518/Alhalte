@@ -1,0 +1,68 @@
+/* Structural CSS: Log entry, avatar, header, and content layout */
+
+.saignant-log-entry {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  box-sizing: border-box;
+  min-inline-size: 0;
+  inline-size: 100%;
+}
+
+.saignant-log-icon {
+  flex-shrink: 0;
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.saignant-log-avatar {
+  display: block;
+  inline-size: 40px;
+  block-size: 40px;
+  object-fit: cover;
+}
+
+.saignant-log-avatar-placeholder {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: 40px;
+  block-size: 40px;
+  user-select: none;
+}
+
+.saignant-log-body {
+  flex: 1 1 0%;
+  min-inline-size: 0;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+}
+
+.saignant-log-header {
+  display: flex;
+  flex-direction: row;
+  align-items: baseline;
+  flex-wrap: wrap;
+  box-sizing: border-box;
+}
+
+.saignant-log-speaker {
+  display: inline-block;
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+.saignant-log-timestamp {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+.saignant-log-content {
+  display: block;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  min-inline-size: 0;
+}
