@@ -7,7 +7,7 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    */
-  import { Button, Carousel, CarouselItem, Slider, Switch } from 'noph-ui';
+  import { Button, Carousel, CarouselItem, Slider, Switch, TextField } from 'noph-ui';
   import type { Character, Scene } from '../../../types/index.js';
   import {
     loadAssets,
@@ -218,13 +218,14 @@
   -->
   <div class="split-button-container" bind:this={sceneSplitContainer} data-testid="scene-split-container">
     <div class="scene-name-split-row">
-      <input
-        type="text"
-        class="scene-name-input-centered"
+      <TextField
+        variant="outlined"
+        label="シーン名"
         value={currentScene.name}
         oninput={handleSceneNameInput}
         data-testid="scene-name-input"
         placeholder="シーン名"
+        class="scene-name-field"
       />
       <button
         type="button"
@@ -308,27 +309,31 @@
 
       <div class="dimensions-row">
         <div class="dim-field">
-          <label for="width-input">横幅</label>
-          <input
+          <TextField
             id="width-input"
+            variant="outlined"
             type="number"
-            class="num-input"
+            label="横幅"
             placeholder="自動計算"
+            suffixText="px"
             value={inputWidth ?? ''}
             oninput={handleWidthChange}
             data-testid="bg-width-input"
+            class="dim-text-field"
           />
         </div>
         <div class="dim-field">
-          <label for="height-input">縦幅</label>
-          <input
+          <TextField
             id="height-input"
+            variant="outlined"
             type="number"
-            class="num-input"
+            label="縦幅"
             placeholder="自動計算"
+            suffixText="px"
             value={inputHeight ?? ''}
             oninput={handleHeightChange}
             data-testid="bg-height-input"
+            class="dim-text-field"
           />
         </div>
       </div>
@@ -467,14 +472,14 @@
         <h2 class="dialog-title-centered" data-testid="create-scene-title">シーンを新規作成</h2>
 
         <div class="dialog-input-row">
-          <label for="new-scene-name" class="label-text">シーン名</label>
-          <input
+          <TextField
             id="new-scene-name"
-            type="text"
-            class="text-input"
+            variant="outlined"
+            label="シーン名"
             placeholder="シーン名"
             bind:value={newSceneName}
             data-testid="new-scene-name-input"
+            class="new-scene-name-field"
           />
         </div>
 
@@ -525,12 +530,13 @@
               <span class="arrow-symbol">➔</span>
 
               <div class="split-select-wrapper">
-                <input
-                  type="text"
-                  class="scene-target-input"
-                  bind:value={memberTargetSceneNames[char.id]}
+                <TextField
+                  variant="outlined"
+                  label="シーン名"
                   placeholder="シーン名"
+                  bind:value={memberTargetSceneNames[char.id]}
                   data-testid="member-target-input-{char.id}"
+                  class="member-target-field"
                 />
                 <button
                   type="button"
@@ -642,28 +648,17 @@
   .scene-name-split-row {
     display: flex;
     align-items: center;
-    background: var(--np-color-surface-container-lowest);
-    border: 1px solid var(--np-color-outline);
-    border-radius: var(--np-shape-corner-medium);
-    overflow: hidden;
+    gap: 8px;
   }
-  .scene-name-input-centered {
+  .scene-name-split-row :global(.scene-name-field) {
     flex: 1;
-    border: none;
-    text-align: center;
-    font-size: 1.05rem;
-    font-weight: 600;
-    padding: 10px 14px;
-    outline: none;
-    background: transparent;
-    color: var(--np-color-on-surface);
   }
   .split-arrow-btn {
-    border: none;
-    background: transparent;
-    padding: 10px 14px;
+    border: 1px solid var(--np-color-outline);
+    border-radius: var(--np-shape-corner-small);
+    background: var(--np-color-surface-container);
+    padding: 14px 16px;
     cursor: pointer;
-    border-left: 1px solid var(--np-color-outline-variant);
     font-size: 0.8rem;
     color: var(--np-color-on-surface-variant);
   }
@@ -745,18 +740,8 @@
     flex-direction: column;
     gap: 4px;
   }
-  .dim-field label {
-    font-size: 0.85rem;
-    font-weight: 500;
-    color: var(--np-color-on-surface-variant);
-  }
-  .num-input {
-    padding: 8px 12px;
-    border: 1px solid var(--np-color-outline);
-    border-radius: var(--np-shape-corner-small);
-    font-size: 0.95rem;
-    background: var(--np-color-surface-container-lowest);
-    color: var(--np-color-on-surface);
+  .dim-field :global(.dim-text-field) {
+    width: 100%;
   }
   .bgm-controls {
     display: flex;
@@ -842,18 +827,8 @@
     flex-direction: column;
     gap: 6px;
   }
-  .label-text {
-    font-size: 0.9rem;
-    font-weight: 500;
-    color: var(--np-color-on-surface);
-  }
-  .text-input {
-    padding: 10px 14px;
-    border: 1px solid var(--np-color-outline);
-    border-radius: var(--np-shape-corner-small);
-    font-size: 0.95rem;
-    background: var(--np-color-surface-container-lowest);
-    color: var(--np-color-on-surface);
+  .dialog-input-row :global(.new-scene-name-field) {
+    width: 100%;
   }
   .toggle-row {
     display: flex;
@@ -906,14 +881,8 @@
     display: flex;
     align-items: center;
   }
-  .scene-target-input {
+  .split-select-wrapper :global(.member-target-field) {
     width: 100%;
-    padding: 6px 10px;
-    border: 1px solid var(--np-color-outline);
-    border-radius: var(--np-shape-corner-small);
-    font-size: 0.88rem;
-    background: var(--np-color-surface-container-lowest);
-    color: var(--np-color-on-surface);
   }
   .inline-arrow-btn {
     position: absolute;

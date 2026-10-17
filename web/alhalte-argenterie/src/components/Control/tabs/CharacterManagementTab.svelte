@@ -5,7 +5,7 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> キャラクタータブ`
    */
-  import { Button, Card, Carousel, CarouselItem, IconButton, Switch } from 'noph-ui';
+  import { Button, Card, Carousel, CarouselItem, IconButton, Switch, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character } from '../../../types/index.js';
   import {
@@ -329,55 +329,55 @@
           </div>
 
           <div class="name-init-fields">
-            <div class="field-item">
-              <label for="char-edit-name">名前</label>
-              <input
-                id="char-edit-name"
-                type="text"
-                class="single-line-input"
-                placeholder="名前"
-                bind:value={editingCharacter.name}
-                data-testid="edit-name-input"
-              />
-            </div>
+            <TextField
+              id="char-edit-name"
+              variant="outlined"
+              label="名前"
+              placeholder="名前"
+              bind:value={editingCharacter.name}
+              data-testid="edit-name-input"
+              class="char-text-field"
+            />
 
-            <div class="field-item init-field">
-              <label for="char-edit-init">イニシアチブ</label>
-              <input
-                id="char-edit-init"
-                type="number"
-                class="single-line-input"
-                placeholder="0"
-                bind:value={editingCharacter.initiative}
-                data-testid="edit-init-input"
-              />
-            </div>
+            <TextField
+              id="char-edit-init"
+              variant="outlined"
+              type="number"
+              label="イニシアチブ"
+              placeholder="0"
+              bind:value={editingCharacter.initiative}
+              data-testid="edit-init-input"
+              class="char-text-field init-field"
+            />
           </div>
         </div>
 
         <!-- Description multiline -->
         <div class="field-item">
-          <label for="char-edit-desc">説明</label>
-          <textarea
+          <TextField
             id="char-edit-desc"
-            class="multiline-input"
-            rows="3"
+            variant="outlined"
+            type="textarea"
+            minLines={3}
+            maxLines={6}
+            label="説明"
             placeholder="説明"
             bind:value={editingCharacter.description}
             data-testid="edit-description-input"
-          ></textarea>
+            class="char-text-field"
+          />
         </div>
 
         <!-- Reference single-line -->
         <div class="field-item">
-          <label for="char-edit-ref">参照</label>
-          <input
+          <TextField
             id="char-edit-ref"
-            type="text"
-            class="single-line-input"
+            variant="outlined"
+            label="参照"
             placeholder="参照URL等"
             bind:value={editingCharacter.reference}
             data-testid="edit-reference-input"
+            class="char-text-field"
           />
         </div>
 
@@ -390,27 +390,32 @@
           <div class="rows-list" data-testid="edit-status-list">
             {#each editingCharacter.statuses as st, sIdx (sIdx)}
               <div class="status-edit-row">
-                <input
-                  type="text"
-                  class="single-line-input mini-input"
+                <TextField
+                  variant="outlined"
+                  label="ラベル"
                   placeholder="ラベル"
                   bind:value={st.label}
                   data-testid="status-label-{sIdx}"
+                  class="status-label-field"
                 />
-                <input
+                <TextField
+                  variant="outlined"
                   type="number"
-                  class="single-line-input num-mini-input"
-                  placeholder="現在値"
+                  label="現在値"
+                  placeholder="0"
                   bind:value={st.current}
                   data-testid="status-current-{sIdx}"
+                  class="status-num-field"
                 />
                 <span class="slash-div">/</span>
-                <input
+                <TextField
+                  variant="outlined"
                   type="number"
-                  class="single-line-input num-mini-input"
-                  placeholder="最大値"
+                  label="最大値"
+                  placeholder="0"
                   bind:value={st.max}
                   data-testid="status-max-{sIdx}"
+                  class="status-num-field"
                 />
                 <button
                   type="button"
@@ -433,19 +438,22 @@
           <div class="rows-list" data-testid="edit-param-list">
             {#each editingCharacter.parameters as param, pIdx (pIdx)}
               <div class="param-edit-row">
-                <input
-                  type="text"
-                  class="single-line-input mini-input"
+                <TextField
+                  variant="outlined"
+                  label="ラベル"
                   placeholder="ラベル"
                   bind:value={param.label}
                   data-testid="param-label-{pIdx}"
+                  class="param-label-field"
                 />
-                <input
+                <TextField
+                  variant="outlined"
                   type="number"
-                  class="single-line-input num-mini-input"
-                  placeholder="値"
+                  label="値"
+                  placeholder="0"
                   bind:value={param.value}
                   data-testid="param-value-{pIdx}"
+                  class="param-num-field"
                 />
                 <button
                   type="button"
@@ -461,15 +469,18 @@
 
         <!-- Chat Palette multiline -->
         <div class="field-item">
-          <label for="char-edit-palette">チャットパレット</label>
-          <textarea
+          <TextField
             id="char-edit-palette"
-            class="multiline-input palette-area"
-            rows="5"
+            variant="outlined"
+            type="textarea"
+            minLines={5}
+            maxLines={10}
+            label="チャットパレット"
             placeholder="チャットパレット（1行に1コマンド）"
             bind:value={editingCharacter.chatPalette}
             data-testid="edit-chat-palette-input"
-          ></textarea>
+            class="char-text-field palette-field"
+          />
         </div>
 
         <!-- Toggle: ステータスを秘匿 -->
@@ -694,27 +705,16 @@
     gap: 4px;
     flex: 1;
   }
-  .init-field {
-    max-width: 120px;
+  .name-init-fields :global(.char-text-field) {
+    flex: 1;
   }
-  .single-line-input {
-    padding: 8px 12px;
-    border: 1px solid var(--np-color-outline);
-    border-radius: 8px;
-    font-size: 0.9rem;
-    background: var(--np-color-surface-container-lowest);
-    color: var(--np-color-on-surface);
+  .name-init-fields :global(.init-field) {
+    max-width: 140px;
   }
-  .multiline-input {
-    padding: 8px 12px;
-    border: 1px solid var(--np-color-outline);
-    border-radius: 8px;
-    font-size: 0.9rem;
-    font-family: inherit;
-    background: var(--np-color-surface-container-lowest);
-    color: var(--np-color-on-surface);
+  .field-item :global(.char-text-field) {
+    width: 100%;
   }
-  .palette-area {
+  :global(.palette-field textarea) {
     font-family: monospace;
   }
   .sub-section {
@@ -754,11 +754,14 @@
     align-items: center;
     gap: 6px;
   }
-  .mini-input {
-    flex: 1;
+  .status-edit-row :global(.status-label-field),
+  .param-edit-row :global(.param-label-field) {
+    flex: 2;
   }
-  .num-mini-input {
-    width: 70px;
+  .status-edit-row :global(.status-num-field),
+  .param-edit-row :global(.param-num-field) {
+    flex: 1;
+    min-width: 80px;
   }
   .slash-div {
     font-weight: 700;
