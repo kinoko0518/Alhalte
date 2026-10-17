@@ -5,18 +5,26 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> キャラクタータブ`
    */
-  import { Button, Card, Switch } from 'noph-ui';
+  import { Button, Card, Carousel, CarouselItem, Switch } from 'noph-ui';
   import type { Character } from '../../../types/index.js';
+  import {
+    loadAssets,
+    subscribeAssets,
+    type AssetItem,
+  } from '../../../utils/assets.js';
   import { truncateDescription } from '../../../utils/character.js';
+  import AssetPickerModal from '../AssetPickerModal.svelte';
 
   let {
     characters = [],
+    isAdmin = false,
     onUpdateCharacter,
     onCreateCharacter,
     onDeleteCharacter,
     onTogglePiece,
   }: {
     characters?: Character[];
+    isAdmin?: boolean;
     onUpdateCharacter?: (character: Character) => void;
     onCreateCharacter?: (character: Character) => void;
     onDeleteCharacter?: (characterId: string) => void;
@@ -24,6 +32,21 @@
   } = $props();
 
   let isEditOpen = $state(false);
+  let isAssetPickerOpen = $state(false);
+  let allAssets = $state<AssetItem[]>(loadAssets());
+
+  $effect(() => {
+    allAssets = loadAssets();
+    const unsubscribe = subscribeAssets((updated) => {
+      allAssets = updated;
+    });
+    return unsubscribe;
+  });
+
+  let imageAssets = $derived(
+    allAssets.filter((a) => a.mediaType === 'image' && (isAdmin || a.scope === 'personal')),
+  );
+
   let editingCharacter = $state<Character>({
     id: '',
     name: '',
@@ -87,9 +110,12 @@
   }
 
   function handleIconFileSelect() {
-    const url = prompt('アイコン画像URLまたはファイルパスを入力:', editingCharacter?.iconUrl || '');
-    if (url !== null && editingCharacter) {
-      editingCharacter.iconUrl = url;
+    isAssetPickerOpen = true;
+  }
+
+  function handleIconPicked(dataUrl: string | undefined) {
+    if (editingCharacter) {
+      editingCharacter.iconUrl = dataUrl;
     }
   }
 
@@ -211,22 +237,57 @@
       <div class="edit-dialog-content">
         <h2 class="edit-header-centered" data-testid="edit-dialog-title">キャラクター編集</h2>
 
+        <!-- Quick-select Image Asset Carousel -->
+        <div class="char-carousel-section">
+          <div class="char-carousel-wrapper" data-testid="char-image-carousel">
+            <Carousel variant="uncontained" label="キャラクター画像アセット">
+              <CarouselItem
+                type="button"
+                label="NONE"
+                aspectRatio={1}
+                onclick={() => handleIconPicked(undefined)}
+                data-testid="char-carousel-item-none"
+              />
+              {#each imageAssets as asset (asset.id)}
+                <CarouselItem
+                  type="button"
+                  image={asset.dataUrl}
+                  label={asset.name}
+                  aspectRatio={1}
+                  onclick={() => handleIconPicked(asset.dataUrl)}
+                  data-testid="char-carousel-item-{asset.id}"
+                />
+              {/each}
+            </Carousel>
+          </div>
+        </div>
+
         <!-- Avatar, Name, Initiative row -->
         <div class="edit-top-row">
-          <button
-            type="button"
-            class="avatar-picker-btn"
-            onclick={handleIconFileSelect}
-            title="クリックでファイル選択"
-            data-testid="edit-avatar-picker"
-          >
-            <img
-              class="edit-avatar"
-              src={editingCharacter.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
-              alt={editingCharacter.name}
-            />
-            <span class="avatar-hint">画像選択</span>
-          </button>
+          <div class="avatar-picker-column">
+            <button
+              type="button"
+              class="avatar-picker-btn"
+              onclick={handleIconFileSelect}
+              title="クリックでファイル選択"
+              data-testid="edit-avatar-picker"
+            >
+              <img
+                class="edit-avatar"
+                src={editingCharacter.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
+                alt={editingCharacter.name}
+                data-testid="edit-avatar-img"
+              />
+            </button>
+            <Button
+              variant="tonal"
+              size="xs"
+              onclick={handleIconFileSelect}
+              data-testid="open-char-image-picker-btn"
+            >
+              画像選択
+            </Button>
+          </div>
 
           <div class="name-init-fields">
             <div class="field-item">
@@ -420,6 +481,17 @@
       </div>
     </div>
   {/if}
+
+  <!-- Overlay: アセット選択 (AssetPickerModal) -->
+  {#if isAssetPickerOpen}
+    <AssetPickerModal
+      open={isAssetPickerOpen}
+      initialMediaType="image"
+      {isAdmin}
+      onSelect={handleIconPicked}
+      onClose={() => (isAssetPickerOpen = false)}
+    />
+  {/if}
 </div>
 
 <style>
@@ -430,7 +502,7 @@
     padding: 16px;
     box-sizing: border-box;
     overflow-y: auto;
-    background: var(--md-sys-color-surface, #fbf8fd);
+    background: var(--np-color-surface);
     gap: 16px;
   }
   .tab-header {
@@ -442,6 +514,7 @@
     margin: 0;
     font-size: 1.15rem;
     font-weight: 700;
+    color: var(--np-color-on-surface);
   }
   .character-list {
     display: flex;
@@ -466,7 +539,7 @@
     height: 48px;
     border-radius: 10px;
     object-fit: cover;
-    background: #e0e0e0;
+    background: var(--np-color-surface-container-highest);
   }
   .char-text-block {
     flex: 1;
@@ -479,12 +552,12 @@
   .char-name-label {
     font-weight: 600;
     font-size: 0.95rem;
-    color: var(--md-sys-color-on-surface, #1b1b1f);
+    color: var(--np-color-on-surface);
   }
   .char-desc-label {
     margin: 0;
     font-size: 0.8rem;
-    color: var(--md-sys-color-on-surface-variant, #49454f);
+    color: var(--np-color-on-surface-variant);
     line-height: 1.3;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -500,7 +573,7 @@
     border: none;
     cursor: pointer;
     font-size: 1.1rem;
-    color: var(--md-sys-color-error, #b3261e);
+    color: var(--np-color-error);
     padding: 6px;
   }
   .edit-panel-overlay {
@@ -509,21 +582,21 @@
     left: 0;
     right: 0;
     bottom: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: color-mix(in srgb, var(--np-color-scrim, var(--np-color-on-surface)) 50%, transparent);
     display: flex;
     align-items: center;
     justify-content: center;
     z-index: 1000;
   }
   .edit-dialog-content {
-    background: var(--md-sys-color-surface-container-high, #ece6f0);
+    background: var(--np-color-surface-container-high);
     border-radius: 28px;
     padding: 24px;
     width: 90%;
     max-width: 580px;
     max-height: 90vh;
     overflow-y: auto;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.2);
+    box-shadow: var(--np-elevation-3);
     display: flex;
     flex-direction: column;
     gap: 14px;
@@ -533,11 +606,30 @@
     text-align: center;
     font-size: 1.35rem;
     font-weight: 600;
+    color: var(--np-color-on-surface);
+  }
+  .char-carousel-section {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .char-carousel-wrapper {
+    --np-carousel-item-height: 76px;
+    --np-carousel-item-width: 76px;
+    --np-carousel-item-container-color: var(--np-color-surface-container-highest);
+    --np-carousel-item-outline-width: 1px;
+    --np-carousel-item-outline-color: var(--np-color-outline-variant);
   }
   .edit-top-row {
     display: flex;
     gap: 14px;
     align-items: flex-start;
+  }
+  .avatar-picker-column {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
   }
   .avatar-picker-btn {
     display: flex;
@@ -547,17 +639,14 @@
     background: none;
     border: none;
     cursor: pointer;
+    padding: 0;
   }
   .edit-avatar {
     width: 64px;
     height: 64px;
     border-radius: 12px;
     object-fit: cover;
-    background: #ccc;
-  }
-  .avatar-hint {
-    font-size: 0.7rem;
-    color: var(--md-sys-color-primary, #6750a4);
+    background: var(--np-color-surface-container-highest);
   }
   .name-init-fields {
     flex: 1;

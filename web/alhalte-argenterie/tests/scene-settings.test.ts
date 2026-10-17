@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { mount, unmount } from 'svelte';
 import {
   calculateDimensionsAndCrop,
@@ -6,10 +6,19 @@ import {
   inheritJuices,
   moveMemberToScene,
 } from '../src/utils/sceneSettings.js';
+import {
+  addAsset,
+  clearAssets,
+  loadAssets,
+} from '../src/utils/assets.js';
 import SceneSettingsTab from '../src/components/Control/tabs/SceneSettingsTab.svelte';
 import type { Character, Scene } from '../src/types/index.js';
 
 describe('Scene Settings & Juices', () => {
+  beforeEach(() => {
+    clearAssets();
+  });
+
   // spec: alhalte-argenterie/scene-settings 背景画像縦横自動計算
   it('automatically calculates the other dimension from aspect ratio when only one is specified', () => {
     // 1920x1080 (16:9 = 1.7777...)
@@ -152,6 +161,7 @@ describe('Scene Settings & Juices', () => {
 
     // Check Juices headings and controls
     expect(target.querySelector('[data-testid="heading-juices"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bg-image-carousel"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="bg-image-card"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="bg-description-text"]')?.textContent).toContain(
       '画像は一方を指定すればもう一方を自動で計算します',
@@ -184,6 +194,199 @@ describe('Scene Settings & Juices', () => {
     expect(deletedSceneId).toBe('scene-test');
 
     unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/scene-settings アセット選択オーバーレイUIとカルーセル (Issue #28)
+  it('opens AssetPickerModal for background image and BGM, supports scope/media toggles, upload, NONE at index 0, delete, and cancel', async () => {
+    const personalImg = addAsset({
+      id: 'img-personal-1',
+      name: 'forest.webp',
+      scope: 'personal',
+      mediaType: 'image',
+      dataUrl: 'data:image/webp;base64,Zm9yZXN0',
+      mimeType: 'image/webp',
+      createdAt: 1000,
+    });
+    const roomImg = addAsset({
+      id: 'img-room-1',
+      name: 'castle.webp',
+      scope: 'room',
+      mediaType: 'image',
+      dataUrl: 'data:image/webp;base64,Y2FzdGxl',
+      mimeType: 'image/webp',
+      createdAt: 2000,
+    });
+    const personalAudio = addAsset({
+      id: 'aud-personal-1',
+      name: 'battle.ogg',
+      scope: 'personal',
+      mediaType: 'audio',
+      dataUrl: 'data:audio/ogg;base64,YmF0dGxl',
+      mimeType: 'audio/ogg',
+      createdAt: 3000,
+    });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const currentScene: Scene = {
+      id: 'scene-assets',
+      name: 'アセットテストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    let lastUpdatedScene: Scene | null = null;
+
+    // 1. Mount as non-admin (!isAdmin) to verify room scope is disabled
+    const instanceNonAdmin = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene,
+        allScenes: [currentScene],
+        characters: [],
+        isAdmin: false,
+        onUpdateScene: (sc) => {
+          lastUpdatedScene = sc;
+        },
+      },
+    });
+
+    // Quick-select via Carousel
+    const carouselItem = target.querySelector<HTMLButtonElement>(
+      `[data-testid="bg-carousel-item-${personalImg.id}"]`,
+    );
+    expect(carouselItem).toBeTruthy();
+    carouselItem?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastUpdatedScene?.juices.bgImage).toBe(personalImg.dataUrl);
+
+    // Quick-select NONE via Carousel
+    target.querySelector<HTMLButtonElement>('[data-testid="bg-carousel-item-none"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastUpdatedScene?.juices.bgImage).toBeUndefined();
+
+    // Open AssetPickerModal from bg-image-card / open-bg-picker-btn
+    target.querySelector<HTMLButtonElement>('[data-testid="open-bg-picker-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const modal = target.querySelector('[data-testid="asset-picker-modal"]');
+    expect(modal).toBeTruthy();
+
+    // Verify scope segmented button: room option is disabled when !isAdmin
+    const scopeSegmented = target.querySelector('[data-testid="asset-scope-segmented"]');
+    expect(scopeSegmented).toBeTruthy();
+    const roomRadio = scopeSegmented?.querySelector<HTMLInputElement>('input[value="room"]');
+    expect(roomRadio).toBeTruthy();
+    expect(roomRadio?.disabled).toBe(true);
+
+    // Verify grid index 0 is ALWAYS "NONE" card
+    const grid = target.querySelector('[data-testid="asset-cards-grid"]');
+    expect(grid).toBeTruthy();
+    expect(grid?.children[0]?.getAttribute('data-testid')).toBe('asset-card-none');
+    expect(grid?.children[0]?.textContent).toContain('NONE');
+
+    // Select personal image card
+    target.querySelector<HTMLElement>(`[data-testid="asset-card-${personalImg.id}"]`)?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastUpdatedScene?.juices.bgImage).toBe(personalImg.dataUrl);
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeNull();
+
+    // Reopen and select NONE card at index 0 -> clears bgImage to undefined
+    target.querySelector<HTMLElement>('[data-testid="bg-image-card"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLElement>('[data-testid="asset-card-none"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastUpdatedScene?.juices.bgImage).toBeUndefined();
+
+    // Open BGM1 picker -> initialMediaType is 'audio'
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-pill-1"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
+    expect(
+      target.querySelector(`[data-testid="asset-card-${personalAudio.id}"]`),
+    ).toBeTruthy();
+
+    // Select audio asset for BGM1
+    target.querySelector<HTMLElement>(`[data-testid="asset-card-${personalAudio.id}"]`)?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(lastUpdatedScene?.juices.bgm1).toBe(personalAudio.dataUrl);
+
+    unmount(instanceNonAdmin);
+
+    // 2. Mount as admin (isAdmin = true) to verify room scope switching, file upload, delete, and cancel
+    const instanceAdmin = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene,
+        allScenes: [currentScene],
+        characters: [],
+        isAdmin: true,
+        onUpdateScene: (sc) => {
+          lastUpdatedScene = sc;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="open-bg-picker-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const adminScopeSeg = target.querySelector('[data-testid="asset-scope-segmented"]');
+    const adminRoomRadio = adminScopeSeg?.querySelector<HTMLInputElement>('input[value="room"]');
+    expect(adminRoomRadio?.disabled).toBe(false);
+
+    // Switch to 'room' scope
+    adminRoomRadio?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector(`[data-testid="asset-card-${roomImg.id}"]`)).toBeTruthy();
+
+    // Switch mediaType toggle to 'audio' and back to 'image'
+    const typeSeg = target.querySelector('[data-testid="asset-type-segmented"]');
+    const audioRadio = typeSeg?.querySelector<HTMLInputElement>('input[value="audio"]');
+    const imageRadio = typeSeg?.querySelector<HTMLInputElement>('input[value="image"]');
+    audioRadio?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector(`[data-testid="asset-card-${roomImg.id}"]`)).toBeNull();
+    imageRadio?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector(`[data-testid="asset-card-${roomImg.id}"]`)).toBeTruthy();
+
+    // Test file upload via hidden file input
+    expect(target.querySelector('[data-testid="asset-upload-btn"]')).toBeTruthy();
+    const fileInput = target.querySelector<HTMLInputElement>('[data-testid="asset-file-input"]');
+    expect(fileInput).toBeTruthy();
+    const uploadedFile = new File(['dummy-image-bytes'], 'dungeon.webp', { type: 'image/webp' });
+    Object.defineProperty(fileInput!, 'files', {
+      value: [uploadedFile],
+      configurable: true,
+    });
+    fileInput!.dispatchEvent(new Event('change'));
+    await new Promise((r) => setTimeout(r, 50));
+
+    const roomAssetsAfterUpload = loadAssets().map(
+      (a) => `${a.name}:${a.scope}:${a.mediaType}`,
+    );
+    expect(roomAssetsAfterUpload).toContain('dungeon.webp:room:image');
+
+    // Test deleting an asset card
+    const deleteBtn = target.querySelector<HTMLButtonElement>(
+      `[data-testid="asset-delete-btn-${roomImg.id}"]`,
+    );
+    expect(deleteBtn).toBeTruthy();
+    deleteBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector(`[data-testid="asset-card-${roomImg.id}"]`)).toBeNull();
+    // Modal remains open after deleting an asset
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
+
+    // Test cancel button
+    target.querySelector<HTMLButtonElement>('[data-testid="asset-cancel-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeNull();
+
+    unmount(instanceAdmin);
     target.remove();
   });
 });
