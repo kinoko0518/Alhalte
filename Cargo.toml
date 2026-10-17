@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "extensions/*"]
+
+[workspace.package]
+edition = "2024"
+repository = "https://github.com/kinoko0518/Alhalte"
+rust-version = "1.90"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.release-wasm]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+panic = "abort"

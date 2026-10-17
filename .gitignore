@@ -1,0 +1,12 @@
+/target
+node_modules/
+dist/
+build/
+.svelte-kit/
+*.db
+*.db-shm
+*.db-wal
+.DS_Store
+.direnv/
+result
+result-*
