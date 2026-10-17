@@ -1,18 +1,26 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mount, unmount } from 'svelte';
 import {
   generateRoomUrl,
   getVisitedRooms,
   saveVisitedRoom,
   removeVisitedRoom,
+  parseRoomUrl,
+  resolveRoomFromLocation,
   LOCAL_STORAGE_VISITED_ROOMS_KEY,
 } from '../src/utils/home.js';
 import HomeScreen from '../src/components/Home/HomeScreen.svelte';
+import App from '../src/components/App.svelte';
 import type { VisitedRoom } from '../src/types/index.js';
 
 describe('Home Screen & Room URL', () => {
   beforeEach(() => {
     localStorage.clear();
+    window.history.replaceState(null, '', '/');
+  });
+
+  afterEach(() => {
+    window.history.replaceState(null, '', '/');
   });
 
   // spec: alhalte-argenterie/home 招待URL生成・URLフラグメント
@@ -23,6 +31,64 @@ describe('Home Screen & Room URL', () => {
     expect(result.roomId).toMatch(/^[0-9a-f]{16}$/);
     expect(result.roomKeyHex).toMatch(/^[0-9a-f]{64}$/);
     expect(result.roomUrl).toBe(`${origin}/rooms/${result.roomId}#${result.roomKeyHex}`);
+  });
+
+  // spec: alhalte-argenterie/home 招待URL解析 (parseRoomUrl)
+  it('parses room URLs in /rooms/<id>#<key>, /room/<id>#<key>, and /?room=<id>#<key> formats', () => {
+    const key = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+
+    const p1 = parseRoomUrl(`https://alhalte.example/rooms/0102030405060708#${key}`);
+    expect(p1).toEqual({
+      roomId: '0102030405060708',
+      roomKeyHex: key,
+      roomUrl: `https://alhalte.example/rooms/0102030405060708#${key}`,
+    });
+
+    const p2 = parseRoomUrl(`/room/abcdef0123456789#${key}`);
+    expect(p2).toEqual({
+      roomId: 'abcdef0123456789',
+      roomKeyHex: key,
+      roomUrl: `/room/abcdef0123456789#${key}`,
+    });
+
+    const p3 = parseRoomUrl(`http://127.0.0.1:5173/?room=feedfacecafebeef#${key}`);
+    expect(p3).toEqual({
+      roomId: 'feedfacecafebeef',
+      roomKeyHex: key,
+      roomUrl: `http://127.0.0.1:5173/?room=feedfacecafebeef#${key}`,
+    });
+
+    expect(parseRoomUrl('https://alhalte.example/')).toBeNull();
+  });
+
+  // spec: alhalte-argenterie/home URLからの部屋解決とlocalStorage連携 (resolveRoomFromLocation)
+  it('resolves room from location for new links and preserves existing admin room metadata', () => {
+    const key = 'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210';
+    const newUrl = `http://localhost:3000/rooms/1122334455667788#${key}`;
+
+    const resolvedNew = resolveRoomFromLocation({ href: newUrl });
+    expect(resolvedNew).toBeTruthy();
+    expect(resolvedNew?.id).toBe('1122334455667788');
+    expect(resolvedNew?.name).toBe('Room 11223344');
+    expect(resolvedNew?.isAdmin).toBe(false);
+    expect(getVisitedRooms().map((r) => r.id)).toContain('1122334455667788');
+
+    // Existing admin room in localStorage should preserve name and isAdmin: true
+    const adminRoom: VisitedRoom = {
+      id: 'aabbccddeeff0011',
+      name: 'GM Room',
+      url: `http://localhost:3000/rooms/aabbccddeeff0011#${key}`,
+      lastVisited: 1000,
+      isAdmin: true,
+    };
+    saveVisitedRoom(adminRoom);
+
+    const resolvedAdmin = resolveRoomFromLocation({
+      href: `http://localhost:3000/rooms/aabbccddeeff0011#${key}`,
+    });
+    expect(resolvedAdmin?.id).toBe('aabbccddeeff0011');
+    expect(resolvedAdmin?.name).toBe('GM Room');
+    expect(resolvedAdmin?.isAdmin).toBe(true);
   });
 
   // spec: alhalte-argenterie/home localStorage保存・取得・管理者除外
@@ -127,8 +193,29 @@ describe('Home Screen & Room URL', () => {
     expect(enteredRoom).toBeTruthy();
     expect(enteredRoom?.name).toBe('新セッション部屋');
     expect(enteredRoom?.isAdmin).toBe(true);
+    expect(window.location.pathname).toContain('/rooms/');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/home 招待リンク直接アクセスで部屋へ直接入室 (#34)
+  it('directly enters the room when App is mounted at a room invitation URL', () => {
+    const key = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+    window.history.replaceState(null, '', `/rooms/direct-room-0001#${key}`);
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(App, {
+      target,
+    });
+
+    expect(target.querySelector('[data-testid="room-layout"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="home-screen"]')).toBeNull();
 
     unmount(instance);
     target.remove();
   });
 });
+
