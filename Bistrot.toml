@@ -1,0 +1,21 @@
+[restaurant]
+domain = "localhost"
+host = "127.0.0.1"
+data-dir = ".alhalte/data"
+socket-dir = ".alhalte/sockets"
+
+[maitre-d]
+port = 8080
+client-id = "alhalte-local-client"
+client-secret = "alhalte-local-secret"
+salt = "alhalte-local-instance-salt-0001"
+
+[cellar]
+port = 8081
+anti-oracle = false
+
+[banquette]
+chunk-size-exponent = 8
+
+[argenterie]
+port = 5173

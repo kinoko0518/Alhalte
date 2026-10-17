@@ -16,6 +16,8 @@ pub const DEFAULT_SOCKET_DIR: &str = "/run/alhalte";
 pub const DEFAULT_MAITRE_D_PORT: u16 = 8080;
 /// Default port for cellar.
 pub const DEFAULT_CELLAR_PORT: u16 = 8081;
+/// Default port for argenterie development server.
+pub const DEFAULT_ARGENTERIE_PORT: u16 = 5173;
 /// Default log chunk size exponent N (1 << 8 = 256 logs per chunk).
 pub const DEFAULT_CHUNK_SIZE_EXPONENT: u8 = 8;
 
@@ -41,6 +43,10 @@ fn default_maitre_d_port() -> u16 {
 
 fn default_cellar_port() -> u16 {
     DEFAULT_CELLAR_PORT
+}
+
+fn default_argenterie_port() -> u16 {
+    DEFAULT_ARGENTERIE_PORT
 }
 
 fn default_anti_oracle() -> bool {
@@ -69,6 +75,10 @@ pub struct BistrotConfig {
     /// Configuration for `alhalte-banquette` module.
     #[serde(default)]
     pub banquette: BanquetteConfig,
+
+    /// Configuration for `alhalte-argenterie` web frontend module.
+    #[serde(default)]
+    pub argenterie: ArgenterieConfig,
 }
 
 impl BistrotConfig {
@@ -98,7 +108,22 @@ impl BistrotConfig {
                 "banquette chunk-size-exponent must be between 1 and 30".to_string(),
             ));
         }
+        if self.argenterie.port == 0 {
+            return Err(BistrotError::ConfigValidation(
+                "argenterie port must not be 0".to_string(),
+            ));
+        }
         Ok(())
+    }
+
+    /// Resolves the URL for the `alhalte-argenterie` web frontend in a browser.
+    pub fn argenterie_url(&self) -> String {
+        let host = if self.restaurant.host == "0.0.0.0" || self.restaurant.host == "::" {
+            "127.0.0.1"
+        } else {
+            &self.restaurant.host
+        };
+        format!("http://{host}:{}/", self.argenterie.port)
     }
 
     /// Resolves the SQLite database path for `maitre-d`.
@@ -243,6 +268,23 @@ impl Default for BanquetteConfig {
         Self {
             chunk_size_exponent: default_chunk_size_exponent(),
             socket_dir: None,
+        }
+    }
+}
+
+/// Configuration for `alhalte-argenterie` (frontend web development server).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct ArgenterieConfig {
+    /// Listening HTTP port for argenterie frontend server.
+    #[serde(default = "default_argenterie_port")]
+    pub port: u16,
+}
+
+impl Default for ArgenterieConfig {
+    fn default() -> Self {
+        Self {
+            port: default_argenterie_port(),
         }
     }
 }

@@ -53,6 +53,14 @@ enum Commands {
         #[arg(long)]
         working_dir: Option<PathBuf>,
 
+        /// Directory for alhalte-argenterie web frontend.
+        #[arg(long)]
+        web_dir: Option<PathBuf>,
+
+        /// Optional path to pnpm executable.
+        #[arg(long)]
+        pnpm_bin: Option<PathBuf>,
+
         /// Linux user under which to execute services.
         #[arg(long)]
         user: Option<String>,
@@ -60,7 +68,14 @@ enum Commands {
         /// Linux group under which to execute services.
         #[arg(long)]
         group: Option<String>,
+
+        /// Optional extra PATH environment variable for services.
+        #[arg(long)]
+        extra_path: Option<String>,
     },
+
+    /// Print the argenterie frontend URL.
+    Url,
 
     /// Validate configuration and print parsed summary.
     Validate,
@@ -111,15 +126,34 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             bin_dir,
             output_dir,
             working_dir,
+            web_dir,
+            pnpm_bin,
             user,
             group,
+            extra_path,
         } => {
             let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
+            let pnpm_bin = pnpm_bin.or_else(|| {
+                std::env::var_os("PATH").and_then(|paths| {
+                    std::env::split_paths(&paths).find_map(|dir| {
+                        let candidate = dir.join("pnpm");
+                        if candidate.is_file() {
+                            Some(candidate)
+                        } else {
+                            None
+                        }
+                    })
+                })
+            });
+            let extra_path = extra_path.or_else(|| std::env::var("PATH").ok());
             let options = SystemdOptions {
                 bin_dir,
                 working_dir,
+                web_dir,
+                pnpm_bin,
                 user,
                 group,
+                extra_path,
                 ..Default::default()
             };
 
@@ -137,8 +171,16 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
                     units.maitre_d_service
                 );
                 println!("=== alhalte-cellar.service ===\n{}", units.cellar_service);
+                println!(
+                    "=== alhalte-argenterie.service ===\n{}",
+                    units.argenterie_service
+                );
                 println!("=== alhalte-bistrot.target ===\n{}", units.bistrot_target);
             }
+        }
+        Commands::Url => {
+            let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
+            println!("{}", config.argenterie_url());
         }
         Commands::Validate => {
             let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
@@ -149,6 +191,8 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             println!("  Socket dir:   {}", config.restaurant.socket_dir.display());
             println!("  maitre-d port: {}", config.maitre_d.port);
             println!("  cellar port:   {}", config.cellar.port);
+            println!("  argenterie port: {}", config.argenterie.port);
+            println!("  argenterie url:  {}", config.argenterie_url());
             println!(
                 "  banquette N:   {} (chunk size: {})",
                 config.banquette.chunk_size_exponent,
