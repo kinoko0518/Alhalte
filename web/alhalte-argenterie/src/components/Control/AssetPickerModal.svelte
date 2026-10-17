@@ -164,6 +164,9 @@
     aria-modal="true"
     aria-label="アセット選択"
     data-testid="asset-picker-modal"
+    onclick={(e) => {
+      if (e.target === e.currentTarget) onClose?.();
+    }}
   >
     <div class="asset-picker-surface">
       <!-- Top Bar:
@@ -297,11 +300,11 @@
   .asset-picker-overlay {
     position: fixed;
     inset: 0;
-    background: color-mix(in srgb, var(--np-color-scrim, var(--np-color-on-surface)) 50%, transparent);
+    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 1500;
+    z-index: 1000;
     padding: 16px;
     box-sizing: border-box;
   }

@@ -23,6 +23,8 @@
     onCreateCharacter,
     onDeleteCharacter,
     onTogglePiece,
+    onRequestDeleteCharacter,
+    onRequestAssetPicker,
   }: {
     characters?: Character[];
     isAdmin?: boolean;
@@ -30,6 +32,12 @@
     onCreateCharacter?: (character: Character) => void;
     onDeleteCharacter?: (characterId: string) => void;
     onTogglePiece?: (characterId: string) => void;
+    onRequestDeleteCharacter?: (char: { id: string; name: string }) => void;
+    onRequestAssetPicker?: (options: {
+      mediaType: AssetMediaType;
+      initialScope?: AssetScope;
+      onSelect: (dataUrl?: string, asset?: AssetItem) => void;
+    }) => void;
   } = $props();
 
   let isEditOpen = $state(false);
@@ -78,8 +86,12 @@
   }
 
   function openDeleteConfirm(char: Character) {
-    characterToDelete = char;
-    isDeleteConfirmOpen = true;
+    if (onRequestDeleteCharacter) {
+      onRequestDeleteCharacter({ id: char.id, name: char.name });
+    } else {
+      characterToDelete = char;
+      isDeleteConfirmOpen = true;
+    }
   }
 
   function confirmDelete() {
@@ -111,7 +123,17 @@
   }
 
   function handleIconFileSelect() {
-    isAssetPickerOpen = true;
+    if (onRequestAssetPicker) {
+      onRequestAssetPicker({
+        mediaType: 'image',
+        initialScope: 'personal',
+        onSelect: (dataUrl) => {
+          handleIconPicked(dataUrl);
+        },
+      });
+    } else {
+      isAssetPickerOpen = true;
+    }
   }
 
   function handleIconPicked(dataUrl: string | undefined) {
@@ -244,7 +266,13 @@
     ］
   -->
   {#if isEditOpen}
-    <div class="edit-panel-overlay" data-testid="character-edit-panel">
+    <div
+      class="edit-panel-overlay"
+      data-testid="character-edit-panel"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) closeEdit();
+      }}
+    >
       <div class="edit-dialog-content">
         <h2 class="edit-header-centered" data-testid="edit-dialog-title">キャラクター編集</h2>
 
@@ -469,7 +497,13 @@
     削除ボタン※全画面警告あり
   -->
   {#if isDeleteConfirmOpen && characterToDelete}
-    <div class="fullscreen-warning-overlay" data-testid="char-delete-confirm-dialog">
+    <div
+      class="fullscreen-warning-overlay"
+      data-testid="char-delete-confirm-dialog"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) isDeleteConfirmOpen = false;
+      }}
+    >
       <div class="delete-warning-box">
         <h2 class="warning-title-centered" data-testid="char-delete-warning-title">
           キャラクター「{characterToDelete.name}」を削除しますか？
@@ -582,11 +616,8 @@
   }
   .edit-panel-overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: color-mix(in srgb, var(--np-color-scrim, var(--np-color-on-surface)) 50%, transparent);
+    inset: 0;
+    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
     display: flex;
     align-items: center;
     justify-content: center;
@@ -753,15 +784,12 @@
   }
   .fullscreen-warning-overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: color-mix(in srgb, var(--np-color-scrim, var(--np-color-on-surface)) 60%, transparent);
+    inset: 0;
+    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 1200;
+    z-index: 1000;
   }
   .delete-warning-box {
     background: var(--np-color-surface-container-high);

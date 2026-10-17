@@ -284,7 +284,13 @@
   </div>
 
   {#if isCreateDialogOpen}
-    <div class="dialog-overlay" data-testid="create-room-overlay">
+    <div
+      class="dialog-overlay"
+      data-testid="create-room-overlay"
+      onclick={(e) => {
+        if (e.target === e.currentTarget) closeCreateDialog();
+      }}
+    >
       <div class="dialog-content">
         <h2 class="dialog-header-centered" data-testid="dialog-title">部屋の作成</h2>
 
@@ -587,11 +593,8 @@
   }
   .dialog-overlay {
     position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    bottom: 0;
-    background: color-mix(in srgb, var(--np-color-scrim) 45%, transparent);
+    inset: 0;
+    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
     display: flex;
     align-items: center;
     justify-content: center;
