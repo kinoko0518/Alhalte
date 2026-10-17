@@ -389,10 +389,11 @@ fn test_log_event_serialization_and_duck_typing() {
     let from_duck = ChangeBgImgEvent::from_duck_typed_map(&duck).unwrap();
     assert_eq!(from_duck, img_evt);
 
-    // 2. ChangeBgmEvent
+    // 2. ChangeBgmEvent (spec: banquette/log change-bgm slot & stop)
     let bgm_evt = ChangeBgmEvent {
         bgm_tin_id: Some([9u8; 32]),
         volume: Some(0.85),
+        slot: 2,
         track_index: Some(2),
     };
     let tin = bgm_evt.to_tin().unwrap();
@@ -403,6 +404,18 @@ fn test_log_event_serialization_and_duck_typing() {
     let duck = bgm_evt.to_duck_typed_map();
     let from_duck = ChangeBgmEvent::from_duck_typed_map(&duck).unwrap();
     assert_eq!(from_duck, bgm_evt);
+
+    // Stop BGM with None
+    let stop_bgm = ChangeBgmEvent {
+        bgm_tin_id: None,
+        volume: None,
+        slot: 1,
+        track_index: None,
+    };
+    let stop_tin = stop_bgm.to_tin().unwrap();
+    let decoded_stop = ChangeBgmEvent::from_tin(&stop_tin).unwrap();
+    assert_eq!(decoded_stop.bgm_tin_id, None);
+    assert_eq!(decoded_stop.slot, 1);
 
     // 3. CharacterCameEvent
     let came = CharacterCameEvent {

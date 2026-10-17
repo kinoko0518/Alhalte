@@ -168,8 +168,16 @@ pub struct ChangeBgmEvent {
     pub bgm_tin_id: Option<TinId>,
     /// Volume from 0.0 to 1.0.
     pub volume: Option<f32>,
-    /// Optional track index (e.g. 1, 2, or 3 as per UI).
+    /// Slot index of the BGM track (1-based, e.g. 1, 2, or 3).
+    #[serde(default = "default_bgm_slot")]
+    pub slot: u32,
+    /// Optional legacy track index.
+    #[serde(default)]
     pub track_index: Option<u8>,
+}
+
+fn default_bgm_slot() -> u32 {
+    1
 }
 
 impl ChangeBgmEvent {
@@ -199,6 +207,7 @@ impl ChangeBgmEvent {
         if let Some(v) = self.volume {
             map.insert("volume".to_string(), Tin::from_f32(v));
         }
+        map.insert("slot".to_string(), Tin::from_u32(self.slot));
         if let Some(idx) = self.track_index {
             map.insert("track_index".to_string(), Tin::from_u8(idx));
         }
@@ -215,6 +224,14 @@ impl ChangeBgmEvent {
             Some(t) => Some(t.as_f32().map_err(BanquetteError::Tin)?),
             None => None,
         };
+        let slot = match map.get("slot") {
+            Some(t) => t.as_u32().map_err(BanquetteError::Tin)?,
+            None => map
+                .get("track_index")
+                .and_then(|t| t.as_u8().ok())
+                .map(|idx| idx as u32)
+                .unwrap_or(1),
+        };
         let track_index = match map.get("track_index") {
             Some(t) => Some(t.as_u8().map_err(BanquetteError::Tin)?),
             None => None,
@@ -222,6 +239,7 @@ impl ChangeBgmEvent {
         Ok(Self {
             bgm_tin_id,
             volume,
+            slot,
             track_index,
         })
     }
