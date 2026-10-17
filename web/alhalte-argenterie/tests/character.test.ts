@@ -124,4 +124,62 @@ describe('Character Management & Edit Panel', () => {
     unmount(instance);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/character 新規作成時の初期値（ステータス、パラメータ、チャットパレットは空） Issue #27
+  it('creates new character with empty statuses, parameters, and chatPalette', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    let createdChar: Character | null = null;
+
+    const instance = mount(CharacterManagementTab, {
+      target,
+      props: {
+        characters: [],
+        onCreateCharacter: (c) => {
+          createdChar = c;
+        },
+      },
+    });
+
+    const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="create-character-btn"]');
+    expect(createBtn).toBeTruthy();
+    createBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(createdChar).toBeTruthy();
+    expect(createdChar?.statuses).toEqual([]);
+    expect(createdChar?.parameters).toEqual([]);
+    expect(createdChar?.chatPalette).toBe('');
+    expect(createdChar?.name).toBe('新規キャラクター');
+    expect(createdChar?.initiative).toBe(0);
+
+    // Edit panel should be open for the newly created character
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeTruthy();
+    const chatPaletteInput = target.querySelector<HTMLTextAreaElement>('[data-testid="edit-chat-palette-input"]');
+    expect(chatPaletteInput?.value).toBe('');
+
+    // Adding status row initializes with empty label and 0 values
+    target.querySelector<HTMLButtonElement>('[data-testid="add-status-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const statusLabel = target.querySelector<HTMLInputElement>('[data-testid="status-label-0"]');
+    const statusCurrent = target.querySelector<HTMLInputElement>('[data-testid="status-current-0"]');
+    const statusMax = target.querySelector<HTMLInputElement>('[data-testid="status-max-0"]');
+    expect(statusLabel?.value).toBe('');
+    expect(Number(statusCurrent?.value)).toBe(0);
+    expect(Number(statusMax?.value)).toBe(0);
+
+    // Adding param row initializes with empty label and 0 value
+    target.querySelector<HTMLButtonElement>('[data-testid="add-param-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const paramLabel = target.querySelector<HTMLInputElement>('[data-testid="param-label-0"]');
+    const paramValue = target.querySelector<HTMLInputElement>('[data-testid="param-value-0"]');
+    expect(paramLabel?.value).toBe('');
+    expect(Number(paramValue?.value)).toBe(0);
+
+    unmount(instance);
+    target.remove();
+  });
 });
