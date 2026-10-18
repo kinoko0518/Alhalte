@@ -13,6 +13,7 @@
   import { ChunkLogManager } from '../../utils/log.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
   import CommonFooter, { type ActiveTab } from './CommonFooter.svelte';
+  import CommonHeader from './CommonHeader.svelte';
   import CharacterManagementTab from './tabs/CharacterManagementTab.svelte';
   import ExtensionManagementTab from './tabs/ExtensionManagementTab.svelte';
   import LogTab from './tabs/LogTab.svelte';
@@ -119,19 +120,21 @@
 </script>
 
 <div class="control-panel-container" data-testid="control-panel">
-  {#if activeTab !== 'log' && onCollapse}
-    <div class="sheet-collapse-strip" data-testid="sheet-collapse-strip">
-      <IconButton
-        variant="text"
-        size="xs"
-        onclick={onCollapse}
-        data-testid="sheet-collapse-button"
-        aria-label="コントロールパネルをしまう"
-      >
-        <Icon>right_panel_close</Icon>
-      </IconButton>
-    </div>
-  {/if}
+  <!-- Unified Common Header across all tabs (Issue #89) -->
+  <CommonHeader
+    scene={currentScene}
+    {allScenes}
+    {characters}
+    {roomId}
+    {isAdmin}
+    {onCollapse}
+    {onSelectScene}
+    {onExportZip}
+    onRenameScene={() => (activeTab = 'settings')}
+    onDeleteScene={() => (activeTab = 'settings')}
+    onManageMembers={() => (activeTab = 'settings')}
+    {onSetDone}
+  />
 
   <!-- Active Tab Body -->
   <div class="tab-content-area" data-testid="tab-content-area">
@@ -148,6 +151,7 @@
         {onExportZip}
         {onSetDone}
         {onRequestAssetPicker}
+        hideHeader={true}
         onRenameScene={() => (activeTab = 'settings')}
         onDeleteScene={() => (activeTab = 'settings')}
         onManageMembers={() => (activeTab = 'settings')}
@@ -223,14 +227,6 @@
     background: var(--np-color-surface);
     color: var(--np-color-on-surface);
     border-left: 1px solid var(--np-color-outline-variant);
-  }
-  .sheet-collapse-strip {
-    display: flex;
-    align-items: center;
-    padding: 4px 8px;
-    background: var(--np-color-surface-container);
-    border-bottom: 1px solid var(--np-color-outline-variant);
-    flex-shrink: 0;
   }
   .tab-content-area {
     flex: 1;
