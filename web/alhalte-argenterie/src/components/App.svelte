@@ -28,6 +28,7 @@
     WasmExtensionInstance,
   } from '../wasm/runner.js';
   import AssetPickerModal from './Control/AssetPickerModal.svelte';
+  import CharacterEditModal from './Control/CharacterEditModal.svelte';
   import ControlPanel from './Control/ControlPanel.svelte';
   import FieldPanel from './Field/FieldPanel.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
@@ -209,6 +210,12 @@
       initialScope: options.initialScope,
       onSelect: options.onSelect,
     };
+  }
+
+  let activeCharacterEdit = $state<Character | null>(null);
+
+  function handleRequestEditCharacter(char: Character) {
+    activeCharacterEdit = char;
   }
 
   const chunkManager = new ChunkLogManager();
@@ -765,6 +772,7 @@
                   roomId={currentRoom.id || (currentRoom as any).roomId}
                   onSetDone={(done) => roomSocket?.setDone(done)}
                   onRequestAssetPicker={handleRequestAssetPicker}
+                  onRequestEditCharacter={handleRequestEditCharacter}
                 />
               </div>
             </div>
@@ -844,6 +852,7 @@
                 roomId={currentRoom.id || (currentRoom as any).roomId}
                 onSetDone={(done) => roomSocket?.setDone(done)}
                 onRequestAssetPicker={handleRequestAssetPicker}
+                onRequestEditCharacter={handleRequestEditCharacter}
               />
             </div>
           </Sheet>
@@ -1011,6 +1020,27 @@
         }}
         onClose={() => {
           activeOverlay = null;
+        }}
+      />
+    </div>
+  {/if}
+
+  <!-- Character Edit Modal at Root Viewport Level (Issue #60) -->
+  {#if activeCharacterEdit}
+    <div
+      class="root-character-edit-wrapper"
+      data-testid="root-character-edit-wrapper"
+    >
+      <CharacterEditModal
+        character={activeCharacterEdit}
+        isAdmin={isAdmin || (currentRoom ? currentRoom.isAdmin : false)}
+        onRequestAssetPicker={handleRequestAssetPicker}
+        onSave={(updated) => {
+          handleUpdateCharacter(updated);
+          activeCharacterEdit = null;
+        }}
+        onClose={() => {
+          activeCharacterEdit = null;
         }}
       />
     </div>
@@ -1210,7 +1240,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 1000;
+    z-index: 9000;
   }
   .dialog-box {
     background: var(--np-color-surface-container-high, #ece6f0);

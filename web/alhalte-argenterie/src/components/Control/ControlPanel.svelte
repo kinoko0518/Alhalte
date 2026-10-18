@@ -52,6 +52,7 @@
     onDeleteSceneLogs,
     onRequestDeleteCharacter,
     onRequestAssetPicker,
+    onRequestEditCharacter,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -89,6 +90,7 @@
       initialScope?: AssetScope;
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
+    onRequestEditCharacter?: (char: Character) => void;
   } = $props();
 
   let activeTab = $state<ActiveTab>('log');
@@ -187,6 +189,7 @@
         {onTogglePiece}
         {onRequestDeleteCharacter}
         {onRequestAssetPicker}
+        {onRequestEditCharacter}
       />
     {:else if activeTab === 'extensions'}
       <ExtensionManagementTab

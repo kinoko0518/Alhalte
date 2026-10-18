@@ -341,4 +341,183 @@ describe('Fullscreen Warnings & Overlays Viewport Hoisting (Issue #60)', () => {
     unmount(instance);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/fullscreen-overlay キャラクター編集モーダルのビューポート最前面化と全画面スクリム (Issue #60)
+  it('renders CharacterEditModal at root viewport level outside control panel with dark scrim, closing on outside click and cancel', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: dummyRoom,
+        initialScenes: [scene1],
+        initialCharacters: [testChar],
+        isAdmin: true,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Switch to Characters Tab
+    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-characters"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Click character item to edit
+    const charCard = target.querySelector<HTMLElement>('[data-testid="character-card-char-1"]');
+    expect(charCard).toBeTruthy();
+    charCard?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Verify CharacterEditModal is hoisted to root level outside control panel and outside side sheet
+    const controlPanel = target.querySelector('[data-testid="control-panel"]');
+    const sideSheet = target.querySelector('[data-testid="landscape-side-sheet"]');
+    const rootEditWrapper = target.querySelector('[data-testid="root-character-edit-wrapper"]');
+    const editPanel = target.querySelector('[data-testid="character-edit-panel"]');
+
+    expect(rootEditWrapper).toBeTruthy();
+    expect(editPanel).toBeTruthy();
+    expect(controlPanel?.contains(editPanel)).toBe(false);
+    expect(sideSheet?.contains(editPanel)).toBe(false);
+
+    // Verify dark scrim overlay style
+    expect(editPanel?.classList.contains('character-edit-overlay')).toBe(true);
+
+    // Click outside on scrim to close
+    editPanel?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeNull();
+
+    // Reopen and test Cancel button
+    charCard?.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeTruthy();
+
+    const cancelBtn = target.querySelector<HTMLButtonElement>('[data-testid="cancel-character-btn"]');
+    cancelBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/fullscreen-overlay キャラクター編集中のアセットピッカー重畳表示 (Issue #52, #60)
+  it('opens AssetPickerModal on top of hoisted CharacterEditModal without dismissing edit modal', async () => {
+    const avatarAsset = addAsset({
+      id: 'hoisted-avatar-1',
+      name: 'wizard.webp',
+      scope: 'personal',
+      mediaType: 'image',
+      dataUrl: 'data:image/webp;base64,d2l6YXJk',
+      mimeType: 'image/webp',
+    });
+
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: dummyRoom,
+        initialScenes: [scene1],
+        initialCharacters: [testChar],
+        isAdmin: true,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Switch to Characters Tab
+    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-characters"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Open character edit
+    target.querySelector<HTMLElement>('[data-testid="character-card-char-1"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Edit panel is open
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeTruthy();
+
+    // Click "画像選択" in CharacterEditModal
+    target.querySelector<HTMLButtonElement>('[data-testid="open-char-image-picker-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Both CharacterEditModal and AssetPickerModal exist at root level
+    const editPanel = target.querySelector('[data-testid="character-edit-panel"]');
+    const assetModal = target.querySelector('[data-testid="asset-picker-modal"]');
+    expect(editPanel).toBeTruthy();
+    expect(assetModal).toBeTruthy();
+
+    // Pick asset in modal
+    target.querySelector<HTMLElement>(`[data-testid="asset-card-${avatarAsset.id}"]`)?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // AssetPickerModal closed, CharacterEditModal still open with updated image
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeNull();
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeTruthy();
+
+    const avatarImg = target.querySelector<HTMLImageElement>('[data-testid="edit-avatar-img"]');
+    expect(avatarImg?.getAttribute('src')).toBe(avatarAsset.dataUrl);
+
+    // Save character
+    target.querySelector<HTMLButtonElement>('[data-testid="save-character-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/fullscreen-overlay 縦長画面（portrait）Bottom Sheetでのキャラクター編集のビューポート最前面化 (Issue #60)
+  it('renders CharacterEditModal at root viewport level in portrait layout without being trapped in Bottom Sheet', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: dummyRoom,
+        initialScenes: [scene1],
+        initialCharacters: [testChar],
+        isAdmin: true,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const bottomSheet = target.querySelector('[data-testid="portrait-bottom-sheet"]');
+    expect(bottomSheet).toBeTruthy();
+
+    // Switch to Characters Tab inside Bottom Sheet
+    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-characters"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Open character edit
+    target.querySelector<HTMLElement>('[data-testid="character-card-char-1"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Verify CharacterEditModal is NOT inside bottomSheet
+    const editPanel = target.querySelector('[data-testid="character-edit-panel"]');
+    expect(editPanel).toBeTruthy();
+    expect(bottomSheet?.contains(editPanel)).toBe(false);
+
+    // Click cancel to close
+    target.querySelector<HTMLButtonElement>('[data-testid="cancel-character-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="character-edit-panel"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
 });

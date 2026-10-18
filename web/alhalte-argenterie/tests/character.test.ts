@@ -250,7 +250,8 @@ describe('Character Management & Edit Panel', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="edit-char-btn-char-knight"]')?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    expect(target.querySelector('[data-testid="char-image-carousel"]')).toBeTruthy();
+    // spec: Issue #52 アイコン画像選択UIではCarouselは不要
+    expect(target.querySelector('[data-testid="char-image-carousel"]')).toBeNull();
 
     // Open AssetPickerModal by clicking edit-avatar-picker
     target.querySelector<HTMLButtonElement>('[data-testid="edit-avatar-picker"]')?.click();
@@ -275,10 +276,10 @@ describe('Character Management & Edit Panel', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(avatarImg?.getAttribute('src')).toContain('data:image/svg+xml');
 
-    // Quick-select via M3 Carousel item
-    target
-      .querySelector<HTMLButtonElement>(`[data-testid="char-carousel-item-${heroIcon.id}"]`)
-      ?.click();
+    // Re-select via AssetPickerModal (Issue #52: icons use AssetPickerModal instead of Carousel)
+    target.querySelector<HTMLButtonElement>('[data-testid="edit-avatar-picker"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLElement>(`[data-testid="asset-card-${heroIcon.id}"]`)?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(avatarImg?.getAttribute('src')).toBe(heroIcon.dataUrl);
 

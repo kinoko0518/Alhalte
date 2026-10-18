@@ -150,7 +150,7 @@ export function addAsset(
     scope: input.scope,
     mediaType: input.mediaType,
     dataUrl: input.dataUrl,
-    mimeType: input.mimeType,
+    mimeType: input.mimeType || (input.mediaType === 'image' ? 'image/webp' : 'audio/webm'),
     createdAt: input.createdAt ?? Date.now(),
   };
 
