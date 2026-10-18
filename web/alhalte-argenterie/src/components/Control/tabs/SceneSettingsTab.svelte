@@ -376,19 +376,6 @@
 <svelte:window onclick={handleWindowClick} />
 
 <div class="scene-settings-container" data-testid="scene-settings-tab">
-  <!-- Scene Name Edit Field (Scene switching is delegated to CommonHeader per Issue #107) -->
-  <div class="scene-name-container" data-testid="scene-name-container">
-    <TextField
-      variant="outlined"
-      label="シーン名"
-      value={currentScene.name}
-      oninput={handleSceneNameInput}
-      data-testid="scene-name-input"
-      placeholder="シーン名"
-      class="scene-name-field"
-    />
-  </div>
-
   <div class="settings-scroll-content">
     <!-- Heading Juices -->
     <h3 class="section-heading" data-testid="heading-juices">Juices</h3>
@@ -533,6 +520,19 @@
 
     <!-- Management buttons in 1 row with 7 : 5 : 3 ratio and soft Material Color for delete -->
     <div class="management-buttons" data-testid="management-buttons">
+      <!-- Scene Name Edit Field (Issue #123: Moved above create scene in management section) -->
+      <div class="scene-name-container" data-testid="scene-name-container">
+        <TextField
+          variant="outlined"
+          label="シーン名"
+          value={currentScene.name}
+          oninput={handleSceneNameInput}
+          data-testid="scene-name-input"
+          placeholder="シーン名"
+          class="scene-name-field"
+        />
+      </div>
+
       <!-- 3つのアクション「シーンを新規作成」「シーンのログを削除」「シーンを削除」:
            横並びの Square L ボタン群として配置。
            初期状態では左ほど大きく、右ほど小さい square の比率。
@@ -873,9 +873,9 @@
     color: var(--np-color-on-surface);
   }
   .scene-name-container {
-    padding: 12px 16px;
-    background: var(--np-color-surface-container);
-    border-bottom: 1px solid var(--np-color-outline-variant);
+    display: flex;
+    flex-direction: column;
+    width: 100%;
   }
   .scene-name-container :global(.scene-name-field) {
     width: 100%;
