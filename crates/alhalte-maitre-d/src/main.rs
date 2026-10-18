@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use alhalte_maitre_d::server::CellarProxy;
 use alhalte_maitre_d::{
     AppState, Database, GoogleOAuthProvider, ProcessBanquetteSpawner, RoomBridgeManager,
     create_router, parse_cli_args, spawn_session_cleanup_task,
@@ -41,7 +42,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let room_manager = RoomBridgeManager::new(spawner);
 
-    let state = AppState::new(db, args.salt, oauth, room_manager);
+    let state = AppState::new(db, args.salt, oauth, room_manager)
+        .with_cellar_proxy(CellarProxy::new(&args.cellar_url)?);
     let app = create_router(state);
 
     // If an optional UNIX domain socket is specified, also serve on it

@@ -533,6 +533,52 @@ async fn test_http_api_flow() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+// spec: alhalte-cellar/handlers raises the upload body limit above Axum's 2 MiB default (Issue #109 / #146)
+#[tokio::test]
+async fn test_store_accepts_body_larger_than_default_limit() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    verifier.allow(100, 1000);
+
+    let service =
+        Arc::new(CellarService::new_with_in_memory_db(dir.path(), verifier, false).unwrap());
+    let app = service.clone().into_router();
+
+    // Deliberately uncompressed so the wire body really exceeds 2 MiB.
+    let text = "x".repeat(3 * 1024 * 1024 + 1);
+    let (tin_bytes, tin_id) = Tin::from_string(&text)
+        .encode_plaintext(tin::Compression::None)
+        .unwrap();
+    assert!(
+        tin_bytes.len() > 2 * 1024 * 1024,
+        "test payload must exceed the default body limit"
+    );
+    let hex_id = format_tin_id(&tin_id);
+
+    let req = Request::builder()
+        .method("PUT")
+        .uri(format!("/store/{hex_id}"))
+        .header("X-Alhalte-Owner", "100")
+        .header("X-Alhalte-Session-Id", "1000")
+        .header("Content-Type", "application/octet-stream")
+        .body(Body::from(tin_bytes.clone()))
+        .unwrap();
+
+    // Axum's default 2 MiB limit would answer 413 here.
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let req = Request::builder()
+        .method("GET")
+        .uri(format!("/download/{hex_id}?owner=100"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), tin_bytes.as_slice());
+}
+
 // spec: alhalte-cellar/cli
 #[test]
 fn test_cli_bistrot_argument_compatibility() {

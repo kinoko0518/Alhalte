@@ -4,6 +4,12 @@ import CharacterManagementTab from '../src/components/Control/tabs/CharacterMana
 import ExtensionManagementTab from '../src/components/Control/tabs/ExtensionManagementTab.svelte';
 import type { Character, ExtensionItem } from '../src/types/index.js';
 import { clearAssets } from '../src/utils/assets.js';
+import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
+
+/** Lets the tab-open `QueryState('/')` (a microtask) settle. */
+function tick(ms = 20): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
   beforeEach(() => {
@@ -110,16 +116,25 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
 
     let updatedExtensions: ExtensionItem[] | null = null;
 
+    // The tab only mutates after the server acknowledges (Issue #109 / #145), so
+    // mount it on a connected socket whose state writes answer immediately.
+    const fakeSocket = new FakeRoomSocket();
+
     const instance = mount(ExtensionManagementTab, {
       target,
       props: {
         extensions: [testExt],
         isAdmin: true,
+        roomSocket: asRoomSocket(fakeSocket),
         onUpdateExtensions: (exts) => {
           updatedExtensions = exts;
         },
       },
     });
+
+    // Let the tab-open `QueryState('/')` merge settle (empty remote state keeps
+    // the local row because the list is only used for rendering here).
+    await tick();
 
     // Verify List container
     const listEl = target.querySelector<HTMLUListElement>('[data-testid="extension-list"]');
@@ -148,6 +163,7 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
     expect(switchInput).toBeTruthy();
     expect(switchInput?.checked).toBe(true);
     switchInput?.click();
+    await tick();
     expect(updatedExtensions).toBeTruthy();
     expect(updatedExtensions?.find((e) => e.id === 'ext-dice')?.enabled).toBe(false);
 

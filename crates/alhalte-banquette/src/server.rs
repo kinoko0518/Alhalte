@@ -11,12 +11,13 @@ use tokio::sync::{RwLock, mpsc};
 use tokio_util::codec::Framed;
 
 use crate::cellar_sink::CellarSink;
-use crate::error::Result;
-use crate::log::{CharacterCameEvent, CharacterGoneEvent};
+use crate::error::{BanquetteError, Result};
+use crate::log::{ChangeBgmEvent, CharacterCameEvent, CharacterGoneEvent, LogOperationEvent};
 use crate::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
 };
 use crate::room::{HeartbeatOutcome, Room};
+use tin::TinId;
 
 /// Connected client metadata registered with the server.
 #[derive(Debug, Clone)]
@@ -53,6 +54,53 @@ impl Default for ServerConfig {
             system_session_id: 1,
         }
     }
+}
+
+/// Sends a [`ServerFrame`] to a single client through the connection's outgoing channel.
+///
+/// Delivery failures mean that the maitre-d connection is closing, so they are
+/// intentionally ignored (the connection task terminates on its own).
+async fn send_to_client(
+    out_tx: &mpsc::Sender<BanquetteToMaitreD>,
+    client_id: u64,
+    frame: ServerFrame,
+) {
+    let _ = out_tx
+        .send(BanquetteToMaitreD::SendToClient { client_id, frame })
+        .await;
+}
+
+/// Broadcasts a [`ServerFrame`] to all clients currently in a scene.
+async fn broadcast_to_scene(
+    out_tx: &mpsc::Sender<BanquetteToMaitreD>,
+    scene_id: &str,
+    frame: ServerFrame,
+) {
+    let _ = out_tx
+        .send(BanquetteToMaitreD::BroadcastToScene {
+            scene_id: scene_id.to_string(),
+            frame,
+        })
+        .await;
+}
+
+/// Broadcasts a [`ServerFrame`] to all clients in the room.
+async fn broadcast_to_room(out_tx: &mpsc::Sender<BanquetteToMaitreD>, frame: ServerFrame) {
+    let _ = out_tx
+        .send(BanquetteToMaitreD::BroadcastToRoom { frame })
+        .await;
+}
+
+/// Decodes a 64 hexadecimal character tin ID into a [`TinId`].
+fn decode_tin_id_hex(value: &str) -> Result<TinId> {
+    let bytes = hex::decode(value)
+        .map_err(|e| BanquetteError::Serialization(format!("invalid tin id hex '{value}': {e}")))?;
+    let len = bytes.len();
+    bytes.as_slice().try_into().map_err(|_| {
+        BanquetteError::Serialization(format!(
+            "tin id must be 32 bytes (64 hex characters), got {len} bytes"
+        ))
+    })
 }
 
 /// The Banquette UNIX domain socket server instance.
@@ -300,30 +348,58 @@ impl BanquetteServer {
             } => {
                 let mut r = room.write().await;
                 let source = if inherit_juices { Some("/") } else { None };
-                if let Err(e) = r.create_scene(account_id, &scene_id, source) {
-                    let _ = out_tx
-                        .send(BanquetteToMaitreD::SendToClient {
+                match r.create_scene(account_id, &scene_id, source) {
+                    Ok(()) => {
+                        let scenes = r.list_scene_ids();
+                        send_to_client(
+                            out_tx,
                             client_id,
-                            frame: ServerFrame::Error {
+                            ServerFrame::SceneCreated {
+                                scene_id: scene_id.clone(),
+                            },
+                        )
+                        .await;
+                        broadcast_to_room(out_tx, ServerFrame::SceneList { scenes }).await;
+                    }
+                    Err(e) => {
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
                                 code: "CreateSceneFailed".to_string(),
                                 message: e.to_string(),
                             },
-                        })
+                        )
                         .await;
+                    }
                 }
             }
             ClientFrame::DeleteScene { scene_id } => {
                 let mut r = room.write().await;
-                if let Err(e) = r.delete_scene(account_id, &scene_id) {
-                    let _ = out_tx
-                        .send(BanquetteToMaitreD::SendToClient {
+                match r.delete_scene(account_id, &scene_id) {
+                    Ok(()) => {
+                        let scenes = r.list_scene_ids();
+                        send_to_client(
+                            out_tx,
                             client_id,
-                            frame: ServerFrame::Error {
+                            ServerFrame::SceneDeleted {
+                                scene_id: scene_id.clone(),
+                            },
+                        )
+                        .await;
+                        broadcast_to_room(out_tx, ServerFrame::SceneList { scenes }).await;
+                    }
+                    Err(e) => {
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
                                 code: "DeleteSceneFailed".to_string(),
                                 message: e.to_string(),
                             },
-                        })
+                        )
                         .await;
+                    }
                 }
             }
             ClientFrame::EnterScene { scene_id } => {
@@ -393,28 +469,29 @@ impl BanquetteServer {
                 let mut r = room.write().await;
                 match r.update_scene_state(account_id, &scene_id, key.clone(), value.clone()) {
                     Ok(_) => {
-                        // Relay state update to scene clients
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::BroadcastToScene {
-                                scene_id: scene_id.clone(),
-                                frame: ServerFrame::StateUpdated {
-                                    scene_id: scene_id.clone(),
-                                    key,
-                                    value,
-                                },
-                            })
-                            .await;
+                        let frame = ServerFrame::StateUpdated {
+                            scene_id: scene_id.clone(),
+                            key,
+                            value,
+                        };
+                        // The requester may not be in the target scene (root-scene state is
+                        // edited from other scenes, e.g. room assets and extensions), so the
+                        // success is acknowledged directly in addition to the scene broadcast.
+                        // A sender that is in the scene receives both frames; state updates
+                        // are idempotent, so applying them twice is harmless.
+                        send_to_client(out_tx, client_id, frame.clone()).await;
+                        broadcast_to_scene(out_tx, &scene_id, frame).await;
                     }
                     Err(e) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::Error {
-                                    code: "UpdateStateFailed".to_string(),
-                                    message: e.to_string(),
-                                },
-                            })
-                            .await;
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "UpdateStateFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -422,69 +499,60 @@ impl BanquetteServer {
                 let mut r = room.write().await;
                 match r.delete_scene_state(account_id, &scene_id, &key) {
                     Ok(_) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::BroadcastToScene {
-                                scene_id: scene_id.clone(),
-                                frame: ServerFrame::StateDeleted {
-                                    scene_id: scene_id.clone(),
-                                    key,
-                                },
-                            })
-                            .await;
+                        let frame = ServerFrame::StateDeleted {
+                            scene_id: scene_id.clone(),
+                            key,
+                        };
+                        // Direct ack for requesters outside the target scene, plus the
+                        // scene broadcast for everyone else. Deletion is idempotent.
+                        send_to_client(out_tx, client_id, frame.clone()).await;
+                        broadcast_to_scene(out_tx, &scene_id, frame).await;
                     }
                     Err(e) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::Error {
-                                    code: "DeleteStateFailed".to_string(),
-                                    message: e.to_string(),
-                                },
-                            })
-                            .await;
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "DeleteStateFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
             ClientFrame::AppendLog { scene_id, entry } => {
                 let mut r = room.write().await;
                 match r
-                    .append_log(
-                        account_id,
-                        session_id,
-                        &scene_id,
-                        entry.clone(),
-                        cellar.as_ref(),
-                    )
+                    .append_log(account_id, session_id, &scene_id, entry, cellar.as_ref())
                     .await
                 {
-                    Ok(_) => {
-                        let head = r
-                            .scene_biblio
-                            .get(&scene_id)
-                            .map(|s| s.log.head())
-                            .unwrap_or((0, 0));
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::BroadcastToScene {
+                    Ok(LogOperationEvent::Appended { position, entry }) => {
+                        // Broadcast the appended entry to every client of the scene,
+                        // including the requester, so that it can observe its own write.
+                        broadcast_to_scene(
+                            out_tx,
+                            &scene_id,
+                            ServerFrame::LogEventAppended {
                                 scene_id: scene_id.clone(),
-                                frame: ServerFrame::LogEventAppended {
-                                    scene_id: scene_id.clone(),
-                                    chunk_index: head.0,
-                                    position: head.1,
-                                    entry,
-                                },
-                            })
-                            .await;
+                                chunk_index: position.0,
+                                position: position.1,
+                                entry,
+                            },
+                        )
+                        .await;
                     }
+                    Ok(_) => {}
                     Err(e) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::Error {
-                                    code: "AppendLogFailed".to_string(),
-                                    message: e.to_string(),
-                                },
-                            })
-                            .await;
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "AppendLogFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -753,6 +821,9 @@ impl BanquetteServer {
                     .iter()
                     .find(|(_, s)| s.present_characters.contains(&character_id))
                     .map(|(id, _)| id.clone());
+                // `move_character` implicitly creates the destination scene when missing,
+                // so the room's scene list must be re-broadcast in that case.
+                let destination_created = !r.scene_biblio.contains_key(&to_scene_id);
 
                 match r.move_character(account_id, character_id, &to_scene_id) {
                     Ok(()) => {
@@ -784,17 +855,115 @@ impl BanquetteServer {
                                 )
                                 .await;
                         }
+
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::CharacterMoved {
+                                character_id,
+                                to_scene_id: to_scene_id.clone(),
+                            },
+                        )
+                        .await;
+
+                        if destination_created {
+                            let scenes = r.list_scene_ids();
+                            broadcast_to_room(out_tx, ServerFrame::SceneList { scenes }).await;
+                        }
                     }
                     Err(e) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::Error {
-                                    code: "MoveCharacterFailed".to_string(),
-                                    message: e.to_string(),
-                                },
-                            })
-                            .await;
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "MoveCharacterFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+            ClientFrame::ChangeBgm {
+                scene_id,
+                slot,
+                tin_id,
+            } => {
+                // Decode the optional 64-hex tin ID and append a `ChangeBgmEvent` log entry.
+                let bgm_tin_id = match tin_id.as_deref().map(decode_tin_id_hex).transpose() {
+                    Ok(id) => id,
+                    Err(e) => {
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "ChangeBgmFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                };
+
+                let event = ChangeBgmEvent {
+                    bgm_tin_id,
+                    volume: None,
+                    slot,
+                    track_index: None,
+                };
+                let entry = match event.to_tin() {
+                    Ok(tin) => tin,
+                    Err(e) => {
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "ChangeBgmFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                };
+
+                let mut r = room.write().await;
+                match r
+                    .append_log(
+                        account_id,
+                        session_id,
+                        &scene_id,
+                        Some(entry),
+                        cellar.as_ref(),
+                    )
+                    .await
+                {
+                    Ok(LogOperationEvent::Appended { position, entry }) => {
+                        // Success is observed by the requester as this broadcast.
+                        broadcast_to_scene(
+                            out_tx,
+                            &scene_id,
+                            ServerFrame::LogEventAppended {
+                                scene_id: scene_id.clone(),
+                                chunk_index: position.0,
+                                position: position.1,
+                                entry,
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "ChangeBgmFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }

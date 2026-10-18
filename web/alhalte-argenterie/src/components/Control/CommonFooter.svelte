@@ -28,15 +28,21 @@
    * 3. Center-aligned 8-dice buttons row (Standard IconButtons for 1D2, 1D4, 1D6, 1D8, 1D10, 1D12, 1D20, 1D100) with Tooltips.
    * 4. Multiline Outlined TextField (minLines=4, maxLines=10, rows=4) with chat palette partial-match suggestion overlay.
    * 5. Generast AST generation on message submission (via extension pipeline if active, or text node fallback).
+   * 6. Send-in-flight state (`sending`): wavy indeterminate `CircularProgress`
+   *    instead of the send icon, `aria-busy` + dimmed footer, disabled input.
+   * 7. Offline queue notice above the whole footer (`pendingMessageCount > 0`).
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> コントロールパネル共通フッター`
    * - ARCHITECTURE.md: `# 拡張機能 -> ## 拡張機能ABI`
+   * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`
    * - GitHub Issue #54: 共通フッターに関する提言
+   * - GitHub Issue #109 / sub-issue #139: 送信中インジケーター・オフラインキュー通知
    */
   import {
     Button,
     ButtonGroup,
+    CircularProgress,
     IconButton,
     Menu,
     MenuItem,
@@ -44,6 +50,7 @@
     Tooltip,
   } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
+  import OfflineQueueNotice from '../OfflineQueueNotice.svelte';
   import type { Character, ExtensionItem } from '../../types/index.js';
   import {
     findChatPaletteMatches,
@@ -76,6 +83,8 @@
     selectedCharacterId,
     showDicePicker = $bindable(true),
     isViewer = false,
+    sending = false,
+    pendingMessageCount = 0,
     onTabChange,
     onSelectCharacter,
     onSendMessage,
@@ -89,12 +98,29 @@
     selectedCharacterId?: string;
     showDicePicker?: boolean;
     isViewer?: boolean;
+    /**
+     * True while a message send is waiting for the server acknowledgement.
+     * Swaps the send icon for a wavy indeterminate `CircularProgress`, dims the
+     * footer, sets `aria-busy`, and blocks further sends.
+     * @default false
+     */
+    sending?: boolean;
+    /**
+     * Number of messages waiting in the durable offline outbox. When greater
+     * than zero an `OfflineQueueNotice kind="message"` is rendered above the
+     * footer contents.
+     * @default 0
+     */
+    pendingMessageCount?: number;
     onTabChange?: (tab: ActiveTab) => void;
     onSelectCharacter?: (charId: string) => void;
     onSendMessage?: (text: string, characterId?: string, generast?: GenerastAST) => void;
     onSendGenerast?: (generast: GenerastAST, characterId?: string, rawText?: string) => void;
     onToggleDicePicker?: (show: boolean) => void;
   } = $props();
+
+  /** Footer interactions are blocked while a send is in flight (Issue #109). */
+  let isBusy = $derived(isViewer || sending);
 
   let messageInput = $state('');
   let isCharPickerOpen = $state(false);
@@ -163,7 +189,7 @@
   }
 
   function handleInsertDice(dice: string) {
-    if (isViewer) return;
+    if (isBusy) return;
     if (textareaElement) {
       const start = textareaElement.selectionStart ?? messageInput.length;
       const end = textareaElement.selectionEnd ?? messageInput.length;
@@ -183,7 +209,10 @@
   }
 
   function handleSend() {
-    if (isViewer) return;
+    // `sending` blocks double sends while the previous message awaits its echo
+    // (Issue #109); the disabled attributes alone are not enough because the
+    // Enter key path also reaches this function.
+    if (isViewer || sending) return;
     const rawText = messageInput.trim();
     if (!rawText) return;
 
@@ -211,7 +240,7 @@
 
 
   function handleKeyDown(e: KeyboardEvent) {
-    if (isViewer) return;
+    if (isBusy) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -312,8 +341,18 @@
 
 <footer
   class="common-footer-container"
+  class:sending
   data-testid="common-footer"
+  data-sending={sending ? 'true' : 'false'}
+  aria-busy={sending ? 'true' : 'false'}
 >
+  <!-- Offline outbox notice: messages queued while the server was unreachable (Issue #109) -->
+  {#if pendingMessageCount > 0}
+    <div class="footer-queue-notice" data-testid="footer-queue-notice">
+      <OfflineQueueNotice kind="message" count={pendingMessageCount} />
+    </div>
+  {/if}
+
   <!-- 1. Tab Selection Button Group (smooth horizontal expand on select) -->
   <div class="tabs-row np-tabs" data-testid="tab-buttons-row">
     <ButtonGroup
@@ -355,6 +394,7 @@
         size="s"
         class="character-select-tonal-btn"
         onclick={() => (isCharPickerOpen = !isCharPickerOpen)}
+        disabled={isBusy}
         aria-haspopup="menu"
         aria-expanded={isCharPickerOpen}
         bind:element={charBtnElement}
@@ -414,13 +454,24 @@
         size="s"
         class="send-btn"
         onclick={handleSend}
-        disabled={isViewer}
+        disabled={isBusy}
         aria-label="送信"
-        title={isViewer ? '閲覧者は送信できません' : '送信'}
+        title={isViewer ? '閲覧者は送信できません' : sending ? '送信中...' : '送信'}
         data-testid="send-message-button"
       >
         {#snippet start()}
-          <Icon>send</Icon>
+          {#if sending}
+            <!-- Wavy indeterminate progress (the Button `loading` slot is not wavy) -->
+            <CircularProgress
+              indeterminate
+              wavy
+              track={false}
+              data-testid="send-progress-indicator"
+              aria-label="送信中"
+            />
+          {:else}
+            <Icon>send</Icon>
+          {/if}
         {/snippet}
         送信
       </Button>
@@ -483,7 +534,7 @@
           variant="text"
           size="m"
           onclick={() => handleInsertDice(dice)}
-          disabled={isViewer}
+          disabled={isBusy}
           aria-label={dice}
           aria-describedby={`tooltip-dice-${dice.toLowerCase()}`}
           data-testid={`dice-btn-${dice.toLowerCase()}`}
@@ -498,7 +549,7 @@
 
   <!-- Input field wrapper with chat palette suggestion overlay -->
   <div class="input-wrapper" data-testid="footer-input-wrapper">
-    {#if suggestions.length > 0 && !isViewer}
+    {#if suggestions.length > 0 && !isBusy}
       <div
         class="chat-palette-suggestions"
         data-testid="chat-palette-suggestions"
@@ -522,7 +573,7 @@
       minLines={4}
       maxLines={10}
       rows={4}
-      disabled={isViewer}
+      disabled={isBusy}
       placeholder={isViewer ? '閲覧者モードのためメッセージは送信できません' : 'メッセージを入力...'}
       bind:value={messageInput}
       bind:inputElement={textareaElement}
@@ -548,6 +599,29 @@
     position: relative;
     z-index: 100;
     flex-shrink: 0;
+    transition: opacity var(--np-motion-expressive-fast-effects, 200ms ease);
+  }
+
+  /*
+   * Send-in-flight state (Issue #109): the whole footer is dimmed and made
+   * non-interactive so a second send cannot be triggered, and the live region
+   * (`aria-busy`) reports the busy state. Colors come from `--np-color-*`
+   * tokens only; the dim factor is a component-level variable so themes can
+   * override it without hard-coding a color.
+   */
+  .common-footer-container.sending {
+    opacity: var(--np-footer-sending-opacity, 0.6);
+    pointer-events: none;
+    cursor: progress;
+  }
+
+  .footer-queue-notice {
+    margin-block-end: 4px;
+  }
+
+  /* Keep the spinner inside the S-sized send button's icon slot. */
+  :global(.send-btn .button-icon .np-container) {
+    --np-circular-progress-size: var(--np-button-icon-size, 1.25rem);
   }
 
   /* 1. Tabs Button Group Row */

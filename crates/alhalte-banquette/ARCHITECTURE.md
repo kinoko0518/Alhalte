@@ -47,7 +47,11 @@ CLI（`CliArgs`）:
 
 `BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`AccountPermissionResponse` を持つ。
 
-`ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答を持つ。`ServerFrame` はその結果と broadcast を返す。
+`ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答、BGM 変更を持つ。`ServerFrame` はその結果と broadcast を返す。
+
+- `CreateScene` / `DeleteScene` の成功時は要求元へ `SceneCreated` / `SceneDeleted` を返し、更新後の scene id 列を `SceneList` として room 全体へ broadcast する。`MoveCharacter` の成功時は `CharacterMoved` を返し、移動先 scene が暗黙に作られた場合は `SceneList` も broadcast する。
+- state の `UpdateState` / `DeleteState` 成功時は、要求元への直接 ack と対象 scene への broadcast の両方を行う。ルート scene `/` の state は他 scene から編集される（アセット・拡張機能）ため、要求元が対象 scene に居なくても ack が届く。両方を受け取ったクライアントは同じ frame を 2 回適用するが、state 更新・削除は冪等。
+- `ClientFrame::ChangeBgm { scene_id, slot, tin_id }` は `tin_id` の 64 hex 文字列を `TinId` に復元し、`ChangeBgmEvent` を log に append する。成功は既存の `LogEventAppended` broadcast で観測できる。BGM の現在値は `std::bgm` / `std::bgm2` / `std::bgm3` の state が持つ。
 
 ## データ形式
 
@@ -65,8 +69,9 @@ CLI（`CliArgs`）:
 予約 state キー:
 
 - `std::admins`（`/` の state。account-id の postcard リスト）
-- `std::bgm`、`std::b-img`
+- `std::bgm`、`std::bgm2`、`std::bgm3`（BGM slot 1/2/3 の Tin ID）、`bgm::<slot>::volume`（音量）、`std::b-img`
 - character 属性の `std::name`、`std::owner_account`
+- cutlery 予約: `asset::<id>`（`/` のアセットメタデータ）、`extension::<id>`（`/` の拡張機能メタデータ）
 
 state キーは 1 個以上の `::` を含む必要がある。値は `to_plaintext().len()` が 4KiB 以下。`std::admins` の変更は管理者のみ。
 
@@ -91,6 +96,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 `SceneLog` は `1 << N` 件の chunk を持つ。`head = (chunk_index, position)`。
 
 - `append`: head 位置へ `Some(Tin)` を書き、head を進める。chunk が満杯なら `LogChunk` Tin に封入し、Zstd で cellar へ保存して biblio に tin id を追加する。
+- `append` の成功は `LogOperationEvent::Appended { position, entry }` を返し、`LogEventAppended` には append 後の head ではなく **実際に書き込んだ位置** を載せる。以前は append 後の head を送っていたため、クライアントの position が 1 進んでいた。
 - `edit`: head より前の位置を `Some(Tin)` で上書きする。封入済み chunk の場合は再 Tin 化して cellar へ再送する。
 - `delete`: head より前の位置を `None`（tombstone）で上書きする。
 - `rewind`: head を過去へ戻し、以降を切り捨てる。

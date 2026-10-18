@@ -28,6 +28,8 @@ tin の実体をファイルとして保存し、`(tin_id, path, owner, wrapped_
 
 アップロード時の認証情報はヘッダ `X-Alhalte-Owner` / `X-Alhalte-Session-Id`、またはクエリ `owner` / `session_id`。wrapped key は `X-Alhalte-Wrapped-Key`（hex）またはクエリ `wrapped_key`。
 
+`/store/{tin_id}` と `/tin/{tin_id}` の upload は Axum 既定の 2 MiB を超える Tin を受け取れるよう、`DefaultBodyLimit::max(64 MiB)`（`MAX_STORE_BODY_BYTES`）を route 単位で設定する。他の route は既定のまま。
+
 ### ステータス
 
 | コード | 意味 |
@@ -102,3 +104,4 @@ tin_references(
 - `path` は現状 tin id の hex で、ディレクトリ階層は持たない。
 - anti-oracle 時の `/dev/null` は `StorageManager::discard_to_dev_null` による no-op で、実際のファイルディスクリプタは開かない。
 - GC は DB の参照だけを見る。tin 間の参照関係（chunk 内の tin id など）は追跡しない。
+- upload は `Bytes` extractor でリクエスト全量をメモリにバッファする（上限 64 MiB）。maitre-d proxy も同じ上限・同じバッファリングを行う。

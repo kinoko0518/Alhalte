@@ -107,9 +107,10 @@ client 総体 = cutlery
 
 ### アセット
 
-1. クライアントは `canner` 相当の処理で再エンコード・暗号化する（現状は `pantry` の TS 実装が一部を担う）。
-2. `cellar` の `POST /store` で保存可否を問い合わせ、210 なら `POST /store/{tinId}` で本体を送る。
-3. 取得時は `GET /tin/{tinId}` で本体と `X-Alhalte-Wrapped-Key` を受け取り、`pantry` が部屋鍵で復号する。
+1. クライアントは `pantry` の `encodeTin` で payload を RoomKey 暗号化・圧縮する（`argenterie` の `encodeRoomTin`）。
+2. `maitre-d` の `/api/cellar/store` で保存可否を問い合わせ、210 なら `/api/cellar/store/{tinId}` で本体を送る。owner は maitre-d が session から付与する。
+3. 取得時は `/api/cellar/tin/{tinId}` で本体と `X-Alhalte-Wrapped-Key` を受け取り、`pantry` が部屋鍵で復号する。
+4. room アセットのメタデータは `/` の `asset::<id>`、拡張機能は `extension::<id>` に置き、cellar の `tinId` だけを共有する。
 
 ### エクスポート
 
@@ -181,7 +182,7 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 | 権限 | 部屋の `done` フラグと `std::admins` | `maitre-d` の SQLite `gm/pl/viewer` と `done` を併用。Issue #114 で 4 段階権限へ移行中。 |
 | 拡張 ABI | `process-generast(Generast) -> Generast` | `process_generast(ptr, len) -> i64`。`(Generast, speaker_id)` の Tin を入出力し、`alhalte_abi_version` / `alloc` / `dealloc` / `self_introduction` を持つ。 |
 | canner | クライアント側 wasm の `encode-*` / `encrypt-*` | Rust ライブラリとして実装済み。WASM ABI は未エクスポート。ブラウザでは `pantry` の TS 実装が暗号・展開を担う。 |
-| アセット | `pantry` が cellar から取得・復号・キャッシュ | `argenterie` のアセット画面は localStorage の data URL を主に使い、`pantry` の cellar 接続は未配線。 |
+| アセット | `pantry` が cellar から取得・復号・キャッシュ | `argenterie` は `pantry` の `encodeTin` で RoomKey 暗号化した Tin を maitre-d の `/api/cellar/*` proxy 経由で cellar へ保存し、進捗・失敗・再試行をカードに出す。room アセットのメタデータは `/` の state、personal は localStorage のみ。拡張 wasm も同じ経路で `tinId` だけを state に持つ。 |
 | kitchen の room key | ランダム 96bit nonce | `export_room_to_zip` / `export_room_to_tar_gz` は Zero Nonce で room-key 暗号化する。 |
 | bistrot の banquette 引数 | `--socket <path>` | `generate_banquette_args` は `--socket-dir <dir>` を出力する。banquette CLI は `--socket` を取るため不一致。 |
 | saignant の WASM 実行 | キャラクター名を解決 | `render_generast_abi` は `NoopCharacterResolver` を使うため、メンションは `Anonymous` になる。 |

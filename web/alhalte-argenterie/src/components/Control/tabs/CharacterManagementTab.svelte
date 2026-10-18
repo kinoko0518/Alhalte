@@ -5,16 +5,21 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> キャラクタータブ`
    */
-  import { Button, IconButton, List, ListItem } from 'noph-ui';
+  import { Button, IconButton, List, ListItem, LoadingIndicator } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character } from '../../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../../utils/assets.js';
   import { truncateDescription } from '../../../utils/character.js';
+  import type { RoomSocket } from '../../../utils/roomSocket.js';
+  import OfflineQueueNotice from '../../OfflineQueueNotice.svelte';
   import CharacterEditModal from '../CharacterEditModal.svelte';
 
   let {
     characters = [],
     isAdmin = false,
+    roomSocket = null,
+    roomId,
+    pendingCharacterCount,
     onUpdateCharacter,
     onCreateCharacter,
     onDeleteCharacter,
@@ -22,9 +27,21 @@
     onRequestDeleteCharacter,
     onRequestAssetPicker,
     onRequestEditCharacter,
+    onRequestCreateCharacter,
+    onRefreshCharacters,
   }: {
     characters?: Character[];
     isAdmin?: boolean;
+    /**
+     * Socket used to query the authoritative character list when the tab is
+     * shown (Issue #109 / sub-issue #144). Without it the tab renders the
+     * cached `characters` prop only (standalone usage / tests).
+     */
+    roomSocket?: RoomSocket | null;
+    /** Room the tab belongs to (informational; the outbox is keyed in `App`). */
+    roomId?: string;
+    /** Entries waiting in the durable outbox, forwarded to the queue notice. */
+    pendingCharacterCount?: number;
     onUpdateCharacter?: (character: Character) => void;
     onCreateCharacter?: (character: Character) => void;
     onDeleteCharacter?: (characterId: string) => void;
@@ -36,6 +53,13 @@
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
     onRequestEditCharacter?: (char: Character) => void;
+    /**
+     * Requests the hoisted editor for a new draft. When provided, `App` owns the
+     * modal and no character is created until the server acknowledges the save.
+     */
+    onRequestCreateCharacter?: (draft: Character) => void;
+    /** Receives the authoritative list returned by `ListCharacters`. */
+    onRefreshCharacters?: (characters: Character[]) => void;
   } = $props();
 
   let isEditOpen = $state(false);
@@ -53,6 +77,66 @@
   });
   let isDeleteConfirmOpen = $state(false);
   let characterToDelete = $state<Character | null>(null);
+
+  /**
+   * Lifecycle of the tab-open `ListCharacters` round trip
+   * (Issue #109 / sub-issue #144):
+   *
+   * - `idle`: no socket (standalone) or the tab has not queried yet.
+   * - `loading`: `ListCharacters` is in flight; the contained loading indicator
+   *   floats over the (possibly cached) list.
+   * - `loaded`: the authoritative list arrived and was handed to `App`.
+   * - `queued`: the query timed out / failed; keep the cached list and show the
+   *   wavy `OfflineQueueNotice kind="character"`.
+   */
+  type CharacterLoadState = 'idle' | 'loading' | 'loaded' | 'queued';
+
+  let loadState = $state<CharacterLoadState>('idle');
+  /** Socket the current load state belongs to; a new socket triggers a re-query. */
+  let queriedSocket: RoomSocket | null = null;
+
+  let isLoading = $derived(loadState === 'loading');
+  /**
+   * Queue notice: either the tab-open query failed, or `App` reports queued
+   * character operations (a save timed out / was performed offline). Keeping
+   * both sources in one derived flag means a queued save flips the tab into the
+   * queueing state without an extra prop.
+   */
+  let isQueueing = $derived(loadState === 'queued' || (pendingCharacterCount ?? 0) > 0);
+
+  /**
+   * Queries the latest character list once per socket when the tab is shown.
+   *
+   * `App` unmounts this tab when another tab is selected, so mounting *is* "the
+   * tab was opened". The guard uses a plain (non-reactive) variable so the
+   * state transitions inside {@link queryCharacters} cannot re-trigger the
+   * effect into a query loop.
+   */
+  $effect(() => {
+    const socket = roomSocket;
+    if (!socket) return;
+    if (queriedSocket === socket) return;
+    queriedSocket = socket;
+    void queryCharacters(socket);
+  });
+
+  async function queryCharacters(socket: RoomSocket): Promise<void> {
+    const isStale = () => queriedSocket !== socket;
+    loadState = 'loading';
+    try {
+      const list = await socket.queryListCharacters();
+      if (isStale()) return;
+      // Replacing (not merging) keeps the tab free of duplicate records: the
+      // server list is authoritative, including when it is empty.
+      onRefreshCharacters?.(list);
+      loadState = 'loaded';
+    } catch {
+      if (isStale()) return;
+      // Timeout / connection failure: the cached `characters` prop stays
+      // visible and the wavy notice explains that the list is stale.
+      loadState = 'queued';
+    }
+  }
 
   function openEdit(char: Character) {
     if (onRequestEditCharacter) {
@@ -94,6 +178,14 @@
       isNarrative: false,
       placedAsPiece: false,
     };
+    if (onRequestCreateCharacter) {
+      // Hoisted editor: `App` opens the root modal and does not create anything
+      // until the server acknowledges the save (Issue #109 / #144).
+      onRequestCreateCharacter(newChar);
+      return;
+    }
+    // Standalone fallback (tests / tab without `App`): create locally and edit
+    // in the tab-owned panel.
     onCreateCharacter?.(newChar);
     openEdit(newChar);
   }
@@ -113,74 +205,98 @@
     </IconButton>
   </div>
 
-  <!-- Character list:
-    ［
-      （キャラクターアイコン ［
-        キャラクター名 説明※120文字以降は……として省略
-      ］ 削除ボタン※全画面警告あり 駒として配置ボタン）
-      ...
-    ］
-  -->
-  <List class="character-list" data-testid="character-list">
-    {#each characters as char (char.id)}
-      <ListItem
-        type="text"
-        onclick={() => openEdit(char)}
-        class="character-card-wrapper"
-        data-testid="character-card-{char.id}"
+  <!-- Queue state: the tab-open query timed out, or a save was queued in the
+       durable outbox (Issue #109 / #144). The cached list stays visible. -->
+  {#if isQueueing}
+    <div class="character-queue-notice" data-testid="character-queue-notice">
+      <OfflineQueueNotice kind="character" count={pendingCharacterCount} />
+    </div>
+  {/if}
+
+  <div class="character-list-container" data-testid="character-list-container">
+    <!-- Character list:
+      ［
+        （キャラクターアイコン ［
+          キャラクター名 説明※120文字以降は……として省略
+        ］ 削除ボタン※全画面警告あり 駒として配置ボタン）
+        ...
+      ］
+    -->
+    <List class="character-list" data-testid="character-list">
+      {#each characters as char (char.id)}
+        <ListItem
+          type="text"
+          onclick={() => openEdit(char)}
+          class="character-card-wrapper"
+          data-testid="character-card-{char.id}"
+        >
+          {#snippet avatar()}
+            <button
+              type="button"
+              class="char-avatar-btn"
+              onclick={(e) => {
+                e.stopPropagation();
+                openEdit(char);
+              }}
+              title="キャラクター編集"
+              data-testid="edit-char-btn-{char.id}"
+            >
+              <img
+                class="char-list-avatar"
+                src={char.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
+                alt={char.name}
+              />
+            </button>
+          {/snippet}
+
+          <span class="char-name-label" data-testid="char-name-{char.id}">{char.name}</span>
+
+          {#snippet supportingText()}
+            <span class="char-desc-label" data-testid="char-desc-{char.id}">
+              {truncateDescription(char.description)}
+            </span>
+          {/snippet}
+
+          {#snippet end()}
+            <div class="char-actions" onclick={(e) => e.stopPropagation()}>
+              <IconButton
+                variant="tonal"
+                onclick={() => onTogglePiece?.(char.id)}
+                aria-label="駒として配置"
+                title="駒として配置"
+                data-testid="piece-char-btn-{char.id}"
+              >
+                <Icon>person_pin_circle</Icon>
+              </IconButton>
+              <IconButton
+                variant="text"
+                onclick={() => openDeleteConfirm(char)}
+                aria-label="キャラクターを削除"
+                title="キャラクターを削除"
+                data-testid="delete-char-btn-{char.id}"
+              >
+                <Icon>delete</Icon>
+              </IconButton>
+            </div>
+          {/snippet}
+        </ListItem>
+      {/each}
+    </List>
+
+    {#if isLoading}
+      <!-- Contained M3 LoadingIndicator over the cached list while `ListCharacters`
+           is in flight (Issue #109 / #144). The list below stays readable. -->
+      <div
+        class="character-loading-overlay"
+        data-testid="character-loading-overlay"
+        role="status"
+        aria-label="キャラクターを読み込み中"
+        aria-live="polite"
       >
-        {#snippet avatar()}
-          <button
-            type="button"
-            class="char-avatar-btn"
-            onclick={(e) => {
-              e.stopPropagation();
-              openEdit(char);
-            }}
-            title="キャラクター編集"
-            data-testid="edit-char-btn-{char.id}"
-          >
-            <img
-              class="char-list-avatar"
-              src={char.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
-              alt={char.name}
-            />
-          </button>
-        {/snippet}
-
-        <span class="char-name-label" data-testid="char-name-{char.id}">{char.name}</span>
-
-        {#snippet supportingText()}
-          <span class="char-desc-label" data-testid="char-desc-{char.id}">
-            {truncateDescription(char.description)}
-          </span>
-        {/snippet}
-
-        {#snippet end()}
-          <div class="char-actions" onclick={(e) => e.stopPropagation()}>
-            <IconButton
-              variant="tonal"
-              onclick={() => onTogglePiece?.(char.id)}
-              aria-label="駒として配置"
-              title="駒として配置"
-              data-testid="piece-char-btn-{char.id}"
-            >
-              <Icon>person_pin_circle</Icon>
-            </IconButton>
-            <IconButton
-              variant="text"
-              onclick={() => openDeleteConfirm(char)}
-              aria-label="キャラクターを削除"
-              title="キャラクターを削除"
-              data-testid="delete-char-btn-{char.id}"
-            >
-              <Icon>delete</Icon>
-            </IconButton>
-          </div>
-        {/snippet}
-      </ListItem>
-    {/each}
-  </List>
+        <LoadingIndicator contained data-testid="character-loading-indicator" />
+      </div>
+    {/if}
+  </div>
 
   <!-- Character Edit Panel Overlay:
     ［
@@ -272,6 +388,33 @@
     font-size: 1.15rem;
     font-weight: 700;
     color: var(--np-color-on-surface);
+  }
+  .character-list-container {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+  }
+  /*
+   * Queue state (timeout / queued save): the wavy notice sits above the list so
+   * it stays visible even when cached characters fill the tab.
+   */
+  .character-queue-notice {
+    flex: none;
+  }
+  /*
+   * Contained M3 LoadingIndicator floating over the cached character list while
+   * `ListCharacters` is in flight. The surface scrim keeps the cached rows
+   * readable without letting the spinner disappear into the background.
+   */
+  .character-loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    background-color: color-mix(in srgb, var(--np-color-surface) 72%, transparent);
   }
   .character-list {
     display: flex;

@@ -1,10 +1,17 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import CommonFooter from '../src/components/Control/CommonFooter.svelte';
 import type { Character, ExtensionItem } from '../src/types/index.js';
 import type { GenerastAST } from '../src/utils/generast.js';
 import { decodeExtIoTin } from '../src/utils/generast.js';
 import { ExtensionPipeline } from '../src/wasm/runner.js';
+
+const FOOTER_SOURCE = readFileSync(
+  path.resolve(process.cwd(), 'src/components/Control/CommonFooter.svelte'),
+  'utf8',
+);
 
 describe('CommonFooter Component Rebuild (Issue #54)', () => {
   const samplePalette = `
@@ -658,5 +665,195 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
 
     unmount(instance);
     target.remove();
+  });
+
+  // spec: alhalte-argenterie/common-footer 送信中は送信アイコンを波線 CircularProgress に差し替え、
+  // フッター全体を暗転・無効化し aria-busy を立てる (Issue #109 / #139)
+  it('replaces the send icon with a wavy indeterminate CircularProgress and dims the footer while sending', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        sending: true,
+      },
+    });
+
+    const footer = target.querySelector<HTMLElement>('[data-testid="common-footer"]');
+    expect(footer).toBeTruthy();
+    expect(footer?.classList.contains('sending')).toBe(true);
+    expect(footer?.getAttribute('aria-busy')).toBe('true');
+    expect(footer?.getAttribute('data-sending')).toBe('true');
+
+    const sendBtn = target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]');
+    expect(sendBtn).toBeTruthy();
+    expect(sendBtn?.disabled).toBe(true);
+
+    // The wavy indeterminate progress replaces the send icon.
+    const progress = sendBtn?.querySelector<HTMLElement>('[data-testid="send-progress-indicator"]');
+    expect(progress).toBeTruthy();
+    expect(progress?.classList.contains('progress')).toBe(true);
+    expect(progress?.classList.contains('indeterminate')).toBe(true);
+    expect(progress?.classList.contains('wavy')).toBe(true);
+    expect(progress?.getAttribute('role')).toBe('progressbar');
+    // Wavy is drawn as an animated path, not a plain circle.
+    expect(progress?.querySelector('svg path.wave')).toBeTruthy();
+    expect(sendBtn?.querySelector('.np-icon')).toBeNull();
+
+    // The whole footer is non-interactive while sending.
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    expect(textarea?.disabled).toBe(true);
+    expect(target.querySelector<HTMLButtonElement>('[data-testid="dice-btn-1d6"]')?.disabled).toBe(true);
+    expect(target.querySelector<HTMLButtonElement>('[data-testid="character-select-button"]')?.disabled).toBe(
+      true,
+    );
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/common-footer 送信中の二重送信防止 (Issue #109 / #139)
+  it('blocks double sends while sending and restores the send icon when sending is cleared', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const onSendMessage = vi.fn();
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        sending: true,
+        onSendMessage,
+      },
+    });
+
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    if (textarea) {
+      textarea.value = '二重送信テスト';
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    await new Promise((r) => setTimeout(r, 20));
+
+    const sendBtn = target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]');
+    // Programmatic clicks must not reach the send handler while sending.
+    sendBtn?.click();
+    sendBtn?.click();
+    sendBtn?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    textarea?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(onSendMessage).not.toHaveBeenCalled();
+    expect(target.querySelector('[data-testid="send-progress-indicator"]')).toBeTruthy();
+
+    unmount(instance);
+
+    // Without `sending` the footer keeps its normal send affordances.
+    const idleTarget = document.createElement('div');
+    document.body.appendChild(idleTarget);
+    const onIdleSend = vi.fn();
+    const idleInstance = mount(CommonFooter, {
+      target: idleTarget,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        onSendMessage: onIdleSend,
+      },
+    });
+
+    const idleFooter = idleTarget.querySelector<HTMLElement>('[data-testid="common-footer"]');
+    expect(idleFooter?.classList.contains('sending')).toBe(false);
+    expect(idleFooter?.getAttribute('aria-busy')).toBe('false');
+    const idleSendBtn = idleTarget.querySelector<HTMLButtonElement>(
+      '[data-testid="send-message-button"]',
+    );
+    expect(idleSendBtn?.disabled).toBe(false);
+    expect(idleTarget.querySelector('[data-testid="send-progress-indicator"]')).toBeNull();
+    expect(idleSendBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('send');
+
+    const idleTextarea = idleTarget.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    if (idleTextarea) {
+      idleTextarea.value = '通常送信';
+      idleTextarea.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    idleSendBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(onIdleSend).toHaveBeenCalledTimes(1);
+
+    unmount(idleInstance);
+    idleTarget.remove();
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/common-footer 送信中の暗転は M3 セマンティックトークンのみで表現する (Issue #109 / #139)
+  it('dims the footer with token-compatible CSS and no hard-coded colors', () => {
+    const sendingRule = FOOTER_SOURCE.match(/\.common-footer-container\.sending\s*\{([^}]*)\}/);
+    expect(sendingRule).toBeTruthy();
+    const declarations = sendingRule![1];
+    expect(declarations).toContain('opacity: var(--np-footer-sending-opacity');
+    expect(declarations).toContain('pointer-events: none');
+    expect(declarations).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
+    expect(declarations).not.toMatch(/\brgba?\(/);
+    // The wavy spinner must not come from the Button `loading` prop.
+    expect(FOOTER_SOURCE).not.toMatch(/loading=\{sending\}/);
+    expect(FOOTER_SOURCE).toContain('CircularProgress');
+    expect(FOOTER_SOURCE).toContain('wavy');
+  });
+
+  // spec: alhalte-argenterie/common-footer オフラインキューの波線通知をフッター上部に表示する (Issue #109 / #139)
+  it('renders the offline queue notice above the footer contents only when messages are queued', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        pendingMessageCount: 0,
+      },
+    });
+
+    expect(target.querySelector('[data-testid="offline-queue-notice"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+
+    const queuedTarget = document.createElement('div');
+    document.body.appendChild(queuedTarget);
+    const queuedInstance = mount(CommonFooter, {
+      target: queuedTarget,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        pendingMessageCount: 2,
+      },
+    });
+
+    const footer = queuedTarget.querySelector<HTMLElement>('[data-testid="common-footer"]');
+    const notice = queuedTarget.querySelector<HTMLElement>('[data-testid="offline-queue-notice"]');
+    expect(notice).toBeTruthy();
+    // The notice sits above the input area, as the footer's first block.
+    const firstBlock = footer?.firstElementChild;
+    expect(firstBlock?.getAttribute('data-testid')).toBe('footer-queue-notice');
+    expect(notice?.getAttribute('data-kind')).toBe('message');
+    expect(notice?.getAttribute('role')).toBe('status');
+    expect(
+      notice?.querySelector('[data-testid="offline-queue-notice-description"]')?.textContent?.trim(),
+    ).toBe('メッセージは次回の接続時に送信されます');
+    expect(
+      notice?.querySelector('[data-testid="offline-queue-notice-count"]')?.textContent?.trim(),
+    ).toBe('2 件を蓄積中');
+
+    unmount(queuedInstance);
+    queuedTarget.remove();
   });
 });

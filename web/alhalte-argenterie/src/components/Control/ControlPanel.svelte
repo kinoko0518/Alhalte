@@ -10,7 +10,9 @@
   import { Icon } from 'noph-ui/icons';
   import type { Character, ExtensionItem, Scene } from '../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
+  import type { ConnectionState } from '../../utils/connection.js';
   import { ChunkLogManager } from '../../utils/log.js';
+  import type { RoomSocket } from '../../utils/roomSocket.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
   import { ExtensionPipeline } from '../../wasm/runner.js';
   import CommonFooter, { type ActiveTab } from './CommonFooter.svelte';
@@ -45,11 +47,13 @@
     onDeleteCharacter,
     onTogglePiece,
     onUpdateExtensions,
-    onUploadExtension,
+    onRegisterExtension,
     onExportZip,
     onCollapse,
     roomId,
     isViewer = false,
+    sending = false,
+    pendingMessageCount = 0,
     onSetDone,
     onManagePermissions,
     onRequestDeleteScene,
@@ -58,6 +62,14 @@
     onRequestDeleteCharacter,
     onRequestAssetPicker,
     onRequestEditCharacter,
+    onRequestCreateCharacter,
+    onRefreshCharacters,
+    pendingCharacterCount,
+    roomSocket = null,
+    roomKey,
+    connectionState,
+    sceneActionPending = null,
+    sceneActionError = null,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -83,10 +95,15 @@
     onDeleteCharacter?: (characterId: string) => void;
     onTogglePiece?: (characterId: string) => void;
     onUpdateExtensions?: (extensions: ExtensionItem[]) => void;
-    onUploadExtension?: () => void;
+    /** Registers downloaded / uploaded wasm with the pipeline (Issue #109 / #145). */
+    onRegisterExtension?: (id: string, wasmBytes: Uint8Array) => void;
     onExportZip?: (type: 'full' | 'logs') => void;
     onCollapse?: () => void;
     roomId?: string;
+    /** Forwarded to `CommonFooter`: a message send is waiting for its echo (Issue #109). */
+    sending?: boolean;
+    /** Forwarded to `CommonFooter`: messages waiting in the durable offline outbox (Issue #109). */
+    pendingMessageCount?: number;
     onSetDone?: (done: boolean) => void;
     onManagePermissions?: () => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
@@ -99,6 +116,32 @@
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
     onRequestEditCharacter?: (char: Character) => void;
+    /** Forwards a new-character draft to the hoisted root editor (Issue #109 / #144). */
+    onRequestCreateCharacter?: (draft: Character) => void;
+    /** Hands the authoritative `ListCharacters` result back to `App` (Issue #109 / #144). */
+    onRefreshCharacters?: (characters: Character[]) => void;
+    /** Forwards the `character` outbox count to the tab's queue notice (Issue #109 / #144). */
+    pendingCharacterCount?: number;
+    /**
+     * Forwarded to `LogTab` (eager latest-chunk load, Issue #109 / #140) and to
+     * `SceneSettingsTab` (acknowledged BGM state changes, Issue #109 / #142).
+     */
+    roomSocket?: RoomSocket | null;
+    /**
+     * Forwarded to `ExtensionManagementTab`: 32-byte room key for the wasm
+     * cellar transfer (Issue #109 / sub-issue #145).
+     */
+    roomKey?: Uint8Array | null;
+    /** Forwarded to `LogTab`: retries a queued log load when it becomes `connected`. */
+    connectionState?: ConnectionState;
+    /**
+     * Forwarded to `SceneSettingsTab`: the scene action whose control shows a
+     * wavy `CircularProgress` while the server acknowledges it
+     * (Issue #109 / sub-issue #143).
+     */
+    sceneActionPending?: string | null;
+    /** Forwarded to `SceneSettingsTab`: scene-action failure text (Issue #109 / #143). */
+    sceneActionError?: string | null;
   } = $props();
 
   let activeTab = $state<ActiveTab>('log');
@@ -156,6 +199,8 @@
         {roomId}
         {isAdmin}
         {chunkManager}
+        {roomSocket}
+        {connectionState}
         {onCollapse}
         {onSelectScene}
         {onExportZip}
@@ -192,6 +237,9 @@
         {onRequestDeleteSceneLogs}
         {onDeleteSceneLogs}
         {onRequestAssetPicker}
+        {roomSocket}
+        {sceneActionPending}
+        {sceneActionError}
       />
     {:else if activeTab === 'characters'}
       <CharacterManagementTab
@@ -204,13 +252,21 @@
         {onRequestDeleteCharacter}
         {onRequestAssetPicker}
         {onRequestEditCharacter}
+        {onRequestCreateCharacter}
+        {onRefreshCharacters}
+        {pendingCharacterCount}
+        {roomSocket}
+        {roomId}
       />
     {:else if activeTab === 'extensions'}
       <ExtensionManagementTab
         {extensions}
         {isAdmin}
+        {roomSocket}
+        {connectionState}
+        {roomKey}
         {onUpdateExtensions}
-        {onUploadExtension}
+        {onRegisterExtension}
       />
     {/if}
   </div>
@@ -223,6 +279,8 @@
     {extensionPipeline}
     {selectedCharacterId}
     {isViewer}
+    {sending}
+    {pendingMessageCount}
     onTabChange={handleTabChange}
     {onSelectCharacter}
     {onSendMessage}

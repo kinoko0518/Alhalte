@@ -633,5 +633,72 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       unmount(instance);
       target.remove();
     });
+
+    // spec: argenterie/roomSocket Appのシーン管理操作はrequest*のack後にのみローカルへ反映する (Issue #109 / #143)
+    it('sends CreateScene through requestCreateScene and applies the scene only after the SceneCreated ack', async () => {
+      const socket = new RoomSocket({
+        roomId: 'room-app-test',
+        webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+      });
+      socket.connect();
+      const mockWs = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+      mockWs.open();
+      mockWs.sentMessages = [];
+
+      const target = document.createElement('div');
+      document.body.appendChild(target);
+
+      const instance = mount(App, {
+        target,
+        props: {
+          initialRoom: dummyRoom,
+          roomSocket: socket,
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 30));
+
+      // Open the management section and submit a new scene name.
+      target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-settings"]')?.click();
+      await new Promise((r) => setTimeout(r, 30));
+      target.querySelector<HTMLButtonElement>('[data-testid="open-create-scene-btn"]')?.click();
+      await new Promise((r) => setTimeout(r, 20));
+
+      const nameInput = target.querySelector<HTMLInputElement>(
+        '[data-testid="new-scene-name-input"]',
+      );
+      expect(nameInput).toBeTruthy();
+      nameInput!.value = '新しい間';
+      nameInput!.dispatchEvent(new Event('input', { bubbles: true }));
+      target.querySelector<HTMLButtonElement>('[data-testid="submit-create-scene-btn"]')?.click();
+      await new Promise((r) => setTimeout(r, 20));
+
+      // The request is the same `CreateScene` wire frame as before, but it is
+      // now a promise that resolves on the `SceneCreated` ack.
+      const createFrame = mockWs.sentMessages
+        .map((m) => JSON.parse(m))
+        .find((f) => f?.CreateScene !== undefined);
+      expect(createFrame).toBeTruthy();
+      expect(createFrame.CreateScene.inherit_juices).toBe(true);
+      const newSceneId = createFrame.CreateScene.scene_id as string;
+      expect(newSceneId.startsWith('scene-')).toBe(true);
+
+      // Pending: the spinner replaces the create icon and nothing is selected yet.
+      expect(target.querySelector('[data-testid="create-action-pending"]')).toBeTruthy();
+      expect(
+        target.querySelector<HTMLInputElement>('[data-testid="scene-name-input"]')?.value,
+      ).toBe('メインシーン');
+
+      mockWs.receive({ SceneCreated: { scene_id: newSceneId } });
+      await new Promise((r) => setTimeout(r, 30));
+
+      expect(target.querySelector('[data-testid="create-action-pending"]')).toBeNull();
+      expect(
+        target.querySelector<HTMLInputElement>('[data-testid="scene-name-input"]')?.value,
+      ).toBe('新しい間');
+
+      unmount(instance);
+      target.remove();
+    });
   });
 });

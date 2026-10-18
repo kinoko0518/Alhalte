@@ -9,13 +9,16 @@
    * - GitHub Issue #55: `feat(argenterie): ログタブの共通ヘッダー (Search)、ZIP 出力、キャラカラー Pill、Saignant WASM 描画`
    */
   import { untrack } from 'svelte';
+  import { LoadingIndicator } from 'noph-ui';
   import type { Character, ExtensionItem, LogRecord, Scene } from '../../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../../utils/assets.js';
+  import type { ConnectionState } from '../../../utils/connection.js';
   import {
     buildGenerastFromText,
     type GenerastAST,
   } from '../../../utils/generast.js';
-  import { ChunkLogManager } from '../../../utils/log.js';
+  import { ChunkLogManager, readLogBiblioHead } from '../../../utils/log.js';
+  import type { RoomSocket } from '../../../utils/roomSocket.js';
   import {
     clearSaignantCache,
     initSaignant,
@@ -23,6 +26,7 @@
     renderGenerastSync,
   } from '../../../utils/saignant.js';
   import { ExtensionPipeline } from '../../../wasm/runner.js';
+  import OfflineQueueNotice from '../../OfflineQueueNotice.svelte';
   import CommonHeader from '../CommonHeader.svelte';
   import IconImagePicker from '../IconImagePicker.svelte';
 
@@ -45,6 +49,8 @@
     onSetDone,
     onRequestAssetPicker,
     hideHeader = false,
+    roomSocket = null,
+    connectionState,
   }: {
     scene: Scene;
     allScenes?: Scene[];
@@ -68,6 +74,17 @@
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
     hideHeader?: boolean;
+    /**
+     * Room socket used for the eager "latest chunk" load (Issue #109 / #140).
+     * When absent the tab never queries, which keeps component-level tests and
+     * offline previews free of server assumptions.
+     */
+    roomSocket?: RoomSocket | null;
+    /**
+     * Connection state for retry triggering: a transition back to `connected`
+     * retries a load that ended in the queueing (wave notice) state.
+     */
+    connectionState?: ConnectionState;
   } = $props();
 
   // Messages, animation tracking, & WASM rendering cache
@@ -77,6 +94,94 @@
   let listElement = $state<HTMLDivElement | null>(null);
   let renderedContentMap = $state<Record<string, string>>({});
   let renderVersion = 0;
+
+  // ---------------------------------------------------------------------------
+  // Eager latest-chunk loading (Issue #109 / sub-issue #140)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Lifecycle of the eager "latest chunk" request:
+   *
+   * - `idle`: no socket (or the scene was just switched); nothing requested.
+   * - `loading`: `QueryLogBiblio` → `QueryLogChunk` is in flight.
+   * - `loaded`: the response arrived (possibly empty); the empty state may show.
+   * - `queued`: the request timed out / the connection failed; keep cached
+   *   records and show the wavy queue notice until a reconnect retries.
+   */
+  type LogLoadState = 'idle' | 'loading' | 'loaded' | 'queued';
+
+  let loadState = $state<LogLoadState>('idle');
+  /** Scene the current {@link loadState} belongs to (`null` before the first request). */
+  let loadSceneId: string | null = null;
+  /** Incremented on every request and scene switch so stale responses are ignored. */
+  let loadGeneration = 0;
+
+  let isLoading = $derived(loadState === 'loading');
+  let isQueueing = $derived(loadState === 'queued');
+
+  /**
+   * Loads the newest chunk of `targetSceneId`:
+   * `queryLogBiblio` → head `(chunk_index, position)` → `queryLogChunk(head.chunk_index)`.
+   *
+   * `RoomSocket` appends the resulting `LogChunkSnapshot` entries to the chunk
+   * manager itself (they arrive with positional IDs), so this function never
+   * adds records — the existing manager subscription re-renders the list.
+   *
+   * Dedupe: an in-flight or already loaded request for the same scene is a
+   * no-op unless `force` is set (used by the reconnect retry). A scene switch
+   * bumps the generation and resets the state, so a late response for the
+   * previous scene cannot overwrite the new one.
+   */
+  async function loadLatestChunk(targetSceneId: string, force = false): Promise<void> {
+    const socket = roomSocket;
+    if (!socket) return;
+    if (
+      !force &&
+      loadSceneId === targetSceneId &&
+      (loadState === 'loading' || loadState === 'loaded')
+    ) {
+      return;
+    }
+
+    const generation = ++loadGeneration;
+    loadSceneId = targetSceneId;
+    loadState = 'loading';
+
+    const isStale = () =>
+      generation !== loadGeneration || roomSocket !== socket || scene.id !== targetSceneId;
+
+    try {
+      const biblio = await socket.queryLogBiblio(targetSceneId);
+      if (isStale()) return;
+
+      const head = readLogBiblioHead(biblio);
+      if (!head) {
+        // A biblio without a head means the scene has no entries yet.
+        loadState = 'loaded';
+        return;
+      }
+
+      await socket.queryLogChunk(targetSceneId, head.chunkIndex);
+      if (isStale()) return;
+
+      // `RoomSocket` settles the pending operation inside
+      // `dispatchPendingOperations`, *before* `handleServerFrame` appends the
+      // `LogChunkSnapshot` entries to the chunk manager. The continuation of the
+      // await above already runs after that synchronous handler, but yield one
+      // extra microtask so any subscriber work queued by the append (and the
+      // `messages` update it triggers) lands before the spinner is cleared.
+      await Promise.resolve();
+      if (isStale()) return;
+
+      loadState = 'loaded';
+    } catch {
+      if (isStale()) return;
+      // `OperationTimeoutError` or a connection failure: whatever is cached
+      // stays visible and the queue notice replaces the empty state. The
+      // connection-state effect below retries once on reconnect.
+      loadState = 'queued';
+    }
+  }
 
   function handleAnimationEnd(recordId: string, event?: AnimationEvent) {
     // If multiple animations run (fade-in 150ms and spring-spatial 500ms),
@@ -95,8 +200,23 @@
 
   let currentSceneId = scene.id;
   let currentManager = chunkManager;
-  let currentUnsub = chunkManager.subscribe(() => {
-    refreshLogs();
+
+  // The chunk-manager subscription is per manager, not per scene. Keeping it in
+  // its own effect means a scene switch (which re-runs the scene effect below)
+  // can never drop the subscription: otherwise `LogChunkSnapshot` / append
+  // updates emitted after the switch would not reach the list.
+  $effect(() => {
+    const manager = chunkManager;
+    const unsubscribe = manager.subscribe(() => {
+      refreshLogs();
+    });
+    // Re-sync once: records may have been appended between component
+    // initialization and this effect running. `untrack` keeps `refreshLogs`'
+    // reactive reads from re-triggering this effect (it assigns `messages`).
+    untrack(() => {
+      refreshLogs();
+    });
+    return unsubscribe;
   });
 
   async function updateRenderedHtml(recs: LogRecord[]) {
@@ -192,27 +312,59 @@
     const activeSceneId = scene.id;
     const activeManager = chunkManager;
 
-    if (activeSceneId !== currentSceneId || activeManager !== currentManager) {
-      currentSceneId = activeSceneId;
-      if (activeManager !== currentManager) {
-        currentUnsub();
-        currentManager = activeManager;
-        currentUnsub = currentManager.subscribe(() => {
-          refreshLogs();
-        });
-      }
-      untrack(() => {
-        const records = currentManager.getLoadedRecords(activeSceneId);
-        initialRecordIds = new Set(records.map((r) => r.id));
-        newRecordIds = new Set();
-        messages = records;
-        void updateRenderedHtml(messages);
-      });
-    }
+    untrack(() => {
+      const sceneChanged = activeSceneId !== currentSceneId;
+      const managerChanged = activeManager !== currentManager;
+      if (!sceneChanged && !managerChanged) return;
 
+      currentSceneId = activeSceneId;
+      currentManager = activeManager;
+
+      if (sceneChanged) {
+        // Ignore in-flight responses for the previous scene. The loading
+        // effect below starts a fresh request for the new one.
+        loadGeneration += 1;
+        loadSceneId = null;
+        loadState = 'idle';
+      }
+
+      const records = currentManager.getLoadedRecords(activeSceneId);
+      initialRecordIds = new Set(records.map((r) => r.id));
+      newRecordIds = new Set();
+      messages = records;
+      void updateRenderedHtml(messages);
+    });
+  });
+
+  // The log tab is mounted when it is shown, so mounting and scene switches are
+  // the two eager-load triggers (Issue #109 / #140).
+  $effect(() => {
+    const socket = roomSocket;
+    const targetSceneId = scene.id;
+    if (!socket) return;
+    untrack(() => {
+      void loadLatestChunk(targetSceneId);
+    });
     return () => {
-      currentUnsub();
+      // Invalidate any response still in flight (unmount / socket swap).
+      loadGeneration += 1;
+      loadSceneId = null;
+      loadState = 'idle';
     };
+  });
+
+  // Retry a queued load once the connection transitions back to `connected`.
+  let previousConnectionState: ConnectionState | undefined = connectionState;
+  $effect(() => {
+    const state = connectionState;
+    const previous = previousConnectionState;
+    previousConnectionState = state;
+    if (state !== 'connected' || previous === 'connected') return;
+    if (loadState !== 'queued') return;
+    const targetSceneId = scene.id;
+    untrack(() => {
+      void loadLatestChunk(targetSceneId, true);
+    });
   });
 
   async function handleScroll(e: Event) {
@@ -272,75 +424,103 @@
     />
   {/if}
 
+  {#if isQueueing}
+    <!-- Download/interpretation did not finish: keep cached records and tell
+         the reader that a reconnect will reload the latest chunk (Issue #109). -->
+    <div class="log-queue-notice" data-testid="log-queue-notice">
+      <OfflineQueueNotice
+        kind="generic"
+        description="接続が回復したらログを再読み込みします"
+      />
+    </div>
+  {/if}
+
   <!-- Messages List -->
-  <div
-    class="messages-list"
-    bind:this={listElement}
-    onscroll={handleScroll}
-    data-testid="messages-list"
-  >
-    {#if messages.length === 0}
-      <div class="empty-log-notice" data-testid="empty-log-notice">
-        ログはありません
-      </div>
-    {:else}
-      {#each messages as record (record.id)}
-        {@const char = findCharacter(record.speakerId, record.speaker)}
-        {@const charColor = char?.color}
-        {@const isNew = newRecordIds.has(record.id)}
-        <div
-          class="message-entry"
-          class:message-entry-new={isNew}
-          data-testid="log-record-{record.id}"
-          data-is-new={isNew ? 'true' : undefined}
-          onanimationend={(e) => handleAnimationEnd(record.id, e)}
-        >
-          <!-- Character Avatar / Icon -->
-          <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
-            {#if char?.iconUrl}
-              <IconImagePicker
-                src={char.iconUrl}
-                alt={record.speaker}
-                size={36}
-                shape="circle"
-                dataTestId="msg-avatar-{record.id}"
-                {onRequestAssetPicker}
-              />
-            {:else}
-              <div
-                class="msg-avatar-placeholder"
-                data-testid="msg-avatar-{record.id}"
-                style={charColor
-                  ? `background-color: color-mix(in srgb, ${charColor} 18%, transparent); color: ${charColor}; border-color: ${charColor};`
-                  : ''}
-              >
-                {record.speaker ? record.speaker.slice(0, 2) : '👤'}
-              </div>
-            {/if}
-          </div>
-
-          <div class="msg-body">
-            <!-- 1st Row: Character Color Pill Badge & Timestamp -->
-            <div class="msg-header-row">
-              <span
-                class="msg-speaker-pill"
-                style={charColor ? `--char-color: ${charColor};` : ''}
-                data-testid="msg-speaker-{record.id}"
-              >
-                {record.speaker}
-              </span>
-              <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
-                {formatTime(record.timestamp)}
-              </span>
-            </div>
-
-            <!-- 2nd Row: Generast rendered HTML via Saignant WASM -->
-            <div class="msg-content saignant-content" data-testid="msg-content-{record.id}">
-              {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content)}
-            </div>
-          </div>
+  <div class="messages-area">
+    <div
+      class="messages-list"
+      bind:this={listElement}
+      onscroll={handleScroll}
+      data-testid="messages-list"
+      aria-busy={isLoading}
+    >
+      {#if messages.length === 0 && !isLoading && !isQueueing}
+        <div class="empty-log-notice" data-testid="empty-log-notice">
+          ログはありません
         </div>
-      {/each}
+      {:else}
+        {#each messages as record (record.id)}
+          {@const char = findCharacter(record.speakerId, record.speaker)}
+          {@const charColor = char?.color}
+          {@const isNew = newRecordIds.has(record.id)}
+          <div
+            class="message-entry"
+            class:message-entry-new={isNew}
+            data-testid="log-record-{record.id}"
+            data-is-new={isNew ? 'true' : undefined}
+            onanimationend={(e) => handleAnimationEnd(record.id, e)}
+          >
+            <!-- Character Avatar / Icon -->
+            <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
+              {#if char?.iconUrl}
+                <IconImagePicker
+                  src={char.iconUrl}
+                  alt={record.speaker}
+                  size={36}
+                  shape="circle"
+                  dataTestId="msg-avatar-{record.id}"
+                  {onRequestAssetPicker}
+                />
+              {:else}
+                <div
+                  class="msg-avatar-placeholder"
+                  data-testid="msg-avatar-{record.id}"
+                  style={charColor
+                    ? `background-color: color-mix(in srgb, ${charColor} 18%, transparent); color: ${charColor}; border-color: ${charColor};`
+                    : ''}
+                >
+                  {record.speaker ? record.speaker.slice(0, 2) : '👤'}
+                </div>
+              {/if}
+            </div>
+
+            <div class="msg-body">
+              <!-- 1st Row: Character Color Pill Badge & Timestamp -->
+              <div class="msg-header-row">
+                <span
+                  class="msg-speaker-pill"
+                  style={charColor ? `--char-color: ${charColor};` : ''}
+                  data-testid="msg-speaker-{record.id}"
+                >
+                  {record.speaker}
+                </span>
+                <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
+                  {formatTime(record.timestamp)}
+                </span>
+              </div>
+
+              <!-- 2nd Row: Generast rendered HTML via Saignant WASM -->
+              <div class="msg-content saignant-content" data-testid="msg-content-{record.id}">
+                {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content)}
+              </div>
+            </div>
+          </div>
+        {/each}
+      {/if}
+    </div>
+
+    {#if isLoading}
+      <!-- Contained M3 loading indicator over the (possibly cached) list. The
+           empty state stays hidden until the request settles. -->
+      <div
+        class="log-loading-overlay"
+        data-testid="log-loading-overlay"
+        role="status"
+        aria-label="ログを読み込み中"
+        aria-live="polite"
+      >
+        <LoadingIndicator contained data-testid="log-loading-indicator" />
+      </div>
     {/if}
   </div>
 </div>
@@ -353,6 +533,15 @@
     overflow: hidden;
     background: var(--np-color-surface, #fbf8fd);
     color: var(--np-color-on-surface, #1b1b1f);
+  }
+
+  .messages-area {
+    position: relative;
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
 
   .messages-list {
@@ -370,6 +559,30 @@
     text-align: center;
     color: var(--np-color-on-surface-variant, #49454f);
     font-size: 0.9rem;
+  }
+
+  /*
+   * Queue state (timeout / connection failure): the wavy notice sits above the
+   * list so it stays visible even when cached records fill the tab.
+   */
+  .log-queue-notice {
+    flex: none;
+    padding: 8px 16px 0;
+  }
+
+  /*
+   * Contained M3 LoadingIndicator floating over the message list while the
+   * biblio/chunk round trip is in flight. A surface scrim keeps cached records
+   * readable without making the spinner disappear into the background.
+   */
+  .log-loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    background-color: color-mix(in srgb, var(--np-color-surface) 72%, transparent);
   }
 
   .message-entry {
@@ -479,6 +692,12 @@
       animation: none;
       transform: none;
       opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-transparency: reduce) {
+    .log-loading-overlay {
+      background-color: var(--np-color-surface);
     }
   }
 </style>

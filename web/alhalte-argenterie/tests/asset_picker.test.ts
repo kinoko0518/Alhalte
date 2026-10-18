@@ -5,13 +5,47 @@
  * - Issue #28: アセット選択UI（自分のアセット｜部屋のアセット、画像｜音声、アップロード、NONEカード、削除）
  * - Issue #52: 画像選択UIの分離（汎用Carousel + "+ その他の画像" ボタン vs. アイコン単一ホバーズーム）
  * - Issue #60: ビューポート最前面化とオーバーレイ
+ * - Issue #109 / #141: カード内アップロード進捗・失敗・再試行、開くたびの同期
  */
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+const cellar = vi.hoisted(() => {
+  class MockCellarTransferError extends Error {
+    code: string;
+    constructor(code: string, message: string) {
+      super(message);
+      this.name = 'CellarTransferError';
+      this.code = code;
+    }
+  }
+  return {
+    DEFAULT_OPERATION_TIMEOUT_MS: 8000,
+    CELLAR_PROXY_BASE_PATH: '/api/cellar',
+    encodeRoomTin: vi.fn(),
+    uploadTin: vi.fn(),
+    downloadTin: vi.fn(),
+    getRoomKeyFromLocation: vi.fn(() => null),
+    isCellarTransferError: (error: unknown) => error instanceof MockCellarTransferError,
+    CellarTransferError: MockCellarTransferError,
+  };
+});
+
+vi.mock('../src/utils/cellarTransfer.js', () => cellar);
+
 import { mount, unmount } from 'svelte';
 import AssetPickerModal from '../src/components/Control/AssetPickerModal.svelte';
 import GenericImagePicker from '../src/components/Control/GenericImagePicker.svelte';
 import IconImagePicker from '../src/components/Control/IconImagePicker.svelte';
-import { addAsset, addAssetFromFile, clearAssets, formatFileSize, loadAssets } from '../src/utils/assets.js';
+import {
+  ASSET_STATE_KEY_PREFIX,
+  addAsset,
+  addAssetFromFile,
+  clearAssets,
+  formatFileSize,
+  loadAssets,
+  type RoomAssetMetadata,
+} from '../src/utils/assets.js';
+import { FakeRoomSocket, asRoomSocket } from './helpers/fakeRoomSocket.js';
 
 describe('AssetPickerModal & Image Pickers Integration (Issue #52, #60)', () => {
   beforeEach(() => {
@@ -309,5 +343,392 @@ describe('AssetPickerModal & Image Pickers Integration (Issue #52, #60)', () => 
 
     unmount(instance);
     target.remove();
+  });
+});
+
+// =========================================================================
+// Issue #109 / #141: cellar transfer, per-card progress, sync-on-open
+// =========================================================================
+
+const ROOM_KEY = new Uint8Array(32);
+const TIN_ID = 'f0'.repeat(32);
+const WIRE_BYTES = new Uint8Array([1, 2, 3]);
+
+/** Builds a small image File. */
+function imageFile(name: string): File {
+  return new File([new Uint8Array([1, 2, 3])], name, { type: 'image/png' });
+}
+
+/** Builds a `CellarTransferError`-shaped failure (the mock recognises it). */
+function cellarError(code: string, message: string): Error {
+  return new cellar.CellarTransferError(code, message);
+}
+
+/** Builds the metadata another client publishes under `asset::<id>`. */
+function roomMetadata(
+  id: string,
+  overrides: Partial<RoomAssetMetadata> = {},
+): RoomAssetMetadata {
+  return {
+    id,
+    name: `${id}.png`,
+    mediaType: 'image',
+    mimeType: 'image/png',
+    size: 3,
+    tinId: TIN_ID,
+    createdAt: 1000,
+    ...overrides,
+  };
+}
+
+describe('AssetPickerModal cellar transfer (Issue #109 / #141)', () => {
+  let target: HTMLDivElement;
+
+  beforeEach(() => {
+    clearAssets();
+    localStorage.clear();
+    cellar.encodeRoomTin.mockReset();
+    cellar.uploadTin.mockReset();
+    cellar.downloadTin.mockReset();
+    cellar.getRoomKeyFromLocation.mockReset();
+    cellar.getRoomKeyFromLocation.mockReturnValue(null);
+    cellar.encodeRoomTin.mockResolvedValue({ wireBytes: WIRE_BYTES, tinIdHex: TIN_ID });
+    target = document.createElement('div');
+    document.body.appendChild(target);
+  });
+
+  afterEach(() => {
+    target.remove();
+  });
+
+  /** Mounts the picker on the shared test target. */
+  function mountPicker(props: Record<string, unknown>) {
+    return mount(AssetPickerModal, {
+      target,
+      props: {
+        open: true,
+        isAdmin: false,
+        initialMediaType: 'image',
+        initialScope: 'personal',
+        ...props,
+      },
+    });
+  }
+
+  /** Drives the hidden file input like a user picking files. */
+  function pickFiles(files: File[]): void {
+    const input = target.querySelector<HTMLInputElement>('[data-testid="asset-file-input"]');
+    expect(input).toBeTruthy();
+    Object.defineProperty(input!, 'files', { value: files, configurable: true });
+    input!.dispatchEvent(new Event('change'));
+  }
+
+  it('shows a wavy determinate LinearProgress inside the card, blocks selection, and publishes asset:: metadata', async () => {
+    let releaseUpload!: () => void;
+    const uploadGate = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
+    cellar.uploadTin.mockImplementation(async (_bytes: Uint8Array, options: any) => {
+      options.onProgress?.(0.4);
+      await uploadGate;
+      return { tinId: TIN_ID };
+    });
+
+    const socket = new FakeRoomSocket();
+    let selected: string | undefined;
+    mountPicker({
+      isAdmin: true,
+      initialScope: 'room',
+      roomSocket: asRoomSocket(socket),
+      roomKey: ROOM_KEY,
+      onSelect: (dataUrl?: string) => {
+        selected = dataUrl;
+      },
+    });
+    // Let the mount effect attach the file input `change` listener.
+    await new Promise((r) => setTimeout(r, 20));
+
+    pickFiles([imageFile('progress.png')]);
+
+    // Progress is only reported by the mocked XHR callback (no fake ticks).
+    await vi.waitFor(() => {
+      const pending = loadAssets().find((asset) => asset.name === 'progress.png');
+      expect(pending?.uploadState).toBe('uploading');
+      expect(pending?.uploadProgress).toBe(0.4);
+    });
+    const asset = loadAssets().find((item) => item.name === 'progress.png')!;
+    const card = target.querySelector<HTMLElement>(`[data-testid="asset-card-${asset.id}"]`);
+    expect(card).toBeTruthy();
+    expect(card?.getAttribute('aria-busy')).toBe('true');
+    expect(card?.getAttribute('aria-disabled')).toBe('true');
+    expect(card?.getAttribute('tabindex')).toBe('-1');
+
+    const progressHost = target.querySelector<HTMLElement>(
+      `[data-testid="asset-upload-progress-${asset.id}"]`,
+    );
+    expect(progressHost).toBeTruthy();
+    const bar = progressHost!.querySelector<HTMLElement>('[role="progressbar"]');
+    expect(bar).toBeTruthy();
+    expect(bar!.classList.contains('wavy')).toBe(true);
+    expect(bar!.classList.contains('indeterminate')).toBe(false);
+    expect(bar!.getAttribute('aria-valuenow')).toBe('0.4');
+    expect(bar!.getAttribute('aria-valuemax')).toBe('1');
+
+    // Selecting an uploading card is disabled and keeps the modal open.
+    card!.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(selected).toBeUndefined();
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
+
+    releaseUpload();
+    await vi.waitFor(() => {
+      expect(loadAssets().find((item) => item.id === asset.id)?.uploadState).toBe('idle');
+    });
+    await vi.waitFor(() => {
+      expect(
+        target.querySelector(`[data-testid="asset-upload-progress-${asset.id}"]`),
+      ).toBeNull();
+    });
+
+    expect(socket.requestUpdateStateCalls).toHaveLength(1);
+    expect(socket.requestUpdateStateCalls[0]!.sceneId).toBe('/');
+    expect(socket.requestUpdateStateCalls[0]!.key).toBe(`${ASSET_STATE_KEY_PREFIX}${asset.id}`);
+  });
+
+  it('shows the failure message plus a retry action on the card and leaves other cards unaffected', async () => {
+    addAsset({
+      id: 'other-room-asset',
+      name: 'other.png',
+      scope: 'room',
+      mediaType: 'image',
+      dataUrl: 'data:image/png;base64,AAAA',
+      mimeType: 'image/png',
+      createdAt: 1,
+    });
+    cellar.uploadTin
+      .mockRejectedValueOnce(cellarError('timeout', 'Cellar request exceeded 8000 ms'))
+      .mockResolvedValueOnce({ tinId: TIN_ID });
+
+    const socket = new FakeRoomSocket();
+    mountPicker({
+      isAdmin: true,
+      initialScope: 'room',
+      roomSocket: asRoomSocket(socket),
+      roomKey: ROOM_KEY,
+    });
+
+    // Let the mount effect attach the file input `change` listener.
+    await new Promise((r) => setTimeout(r, 20));
+    pickFiles([imageFile('failing.png')]);
+
+    await vi.waitFor(() => {
+      expect(loadAssets().find((asset) => asset.name === 'failing.png')?.uploadState).toBe(
+        'failed',
+      );
+    });
+    const failed = loadAssets().find((asset) => asset.name === 'failing.png')!;
+    const failedCard = target.querySelector<HTMLElement>(
+      `[data-testid="asset-card-${failed.id}"]`,
+    );
+    expect(failedCard?.textContent).toContain('アップロードに失敗しました');
+    expect(failedCard?.getAttribute('aria-busy')).not.toBe('true');
+    // The unrelated card never shows the failure text.
+    expect(
+      target.querySelector(`[data-testid="asset-card-other-room-asset"]`)?.textContent,
+    ).not.toContain('アップロードに失敗しました');
+    expect(socket.requestUpdateStateCalls).toHaveLength(0);
+
+    // Retry reuses the same card and publishes the metadata on success.
+    const retry = failedCard?.querySelector<HTMLElement>(
+      `[data-testid="asset-retry-btn-${failed.id}"]`,
+    );
+    expect(retry).toBeTruthy();
+    retry!.click();
+
+    await vi.waitFor(() => {
+      const retried = loadAssets().find((asset) => asset.id === failed.id);
+      expect(retried?.uploadState).toBe('idle');
+      expect(retried?.tinId).toBe(TIN_ID);
+    });
+    await vi.waitFor(() => {
+      expect(
+        target.querySelector(`[data-testid="asset-upload-failed-${failed.id}"]`),
+      ).toBeNull();
+    });
+    expect(cellar.uploadTin).toHaveBeenCalledTimes(2);
+    expect(socket.requestUpdateStateCalls).toHaveLength(1);
+  });
+
+  it('syncs room assets once when the picker opens and merges published metadata', async () => {
+    addAsset({
+      id: 'remote-room',
+      name: 'old-name.png',
+      scope: 'room',
+      mediaType: 'image',
+      dataUrl: 'data:image/png;base64,AAAA',
+      mimeType: 'image/png',
+      createdAt: 1000,
+    });
+    const socket = new FakeRoomSocket();
+    socket.stateSnapshot = {
+      [`${ASSET_STATE_KEY_PREFIX}remote-room`]: roomMetadata('remote-room', {
+        name: 'synced.png',
+      }),
+    };
+
+    mountPicker({
+      isAdmin: true,
+      initialScope: 'room',
+      roomSocket: asRoomSocket(socket),
+      roomKey: ROOM_KEY,
+    });
+
+    await vi.waitFor(() => {
+      expect(socket.queryStateCalls).toHaveLength(1);
+    });
+    expect(socket.queryStateCalls[0]).toEqual({ sceneId: '/' });
+    // A cached preview is reused instead of downloading the tin again.
+    expect(cellar.downloadTin).not.toHaveBeenCalled();
+    await vi.waitFor(() => {
+      expect(
+        target.querySelector('[data-testid="asset-card-remote-room"]')?.textContent,
+      ).toContain('synced.png');
+    });
+
+    // Reactive UI changes (scope / media type / search) never re-sync.
+    const mediaSeg = target.querySelector('[data-testid="asset-type-segmented"]');
+    mediaSeg?.querySelector<HTMLInputElement>('input[value="audio"]')?.click();
+    mediaSeg?.querySelector<HTMLInputElement>('input[value="image"]')?.click();
+    const searchInput = target.querySelector<HTMLInputElement>(
+      '[data-testid="asset-search-input"]',
+    );
+    if (searchInput) {
+      searchInput.value = 'sync';
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    await new Promise((r) => setTimeout(r, 30));
+    expect(socket.queryStateCalls).toHaveLength(1);
+  });
+
+  it('keeps the local cache visible when the sync query fails', async () => {
+    addAsset({
+      id: 'cached-room-asset',
+      name: 'cached.png',
+      scope: 'room',
+      mediaType: 'image',
+      dataUrl: 'data:image/png;base64,AAAA',
+      mimeType: 'image/png',
+      createdAt: 1000,
+    });
+    const socket = new FakeRoomSocket();
+    socket.queryState = () =>
+      Promise.reject(cellarError('timeout', 'QueryState was not acknowledged'));
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    mountPicker({
+      isAdmin: true,
+      initialScope: 'room',
+      roomSocket: asRoomSocket(socket),
+      roomKey: ROOM_KEY,
+    });
+
+    await vi.waitFor(() => {
+      expect(warn).toHaveBeenCalled();
+    });
+    const card = target.querySelector('[data-testid="asset-card-cached-room-asset"]');
+    expect(card?.textContent).toContain('cached.png');
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
+    warn.mockRestore();
+  });
+
+  it('deletes room assets through requestDeleteState and keeps the card when the delete fails', async () => {
+    addAsset({
+      id: 'room-deletable',
+      name: 'deletable.png',
+      scope: 'room',
+      mediaType: 'image',
+      dataUrl: 'data:image/png;base64,AAAA',
+      mimeType: 'image/png',
+      createdAt: 1000,
+    });
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerStateWrites = false;
+    // The rejected delete is expected: silence the diagnostic warn.
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    mountPicker({
+      isAdmin: true,
+      initialScope: 'room',
+      roomSocket: asRoomSocket(socket),
+      roomKey: ROOM_KEY,
+    });
+
+    const deleteBtn = target.querySelector<HTMLElement>(
+      '[data-testid="asset-delete-btn-room-deletable"]',
+    );
+    expect(deleteBtn).toBeTruthy();
+    deleteBtn!.click();
+
+    await vi.waitFor(() => {
+      expect(socket.pendingStateOperationCount).toBe(1);
+    });
+    expect(socket.requestDeleteStateCalls[0]).toEqual({
+      sceneId: '/',
+      key: `${ASSET_STATE_KEY_PREFIX}room-deletable`,
+    });
+
+    // Failed delete: the card stays and a notice explains the failure.
+    socket.rejectDeleteState(cellarError('timeout', 'DeleteState was not acknowledged'));
+    await vi.waitFor(() => {
+      expect(target.querySelector('[data-testid="asset-picker-notice"]')?.textContent).toContain(
+        '削除に失敗しました',
+      );
+    });
+    expect(target.querySelector('[data-testid="asset-card-room-deletable"]')).toBeTruthy();
+    expect(loadAssets().some((asset) => asset.id === 'room-deletable')).toBe(true);
+
+    // Retrying the delete succeeds and removes the card.
+    socket.autoAnswerStateWrites = true;
+    target.querySelector<HTMLElement>('[data-testid="asset-delete-btn-room-deletable"]')!.click();
+    await vi.waitFor(() => {
+      expect(target.querySelector('[data-testid="asset-card-room-deletable"]')).toBeNull();
+    });
+    expect(loadAssets().some((asset) => asset.id === 'room-deletable')).toBe(false);
+    expect(socket.requestDeleteStateCalls).toHaveLength(2);
+    warn.mockRestore();
+  });
+
+  it('keeps room-scope delete admin-only and deletes personal assets locally', async () => {
+    addAsset({
+      id: 'personal-deletable',
+      name: 'personal.png',
+      scope: 'personal',
+      mediaType: 'image',
+      dataUrl: 'data:image/png;base64,AAAA',
+      mimeType: 'image/png',
+      createdAt: 1000,
+    });
+    const socket = new FakeRoomSocket();
+    mountPicker({
+      isAdmin: false,
+      initialScope: 'personal',
+      roomSocket: asRoomSocket(socket),
+      roomKey: ROOM_KEY,
+    });
+
+    // Non-admins cannot switch to the room scope.
+    const roomRadio = target.querySelector<HTMLInputElement>(
+      '[data-testid="asset-scope-segmented"] input[value="room"]',
+    );
+    expect(roomRadio?.disabled).toBe(true);
+
+    target
+      .querySelector<HTMLElement>('[data-testid="asset-delete-btn-personal-deletable"]')!
+      .click();
+    await vi.waitFor(() => {
+      expect(target.querySelector('[data-testid="asset-card-personal-deletable"]')).toBeNull();
+    });
+    expect(socket.requestDeleteStateCalls).toHaveLength(0);
+    expect(loadAssets().some((asset) => asset.id === 'personal-deletable')).toBe(false);
   });
 });

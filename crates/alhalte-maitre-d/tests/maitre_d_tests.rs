@@ -16,7 +16,7 @@ use alhalte_maitre_d::{
     LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID, MockOAuthProvider,
     RoomBridgeManager, RoomPermissionItem, RoomRole, SetRoomPermissionRequest, account_id_from_tin,
     account_id_to_tin, cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
-    decrypt_sub, encrypt_sub, extract_session_id_from_cookie, parse_cli_args_from,
+    decrypt_sub, encrypt_sub, extract_session_id_from_cookie, is_mutate_frame, parse_cli_args_from,
     parse_session_id_from_cookie_str, previous_4am_local, resolve_banquette_bin,
     session_id_from_tin, session_id_to_tin,
 };
@@ -1758,4 +1758,24 @@ fn test_resolve_banquette_bin_paths() {
     let dummy = Path::new("nonexistent-banquette-bin-xyz-9876");
     let fallback = resolve_banquette_bin(dummy);
     assert_eq!(fallback, dummy);
+}
+
+// spec: alhalte-maitre-d/ws-permissions ChangeBgm mutates the scene log
+#[test]
+fn test_change_bgm_is_mutate_frame() {
+    let set_bgm = ClientFrame::ChangeBgm {
+        scene_id: "/".to_string(),
+        slot: 1,
+        tin_id: Some("ab".repeat(32)),
+    };
+    assert!(is_mutate_frame(&set_bgm));
+
+    // Stopping a slot (`tin_id = None`) also appends a log entry, so a viewer
+    // must be blocked here too.
+    let stop_bgm = ClientFrame::ChangeBgm {
+        scene_id: "/".to_string(),
+        slot: 1,
+        tin_id: None,
+    };
+    assert!(is_mutate_frame(&stop_bgm));
 }
