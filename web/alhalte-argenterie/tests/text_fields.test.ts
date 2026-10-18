@@ -299,10 +299,7 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
 
     expect(createdSceneData).toEqual({ name: '地下通路', inheritJuice: true });
 
-    // 4. Move members overlay
-    target.querySelector<HTMLButtonElement>('[data-testid="open-move-members-btn"]')?.click();
-    await new Promise((r) => setTimeout(r, 20));
-
+    // 4. Move members embedded in tab (Issue #92)
     const memberTargetInput = target.querySelector<HTMLInputElement>('[data-testid="member-target-input-char-1"]');
     expect(memberTargetInput).toBeTruthy();
     expect(memberTargetInput?.closest('.np-field')?.classList.contains('np-field-outlined')).toBe(true);
