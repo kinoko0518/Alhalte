@@ -188,8 +188,15 @@ describe('Scene Settings & Juices', () => {
     expect(slider2?.closest('.np-slider')).toBeTruthy();
     expect(slider3?.closest('.np-slider')).toBeTruthy();
 
-    // Check Management heading, action buttons, and embedded move members section (Issue #92)
-    expect(target.querySelector('[data-testid="heading-management"]')).toBeTruthy();
+    // Check Management heading, scene name field above create scene, action buttons, and embedded move members section (Issue #92, Issue #123)
+    const headingManagement = target.querySelector('[data-testid="heading-management"]');
+    expect(headingManagement).toBeTruthy();
+    const managementButtons = target.querySelector('[data-testid="management-buttons"]');
+    expect(managementButtons).toBeTruthy();
+    const sceneNameContainer = target.querySelector('[data-testid="scene-name-container"]');
+    expect(sceneNameContainer).toBeTruthy();
+    expect(managementButtons?.contains(sceneNameContainer!)).toBe(true);
+
     const colCreate = target.querySelector<HTMLElement>('[data-testid="action-col-create"]');
     const colDeleteLogs = target.querySelector<HTMLElement>('[data-testid="action-col-delete-logs"]');
     const colDeleteScene = target.querySelector<HTMLElement>('[data-testid="action-col-delete-scene"]');
@@ -202,6 +209,12 @@ describe('Scene Settings & Juices', () => {
     expect(target.querySelector('[data-testid="move-members-title"]')?.textContent).toContain('メンバーを移動');
 
     const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-create-scene-btn"]');
+    expect(
+      Boolean(headingManagement?.compareDocumentPosition(sceneNameContainer!) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+    expect(
+      Boolean(sceneNameContainer?.compareDocumentPosition(createBtn!) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
     const deleteLogsBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-logs-btn"]');
     const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-scene-btn"]');
     expect(createBtn?.classList.contains('np-button')).toBe(true);
@@ -599,6 +612,76 @@ describe('Scene Settings & Juices', () => {
     // Click outside
     window.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await new Promise((r) => setTimeout(r, 20));
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/scene-settings シーン名入力欄を最上部固定からスクロール内「管理」セクション・「シーンを新規作成」直上へ移動 (Issue #123)
+  it('places scene name input inside management section above create scene button instead of fixed top header', () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const currentScene: Scene = {
+      id: 'scene-test-123',
+      name: '作戦本部',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    let updatedScene: Scene | null = null;
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene,
+        allScenes: [currentScene],
+        characters: [],
+        onUpdateScene: (sc) => {
+          updatedScene = sc;
+        },
+      },
+    });
+
+    const rootContainer = target.querySelector<HTMLElement>('[data-testid="scene-settings-tab"]');
+    expect(rootContainer).toBeTruthy();
+
+    const scrollContent = target.querySelector<HTMLElement>('.settings-scroll-content');
+    expect(scrollContent).toBeTruthy();
+
+    const sceneNameContainer = target.querySelector<HTMLElement>('[data-testid="scene-name-container"]');
+    const sceneNameInput = target.querySelector<HTMLInputElement>('[data-testid="scene-name-input"]');
+    const headingManagement = target.querySelector<HTMLElement>('[data-testid="heading-management"]');
+    const managementButtons = target.querySelector<HTMLElement>('[data-testid="management-buttons"]');
+    const sceneActionsRow = target.querySelector<HTMLElement>('[data-testid="scene-actions-row"]');
+    const createSceneBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-create-scene-btn"]');
+
+    // 1. Scene name input is NOT at the top level of rootContainer
+    expect(rootContainer?.firstElementChild).toBe(scrollContent);
+    expect(rootContainer?.firstElementChild?.classList.contains('scene-name-container')).toBe(false);
+
+    // 2. Scene name input and its container are inside scrollContent and managementButtons
+    expect(scrollContent?.contains(sceneNameContainer!)).toBe(true);
+    expect(scrollContent?.contains(sceneNameInput!)).toBe(true);
+    expect(managementButtons?.contains(sceneNameContainer!)).toBe(true);
+
+    // 3. Document order: heading-management -> scene-name-container/input -> scene-actions-row / open-create-scene-btn
+    expect(
+      Boolean(headingManagement?.compareDocumentPosition(sceneNameContainer!) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+    expect(
+      Boolean(sceneNameContainer?.compareDocumentPosition(sceneActionsRow!) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+    expect(
+      Boolean(sceneNameContainer?.compareDocumentPosition(createSceneBtn!) & Node.DOCUMENT_POSITION_FOLLOWING),
+    ).toBe(true);
+
+    // 4. Editing scene name updates currentScene
+    if (sceneNameInput) {
+      sceneNameInput.value = '司令室';
+      sceneNameInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    expect(updatedScene?.name).toBe('司令室');
 
     unmount(instance);
     target.remove();
