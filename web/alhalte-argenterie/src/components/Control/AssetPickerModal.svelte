@@ -12,10 +12,11 @@
    *     （右寄せボタン”キャンセル”）
    *   ］
    */
-  import { Button, Card, IconButton, SegmentedButton, TextField } from 'noph-ui';
+  import { Button, Card, IconButton, Search, SegmentedButton } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import {
     addAssetFromFile,
+    formatFileSize,
     loadAssets,
     removeAsset,
     subscribeAssets,
@@ -47,7 +48,6 @@
   let allAssets = $state<AssetItem[]>(loadAssets());
   let fileInputEl = $state<HTMLInputElement | null>(null);
   let searchQuery = $state('');
-  let directUrl = $state('');
 
   // Sync initialMediaType when modal opens or prop changes
   $effect(() => {
@@ -128,12 +128,6 @@
 
   function handleSelectAsset(asset: AssetItem) {
     onSelect?.(asset.dataUrl, asset);
-    onClose?.();
-  }
-
-  function handleSelectDirectUrl() {
-    if (!directUrl.trim()) return;
-    onSelect?.(directUrl.trim(), undefined);
     onClose?.();
   }
 
@@ -224,36 +218,18 @@
         </div>
       </div>
 
-      <!-- Search & Direct URL Row -->
-      <div class="asset-picker-inputs-row" data-testid="asset-inputs-row">
-        <TextField
-          variant="outlined"
-          type="search"
+      <!-- Search Row: Material 3 Expressive Search -->
+      <div class="asset-picker-search-row" data-testid="asset-search-row">
+        <Search
+          variant="contained"
+          view="docked"
           label="アセット検索"
           placeholder="アセット名で検索"
           bind:value={searchQuery}
-          data-testid="asset-search-input"
-          class="asset-search-field"
+          inputAttributes={{ 'data-testid': 'asset-search-input' }}
+          class="asset-search-bar"
+          data-testid="asset-search-container"
         />
-        <div class="direct-url-group">
-          <TextField
-            variant="outlined"
-            type="url"
-            label="URL直接指定"
-            placeholder="https://... または data:..."
-            bind:value={directUrl}
-            data-testid="asset-url-input"
-            class="asset-url-field"
-          />
-          <Button
-            variant="tonal"
-            disabled={!directUrl.trim()}
-            onclick={handleSelectDirectUrl}
-            data-testid="asset-apply-url-btn"
-          >
-            URLを適用
-          </Button>
-        </div>
       </div>
 
       <!-- Middle Grid:
@@ -269,13 +245,16 @@
           onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && handleSelectNone()}
           data-testid="asset-card-none"
         >
-          <Card variant="outlined">
+          <Card variant="filled">
             <div class="asset-card-body none-card-body">
               <div class="asset-preview none-preview">
                 <Icon>block</Icon>
               </div>
               <div class="asset-card-footer">
-                <span class="asset-name-label">NONE</span>
+                <div class="asset-card-text">
+                  <span class="asset-name-label">NONE</span>
+                  <span class="asset-size-label">-</span>
+                </div>
               </div>
             </div>
           </Card>
@@ -291,7 +270,7 @@
             onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && handleSelectAsset(asset)}
             data-testid="asset-card-{asset.id}"
           >
-            <Card variant="outlined">
+            <Card variant="filled">
               <div class="asset-card-body">
                 <div class="asset-preview">
                   {#if asset.mediaType === 'image'}
@@ -308,7 +287,10 @@
                   {/if}
                 </div>
                 <div class="asset-card-footer">
-                  <span class="asset-name-label" title={asset.name}>{asset.name}</span>
+                  <div class="asset-card-text">
+                    <span class="asset-name-label" title={asset.name}>{asset.name}</span>
+                    <span class="asset-size-label">{formatFileSize(asset.size)}</span>
+                  </div>
                   <IconButton
                     variant="text"
                     size="xs"
@@ -394,28 +376,14 @@
     display: none;
   }
 
-  .asset-picker-inputs-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    align-items: center;
+  .asset-picker-search-row {
+    width: 100%;
   }
 
-  .asset-picker-inputs-row :global(.asset-search-field) {
-    flex: 1;
-    min-width: 200px;
-  }
-
-  .direct-url-group {
-    display: flex;
-    gap: 8px;
-    align-items: center;
-    flex: 2;
-    min-width: 280px;
-  }
-
-  .direct-url-group :global(.asset-url-field) {
-    flex: 1;
+  :global(.asset-search-bar) {
+    --np-search-pane-margin: 0px;
+    --np-search-width: 100%;
+    width: 100%;
   }
 
   .asset-cards-grid {
@@ -429,6 +397,9 @@
   }
 
   .asset-card-wrapper {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
     cursor: pointer;
     border-radius: var(--np-shape-corner-medium, 12px);
     transition: transform var(--np-motion-expressive-fast-spatial, 150ms);
@@ -440,10 +411,29 @@
     outline-offset: 2px;
   }
 
+  .asset-card-wrapper :global(.np-card-container) {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .asset-card-wrapper :global(.np-card-content) {
+    margin: 0;
+    padding: 0;
+    min-width: 100%;
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+  }
+
   .asset-card-body {
     display: flex;
     flex-direction: column;
-    height: 148px;
+    width: 100%;
+    height: 154px;
     box-sizing: border-box;
     overflow: hidden;
   }
@@ -456,11 +446,12 @@
     background: var(--np-color-surface-container-lowest);
     color: var(--np-color-on-surface-variant);
     overflow: hidden;
-    min-height: 92px;
+    min-height: 96px;
+    width: 100%;
   }
 
   .none-preview {
-    background: var(--np-color-surface-container);
+    background: var(--np-color-surface-container-low);
     color: var(--np-color-on-surface-variant);
   }
 
@@ -483,12 +474,20 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 4px;
+    gap: 6px;
     padding: 6px 10px;
-    min-height: 40px;
+    min-height: 48px;
     background: var(--np-color-surface-container);
     border-top: 1px solid var(--np-color-outline-variant);
     box-sizing: border-box;
+  }
+
+  .asset-card-text {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    flex: 1;
+    gap: 2px;
   }
 
   .asset-name-label {
@@ -498,7 +497,15 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    flex: 1;
+  }
+
+  .asset-size-label {
+    font-size: 0.75rem;
+    font-weight: 400;
+    color: var(--np-color-on-surface-variant);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .asset-picker-bottombar {

@@ -308,8 +308,8 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
     target.remove();
   });
 
-  // spec: alhalte-argenterie/asset-picker AssetPickerModal 検索およびURL直接入力 M3 Outlined TextField
-  it('renders M3 Outlined TextFields in AssetPickerModal for searching assets and entering direct URLs', async () => {
+  // spec: alhalte-argenterie/asset-picker AssetPickerModal M3 SearchおよびURL直接入力削除 (Issue #108)
+  it('renders M3 Search in AssetPickerModal, filters assets, and verifies removal of direct URL inputs (Issue #108)', async () => {
     const asset1 = addAsset({
       id: 'ast-castle',
       name: '古城.webp',
@@ -351,12 +351,15 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
     });
 
     const searchInput = target.querySelector<HTMLInputElement>('[data-testid="asset-search-input"]');
+    const searchContainer = target.querySelector('[data-testid="asset-search-container"]');
     const urlInput = target.querySelector<HTMLInputElement>('[data-testid="asset-url-input"]');
-    expect(searchInput).toBeTruthy();
-    expect(urlInput).toBeTruthy();
+    const applyUrlBtn = target.querySelector<HTMLButtonElement>('[data-testid="asset-apply-url-btn"]');
 
-    expect(searchInput?.closest('.np-field')?.classList.contains('np-field-outlined')).toBe(true);
-    expect(urlInput?.closest('.np-field')?.classList.contains('np-field-outlined')).toBe(true);
+    expect(searchInput).toBeTruthy();
+    expect(searchContainer?.classList.contains('np-search')).toBe(true);
+    // Direct URL inputs removed per Issue #108
+    expect(urlInput).toBeNull();
+    expect(applyUrlBtn).toBeNull();
 
     // Both assets are visible initially
     expect(target.querySelector(`[data-testid="asset-card-${asset1.id}"]`)).toBeTruthy();
@@ -371,23 +374,6 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
 
     expect(target.querySelector(`[data-testid="asset-card-${asset1.id}"]`)).toBeNull();
     expect(target.querySelector(`[data-testid="asset-card-${asset2.id}"]`)).toBeTruthy();
-
-    // Direct URL input
-    const applyUrlBtn = target.querySelector<HTMLButtonElement>('[data-testid="asset-apply-url-btn"]');
-    expect(applyUrlBtn?.disabled).toBe(true);
-
-    if (urlInput) {
-      urlInput.value = 'https://images.example/custom-map.png';
-      urlInput.dispatchEvent(new Event('input', { bubbles: true }));
-    }
-    await new Promise((r) => setTimeout(r, 20));
-
-    expect(applyUrlBtn?.disabled).toBe(false);
-    applyUrlBtn?.click();
-    await new Promise((r) => setTimeout(r, 20));
-
-    expect(selectedUrl).toBe('https://images.example/custom-map.png');
-    expect(modalClosed).toBe(true);
 
     unmount(instance);
     target.remove();
