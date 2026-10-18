@@ -17,16 +17,23 @@
  *   to `false` to drive them manually via {@link FakeRoomSocket.resolveLogBiblio}
  *   / {@link FakeRoomSocket.resolveLogChunk}.
  * - `queryState` / `requestUpdateState` / `requestDeleteState` — the room asset
- *   metadata path (Issue #109 / sub-issue #141). Queries answer with
+ *   metadata path (Issue #109 / sub-issue #141) and the BGM state path
+ *   (Issue #109 / sub-issue #142). Queries answer with
  *   {@link FakeRoomSocket.stateSnapshot}; writes resolve immediately unless
  *   {@link FakeRoomSocket.autoAnswerStateWrites} is off, in which case the test
  *   settles them through {@link FakeRoomSocket.resolveStateWrite} /
  *   {@link FakeRoomSocket.rejectStateWrite} /
  *   {@link FakeRoomSocket.rejectDeleteState}.
+ * - `requestChangeBgm` — the BGM change log (Issue #109 / sub-issue #142),
+ *   recorded in {@link FakeRoomSocket.requestChangeBgmCalls} and settled with
+ *   {@link FakeRoomSocket.resolveChangeBgm} /
+ *   {@link FakeRoomSocket.rejectChangeBgm}.
+ * - `emitFrame` — pushes an arbitrary `ServerFrame` to the subscribers so an
+ *   App-level test can drive `StateUpdated` / `StateDeleted`.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`, `### アセット`
- * - GitHub Issue #109 / sub-issue #139, #140, #141
+ * - GitHub Issue #109 / sub-issue #139, #140, #141, #142
  */
 import type { ChunkLogManager } from '../../src/utils/log.js';
 import type { RoomSocket } from '../../src/utils/roomSocket.js';
@@ -61,10 +68,25 @@ export interface StateDeleteCall {
   key: string;
 }
 
+/** One recorded `requestChangeBgm` call. */
+export interface ChangeBgmCall {
+  sceneId: string;
+  slot: number;
+  tinId: string | null;
+}
+
 interface PendingStateOperation {
   kind: 'update' | 'delete';
   sceneId: string;
   key: string;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+}
+
+interface PendingChangeBgmOperation {
+  sceneId: string;
+  slot: number;
+  tinId: string | null;
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
 }
@@ -107,6 +129,7 @@ export class FakeRoomSocket {
   readonly queryStateCalls: Array<{ sceneId: string }> = [];
   readonly requestUpdateStateCalls: StateWriteCall[] = [];
   readonly requestDeleteStateCalls: StateDeleteCall[] = [];
+  readonly requestChangeBgmCalls: ChangeBgmCall[] = [];
 
   private readonly listeners = new Set<FrameListener>();
   private readonly pending: Array<{
@@ -117,6 +140,7 @@ export class FakeRoomSocket {
   }> = [];
   private readonly pendingLogQueries: PendingLogQuery[] = [];
   private readonly pendingStateOperations: PendingStateOperation[] = [];
+  private readonly pendingChangeBgmOperations: PendingChangeBgmOperation[] = [];
 
   setChunkLogManager(manager?: ChunkLogManager): void {
     this.chunkManager = manager ?? null;
@@ -185,9 +209,31 @@ export class FakeRoomSocket {
     });
   }
 
+  /**
+   * Records the BGM change log write (`ChangeBgm`).
+   *
+   * Shares {@link FakeRoomSocket.autoAnswerStateWrites} with the state writes so
+   * BGM tests can hold both acknowledgements back and prove the local model is
+   * only committed after both arrive.
+   */
+  requestChangeBgm(sceneId: string, slot: number, tinId: string | null): Promise<unknown> {
+    this.requestChangeBgmCalls.push({ sceneId, slot, tinId });
+    if (this.autoAnswerStateWrites) {
+      return Promise.resolve({ scene_id: sceneId, slot, tin_id: tinId });
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingChangeBgmOperations.push({ sceneId, slot, tinId, resolve, reject });
+    });
+  }
+
   /** Number of state writes / deletes still waiting for a manual answer. */
   get pendingStateOperationCount(): number {
     return this.pendingStateOperations.length;
+  }
+
+  /** Number of `ChangeBgm` writes still waiting for a manual answer. */
+  get pendingChangeBgmCount(): number {
+    return this.pendingChangeBgmOperations.length;
   }
 
   /**
@@ -210,6 +256,28 @@ export class FakeRoomSocket {
   /** Rejects the oldest pending state delete ack (e.g. `PermissionDenied`). */
   rejectDeleteState(error: unknown): void {
     this.takeStateOperation('delete').reject(error);
+  }
+
+  /** Resolves the oldest pending `ChangeBgm` ack. */
+  resolveChangeBgm(): void {
+    const operation = this.pendingChangeBgmOperations.shift();
+    if (!operation) throw new Error('FakeRoomSocket: no pending ChangeBgm');
+    operation.resolve({ scene_id: operation.sceneId, slot: operation.slot, tin_id: operation.tinId });
+  }
+
+  /** Rejects the oldest pending `ChangeBgm` ack. */
+  rejectChangeBgm(error: unknown): void {
+    const operation = this.pendingChangeBgmOperations.shift();
+    if (!operation) throw new Error('FakeRoomSocket: no pending ChangeBgm');
+    operation.reject(error);
+  }
+
+  /**
+   * Delivers an arbitrary `ServerFrame` to every `subscribe` listener, exactly
+   * like `RoomSocket.notifyServerFrame`. Used by App-level state tests.
+   */
+  emitFrame(frame: unknown): void {
+    for (const listener of this.listeners) listener(frame);
   }
 
   private takeStateOperation(kind: 'update' | 'delete'): PendingStateOperation {

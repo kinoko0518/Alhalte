@@ -6,11 +6,13 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーン設定タブ`
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
+   * - GitHub Issue #109 / sub-issue #142: BGM状態変更のサーバー送信と送信中インジケーター
    */
   import {
     Button,
     Carousel,
     CarouselItem,
+    CircularProgress,
     IconButton,
     List,
     ListItem,
@@ -24,6 +26,7 @@
   import GenericImagePicker from '../GenericImagePicker.svelte';
   import type { BgmSlot, Character, Scene } from '../../../types/index.js';
   import { getNormalizedBgmSlots } from '../../../utils/sceneSettings.js';
+  import { ServerOperationError, type RoomSocket } from '../../../utils/roomSocket.js';
   import {
     applyMenuPosition,
     getMenuPositionStyle,
@@ -49,6 +52,7 @@
     onRequestDeleteSceneLogs,
     onDeleteSceneLogs,
     onRequestAssetPicker,
+    roomSocket = null,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -67,6 +71,11 @@
       initialScope?: AssetScope;
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
+    /**
+     * Room socket used to acknowledge BGM state changes (Issue #109 / #142).
+     * When absent or disconnected the component keeps its local-only behaviour.
+     */
+    roomSocket?: RoomSocket | null;
   } = $props();
 
   // Asset picker state
@@ -183,13 +192,40 @@
     }
   }
 
-  // BGM Slots state & synchronization (Issue #53)
+  // BGM Slots state & synchronization (Issue #53 / Issue #109 sub-issue #142)
+  //
+  // State schema (see the PR 「判断した点」):
+  // - track: `std::bgm` (slot 1), `std::bgm2` / `std::bgm3` (slots 2 / 3)
+  //   with the 64-hex cellar tin id as value; stopping deletes the key.
+  // - volume: `bgm::<slot>::volume` as a number in 0..1, sent on commit only.
+  // - the BGM change log is sent through `requestChangeBgm` alongside the state.
   let bgmSlots = $state<BgmSlot[]>(getNormalizedBgmSlots(currentScene.juices));
   let activeBgmSlotPicking = $state<number | null>(null);
   let lastTinIds = $state<Record<number, string>>({});
+  /** Slots with an in-flight server operation; reassigned so Svelte sees the change. */
+  let pendingBgmSlots = $state<Set<number>>(new Set());
+  /** Per-slot error message rendered under the row with `role="status"`. */
+  let bgmErrors = $state<Record<number, string>>({});
+  /** Slider drafts: the committed volume lives in `bgmSlots` only after the ack. */
+  let draftBgmVolumes = $state<Record<number, number>>({});
+
+  const BGM_COMMUNICATION_ERROR = 'サーバーと通信できませんでした';
+  const BGM_MISSING_TIN_ERROR = 'この音源はサーバーに保存されていません';
+  const TIN_ID_HEX = /^[0-9a-f]{64}$/;
 
   $effect(() => {
     bgmSlots = getNormalizedBgmSlots(currentScene.juices);
+  });
+
+  // A scene switch invalidates in-flight BGM UI state (the ack still checks the
+  // scene id before touching the model).
+  let bgmSceneId = currentScene.id;
+  $effect(() => {
+    if (currentScene.id === bgmSceneId) return;
+    bgmSceneId = currentScene.id;
+    pendingBgmSlots = new Set();
+    bgmErrors = {};
+    draftBgmVolumes = {};
   });
 
   function syncSlotToLegacy(slot: BgmSlot) {
@@ -205,42 +241,171 @@
     }
   }
 
+  /** Room-state key holding the track of a slot (`std::bgm` for slot 1). */
+  function getBgmStateKey(slotNum: number): string {
+    return slotNum === 1 ? 'std::bgm' : `std::bgm${slotNum}`;
+  }
+
+  /** Room-state key holding the volume of a slot. */
+  function getBgmVolumeStateKey(slotNum: number): string {
+    return `bgm::${slotNum}::volume`;
+  }
+
+  function findBgmSlot(slotNum: number): BgmSlot | undefined {
+    return bgmSlots.find((s) => s.slot === slotNum);
+  }
+
+  function isBgmPending(slotNum: number): boolean {
+    return pendingBgmSlots.has(slotNum);
+  }
+
+  function setBgmPending(slotNum: number, pending: boolean) {
+    const next = new Set(pendingBgmSlots);
+    if (pending) {
+      next.add(slotNum);
+    } else {
+      next.delete(slotNum);
+    }
+    pendingBgmSlots = next;
+  }
+
+  function setBgmError(slotNum: number, message: string | null) {
+    const next = { ...bgmErrors };
+    if (message) {
+      next[slotNum] = message;
+    } else {
+      delete next[slotNum];
+    }
+    bgmErrors = next;
+  }
+
+  /** Legacy `bgm1..3` field of a slot, used when no tin id was remembered yet. */
+  function getLegacyBgmTinId(slotNum: number): string | undefined {
+    if (slotNum === 1) return currentScene.juices.bgm1;
+    if (slotNum === 2) return currentScene.juices.bgm2;
+    if (slotNum === 3) return currentScene.juices.bgm3;
+    return undefined;
+  }
+
+  /**
+   * Commits a track change to the local scene after the server acknowledged it.
+   *
+   * Called exactly once per successful operation; `onUpdateScene` follows from it.
+   */
+  function applyBgmSlotState(slotNum: number, tinId: string | null, isPlaying: boolean) {
+    bgmSlots = bgmSlots.map((s) => (s.slot === slotNum ? { ...s, tinId, isPlaying } : s));
+    const updated = findBgmSlot(slotNum);
+    if (updated) {
+      syncSlotToLegacy(updated);
+    }
+    currentScene.juices.bgmSlots = [...bgmSlots];
+    onUpdateScene?.(currentScene);
+  }
+
+  /** Commits a volume change to the local scene after the server acknowledged it. */
+  function applyBgmSlotVolume(slotNum: number, volume: number) {
+    bgmSlots = bgmSlots.map((s) => (s.slot === slotNum ? { ...s, volume } : s));
+    const updated = findBgmSlot(slotNum);
+    if (updated) {
+      syncSlotToLegacy(updated);
+    }
+    currentScene.juices.bgmSlots = [...bgmSlots];
+    onUpdateScene?.(currentScene);
+    const nextDrafts = { ...draftBgmVolumes };
+    delete nextDrafts[slotNum];
+    draftBgmVolumes = nextDrafts;
+  }
+
+  /**
+   * Reports a failed BGM operation: reverts nothing locally (the state was never
+   * applied) and shows the shared communication error next to the slot.
+   */
+  function reportBgmFailure(slotNum: number, error: unknown) {
+    if (error instanceof ServerOperationError && error.code === 'PermissionDenied') {
+      // The root scene `/` only lets administrators change state; keep the UI alive.
+      console.warn(
+        `[SceneSettingsTab] BGM operation for slot ${slotNum} was denied by the server (PermissionDenied)`,
+        error,
+      );
+    } else {
+      console.warn(`[SceneSettingsTab] BGM operation for slot ${slotNum} failed`, error);
+    }
+    setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
+  }
+
+  /**
+   * Sends a track change (play / stop / select) to the server and commits it
+   * locally only when both the state update and the BGM change log succeed.
+   *
+   * A stop is `requestDeleteState` plus `requestChangeBgm(..., null)`. Without a
+   * connected socket the historical local-only behaviour is kept.
+   */
+  async function commitBgmChange(
+    slotNum: number,
+    tinId: string | null,
+    isPlaying: boolean,
+    rememberTinId?: string,
+  ) {
+    if (isBgmPending(slotNum)) return;
+
+    const socket = roomSocket;
+    const sceneId = currentScene.id;
+    setBgmError(slotNum, null);
+
+    if (!socket || !socket.isConnected) {
+      if (rememberTinId) lastTinIds[slotNum] = rememberTinId;
+      applyBgmSlotState(slotNum, tinId, isPlaying);
+      return;
+    }
+
+    setBgmPending(slotNum, true);
+    try {
+      const stateRequest =
+        tinId === null
+          ? socket.requestDeleteState(sceneId, getBgmStateKey(slotNum))
+          : socket.requestUpdateState(sceneId, getBgmStateKey(slotNum), tinId);
+      // The track state and the BGM change log are sent together and both must
+      // be acknowledged before the local model changes.
+      const results = await Promise.allSettled([
+        stateRequest,
+        socket.requestChangeBgm(sceneId, slotNum, tinId),
+      ]);
+      const failure = results.find(
+        (result): result is PromiseRejectedResult => result.status === 'rejected',
+      );
+      if (failure) throw failure.reason;
+
+      // The user may have switched scenes while the requests were in flight.
+      if (currentScene.id !== sceneId) return;
+
+      if (rememberTinId) lastTinIds[slotNum] = rememberTinId;
+      applyBgmSlotState(slotNum, tinId, isPlaying);
+    } catch (error) {
+      reportBgmFailure(slotNum, error);
+    } finally {
+      setBgmPending(slotNum, false);
+    }
+  }
+
   function handleToggleBgmPlay(slotNum: number) {
-    const slot = bgmSlots.find((s) => s.slot === slotNum);
+    if (isBgmPending(slotNum)) return;
+    const slot = findBgmSlot(slotNum);
     if (!slot) return;
 
     if (slot.isPlaying && slot.tinId) {
-      // 再生中 -> 停止 (None / null)
-      lastTinIds[slotNum] = slot.tinId;
-      bgmSlots = bgmSlots.map((s) =>
-        s.slot === slotNum ? { ...s, tinId: null, isPlaying: false } : s,
-      );
-    } else {
-      // 停止中 -> 再生
-      const prev =
-        lastTinIds[slotNum] ||
-        (slotNum === 1
-          ? currentScene.juices.bgm1
-          : slotNum === 2
-            ? currentScene.juices.bgm2
-            : slotNum === 3
-              ? currentScene.juices.bgm3
-              : undefined);
-      if (prev) {
-        bgmSlots = bgmSlots.map((s) =>
-          s.slot === slotNum ? { ...s, tinId: prev, isPlaying: true } : s,
-        );
-      } else {
-        // 音源がなければアセット選択を開く
-        handleBgmSelect(slotNum);
-        return;
-      }
+      // 再生中 -> 停止 (None / null): remembered so Play can resume it.
+      void commitBgmChange(slotNum, null, false, slot.tinId);
+      return;
     }
 
-    const updated = bgmSlots.find((s) => s.slot === slotNum)!;
-    syncSlotToLegacy(updated);
-    currentScene.juices.bgmSlots = [...bgmSlots];
-    onUpdateScene?.(currentScene);
+    // 停止中 -> 再生
+    const prev = lastTinIds[slotNum] || slot.tinId || getLegacyBgmTinId(slotNum);
+    if (!prev) {
+      // 音源がなければアセット選択を開く
+      handleBgmSelect(slotNum);
+      return;
+    }
+    void commitBgmChange(slotNum, prev, true);
   }
 
   function handleBgmSelect(slotOrKey: number | 'bgm1' | 'bgm2' | 'bgm3') {
@@ -252,6 +417,7 @@
           : slotOrKey === 'bgm2'
             ? 2
             : 3;
+    if (isBgmPending(slotNum)) return;
     activeBgmSlotPicking = slotNum;
     assetPickerTarget = `bgm${slotNum}` as any;
     assetPickerMediaType = 'audio';
@@ -259,8 +425,8 @@
       onRequestAssetPicker({
         mediaType: 'audio',
         initialScope: 'personal',
-        onSelect: (dataUrl) => {
-          handleSlotAssetPicked(slotNum, dataUrl);
+        onSelect: (dataUrl, asset) => {
+          handleSlotAssetPicked(slotNum, dataUrl, asset);
         },
       });
     } else {
@@ -268,32 +434,81 @@
     }
   }
 
-  function handleSlotAssetPicked(slotNum: number, dataUrl: string | undefined) {
-    if (dataUrl) {
-      lastTinIds[slotNum] = dataUrl;
+  /**
+   * Handles a picked audio asset.
+   *
+   * The room state stores the cellar tin id, never the local data URL. Assets
+   * without a tin id (legacy local-only entries) are rejected with an inline
+   * error instead of writing an unsynchronisable value. Selecting NONE (no
+   * data URL and no asset) stops the slot like the Play/Stop button.
+   */
+  function handleSlotAssetPicked(slotNum: number, dataUrl?: string, asset?: AssetItem) {
+    activeBgmSlotPicking = null;
+    if (isBgmPending(slotNum)) return;
+
+    if (!dataUrl && !asset) {
+      const previous = findBgmSlot(slotNum)?.tinId ?? undefined;
+      void commitBgmChange(slotNum, null, false, previous);
+      return;
     }
-    bgmSlots = bgmSlots.map((s) =>
-      s.slot === slotNum
-        ? { ...s, tinId: dataUrl ?? null, isPlaying: Boolean(dataUrl) }
-        : s,
-    );
-    const updated = bgmSlots.find((s) => s.slot === slotNum);
-    if (updated) {
-      syncSlotToLegacy(updated);
+
+    const tinId =
+      typeof asset?.tinId === 'string' ? asset.tinId.trim().toLowerCase() : '';
+    if (!TIN_ID_HEX.test(tinId)) {
+      console.warn(
+        `[SceneSettingsTab] The selected audio asset has no cellar tin id; slot ${slotNum} keeps its previous track.`,
+      );
+      setBgmError(slotNum, BGM_MISSING_TIN_ERROR);
+      return;
     }
-    currentScene.juices.bgmSlots = [...bgmSlots];
-    onUpdateScene?.(currentScene);
+    // `dataUrl` is only useful for local preview; the authoritative room state
+    // value is the tin id, so it is deliberately not persisted here.
+    void commitBgmChange(slotNum, tinId, true);
   }
 
-  function handleSlotVolumeInput(slotNum: number, volumeHundred: number) {
-    const vol = Math.max(0, Math.min(100, volumeHundred)) / 100;
-    bgmSlots = bgmSlots.map((s) => (s.slot === slotNum ? { ...s, volume: vol } : s));
-    const updated = bgmSlots.find((s) => s.slot === slotNum);
-    if (updated) {
-      syncSlotToLegacy(updated);
+  function readBgmSliderValue(e: Event): number {
+    const target = e.target as HTMLInputElement | null;
+    const raw = (e as any).detail?.value ?? Number(target?.value);
+    const hundred = Number.isFinite(raw) ? raw : 0;
+    return Math.max(0, Math.min(100, hundred)) / 100;
+  }
+
+  /** Drag preview: updates the label only; nothing is sent or committed. */
+  function handleBgmVolumePreview(slotNum: number, volume: number) {
+    draftBgmVolumes = { ...draftBgmVolumes, [slotNum]: volume };
+  }
+
+  /** Committed volume change: `input` ticks never reach the server. */
+  function handleBgmVolumeCommit(slotNum: number, volume: number) {
+    if (isBgmPending(slotNum)) return;
+    draftBgmVolumes = { ...draftBgmVolumes, [slotNum]: volume };
+    setBgmError(slotNum, null);
+
+    const socket = roomSocket;
+    const sceneId = currentScene.id;
+    if (!socket || !socket.isConnected) {
+      applyBgmSlotVolume(slotNum, volume);
+      return;
     }
-    currentScene.juices.bgmSlots = [...bgmSlots];
-    onUpdateScene?.(currentScene);
+
+    void (async () => {
+      setBgmPending(slotNum, true);
+      try {
+        await socket.requestUpdateState(sceneId, getBgmVolumeStateKey(slotNum), volume);
+        if (currentScene.id !== sceneId) return;
+        applyBgmSlotVolume(slotNum, volume);
+      } catch (error) {
+        reportBgmFailure(slotNum, error);
+        // Drop the preview so the slider shows the last acknowledged volume.
+        if (currentScene.id === sceneId) {
+          const nextDrafts = { ...draftBgmVolumes };
+          delete nextDrafts[slotNum];
+          draftBgmVolumes = nextDrafts;
+        }
+      } finally {
+        setBgmPending(slotNum, false);
+      }
+    })();
   }
 
   function handleAddBgmSlot() {
@@ -310,16 +525,19 @@
     onUpdateScene?.(currentScene);
   }
 
-  function handleAssetPicked(dataUrl: string | undefined) {
+  function handleAssetPicked(dataUrl?: string, asset?: AssetItem) {
     if (assetPickerTarget === 'bgImage') {
       currentScene.juices.bgImage = dataUrl;
+      onUpdateScene?.(currentScene);
     } else if (activeBgmSlotPicking !== null) {
-      handleSlotAssetPicked(activeBgmSlotPicking, dataUrl);
+      const slotNum = activeBgmSlotPicking;
       activeBgmSlotPicking = null;
+      // BGM applies (and notifies `onUpdateScene`) itself, once the server acks.
+      handleSlotAssetPicked(slotNum, dataUrl, asset);
     } else {
       currentScene.juices[assetPickerTarget] = dataUrl;
+      onUpdateScene?.(currentScene);
     }
-    onUpdateScene?.(currentScene);
   }
 
   function handleQuickSelectBgImage(dataUrl: string | undefined) {
@@ -472,66 +690,85 @@
       </div>
 
       {#each bgmSlots as slot (slot.slot)}
-        <div class="bgm-row" data-testid="bgm-row-{slot.slot}">
-          <!-- 1. 停止/再生ボタン: M3 IconButton, width="narrow", toggle play/stop -->
-          <IconButton
-            variant="tonal"
-            size="s"
-            width="narrow"
-            shape="round"
-            aria-label={slot.isPlaying && slot.tinId ? 'BGM停止' : 'BGM再生'}
-            onclick={() => handleToggleBgmPlay(slot.slot)}
-            data-testid="bgm-play-btn-{slot.slot}"
-            class="bgm-play-btn narrow-btn"
-            title={slot.isPlaying && slot.tinId ? `スロット${slot.slot}: 停止` : `スロット${slot.slot}: 再生`}
-          >
-            <Icon>{slot.isPlaying && slot.tinId ? 'stop' : 'play_arrow'}</Icon>
-          </IconButton>
+        <div class="bgm-slot-block" data-testid="bgm-slot-block-{slot.slot}">
+          <div class="bgm-row" data-testid="bgm-row-{slot.slot}">
+            <!-- 1. 停止/再生ボタン: M3 IconButton, width="narrow", toggle play/stop -->
+            <IconButton
+              variant="tonal"
+              size="s"
+              width="narrow"
+              shape="round"
+              aria-label={slot.isPlaying && slot.tinId ? 'BGM停止' : 'BGM再生'}
+              onclick={() => handleToggleBgmPlay(slot.slot)}
+              disabled={isBgmPending(slot.slot)}
+              data-testid="bgm-play-btn-{slot.slot}"
+              class="bgm-play-btn narrow-btn"
+              title={slot.isPlaying && slot.tinId ? `スロット${slot.slot}: 停止` : `スロット${slot.slot}: 再生`}
+            >
+              <Icon>{slot.isPlaying && slot.tinId ? 'stop' : 'play_arrow'}</Icon>
+            </IconButton>
 
-          <!-- 2. 選択ボタン: 縦横比 1:1 の M3 IconButton, library_music アイコン -->
-          <IconButton
-            variant="tonal"
-            size="s"
-            width="default"
-            shape="round"
-            aria-label="BGM選択"
-            onclick={() => handleBgmSelect(slot.slot)}
-            data-testid="bgm-select-btn-{slot.slot}"
-            class="bgm-select-btn square-btn"
-            title={`スロット${slot.slot}: BGM選択`}
-          >
-            <Icon>library_music</Icon>
-          </IconButton>
+            <!-- 2. 選択ボタン: 縦横比 1:1 の M3 IconButton, library_music アイコン
+                 送信中は波線の CircularProgress に差し替える (Issue #109 / #142) -->
+            <IconButton
+              variant="tonal"
+              size="s"
+              width="default"
+              shape="round"
+              aria-label={isBgmPending(slot.slot) ? 'BGM送信中' : 'BGM選択'}
+              onclick={() => handleBgmSelect(slot.slot)}
+              disabled={isBgmPending(slot.slot)}
+              data-testid="bgm-select-btn-{slot.slot}"
+              class="bgm-select-btn square-btn"
+              title={isBgmPending(slot.slot) ? `スロット${slot.slot}: 送信中` : `スロット${slot.slot}: BGM選択`}
+            >
+              {#if isBgmPending(slot.slot)}
+                <CircularProgress
+                  indeterminate
+                  wavy
+                  track={false}
+                  class="bgm-pending-progress"
+                  data-testid="bgm-pending-{slot.slot}"
+                  aria-label="送信中"
+                />
+              {:else}
+                <Icon>library_music</Icon>
+              {/if}
+            </IconButton>
 
-          <!-- 3. 音量バー: M3 Slider (0〜100) -->
-          <div class="slider-wrapper" data-testid="bgm-slider-wrapper-{slot.slot}">
-            <Slider
-              min={0}
-              max={100}
-              step={1}
-              value={Math.round((slot.volume ?? 0.8) * 100)}
-              oninput={(e: Event) => {
-                const target = e.target as HTMLInputElement;
-                const val = (e as any).detail?.value ?? Number(target.value);
-                handleSlotVolumeInput(slot.slot, val);
-              }}
-              onchange={(e: Event) => {
-                const target = e.target as HTMLInputElement;
-                const val = (e as any).detail?.value ?? Number(target.value);
-                handleSlotVolumeInput(slot.slot, val);
-              }}
-              aria-label="BGM音量"
-              data-testid="bgm-slider-{slot.slot}"
-            />
-            <span class="vol-label" data-testid="bgm-vol-label-{slot.slot}">
-              {Math.round((slot.volume ?? 0.8) * 100)}%
+            <!-- 3. 音量バー: M3 Slider (0〜100)。確定 (change) 時だけ送信する -->
+            <div class="slider-wrapper" data-testid="bgm-slider-wrapper-{slot.slot}">
+              <Slider
+                min={0}
+                max={100}
+                step={1}
+                value={Math.round((draftBgmVolumes[slot.slot] ?? slot.volume ?? 0.8) * 100)}
+                oninput={(e: Event) => {
+                  handleBgmVolumePreview(slot.slot, readBgmSliderValue(e));
+                }}
+                onchange={(e: Event) => {
+                  handleBgmVolumeCommit(slot.slot, readBgmSliderValue(e));
+                }}
+                disabled={isBgmPending(slot.slot)}
+                aria-label="BGM音量"
+                data-testid="bgm-slider-{slot.slot}"
+              />
+              <span class="vol-label" data-testid="bgm-vol-label-{slot.slot}">
+                {Math.round((draftBgmVolumes[slot.slot] ?? slot.volume ?? 0.8) * 100)}%
+              </span>
+            </div>
+
+            <!-- スロット番号バッジ (u32) -->
+            <span class="slot-badge" data-testid="bgm-slot-badge-{slot.slot}">
+              #{slot.slot}
             </span>
           </div>
 
-          <!-- スロット番号バッジ (u32) -->
-          <span class="slot-badge" data-testid="bgm-slot-badge-{slot.slot}">
-            #{slot.slot}
-          </span>
+          {#if bgmErrors[slot.slot]}
+            <p class="bgm-error-text" role="status" data-testid="bgm-error-{slot.slot}">
+              {bgmErrors[slot.slot]}
+            </p>
+          {/if}
         </div>
       {/each}
     </div>
@@ -981,6 +1218,21 @@
     flex-direction: row;
     align-items: center;
     gap: 8px;
+  }
+  .bgm-slot-block {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  :global(.bgm-pending-progress) {
+    --np-circular-progress-size: 1.25rem;
+  }
+  .bgm-error-text {
+    margin: 0;
+    padding-left: 2.5rem;
+    font-size: 0.8rem;
+    line-height: 1.3;
+    color: var(--np-color-error);
   }
   /* 停止/再生ボタン: 選択ボタン（1:1）に対してより細い幅 (narrow) */
   :global(.bgm-play-btn.narrow-btn) {

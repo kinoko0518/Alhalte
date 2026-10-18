@@ -12,7 +12,10 @@ import {
   loadAssets,
 } from '../src/utils/assets.js';
 import SceneSettingsTab from '../src/components/Control/tabs/SceneSettingsTab.svelte';
-import type { Character, Scene } from '../src/types/index.js';
+import App from '../src/components/App.svelte';
+import { jsonToTin } from '../src/utils/roomSocket.js';
+import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
+import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
 
 describe('Scene Settings & Juices', () => {
   beforeEach(() => {
@@ -294,6 +297,8 @@ describe('Scene Settings & Juices', () => {
       dataUrl: 'data:audio/ogg;base64,YmF0dGxl',
       mimeType: 'audio/ogg',
       createdAt: 3000,
+      // Issue #109 / #142: BGM state stores the cellar tin id.
+      tinId: 'd'.repeat(64),
     });
 
     const target = document.createElement('div');
@@ -378,10 +383,11 @@ describe('Scene Settings & Juices', () => {
       target.querySelector(`[data-testid="asset-card-${personalAudio.id}"]`),
     ).toBeTruthy();
 
-    // Select audio asset for BGM1
+    // Select audio asset for BGM1 -> the tin id (not the data URL) is stored.
     target.querySelector<HTMLElement>(`[data-testid="asset-card-${personalAudio.id}"]`)?.click();
     await new Promise((r) => setTimeout(r, 20));
-    expect(lastUpdatedScene?.juices.bgm1).toBe(personalAudio.dataUrl);
+    expect(lastUpdatedScene?.juices.bgm1).toBe(personalAudio.tinId);
+    expect(lastUpdatedScene?.juices.bgm1).not.toBe(personalAudio.dataUrl);
 
     unmount(instanceNonAdmin);
 
@@ -706,6 +712,96 @@ describe('Scene Settings & Juices', () => {
       sceneNameInput.dispatchEvent(new Event('input', { bubbles: true }));
     }
     expect(updatedScene?.name).toBe('司令室');
+
+    unmount(instance);
+    target.remove();
+  });
+});
+
+describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)', () => {
+  // spec: argenterie/bgm-controls std::bgm / std::bgm2 / std::bgm3 / bgm::<slot>::volume の state を scene.juices と bgmSlots へ反映する
+  it('applies legacy std::bgm, std::bgm2/3, bgm::<slot>::volume and StateDeleted to the scene BGM slots', async () => {
+    const tinA = 'a'.repeat(64);
+    const tinB = 'b'.repeat(64);
+    const tinC = 'c'.repeat(64);
+    const dummyRoom: VisitedRoom = {
+      id: 'room-bgm-state',
+      name: 'BGM状態テスト部屋',
+      url: 'https://alhalte.example/rooms/room-bgm-state#abcdef',
+      lastVisited: Date.now(),
+    };
+
+    const socket = new FakeRoomSocket();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: dummyRoom,
+        initialScenes: [
+          {
+            id: '/',
+            name: 'メインシーン',
+            juices: createDefaultJuices(),
+            viewTransform: { x: 0, y: 0, scale: 1 },
+            members: [],
+          },
+        ],
+        roomSocket: asRoomSocket(socket),
+      },
+    });
+
+    const settle = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+    await settle();
+
+    // Open the scene settings tab where the BGM rows live.
+    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-settings"]')?.click();
+    await settle();
+
+    const play1 = () =>
+      target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]');
+    const play2 = () =>
+      target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-2"]');
+    const play3 = () =>
+      target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-3"]');
+
+    expect(play1()?.getAttribute('aria-label')).toBe('BGM再生');
+
+    // Legacy `std::bgm` (slot 1) with a Tin-encoded 64-hex tin id.
+    socket.emitFrame({
+      StateUpdated: { scene_id: '/', key: 'std::bgm', value: jsonToTin(tinA) },
+    });
+    await settle();
+    expect(play1()?.getAttribute('aria-label')).toBe('BGM停止');
+
+    // New slot keys `std::bgm2` / `std::bgm3`.
+    socket.emitFrame({
+      StateUpdated: { scene_id: '/', key: 'std::bgm2', value: jsonToTin(tinB) },
+    });
+    await settle();
+    expect(play2()?.getAttribute('aria-label')).toBe('BGM停止');
+
+    // A plain legacy string value is still accepted.
+    socket.emitFrame({
+      StateUpdated: { scene_id: '/', key: 'std::bgm3', value: tinC },
+    });
+    await settle();
+    expect(play3()?.getAttribute('aria-label')).toBe('BGM停止');
+
+    // Volume keys update the slot volume shown next to the slider.
+    socket.emitFrame({
+      StateUpdated: { scene_id: '/', key: 'bgm::2::volume', value: jsonToTin(0.42) },
+    });
+    await settle();
+    expect(
+      target.querySelector('[data-testid="bgm-vol-label-2"]')?.textContent?.trim(),
+    ).toBe('42%');
+
+    // StateDeleted clears the slot (stop).
+    socket.emitFrame({ StateDeleted: { scene_id: '/', key: 'std::bgm' } });
+    await settle();
+    expect(play1()?.getAttribute('aria-label')).toBe('BGM再生');
 
     unmount(instance);
     target.remove();

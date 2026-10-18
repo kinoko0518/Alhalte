@@ -13,13 +13,13 @@
   import 'noph-ui/defaultTheme';
   import { Button, IconButton, Sheet } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { Character, ExtensionItem, LogRecord, Scene, ViewTransform, VisitedRoom } from '../types/index.js';
+  import type { BgmSlot, Character, ExtensionItem, LogRecord, Scene, ViewTransform, VisitedRoom } from '../types/index.js';
   import { saveRecentRoom, type RecentRoom } from '../utils/recentRooms.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
   import { resolveRoomFromLocation } from '../utils/home.js';
   import { ChunkLogManager } from '../utils/log.js';
   import type { SceneMovementEvent } from '../utils/sceneGraph.js';
-  import { createDefaultJuices, inheritJuices, moveMemberToScene } from '../utils/sceneSettings.js';
+  import { createDefaultJuices, getNormalizedBgmSlots, inheritJuices, moveMemberToScene } from '../utils/sceneSettings.js';
   import { applyThemeToDocument } from '../utils/theme.js';
   import {
     DEFAULT_OFFICIAL_EXTENSIONS,
@@ -45,6 +45,7 @@
     OperationTimeoutError,
     ServerOperationError,
     parseCharacter,
+    tinToJson,
   } from '../utils/roomSocket.js';
   import { getOutbox } from '../utils/outbox.js';
   import {
@@ -602,6 +603,133 @@
     }
   });
 
+  // ---------------------------------------------------------------------------
+  // BGM scene-state synchronization (Issue #109 / sub-issue #142)
+  // ---------------------------------------------------------------------------
+  /** Scene-state keys carrying a slot's track; legacy `std::bgm` is slot 1. */
+  const BGM_SLOT_STATE_KEYS: Record<string, number> = {
+    'std::bgm': 1,
+    'std::bgm2': 2,
+    'std::bgm3': 3,
+  };
+
+  /** Scene-state key carrying a slot volume (`bgm::<slot>::volume`). */
+  const BGM_VOLUME_STATE_KEY = /^bgm::(\d+)::volume$/;
+
+  /** True when a `StateUpdated` / `StateDeleted` key belongs to the BGM schema. */
+  function isBgmStateKey(key: string): boolean {
+    return key in BGM_SLOT_STATE_KEYS || BGM_VOLUME_STATE_KEY.test(key);
+  }
+
+  /** Mirrors a slot's tin id (and optionally volume) into the legacy `bgm1..3` fields. */
+  function syncLegacyBgmFields(
+    juices: Scene['juices'],
+    slot: number,
+    tinId: string | null,
+    volume?: number,
+  ) {
+    const value = tinId ?? undefined;
+    if (slot === 1) {
+      juices.bgm1 = value;
+      if (volume !== undefined) juices.bgm1Volume = volume;
+    } else if (slot === 2) {
+      juices.bgm2 = value;
+      if (volume !== undefined) juices.bgm2Volume = volume;
+    } else if (slot === 3) {
+      juices.bgm3 = value;
+      if (volume !== undefined) juices.bgm3Volume = volume;
+    }
+  }
+
+  /** Replaces `juices.bgmSlots` with a normalized copy (legacy `bgm1..3` included). */
+  function setNormalizedBgmSlots(juices: Scene['juices'], slots: BgmSlot[]) {
+    juices.bgmSlots = slots.map((slot) => ({ ...slot }));
+  }
+
+  /**
+   * Applies a BGM `StateUpdated` frame.
+   *
+   * Track values are the 64-hex cellar tin id; the legacy plain-string form of
+   * `std::bgm` is still accepted. Tin-encoded values are decoded first because
+   * `RoomSocket.subscribe` forwards the raw frame.
+   */
+  function applyBgmStateUpdated(scene: Scene, key: string, rawValue: unknown) {
+    const value = tinToJson(rawValue);
+
+    const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
+    if (volumeMatch) {
+      const slotNum = Number(volumeMatch[1]);
+      const volume = typeof value === 'number' ? value : Number(value);
+      if (!Number.isFinite(volume)) return;
+      const clamped = Math.max(0, Math.min(1, volume));
+      const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+        slot.slot === slotNum ? { ...slot, volume: clamped } : { ...slot },
+      );
+      setNormalizedBgmSlots(scene.juices, slots);
+      const updated = slots.find((slot) => slot.slot === slotNum);
+      syncLegacyBgmFields(scene.juices, slotNum, updated?.tinId ?? null, clamped);
+      return;
+    }
+
+    const slotNum = BGM_SLOT_STATE_KEYS[key];
+    if (slotNum === undefined) return;
+    const tinId = typeof value === 'string' && value.length > 0 ? value : null;
+    const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+      slot.slot === slotNum ? { ...slot, tinId, isPlaying: tinId !== null } : { ...slot },
+    );
+    setNormalizedBgmSlots(scene.juices, slots);
+    syncLegacyBgmFields(scene.juices, slotNum, tinId);
+  }
+
+  /** Applies a BGM `StateDeleted` frame (stopping a slot deletes its state key). */
+  function applyBgmStateDeleted(scene: Scene, key: string) {
+    const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
+    if (volumeMatch) {
+      const slotNum = Number(volumeMatch[1]);
+      const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+        slot.slot === slotNum ? { ...slot, volume: 0.8 } : { ...slot },
+      );
+      setNormalizedBgmSlots(scene.juices, slots);
+      const updated = slots.find((slot) => slot.slot === slotNum);
+      syncLegacyBgmFields(scene.juices, slotNum, updated?.tinId ?? null, 0.8);
+      return;
+    }
+
+    const slotNum = BGM_SLOT_STATE_KEYS[key];
+    if (slotNum === undefined) return;
+    const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+      slot.slot === slotNum ? { ...slot, tinId: null, isPlaying: false } : { ...slot },
+    );
+    setNormalizedBgmSlots(scene.juices, slots);
+    syncLegacyBgmFields(scene.juices, slotNum, null);
+  }
+
+  /**
+   * Mirrors a scene model updated by `SceneSettingsTab` (Issue #109 / #142).
+   *
+   * The tab owns the room-state requests; this handler only replaces the scene
+   * by id and normalizes the BGM slots so `scenes` stays the single source of
+   * truth for the field and every tab.
+   */
+  function handleUpdateScene(updatedScene: Scene) {
+    if (!updatedScene || typeof updatedScene.id !== 'string') return;
+    const index = scenes.findIndex((scene) => scene.id === updatedScene.id);
+    if (index < 0) return;
+
+    const juices: Scene['juices'] = {
+      ...updatedScene.juices,
+      bgmSlots: getNormalizedBgmSlots(updatedScene.juices).map((slot) => ({ ...slot })),
+    };
+    const nextScenes = [...scenes];
+    nextScenes[index] = {
+      ...updatedScene,
+      juices,
+      viewTransform: { ...updatedScene.viewTransform },
+      members: [...updatedScene.members],
+    };
+    scenes = nextScenes;
+  }
+
   $effect(() => {
     if (!roomSocket) return;
     roomSocket.setChunkLogManager(chunkManager);
@@ -651,8 +779,10 @@
         const { scene_id, key, value } = frame.StateUpdated;
         const targetScene = scenes.find((s) => s.id === scene_id);
         if (targetScene) {
-          if (key === 'std::bgm') {
-            targetScene.juices.bgm1 = typeof value === 'string' ? value : undefined;
+          if (isBgmStateKey(key)) {
+            // BGM state keys: `std::bgm` (legacy + slot 1), `std::bgm2/3`,
+            // `bgm::<slot>::volume`. Values arrive Tin-encoded.
+            applyBgmStateUpdated(targetScene, key, value);
           } else if (key === 'std::b-img') {
             targetScene.juices.bgImage = typeof value === 'string' ? value : undefined;
           } else if (key === 'view::transform' && value && typeof value === 'object') {
@@ -667,8 +797,8 @@
         // branch, which threw a ReferenceError on every StateDeleted frame.
         const targetScene = scenes.find((s) => s.id === scene_id);
         if (targetScene) {
-          if (key === 'std::bgm') {
-            targetScene.juices.bgm1 = undefined;
+          if (isBgmStateKey(key)) {
+            applyBgmStateDeleted(targetScene, key);
           } else if (key === 'std::b-img') {
             targetScene.juices.bgImage = undefined;
           }
@@ -1044,6 +1174,7 @@
                   onCollapse={() => (isControlSheetOpen = false)}
                   onSelectScene={handleSelectScene}
                   onSelectCharacter={(id) => (selectedCharacterId = id)}
+                  onUpdateScene={handleUpdateScene}
                   onCreateScene={handleCreateScene}
                   onDeleteScene={handleDeleteScene}
                   onMoveMember={handleMoveMember}
@@ -1131,6 +1262,7 @@
                 onCollapse={() => (isControlSheetOpen = false)}
                 onSelectScene={handleSelectScene}
                 onSelectCharacter={(id) => (selectedCharacterId = id)}
+                onUpdateScene={handleUpdateScene}
                 onCreateScene={handleCreateScene}
                 onDeleteScene={handleDeleteScene}
                 onMoveMember={handleMoveMember}

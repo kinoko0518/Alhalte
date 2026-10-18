@@ -110,8 +110,8 @@
     }) => void;
     onRequestEditCharacter?: (char: Character) => void;
     /**
-     * Forwarded to `LogTab`: the room socket used for the eager latest-chunk
-     * load (Issue #109 / #140).
+     * Forwarded to `LogTab` (eager latest-chunk load, Issue #109 / #140) and to
+     * `SceneSettingsTab` (acknowledged BGM state changes, Issue #109 / #142).
      */
     roomSocket?: RoomSocket | null;
     /** Forwarded to `LogTab`: retries a queued log load when it becomes `connected`. */
@@ -211,6 +211,7 @@
         {onRequestDeleteSceneLogs}
         {onDeleteSceneLogs}
         {onRequestAssetPicker}
+        {roomSocket}
       />
     {:else if activeTab === 'characters'}
       <CharacterManagementTab
