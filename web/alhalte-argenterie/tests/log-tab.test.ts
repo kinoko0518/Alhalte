@@ -187,6 +187,10 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       target.querySelector('[data-testid="msg-content-msg-live-1"]')?.textContent?.trim(),
     ).toBe('2D6+3 攻撃ロール！');
 
+    const msgEl = target.querySelector('[data-testid="log-record-msg-live-1"]');
+    expect(msgEl?.classList.contains('message-entry-new')).toBe(true);
+    expect(msgEl?.getAttribute('data-is-new')).toBe('true');
+
     unmount(instance);
     target.remove();
   });
@@ -247,6 +251,10 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     const messagesList = target.querySelector('[data-testid="messages-list"]');
     expect(messagesList?.textContent).toContain('こんにちは、世界！');
     expect(messagesList?.textContent).toContain('アルハルテ太郎');
+
+    const newMsgEl = target.querySelector('.message-entry.message-entry-new');
+    expect(newMsgEl).toBeTruthy();
+    expect(newMsgEl?.getAttribute('data-is-new')).toBe('true');
 
     // Verify default official extensions are populated when switching to Extensions tab
     expect(DEFAULT_OFFICIAL_EXTENSIONS).toHaveLength(6);
@@ -314,6 +322,209 @@ describe('Log Tab & Chunk Lazy Loading', () => {
 
     unmount(instance);
     target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab 新規メッセージ追加時の Material 3 Expressive バネアニメーション (Issue #90)
+  it('applies M3 Expressive spring animation class and attribute only to newly appended messages, preserving natural static rendering for initial messages', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: 'scene-spring-test',
+      name: 'バネテストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const chunkManager = new ChunkLogManager();
+    // Pre-populate with initial existing message before mount
+    chunkManager.appendRecord({
+      id: 'msg-initial-1',
+      sceneId: 'scene-spring-test',
+      content: '既存の初期メッセージ',
+      speaker: 'ルシア',
+      timestamp: 1000,
+    });
+
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        chunkManager,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 1. Initial message must render naturally without animation classes or attributes
+    const initialEl = target.querySelector('[data-testid="log-record-msg-initial-1"]');
+    expect(initialEl).toBeTruthy();
+    expect(initialEl?.classList.contains('message-entry')).toBe(true);
+    expect(initialEl?.classList.contains('message-entry-new')).toBe(false);
+    expect(initialEl?.getAttribute('data-is-new')).toBeNull();
+
+    // 2. Append new message 1
+    chunkManager.appendRecord({
+      id: 'msg-live-1',
+      sceneId: 'scene-spring-test',
+      content: '新着メッセージ1',
+      speaker: 'ベルナルド',
+      timestamp: 1001,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const newEl1 = target.querySelector('[data-testid="log-record-msg-live-1"]');
+    expect(newEl1).toBeTruthy();
+    expect(newEl1?.classList.contains('message-entry')).toBe(true);
+    expect(newEl1?.classList.contains('message-entry-new')).toBe(true);
+    expect(newEl1?.getAttribute('data-is-new')).toBe('true');
+
+    // Initial message still does not have the animation class
+    expect(initialEl?.classList.contains('message-entry-new')).toBe(false);
+
+    // 3. Append new message 2
+    chunkManager.appendRecord({
+      id: 'msg-live-2',
+      sceneId: 'scene-spring-test',
+      content: '新着メッセージ2',
+      speaker: 'ルシア',
+      timestamp: 1002,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const newEl2 = target.querySelector('[data-testid="log-record-msg-live-2"]');
+    expect(newEl2).toBeTruthy();
+    expect(newEl2?.classList.contains('message-entry-new')).toBe(true);
+    expect(newEl2?.getAttribute('data-is-new')).toBe('true');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab シーン切り替え時の既存メッセージの自然描画と新規メッセージのアニメーション (Issue #90)
+  it('resets new record animation state when switching scenes, treating next scene records as existing', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const sceneA: Scene = {
+      id: 'scene-a',
+      name: 'シーンA',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+    const sceneB: Scene = {
+      id: 'scene-b',
+      name: 'シーンB',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const chunkManager = new ChunkLogManager();
+    chunkManager.appendRecord({
+      id: 'msg-a-1',
+      sceneId: 'scene-a',
+      content: 'シーンAの既存メッセージ',
+      speaker: 'ルシア',
+      timestamp: 100,
+    });
+    chunkManager.appendRecord({
+      id: 'msg-b-1',
+      sceneId: 'scene-b',
+      content: 'シーンBの既存メッセージ',
+      speaker: 'ベルナルド',
+      timestamp: 101,
+    });
+
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: sceneA,
+        allScenes: [sceneA, sceneB],
+        chunkManager,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Scene A initial record: no animation
+    const msgA1 = target.querySelector('[data-testid="log-record-msg-a-1"]');
+    expect(msgA1?.classList.contains('message-entry-new')).toBe(false);
+
+    // Append new record to Scene A
+    chunkManager.appendRecord({
+      id: 'msg-a-new',
+      sceneId: 'scene-a',
+      content: 'シーンAの新規メッセージ',
+      speaker: 'ルシア',
+      timestamp: 102,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const msgANew = target.querySelector('[data-testid="log-record-msg-a-new"]');
+    expect(msgANew?.classList.contains('message-entry-new')).toBe(true);
+
+    unmount(instance);
+    target.innerHTML = '';
+
+    // Mount in Scene B: msg-b-1 is existing
+    const instanceB = mount(LogTab, {
+      target,
+      props: {
+        scene: sceneB,
+        allScenes: [sceneA, sceneB],
+        chunkManager,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const msgB1 = target.querySelector('[data-testid="log-record-msg-b-1"]');
+    expect(msgB1).toBeTruthy();
+    expect(msgB1?.classList.contains('message-entry-new')).toBe(false);
+
+    // Append new record to Scene B
+    chunkManager.appendRecord({
+      id: 'msg-b-new',
+      sceneId: 'scene-b',
+      content: 'シーンBの新規メッセージ',
+      speaker: 'ベルナルド',
+      timestamp: 103,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const msgBNew = target.querySelector('[data-testid="log-record-msg-b-new"]');
+    expect(msgBNew?.classList.contains('message-entry-new')).toBe(true);
+    expect(msgBNew?.getAttribute('data-is-new')).toBe('true');
+
+    unmount(instanceB);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab Material 3 Expressive バネアニメーション規則の定義 (Issue #90)
+  it('defines M3 Expressive spatial cubic-bezier, effects curve, and spring keyframes in LogTab', async () => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const filePath = path.resolve(__dirname, '../src/components/Control/tabs/LogTab.svelte');
+    const content = fs.readFileSync(filePath, 'utf-8');
+
+    // M3 Expressive spatial motion token & cubic-bezier: 500ms cubic-bezier(0.38, 1.21, 0.22, 1)
+    expect(content).toContain('--np-motion-expressive-default-spatial');
+    expect(content).toContain('cubic-bezier(0.38, 1.21, 0.22, 1)');
+    expect(content).toContain('np-message-spring-spatial');
+
+    // M3 Expressive effects motion token for fade-in: 150ms cubic-bezier(0.31, 0.94, 0.34, 1)
+    expect(content).toContain('--np-motion-expressive-fast-effects');
+    expect(content).toContain('np-message-fade-in');
+
+    // Spring translate from right offset to 0
+    expect(content).toContain('translateX(var(--msg-entry-offset-x, 28px))');
+    expect(content).toContain('transform: translateX(0)');
+
+    // Accessibility: prefers-reduced-motion
+    expect(content).toContain('@media (prefers-reduced-motion: reduce)');
   });
 });
 

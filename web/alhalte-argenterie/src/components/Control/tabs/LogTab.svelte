@@ -78,10 +78,20 @@
   // Theme settings
   let currentPaletteId = $state<ThemePaletteId>(getThemeSettings().palette);
 
-  // Messages & WASM rendering cache
-  let messages = $state<LogRecord[]>([]);
+  // Messages, animation tracking, & WASM rendering cache
+  let initialRecordIds = new Set<string>(chunkManager.getLoadedRecords(scene.id).map((r) => r.id));
+  let newRecordIds = $state(new Set<string>());
+  let messages = $state<LogRecord[]>(chunkManager.getLoadedRecords(scene.id));
   let listElement = $state<HTMLDivElement | null>(null);
   let renderedContentMap = $state<Record<string, string>>({});
+
+  void updateRenderedHtml(messages);
+
+  let currentSceneId = scene.id;
+  let currentManager = chunkManager;
+  let currentUnsub = chunkManager.subscribe(() => {
+    refreshLogs();
+  });
 
   let availableScenes = $derived(allScenes.length > 0 ? allScenes : [scene]);
 
@@ -110,7 +120,24 @@
   }
 
   function refreshLogs() {
-    messages = chunkManager.getLoadedRecords(scene.id);
+    const currentRecords = chunkManager.getLoadedRecords(scene.id);
+    if (currentRecords.length === 0) {
+      initialRecordIds.clear();
+      newRecordIds = new Set();
+    } else {
+      let hasNew = false;
+      const nextNewIds = new Set(newRecordIds);
+      for (const r of currentRecords) {
+        if (!initialRecordIds.has(r.id) && !nextNewIds.has(r.id)) {
+          nextNewIds.add(r.id);
+          hasNew = true;
+        }
+      }
+      if (hasNew) {
+        newRecordIds = nextNewIds;
+      }
+    }
+    messages = currentRecords;
     void updateRenderedHtml(messages);
     queueMicrotask(() => {
       if (listElement) {
@@ -122,23 +149,49 @@
   $effect(() => {
     void initSaignant();
     const activeSceneId = scene.id;
-    untrack(() => {
-      messages = chunkManager.getLoadedRecords(activeSceneId);
-      void updateRenderedHtml(messages);
-    });
-    return chunkManager.subscribe(() => {
-      refreshLogs();
-    });
+    const activeManager = chunkManager;
+
+    if (activeSceneId !== currentSceneId || activeManager !== currentManager) {
+      currentSceneId = activeSceneId;
+      if (activeManager !== currentManager) {
+        currentUnsub();
+        currentManager = activeManager;
+        currentUnsub = currentManager.subscribe(() => {
+          refreshLogs();
+        });
+      }
+      untrack(() => {
+        const records = currentManager.getLoadedRecords(activeSceneId);
+        initialRecordIds = new Set(records.map((r) => r.id));
+        newRecordIds = new Set();
+        messages = records;
+        void updateRenderedHtml(messages);
+      });
+    }
+
+    return () => {
+      currentUnsub();
+    };
   });
 
   async function handleScroll(e: Event) {
     const el = e.currentTarget as HTMLDivElement;
     if (el.scrollTop <= 5) {
       const newRecords = await chunkManager.handleScrollEdge(scene.id, 'top');
-      if (newRecords) refreshLogs();
+      if (newRecords) {
+        for (const r of newRecords) {
+          initialRecordIds.add(r.id);
+        }
+        refreshLogs();
+      }
     } else if (el.scrollHeight - el.scrollTop - el.clientHeight <= 5) {
       const newRecords = await chunkManager.handleScrollEdge(scene.id, 'bottom');
-      if (newRecords) refreshLogs();
+      if (newRecords) {
+        for (const r of newRecords) {
+          initialRecordIds.add(r.id);
+        }
+        refreshLogs();
+      }
     }
   }
 
@@ -421,7 +474,13 @@
       {#each messages as record (record.id)}
         {@const char = findCharacter(record.speakerId, record.speaker)}
         {@const charColor = char?.color}
-        <div class="message-entry" data-testid="log-record-{record.id}">
+        {@const isNew = newRecordIds.has(record.id)}
+        <div
+          class="message-entry"
+          class:message-entry-new={isNew}
+          data-testid="log-record-{record.id}"
+          data-is-new={isNew ? 'true' : undefined}
+        >
           <!-- Character Avatar / Icon -->
           <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
             {#if char?.iconUrl}
@@ -664,6 +723,7 @@
   .messages-list {
     flex: 1;
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 16px;
     display: flex;
     flex-direction: column;
@@ -681,6 +741,13 @@
     display: flex;
     gap: 12px;
     align-items: flex-start;
+  }
+
+  .message-entry-new {
+    animation:
+      np-message-spring-spatial var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) both,
+      np-message-fade-in var(--np-motion-expressive-fast-effects, 150ms cubic-bezier(0.31, 0.94, 0.34, 1)) both;
+    will-change: transform, opacity;
   }
 
   .msg-icon-col {
@@ -884,6 +951,32 @@
     to {
       opacity: 1;
       transform: scale(1);
+    }
+  }
+
+  @keyframes np-message-spring-spatial {
+    from {
+      transform: translateX(var(--msg-entry-offset-x, 28px));
+    }
+    to {
+      transform: translateX(0);
+    }
+  }
+
+  @keyframes np-message-fade-in {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .message-entry-new {
+      animation: none;
+      transform: none;
+      opacity: 1;
     }
   }
 </style>
