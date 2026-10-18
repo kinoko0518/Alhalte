@@ -233,6 +233,31 @@ describe('Server Connection Management & Offline Indicator (Issue #88 & #67)', (
 
       unmount(instance);
     });
+
+    // spec: alhalte-argenterie/offline-indicator Issue #111: y-axis flow layout without position fixed overlay
+    it('uses in-flow layout with indicator-inner wrapper instead of fixed viewport overlay (Issue #111)', () => {
+      const instance = mount(OfflineIndicator, {
+        target,
+        props: {
+          connectionState: 'disconnected',
+        },
+      });
+
+      const indicator = target.querySelector<HTMLElement>('[data-testid="offline-indicator"]');
+      expect(indicator).toBeTruthy();
+      expect(indicator?.tagName.toLowerCase()).toBe('aside');
+      expect(indicator?.classList.contains('offline-indicator-banner')).toBe(true);
+      expect(indicator?.classList.contains('is-visible')).toBe(true);
+
+      // Verify indicator-inner wrapper exists for smooth grid-template-rows height expansion
+      const inner = indicator?.querySelector<HTMLElement>('.indicator-inner');
+      expect(inner).toBeTruthy();
+      expect(inner?.querySelector('[data-testid="offline-indicator-icon"]')).toBeTruthy();
+      expect(inner?.querySelector('[data-testid="offline-message"]')).toBeTruthy();
+      expect(inner?.querySelector('[data-testid="reconnect-button"]')).toBeTruthy();
+
+      unmount(instance);
+    });
   });
 
   // spec: alhalte-argenterie/app-offline App Integration Tests (Issue #88 requirements)
@@ -494,6 +519,106 @@ describe('Server Connection Management & Offline Indicator (Issue #88 & #67)', (
       expect(indicator).toBeTruthy();
       expect(indicator?.classList.contains('is-visible')).toBe(true);
       expect(indicator?.textContent).toContain('サーバーとの接続が切断されました');
+
+      unmount(instance);
+    });
+
+    // spec: alhalte-argenterie/app-offline Issue #111: in-flow y-axis placement above Field and Control panels
+    it('places offline indicator in flow above FieldPanel and ControlPanel on y-axis without z-axis overlay (Issue #111)', async () => {
+      Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1200 });
+      Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+      const manager = createConnectionManager({ initialState: 'connected' });
+      const instance = mount(App, {
+        target,
+        props: {
+          initialRoom: dummyRoom,
+          connectionManager: manager,
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
+
+      const appRoot = target.querySelector<HTMLElement>('[data-testid="alhalte-app"]');
+      const indicator = target.querySelector<HTMLElement>('[data-testid="offline-indicator"]');
+      const roomLayout = target.querySelector<HTMLElement>('[data-testid="room-layout"]');
+      const fieldWrapper = target.querySelector<HTMLElement>('[data-testid="landscape-field-wrapper"]');
+      const controlWrapper = target.querySelector<HTMLElement>('[data-testid="landscape-control-wrapper"]');
+      const commonHeader = target.querySelector<HTMLElement>('[data-testid="common-header"]');
+
+      expect(appRoot).toBeTruthy();
+      expect(indicator).toBeTruthy();
+      expect(roomLayout).toBeTruthy();
+      expect(fieldWrapper).toBeTruthy();
+      expect(controlWrapper).toBeTruthy();
+      expect(commonHeader).toBeTruthy();
+
+      // 1. In-flow document order check: indicator precedes room-layout in the DOM tree (y-axis flow above panels)
+      expect(indicator?.compareDocumentPosition(roomLayout!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(roomLayout?.contains(indicator!)).toBe(false);
+
+      // 2. Control panel and field panel are inside room-layout, situated below the indicator on the y-axis
+      expect(roomLayout?.contains(fieldWrapper!)).toBe(true);
+      expect(roomLayout?.contains(controlWrapper!)).toBe(true);
+      expect(controlWrapper?.contains(commonHeader!)).toBe(true);
+
+      // 3. Initially connected: indicator is collapsed / not visible
+      expect(indicator?.classList.contains('is-visible')).toBe(false);
+      expect(indicator?.getAttribute('aria-hidden')).toBe('true');
+
+      // 4. Disconnected: indicator expands in-flow above room-layout
+      manager.setState('disconnected');
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(indicator?.classList.contains('is-visible')).toBe(true);
+      expect(indicator?.getAttribute('aria-hidden')).toBe('false');
+
+      // FieldPanel, ControlPanel, and CommonHeader remain completely accessible and un-obscured
+      expect(roomLayout?.contains(fieldWrapper!)).toBe(true);
+      expect(roomLayout?.contains(controlWrapper!)).toBe(true);
+      expect(controlWrapper?.contains(commonHeader!)).toBe(true);
+      expect(indicator?.contains(commonHeader!)).toBe(false);
+      expect(indicator?.contains(fieldWrapper!)).toBe(false);
+
+      // 5. Reconnected: indicator smoothly returns to collapsed state
+      manager.setState('connected');
+      await new Promise((r) => setTimeout(r, 20));
+
+      expect(indicator?.classList.contains('is-visible')).toBe(false);
+      expect(indicator?.getAttribute('aria-hidden')).toBe('true');
+
+      unmount(instance);
+    });
+
+    // spec: alhalte-argenterie/app-offline Issue #111: in-flow y-axis placement in portrait layout
+    it('places offline indicator in flow above panels in portrait layout (Issue #111)', async () => {
+      Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
+      Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+      const manager = createConnectionManager({ initialState: 'disconnected' });
+      const instance = mount(App, {
+        target,
+        props: {
+          initialRoom: dummyRoom,
+          connectionManager: manager,
+        },
+      });
+
+      await new Promise((r) => setTimeout(r, 20));
+
+      const indicator = target.querySelector<HTMLElement>('[data-testid="offline-indicator"]');
+      const roomLayout = target.querySelector<HTMLElement>('[data-testid="room-layout"]');
+      const portraitField = target.querySelector<HTMLElement>('[data-testid="portrait-field-wrapper"]');
+
+      expect(indicator).toBeTruthy();
+      expect(roomLayout).toBeTruthy();
+      expect(roomLayout?.classList.contains('portrait')).toBe(true);
+      expect(portraitField).toBeTruthy();
+
+      // In portrait, indicator still precedes room-layout in DOM order on y-axis
+      expect(indicator?.compareDocumentPosition(roomLayout!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(roomLayout?.contains(indicator!)).toBe(false);
+      expect(indicator?.classList.contains('is-visible')).toBe(true);
 
       unmount(instance);
     });

@@ -788,7 +788,7 @@
     data-testid="extension-file-input"
   />
 
-  <!-- Server connection / offline detection indicator at frontmost top of viewport -->
+  <!-- Server connection / offline detection indicator placed in flow above panels on y-axis (Issue #111) -->
   <OfflineIndicator
     connectionState={currentConnectionState}
     {debugMode}
@@ -1205,8 +1205,9 @@
 <style>
   /* Forbidden Screen Styles (Issue #94) */
   .forbidden-screen {
-    width: 100vw;
-    height: 100vh;
+    width: 100%;
+    flex: 1;
+    min-height: 0;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1278,7 +1279,6 @@
   }
   .room-layout-container {
     width: 100%;
-    height: 100%;
     display: flex;
     position: relative;
     flex: 1;
