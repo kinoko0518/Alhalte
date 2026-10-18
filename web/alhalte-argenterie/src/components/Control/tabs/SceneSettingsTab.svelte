@@ -26,7 +26,6 @@
     characters = [],
     isAdmin = false,
     onUpdateScene,
-    onSelectScene,
     onCreateScene,
     onDeleteScene,
     onMoveMember,
@@ -53,8 +52,6 @@
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
   } = $props();
-
-  let isSceneSplitMenuOpen = $state(false);
 
   // Asset picker state
   let isAssetPickerOpen = $state(false);
@@ -348,12 +345,7 @@
     onDeleteSceneLogs?.(currentScene.id);
   }
 
-  let sceneSplitContainer = $state<HTMLElement | null>(null);
-
   function handleWindowClick(e: MouseEvent) {
-    if (isSceneSplitMenuOpen && sceneSplitContainer && !sceneSplitContainer.contains(e.target as Node)) {
-      isSceneSplitMenuOpen = false;
-    }
     if (activeMemberSplitId && membersMoveListContainer && !membersMoveListContainer.contains(e.target as Node)) {
       activeMemberSplitId = null;
     }
@@ -363,51 +355,17 @@
 <svelte:window onclick={handleWindowClick} />
 
 <div class="scene-settings-container" data-testid="scene-settings-tab">
-  <!-- Top Split Button / Scene Name Input:
-    （中央寄せ単一行入力欄としてのシーン名 兼 スプリットボタン［
-      ほかのシーン名 ...※タップで設定中のシーンを切り替え
-    ］）
-  -->
-  <div class="split-button-container" bind:this={sceneSplitContainer} data-testid="scene-split-container">
-    <div class="scene-name-split-row">
-      <TextField
-        variant="outlined"
-        label="シーン名"
-        value={currentScene.name}
-        oninput={handleSceneNameInput}
-        data-testid="scene-name-input"
-        placeholder="シーン名"
-        class="scene-name-field"
-      />
-      <button
-        type="button"
-        class="split-arrow-btn"
-        onclick={() => (isSceneSplitMenuOpen = !isSceneSplitMenuOpen)}
-        data-testid="scene-split-dropdown-toggle"
-        title="シーン切り替え"
-      >
-        ▼
-      </button>
-    </div>
-
-    {#if isSceneSplitMenuOpen}
-      <div class="split-dropdown-menu" data-testid="scene-split-menu">
-        {#each allScenes as sc (sc.id)}
-          <button
-            type="button"
-            class="split-menu-item"
-            class:active-scene={sc.id === currentScene.id}
-            onclick={() => {
-              isSceneSplitMenuOpen = false;
-              onSelectScene?.(sc.id);
-            }}
-            data-testid="scene-option-{sc.id}"
-          >
-            {sc.name}
-          </button>
-        {/each}
-      </div>
-    {/if}
+  <!-- Scene Name Edit Field (Scene switching is delegated to CommonHeader per Issue #107) -->
+  <div class="scene-name-container" data-testid="scene-name-container">
+    <TextField
+      variant="outlined"
+      label="シーン名"
+      value={currentScene.name}
+      oninput={handleSceneNameInput}
+      data-testid="scene-name-input"
+      placeholder="シーン名"
+      class="scene-name-field"
+    />
   </div>
 
   <div class="settings-scroll-content">
@@ -873,60 +831,13 @@
     background: var(--np-color-surface);
     color: var(--np-color-on-surface);
   }
-  .split-button-container {
-    position: relative;
+  .scene-name-container {
     padding: 12px 16px;
     background: var(--np-color-surface-container);
     border-bottom: 1px solid var(--np-color-outline-variant);
   }
-  .scene-name-split-row {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .scene-name-split-row :global(.scene-name-field) {
-    flex: 1;
-  }
-  .split-arrow-btn {
-    border: 1px solid var(--np-color-outline);
-    border-radius: var(--np-shape-corner-small);
-    background: var(--np-color-surface-container);
-    padding: 14px 16px;
-    cursor: pointer;
-    font-size: 0.8rem;
-    color: var(--np-color-on-surface-variant);
-  }
-  .split-dropdown-menu {
-    position: absolute;
-    top: 100%;
-    left: 16px;
-    right: 16px;
-    margin-top: 4px;
-    background: var(--np-color-surface-container-high);
-    border: 1px solid var(--np-color-outline-variant);
-    border-radius: var(--np-shape-corner-medium);
-    box-shadow: var(--np-elevation-2);
-    z-index: 250;
-    max-height: 200px;
-    overflow-y: auto;
-  }
-  .split-menu-item {
-    display: block;
+  .scene-name-container :global(.scene-name-field) {
     width: 100%;
-    padding: 10px 16px;
-    border: none;
-    background: none;
-    text-align: left;
-    font-size: 0.95rem;
-    cursor: pointer;
-    color: var(--np-color-on-surface);
-  }
-  .split-menu-item:hover {
-    background: var(--np-color-surface-container-highest);
-  }
-  .split-menu-item.active-scene {
-    font-weight: 700;
-    color: var(--np-color-primary);
   }
   .settings-scroll-content {
     flex: 1;
