@@ -11,10 +11,17 @@
  */
 
 import {
+  LABEL_ALHALTE_TIN_ID,
+  LABEL_ALHALTE_UNIX_TIME,
   LABEL_NEED_NOT_KNOW,
   LABEL_PRIMITIVE_BOOL,
   LABEL_PRIMITIVE_STRING,
+  LABEL_PRIMITIVE_U8,
+  LABEL_PRIMITIVE_U16,
+  LABEL_PRIMITIVE_U32,
   LABEL_PRIMITIVE_U64,
+  bytesToHex,
+  labelHash,
 } from '@alhalte/pantry';
 import type { Character, LogRecord } from '../types/index.js';
 import {
@@ -25,10 +32,538 @@ import { ChunkLogManager, parseLogRecord } from './log.js';
 
 /**
  * Self-typed Tin container JSON representation.
+ *
+ * The Rust `Tin` struct is `{ label: u64, payload: Vec<u8> }`, so the JSON wire
+ * form is exactly `{ label: number, payload: number[] }`.
  */
 export interface TinJson {
   label: number;
   payload: number[];
+}
+
+// =========================================================================
+// Operation errors & timeout
+// =========================================================================
+
+/**
+ * Default time in milliseconds to wait for a server acknowledgement before
+ * rejecting a Promise-based operation with [`OperationTimeoutError`].
+ */
+export const DEFAULT_OPERATION_TIMEOUT_MS = 8000;
+
+/**
+ * Error used when a Promise-based operation receives no acknowledgement in time.
+ *
+ * The `code` is always `'timeout'` so callers can branch on it uniformly with
+ * [`ServerOperationError`].
+ */
+export class OperationTimeoutError extends Error {
+  /** Machine-readable error code (`'timeout'`). */
+  public readonly code = 'timeout';
+  /** Operation kind that timed out (e.g. `'appendLog'`). */
+  public readonly operation: string;
+  /** Timeout applied to the operation, in milliseconds. */
+  public readonly timeoutMs: number;
+
+  constructor(operation: string, timeoutMs: number) {
+    super(`Operation '${operation}' timed out after ${timeoutMs}ms`);
+    this.name = 'OperationTimeoutError';
+    this.operation = operation;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+/**
+ * Error used when the server rejects a Promise-based operation.
+ *
+ * `code` is the `ServerFrame::Error` code (e.g. `'AppendLogFailed'`,
+ * `'PermissionDenied'`, or `'disconnected'` when the socket closed before the
+ * acknowledgement arrived).
+ */
+export class ServerOperationError extends Error {
+  /** Machine-readable error code reported by the server. */
+  public readonly code: string;
+  /** Optional structured details attached by the client. */
+  public readonly details?: unknown;
+
+  constructor(code: string, message?: string, details?: unknown) {
+    super(message && message.length > 0 ? message : `Server operation failed: ${code}`);
+    this.name = 'ServerOperationError';
+    this.code = code;
+    this.details = details;
+  }
+}
+
+// =========================================================================
+// Tin labels used by the client
+// =========================================================================
+
+/** Label of a chat log entry JSON payload (`alhalte/argenterie/log-record`). */
+export const LABEL_LOG_RECORD = Number(labelHash('alhalte/argenterie/log-record'));
+
+/** Label of an arbitrary JSON payload (`alhalte/argenterie/json`), used for objects and arrays. */
+export const LABEL_JSON = Number(labelHash('alhalte/argenterie/json'));
+
+/** Label of a 32-bit float payload (`primitive/f32`). */
+export const LABEL_PRIMITIVE_F32 = Number(labelHash('primitive/f32'));
+
+/** Label of a 64-bit float payload (`primitive/f64`). */
+export const LABEL_PRIMITIVE_F64 = Number(labelHash('primitive/f64'));
+
+/** Label of a BGM change log event (`alhalte/banquette/log/change-bgm`). */
+export const LABEL_BANQUETTE_LOG_CHANGE_BGM = Number(
+  labelHash('alhalte/banquette/log/change-bgm'),
+);
+
+/** Acknowledgement payload of an appended log entry (`LogEventAppended`). */
+export interface LogAppendedAck {
+  scene_id: string;
+  chunk_index: number;
+  position: number;
+  entry: any;
+}
+
+/** Acknowledgement payload of `StateUpdated`. */
+export interface StateUpdatedAck {
+  scene_id: string;
+  key: string;
+  value: any;
+}
+
+/** Acknowledgement payload of `StateDeleted`. */
+export interface StateDeletedAck {
+  scene_id: string;
+  key: string;
+}
+
+/** Acknowledgement payload of `SceneCreated` / `SceneDeleted`. */
+export interface SceneAck {
+  scene_id: string;
+}
+
+/** Acknowledgement payload of `CharacterMoved`. */
+export interface CharacterMovedAck {
+  character_id: number;
+  to_scene_id: string;
+}
+
+/** Acknowledgement payload of `CharacterCreated` / `CharacterUpdated` / `CharacterDeleted`. */
+export interface CharacterAck {
+  character_id: number;
+}
+
+/** Acknowledgement payload of `LogEventRewound`. */
+export interface LogRewoundAck {
+  scene_id: string;
+  chunk_index: number;
+  position: number;
+}
+
+// =========================================================================
+// Tin codec
+// =========================================================================
+
+/** Payload bytes viewed as a plain `number[]` (the JSON wire representation). */
+function toByteArray(payload: unknown): number[] {
+  if (Array.isArray(payload)) {
+    return payload.map((byte) => Number(byte) & 0xff);
+  }
+  if (payload instanceof Uint8Array) {
+    return Array.from(payload);
+  }
+  if (payload && typeof payload === 'object') {
+    return Object.values(payload as Record<string, number>).map((byte) => Number(byte) & 0xff);
+  }
+  return [];
+}
+
+/**
+ * Returns true when `value` already looks like a self-typed Tin container.
+ */
+export function isTinJson(value: unknown): value is TinJson {
+  if (!value || typeof value !== 'object') return false;
+  const label = (value as TinJson).label;
+  return (
+    (typeof label === 'number' || typeof label === 'bigint') &&
+    'payload' in (value as Record<string, unknown>)
+  );
+}
+
+/**
+ * Writes an unsigned integer as little-endian bytes.
+ */
+function writeLeBytes(value: bigint, byteLength: number): number[] {
+  const bytes: number[] = [];
+  let rest = value < 0n ? 0n : value;
+  for (let i = 0; i < byteLength; i++) {
+    bytes.push(Number(rest & 0xffn));
+    rest >>= 8n;
+  }
+  return bytes;
+}
+
+/**
+ * Reads an unsigned little-endian integer from payload bytes.
+ */
+function readLeBytes(payload: number[], byteLength: number): bigint {
+  let value = 0n;
+  for (let i = byteLength - 1; i >= 0; i--) {
+    value = (value << 8n) | BigInt(payload[i] ?? 0);
+  }
+  return value;
+}
+
+/**
+ * Reads an unsigned little-endian integer as a `number`, or as a `bigint` when
+ * it exceeds `Number.MAX_SAFE_INTEGER`.
+ */
+function readUnsigned(payload: number[], byteLength: number): number | bigint {
+  const value = readLeBytes(payload, byteLength);
+  return value > BigInt(Number.MAX_SAFE_INTEGER) ? value : Number(value);
+}
+
+/**
+ * Normalizes any value into a Tin container.
+ *
+ * - An existing Tin is returned normalized (payload as `number[]`, label as `number`).
+ * - `string` -> `primitive/string`
+ * - `number` -> `primitive/u64` when a non-negative integer, `primitive/f64` otherwise
+ * - `bigint` -> `primitive/u64`
+ * - `boolean` -> `primitive/bool`
+ * - `null` / `undefined` -> `need not know` with an empty payload
+ * - arrays and objects -> JSON text with `alhalte/argenterie/json`
+ *
+ * Passing an explicit `label` overrides the type-derived label.
+ *
+ * Note: JSON cannot represent a full 64-bit label without loss, so labels are
+ * forwarded as JavaScript numbers. The server does not validate `label` values
+ * for log entries and state values, and `Number(labelHash(...))` reproduces the
+ * same double on both sides, so round-trips stay stable.
+ */
+export function jsonToTin(value: unknown, label?: number | bigint): TinJson {
+  if (isTinJson(value)) {
+    return { label: Number(value.label), payload: toByteArray(value.payload) };
+  }
+  const explicit = label === undefined || label === null ? undefined : Number(label);
+
+  if (value === null || value === undefined) {
+    return { label: explicit ?? Number(LABEL_NEED_NOT_KNOW), payload: [] };
+  }
+  if (typeof value === 'string') {
+    return {
+      label: explicit ?? Number(LABEL_PRIMITIVE_STRING),
+      payload: Array.from(new TextEncoder().encode(value)),
+    };
+  }
+  if (typeof value === 'boolean') {
+    return { label: explicit ?? Number(LABEL_PRIMITIVE_BOOL), payload: [value ? 1 : 0] };
+  }
+  if (typeof value === 'bigint') {
+    return { label: explicit ?? Number(LABEL_PRIMITIVE_U64), payload: writeLeBytes(value, 8) };
+  }
+  if (typeof value === 'number') {
+    if (Number.isInteger(value) && value >= 0) {
+      return {
+        label: explicit ?? Number(LABEL_PRIMITIVE_U64),
+        payload: writeLeBytes(BigInt(value), 8),
+      };
+    }
+    const buffer = new Uint8Array(8);
+    new DataView(buffer.buffer).setFloat64(0, value, true);
+    return { label: explicit ?? LABEL_PRIMITIVE_F64, payload: Array.from(buffer) };
+  }
+
+  return {
+    label: explicit ?? LABEL_JSON,
+    payload: Array.from(new TextEncoder().encode(JSON.stringify(value))),
+  };
+}
+
+/**
+ * Decodes a Tin container back into a JavaScript value.
+ *
+ * Primitive labels are decoded to their natural type, JSON payloads are parsed,
+ * and anything undecodable falls back to the payload's UTF-8 text. Non-Tin
+ * values are returned unchanged so the function is safe on duck-typed input.
+ */
+export function tinToJson(tin: unknown): any {
+  if (!isTinJson(tin)) return tin;
+  const label = Number(tin.label);
+  const payload = toByteArray(tin.payload);
+  const bytes = Uint8Array.from(payload);
+
+  if (label === Number(LABEL_PRIMITIVE_STRING)) {
+    return new TextDecoder().decode(bytes);
+  }
+  if (label === Number(LABEL_PRIMITIVE_BOOL)) {
+    return (payload[0] ?? 0) !== 0;
+  }
+  if (label === Number(LABEL_PRIMITIVE_U8) && payload.length === 1) {
+    return readUnsigned(payload, 1);
+  }
+  if (label === Number(LABEL_PRIMITIVE_U16) && payload.length === 2) {
+    return readUnsigned(payload, 2);
+  }
+  if (label === Number(LABEL_PRIMITIVE_U32) && payload.length === 4) {
+    return readUnsigned(payload, 4);
+  }
+  if (label === Number(LABEL_PRIMITIVE_U64) && payload.length === 8) {
+    return readUnsigned(payload, 8);
+  }
+  if (label === LABEL_PRIMITIVE_F32 && payload.length === 4) {
+    return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat32(0, true);
+  }
+  if (label === LABEL_PRIMITIVE_F64 && payload.length === 8) {
+    return new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getFloat64(0, true);
+  }
+  if (label === Number(LABEL_ALHALTE_TIN_ID) && payload.length === 32) {
+    return bytesToHex(bytes);
+  }
+  if (label === Number(LABEL_ALHALTE_UNIX_TIME) && payload.length === 8) {
+    return Number(readLeBytes(payload, 8));
+  }
+
+  const text = new TextDecoder().decode(bytes);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+/**
+ * Encodes a `LogRecord` (or any plain record object) as a Tin whose payload is
+ * UTF-8 JSON, embedding `clientOpId` so that the sender can correlate the
+ * `LogEventAppended` broadcast with this append.
+ */
+export function logRecordToTin(
+  record: LogRecord | Record<string, any> | null | undefined,
+  clientOpId: string,
+): TinJson {
+  const payload: Record<string, any> = {};
+  if (record && typeof record === 'object') {
+    for (const key of ['id', 'sceneId', 'content', 'speaker', 'speakerId', 'timestamp', 'chunkId']) {
+      const value = (record as Record<string, any>)[key];
+      if (value !== undefined) {
+        payload[key] = value;
+      }
+    }
+  }
+  payload.clientOpId = clientOpId;
+  return {
+    label: LABEL_LOG_RECORD,
+    payload: Array.from(new TextEncoder().encode(JSON.stringify(payload))),
+  };
+}
+
+/**
+ * Decodes a log entry Tin into a `LogRecord`.
+ *
+ * Returns `null` for tombstone (`null`) entries. The position is used for the
+ * fallback record ID when the payload does not carry one.
+ */
+export function tinToLogRecord(
+  entry: unknown,
+  sceneId: string,
+  chunkIndex = 0,
+  position = 0,
+): LogRecord | null {
+  if (entry === null || entry === undefined) return null;
+
+  let raw: Record<string, any>;
+  if (isTinJson(entry)) {
+    const decoded = tinToJson(entry);
+    raw =
+      decoded && typeof decoded === 'object' && !Array.isArray(decoded)
+        ? (decoded as Record<string, any>)
+        : { content: typeof decoded === 'string' ? decoded : '' };
+  } else if (typeof entry === 'object') {
+    raw = entry as Record<string, any>;
+  } else {
+    raw = { content: String(entry) };
+  }
+
+  return parseLogRecord(
+    { ...raw, sceneId: raw.sceneId || sceneId },
+    `log-${chunkIndex}-${position}`,
+  );
+}
+
+/**
+ * Converts a `Character` model into the `HashMap<String, Tin>` attribute map
+ * expected by `ClientFrame::CreateCharacter` / `UpdateCharacter`.
+ *
+ * The human-readable name is stored under the reserved `std::name` key (as the
+ * Rust side does); remaining model fields keep their model names. The character
+ * `id` is omitted because banquette allocates character IDs.
+ */
+export function characterToTinMap(
+  character: Character | Record<string, any> | null | undefined,
+): Record<string, TinJson> {
+  const source = (character ?? {}) as Record<string, any>;
+  const map: Record<string, TinJson> = {};
+
+  if (typeof source.name === 'string') {
+    map['std::name'] = jsonToTin(source.name);
+  }
+  if (typeof source.initiative === 'number') {
+    map.initiative = jsonToTin(source.initiative);
+  }
+  for (const key of ['iconUrl', 'color', 'description', 'reference', 'chatPalette'] as const) {
+    if (typeof source[key] === 'string') {
+      map[key] = jsonToTin(source[key]);
+    }
+  }
+  for (const key of ['hideStatus', 'isNarrative', 'placedAsPiece'] as const) {
+    if (typeof source[key] === 'boolean') {
+      map[key] = jsonToTin(source[key]);
+    }
+  }
+  if (Array.isArray(source.statuses)) {
+    map.statuses = jsonToTin(source.statuses);
+  }
+  if (Array.isArray(source.parameters)) {
+    map.parameters = jsonToTin(source.parameters);
+  }
+  if (source.piecePosition && typeof source.piecePosition === 'object') {
+    map.piecePosition = jsonToTin(source.piecePosition);
+  }
+
+  return map;
+}
+
+/**
+ * Rebuilds a `Character` model from a banquette character attribute map.
+ *
+ * Non-Tin values are accepted as-is so duck-typed server data still renders.
+ */
+export function tinMapToCharacter(
+  id: string | number,
+  map: Record<string, any> | null | undefined,
+): Character {
+  const source = map ?? {};
+  const read = (key: string): any => {
+    const value = source[key];
+    if (value === undefined) return undefined;
+    return isTinJson(value) ? tinToJson(value) : value;
+  };
+
+  const name = read('std::name');
+  const initiative = read('initiative');
+  const iconUrl = read('iconUrl');
+  const color = read('color');
+  const description = read('description');
+  const reference = read('reference');
+  const statuses = read('statuses');
+  const parameters = read('parameters');
+  const chatPalette = read('chatPalette');
+  const hideStatus = read('hideStatus');
+  const isNarrative = read('isNarrative');
+  const placedAsPiece = read('placedAsPiece');
+  const piecePosition = read('piecePosition');
+
+  return {
+    id: String(id),
+    name: typeof name === 'string' && name.length > 0 ? name : `Character ${id}`,
+    initiative: typeof initiative === 'number' ? initiative : 0,
+    iconUrl: typeof iconUrl === 'string' ? iconUrl : undefined,
+    color: typeof color === 'string' ? color : undefined,
+    description: typeof description === 'string' ? description : '',
+    reference: typeof reference === 'string' ? reference : undefined,
+    statuses: Array.isArray(statuses) ? statuses : [],
+    parameters: Array.isArray(parameters) ? parameters : [],
+    chatPalette: typeof chatPalette === 'string' ? chatPalette : '',
+    hideStatus: Boolean(hideStatus),
+    isNarrative: isNarrative === undefined ? undefined : Boolean(isNarrative),
+    placedAsPiece: placedAsPiece === undefined ? undefined : Boolean(placedAsPiece),
+    piecePosition:
+      piecePosition &&
+      typeof piecePosition.x === 'number' &&
+      typeof piecePosition.y === 'number'
+        ? { x: piecePosition.x, y: piecePosition.y }
+        : undefined,
+  };
+}
+
+/**
+ * Compares two Tin values structurally (label + payload bytes).
+ */
+function tinEquals(a: unknown, b: unknown): boolean {
+  if (isTinJson(a) && isTinJson(b)) {
+    const left = toByteArray(a.payload);
+    const right = toByteArray(b.payload);
+    if (Number(a.label) !== Number(b.label) || left.length !== right.length) return false;
+    return left.every((byte, index) => byte === right[index]);
+  }
+  if (a === b) return true;
+  try {
+    return JSON.stringify(a) === JSON.stringify(b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reads the `clientOpId` embedded in an `AppendLog` entry, if any.
+ */
+function readClientOpId(entry: unknown): string | null {
+  if (!isTinJson(entry)) return null;
+  try {
+    const decoded = new TextDecoder().decode(Uint8Array.from(toByteArray(entry.payload)));
+    const json = JSON.parse(decoded);
+    if (json && typeof json === 'object' && typeof json.clientOpId === 'string') {
+      return json.clientOpId;
+    }
+  } catch {
+    // Not a JSON payload (e.g. a postcard-encoded log event).
+  }
+  return null;
+}
+
+/**
+ * Decodes the leading fields of a postcard-encoded `ChangeBgmEvent`.
+ *
+ * Field order is `bgm_tin_id: Option<TinId>`, `volume: Option<f32>`,
+ * `slot: u32` (varint), `track_index: Option<u8>`. Only the tin id and the slot
+ * are needed for acknowledgement correlation.
+ */
+function decodeChangeBgmEntry(
+  entry: unknown,
+): { tinIdHex: string | null; slot: number | null } | null {
+  if (!isTinJson(entry) || Number(entry.label) !== LABEL_BANQUETTE_LOG_CHANGE_BGM) {
+    return null;
+  }
+  const payload = toByteArray(entry.payload);
+  let offset = 0;
+
+  const tinIdTag = payload[offset++];
+  if (tinIdTag !== 0 && tinIdTag !== 1) return null;
+  let tinIdHex: string | null = null;
+  if (tinIdTag === 1) {
+    if (payload.length < offset + 32) return null;
+    tinIdHex = bytesToHex(Uint8Array.from(payload.slice(offset, offset + 32)));
+    offset += 32;
+  }
+
+  const volumeTag = payload[offset++];
+  if (volumeTag === 1) {
+    if (payload.length < offset + 4) return null;
+    offset += 4;
+  } else if (volumeTag !== 0) {
+    return null;
+  }
+
+  let slot = 0;
+  let shift = 0;
+  for (;;) {
+    if (offset >= payload.length || shift > 28) return null;
+    const byte = payload[offset++];
+    slot += (byte & 0x7f) * 2 ** shift;
+    shift += 7;
+    if ((byte & 0x80) === 0) break;
+  }
+
+  return { tinIdHex, slot };
 }
 
 /**
@@ -60,6 +595,7 @@ export type ClientFrame =
   | { UpdateCharacter: { character_id: number; data: any } }
   | { DeleteCharacter: { character_id: number } }
   | { MoveCharacter: { character_id: number; to_scene_id: string } }
+  | { ChangeBgm: { scene_id: string; slot: number; tin_id: string | null } }
   | { WebRtcSignal: { to_client_id: number; payload: any } }
   | 'HeartbeatResponse';
 
@@ -87,6 +623,9 @@ export type ServerFrame =
   | { WebRtcSignal: { from_client_id: number; payload: any } }
   | 'HeartbeatPing'
   | { HeartbeatPing: Record<string, never> }
+  | { SceneCreated: { scene_id: string } }
+  | { SceneDeleted: { scene_id: string } }
+  | { CharacterMoved: { character_id: number; to_scene_id: string } }
   | { Error: { code: string; message: string } };
 
 /**
@@ -120,13 +659,24 @@ export interface RoomSocketOptions {
 
   // Frame event callbacks
   onSceneList?: (scenes: string[]) => void;
+  onSceneInfo?: (scene: any) => void;
+  onSceneCreated?: (sceneId: string) => void;
+  onSceneDeleted?: (sceneId: string) => void;
   onCharacterList?: (characters: Character[]) => void;
+  onCharacterInfo?: (characterId: number, data: any) => void;
   onCharacterCreated?: (characterId: number) => void;
   onCharacterUpdated?: (characterId: number, data?: any) => void;
   onCharacterDeleted?: (characterId: number) => void;
+  onCharacterMoved?: (characterId: number, toSceneId: string) => void;
   onStateUpdated?: (sceneId: string, key: string, value: any) => void;
   onStateDeleted?: (sceneId: string, key: string) => void;
+  onStateSnapshot?: (sceneId: string, states: Record<string, any>) => void;
+  onLogBiblioSnapshot?: (sceneId: string, biblio: any) => void;
   onLogAppended?: (record: LogRecord) => void;
+  onLogEventEdited?: (sceneId: string, chunkIndex: number, position: number, entry: any) => void;
+  onLogEventDeleted?: (sceneId: string, chunkIndex: number, position: number) => void;
+  onLogEventRewound?: (sceneId: string, chunkIndex: number, position: number) => void;
+  onWebRtcSignal?: (fromClientId: number, payload: any) => void;
   onServerFrame?: (frame: ServerFrame) => void;
   onError?: (error: { code: string; message: string }) => void;
 }
@@ -333,6 +883,46 @@ export function parseCharacter(id: string | number, raw: any): Character {
 }
 
 /**
+ * Kinds of correlated operations tracked while waiting for an acknowledgement.
+ */
+type OperationKind =
+  | 'appendLog'
+  | 'updateState'
+  | 'deleteState'
+  | 'createScene'
+  | 'deleteScene'
+  | 'moveCharacter'
+  | 'createCharacter'
+  | 'updateCharacter'
+  | 'deleteCharacter'
+  | 'rewindLog'
+  | 'changeBgm'
+  | 'querySceneList'
+  | 'queryState'
+  | 'queryLogBiblio'
+  | 'queryLogChunk'
+  | 'queryListCharacters';
+
+/** Result of testing a pending operation against an incoming frame. */
+interface PendingMatch<T> {
+  matched: boolean;
+  value?: T;
+}
+
+/**
+ * A Promise-based operation waiting for its acknowledgement frame.
+ */
+interface PendingOperation<T = any> {
+  id: string;
+  kind: OperationKind;
+  errorCodes: string[];
+  test: (frame: ServerFrame) => PendingMatch<T>;
+  resolve: (value: T) => void;
+  reject: (error: unknown) => void;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
+/**
  * Client managing WebSocket connection, reconnection, and ClientFrame/ServerFrame
  * synchronization for an active room.
  */
@@ -351,6 +941,8 @@ export class RoomSocket {
   private reconnectTimer: any = null;
   private currentSceneId: string;
   private connectPromises: Array<{ resolve: () => void; reject: (err: any) => void }> = [];
+  private pendingOperations: PendingOperation[] = [];
+  private operationCounter = 0;
 
   // Local state cache
   private scenes: string[] = [];
@@ -484,6 +1076,9 @@ export class RoomSocket {
             reject(new Error('WebSocket closed intentionally'));
           }
           this.connectPromises = [];
+          this.rejectAllPendingOperations(
+            new ServerOperationError('disconnected', 'WebSocket closed before the acknowledgement'),
+          );
           return;
         }
 
@@ -494,6 +1089,9 @@ export class RoomSocket {
           reject(new Error('WebSocket connection closed'));
         }
         this.connectPromises = [];
+        this.rejectAllPendingOperations(
+          new ServerOperationError('disconnected', 'WebSocket connection lost before the acknowledgement'),
+        );
 
         const maxAttempts = this.options.maxReconnectAttempts ?? Infinity;
         if (this.reconnectAttempts < maxAttempts) {
@@ -511,6 +1109,9 @@ export class RoomSocket {
         reject(err);
       }
       this.connectPromises = [];
+      this.rejectAllPendingOperations(
+        new ServerOperationError('disconnected', 'WebSocket connection could not be established'),
+      );
     }
   }
 
@@ -731,10 +1332,20 @@ export class RoomSocket {
   }
 
   /**
-   * Appends a log entry to a scene.
+   * Appends a log entry to a scene (fire-and-forget).
+   *
+   * A plain record is encoded as a Tin with a JSON payload (including a
+   * `clientOpId`) so that banquette can decode it. Use
+   * {@link RoomSocket.requestAppendLog} when the result must be awaited.
    */
   public appendLog(sceneId: string, entry: any): void {
-    this.send({ AppendLog: { scene_id: sceneId, entry: entry ? ensureTin(entry) : null } });
+    const wireEntry =
+      entry === null || entry === undefined
+        ? null
+        : isTinJson(entry)
+          ? jsonToTin(entry)
+          : logRecordToTin(entry, this.nextOperationId('appendLog'));
+    this.send({ AppendLog: { scene_id: sceneId, entry: wireEntry } });
   }
 
   /**
@@ -800,6 +1411,572 @@ export class RoomSocket {
   }
 
   // =========================================================================
+  // Promise-based operations (success / error / timeout handling)
+  // =========================================================================
+
+  /**
+   * Returns the number of operations still waiting for an acknowledgement.
+   *
+   * Exposed for diagnostics and tests: every operation is removed from the
+   * pending set when it settles or times out.
+   */
+  public getPendingOperationCount(): number {
+    return this.pendingOperations.length;
+  }
+
+  /**
+   * Generates a unique operation correlation ID.
+   */
+  private nextOperationId(kind: OperationKind): string {
+    this.operationCounter += 1;
+    return `${kind}-${this.operationCounter}-${Date.now().toString(36)}`;
+  }
+
+  /**
+   * Registers a pending operation and returns its Promise.
+   *
+   * The caller is responsible for sending the corresponding frame (usually via
+   * {@link RoomSocket.send}) after registration. The operation is always removed
+   * from the pending set when it resolves, rejects, or times out.
+   */
+  private registerOperation<T>(
+    kind: OperationKind,
+    errorCodes: string[],
+    test: (frame: ServerFrame) => PendingMatch<T>,
+    timeoutMs?: number,
+    id?: string,
+  ): Promise<T> {
+    const effectiveTimeout =
+      typeof timeoutMs === 'number' && timeoutMs > 0 ? timeoutMs : DEFAULT_OPERATION_TIMEOUT_MS;
+    const operationId = id ?? this.nextOperationId(kind);
+
+    return new Promise<T>((resolve, reject) => {
+      const operation: PendingOperation<T> = {
+        id: operationId,
+        kind,
+        errorCodes,
+        test,
+        resolve,
+        reject,
+        timer: null,
+      };
+      operation.timer = setTimeout(() => {
+        this.removePendingOperation(operation);
+        reject(new OperationTimeoutError(kind, effectiveTimeout));
+      }, effectiveTimeout);
+      this.pendingOperations.push(operation);
+    });
+  }
+
+  /**
+   * Removes an operation from the pending set and clears its timeout timer.
+   */
+  private removePendingOperation(operation: PendingOperation): void {
+    if (operation.timer !== null) {
+      clearTimeout(operation.timer);
+      operation.timer = null;
+    }
+    const index = this.pendingOperations.indexOf(operation);
+    if (index >= 0) {
+      this.pendingOperations.splice(index, 1);
+    }
+  }
+
+  /**
+   * Rejects every pending operation, e.g. when the socket closes.
+   */
+  private rejectAllPendingOperations(error: unknown): void {
+    for (const operation of [...this.pendingOperations]) {
+      this.removePendingOperation(operation);
+      operation.reject(error);
+    }
+  }
+
+  /**
+   * Matches an incoming ServerFrame against pending operations and settles the
+   * first (oldest) match. `ServerFrame::Error` rejects the matching operation by
+   * `*Failed` code; `PermissionDenied` rejects all of them because it is not
+   * correlated with a specific request.
+   */
+  private dispatchPendingOperations(frame: ServerFrame): void {
+    if (typeof frame !== 'object' || frame === null) return;
+
+    try {
+      if ('Error' in frame) {
+        const { code, message } = frame.Error;
+        if (code === 'PermissionDenied') {
+          this.rejectAllPendingOperations(new ServerOperationError(code, message));
+          return;
+        }
+        const operation = this.pendingOperations.find((op) => op.errorCodes.includes(code));
+        if (operation) {
+          this.removePendingOperation(operation);
+          operation.reject(new ServerOperationError(code, message));
+        }
+        return;
+      }
+
+      for (const operation of [...this.pendingOperations]) {
+        const result = operation.test(frame);
+        if (result.matched) {
+          this.removePendingOperation(operation);
+          operation.resolve(result.value);
+          return;
+        }
+      }
+    } catch (err) {
+      console.warn('Failed to correlate a ServerFrame with a pending operation:', err);
+    }
+  }
+
+  /**
+   * Appends a log entry and resolves when the server broadcasts the matching
+   * `LogEventAppended` echo (correlated by the embedded `clientOpId`).
+   */
+  public requestAppendLog(
+    sceneId: string,
+    record: LogRecord | Record<string, any>,
+    timeoutMs?: number,
+  ): Promise<LogAppendedAck> {
+    const clientOpId = this.nextOperationId('appendLog');
+    const entry = logRecordToTin(record, clientOpId);
+    const promise = this.registerOperation<LogAppendedAck>(
+      'appendLog',
+      ['AppendLogFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('LogEventAppended' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.LogEventAppended;
+        if (event.scene_id !== sceneId) return { matched: false };
+        // Only the echo carrying our own clientOpId settles this operation, so
+        // broadcasts of other clients never resolve our request.
+        if (readClientOpId(event.entry) !== clientOpId) return { matched: false };
+        return { matched: true, value: event };
+      },
+      timeoutMs,
+      clientOpId,
+    );
+
+    this.send({ AppendLog: { scene_id: sceneId, entry } });
+    return promise;
+  }
+
+  /**
+   * Updates scene state and resolves when the matching `StateUpdated` arrives
+   * (scene id, key, and value must all match).
+   *
+   * banquette acknowledges the requester directly in addition to broadcasting to
+   * the target scene, so a sender inside the scene may receive the same frame
+   * twice. The operation settles on the first copy and the duplicate is applied
+   * idempotently to the cache.
+   */
+  public requestUpdateState(
+    sceneId: string,
+    key: string,
+    value: any,
+    timeoutMs?: number,
+  ): Promise<StateUpdatedAck> {
+    const tin = jsonToTin(value);
+    const promise = this.registerOperation<StateUpdatedAck>(
+      'updateState',
+      ['UpdateStateFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('StateUpdated' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.StateUpdated;
+        if (event.scene_id !== sceneId || event.key !== key) return { matched: false };
+        if (!tinEquals(tin, event.value)) return { matched: false };
+        return {
+          matched: true,
+          value: { scene_id: event.scene_id, key: event.key, value: tinToJson(event.value) },
+        };
+      },
+      timeoutMs,
+    );
+
+    this.send({ UpdateState: { scene_id: sceneId, key, value: tin } });
+    return promise;
+  }
+
+  /**
+   * Deletes a scene state key and resolves when the matching `StateDeleted`
+   * arrives.
+   *
+   * As with {@link RoomSocket.requestUpdateState}, banquette sends a direct ack
+   * and a scene broadcast, so the sender may see the frame twice; the duplicate
+   * is idempotent.
+   */
+  public requestDeleteState(
+    sceneId: string,
+    key: string,
+    timeoutMs?: number,
+  ): Promise<StateDeletedAck> {
+    const promise = this.registerOperation<StateDeletedAck>(
+      'deleteState',
+      ['DeleteStateFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('StateDeleted' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.StateDeleted;
+        if (event.scene_id !== sceneId || event.key !== key) return { matched: false };
+        return { matched: true, value: event };
+      },
+      timeoutMs,
+    );
+
+    this.send({ DeleteState: { scene_id: sceneId, key } });
+    return promise;
+  }
+
+  /**
+   * Creates a scene and resolves when the server acknowledges with `SceneCreated`.
+   */
+  public requestCreateScene(
+    sceneId: string,
+    inheritJuices = false,
+    timeoutMs?: number,
+  ): Promise<SceneAck> {
+    const promise = this.registerOperation<SceneAck>(
+      'createScene',
+      ['CreateSceneFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('SceneCreated' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.SceneCreated;
+        if (event.scene_id !== sceneId) return { matched: false };
+        return { matched: true, value: event };
+      },
+      timeoutMs,
+    );
+
+    this.send({ CreateScene: { scene_id: sceneId, inherit_juices: inheritJuices } });
+    return promise;
+  }
+
+  /**
+   * Deletes a scene and resolves when the server acknowledges with `SceneDeleted`.
+   */
+  public requestDeleteScene(sceneId: string, timeoutMs?: number): Promise<SceneAck> {
+    const promise = this.registerOperation<SceneAck>(
+      'deleteScene',
+      ['DeleteSceneFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('SceneDeleted' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.SceneDeleted;
+        if (event.scene_id !== sceneId) return { matched: false };
+        return { matched: true, value: event };
+      },
+      timeoutMs,
+    );
+
+    this.send({ DeleteScene: { scene_id: sceneId } });
+    return promise;
+  }
+
+  /**
+   * Moves a character to another scene and resolves when the server acknowledges
+   * with `CharacterMoved`.
+   */
+  public requestMoveCharacter(
+    characterId: number,
+    toSceneId: string,
+    timeoutMs?: number,
+  ): Promise<CharacterMovedAck> {
+    const promise = this.registerOperation<CharacterMovedAck>(
+      'moveCharacter',
+      ['MoveCharacterFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('CharacterMoved' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.CharacterMoved;
+        if (Number(event.character_id) !== Number(characterId)) return { matched: false };
+        if (event.to_scene_id !== toSceneId) return { matched: false };
+        return { matched: true, value: event };
+      },
+      timeoutMs,
+    );
+
+    this.send({ MoveCharacter: { character_id: characterId, to_scene_id: toSceneId } });
+    return promise;
+  }
+
+  /**
+   * Creates a character from a `Character` model and resolves when the server
+   * acknowledges with `CharacterCreated` (which carries the allocated ID).
+   */
+  public requestCreateCharacter(
+    character: Character | Record<string, any>,
+    timeoutMs?: number,
+  ): Promise<CharacterAck> {
+    // Character CRUD acknowledgements carry no correlation ID, so pending
+    // operations are matched FIFO by kind. The UI serializes character saves.
+    const promise = this.registerOperation<CharacterAck>(
+      'createCharacter',
+      ['CreateCharacterFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('CharacterCreated' in frame)) {
+          return { matched: false };
+        }
+        return { matched: true, value: frame.CharacterCreated };
+      },
+      timeoutMs,
+    );
+
+    this.send({ CreateCharacter: { data: characterToTinMap(character) } });
+    return promise;
+  }
+
+  /**
+   * Updates a character from a `Character` model and resolves when the server
+   * acknowledges with `CharacterUpdated`.
+   *
+   * Acknowledgements carry no correlation ID, so concurrent updates are matched
+   * FIFO; the UI is expected to serialize character saves.
+   */
+  public requestUpdateCharacter(
+    characterId: number,
+    character: Character | Record<string, any>,
+    timeoutMs?: number,
+  ): Promise<CharacterAck> {
+    const promise = this.registerOperation<CharacterAck>(
+      'updateCharacter',
+      ['UpdateCharacterFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('CharacterUpdated' in frame)) {
+          return { matched: false };
+        }
+        return { matched: true, value: frame.CharacterUpdated };
+      },
+      timeoutMs,
+    );
+
+    this.send({ UpdateCharacter: { character_id: characterId, data: characterToTinMap(character) } });
+    return promise;
+  }
+
+  /**
+   * Deletes a character and resolves when the server acknowledges with
+   * `CharacterDeleted`.
+   */
+  public requestDeleteCharacter(characterId: number, timeoutMs?: number): Promise<CharacterAck> {
+    const promise = this.registerOperation<CharacterAck>(
+      'deleteCharacter',
+      ['DeleteCharacterFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('CharacterDeleted' in frame)) {
+          return { matched: false };
+        }
+        return { matched: true, value: frame.CharacterDeleted };
+      },
+      timeoutMs,
+    );
+
+    this.send({ DeleteCharacter: { character_id: characterId } });
+    return promise;
+  }
+
+  /**
+   * Rewinds a scene log head and resolves when the scene broadcasts the matching
+   * `LogEventRewound`.
+   */
+  public requestRewindLog(
+    sceneId: string,
+    chunkIndex: number,
+    position: number,
+    timeoutMs?: number,
+  ): Promise<LogRewoundAck> {
+    const promise = this.registerOperation<LogRewoundAck>(
+      'rewindLog',
+      ['RewindLogFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('LogEventRewound' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.LogEventRewound;
+        if (
+          event.scene_id !== sceneId ||
+          Number(event.chunk_index) !== Number(chunkIndex) ||
+          Number(event.position) !== Number(position)
+        ) {
+          return { matched: false };
+        }
+        return { matched: true, value: event };
+      },
+      timeoutMs,
+    );
+
+    this.send({ RewindLog: { scene_id: sceneId, chunk_index: chunkIndex, position } });
+    return promise;
+  }
+
+  /**
+   * Changes the BGM of a scene slot (or stops it with `tinId = null`).
+   *
+   * The server appends a `ChangeBgmEvent` log entry and announces it with
+   * `LogEventAppended`; the matching broadcast resolves this operation.
+   */
+  public requestChangeBgm(
+    sceneId: string,
+    slot: number,
+    tinId: string | null,
+    timeoutMs?: number,
+  ): Promise<LogAppendedAck> {
+    const expectedTinId = tinId ? tinId.trim().toLowerCase() : null;
+    const promise = this.registerOperation<LogAppendedAck>(
+      'changeBgm',
+      ['ChangeBgmFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('LogEventAppended' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.LogEventAppended;
+        if (event.scene_id !== sceneId) return { matched: false };
+        const decoded = decodeChangeBgmEntry(event.entry);
+        if (!decoded) return { matched: false };
+        if (decoded.slot !== null && decoded.slot !== Number(slot)) return { matched: false };
+        if (decoded.tinIdHex !== expectedTinId) return { matched: false };
+        return { matched: true, value: event };
+      },
+      timeoutMs,
+    );
+
+    this.send({ ChangeBgm: { scene_id: sceneId, slot, tin_id: tinId ?? null } });
+    return promise;
+  }
+
+  /**
+   * Requests the room scene list and resolves with the `SceneList` payload.
+   */
+  public querySceneList(timeoutMs?: number): Promise<string[]> {
+    const promise = this.registerOperation<string[]>(
+      'querySceneList',
+      [],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('SceneList' in frame)) {
+          return { matched: false };
+        }
+        return { matched: true, value: frame.SceneList.scenes };
+      },
+      timeoutMs,
+    );
+
+    this.send('ListScenes');
+    return promise;
+  }
+
+  /**
+   * Requests a scene state snapshot and resolves with the decoded state map.
+   *
+   * Tin values are decoded with {@link tinToJson}, so `std::bgm` resolves to a
+   * string and object states (e.g. `view::transform`) resolve to plain objects.
+   */
+  public queryState(sceneId: string, timeoutMs?: number): Promise<Record<string, any>> {
+    const promise = this.registerOperation<Record<string, any>>(
+      'queryState',
+      [],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('StateSnapshot' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.StateSnapshot;
+        if (event.scene_id !== sceneId) return { matched: false };
+        const decoded: Record<string, any> = {};
+        for (const [key, value] of Object.entries(event.states ?? {})) {
+          decoded[key] = tinToJson(value);
+        }
+        return { matched: true, value: decoded };
+      },
+      timeoutMs,
+    );
+
+    this.send({ QueryState: { scene_id: sceneId } });
+    return promise;
+  }
+
+  /**
+   * Requests a scene log biblio and resolves with the `LogBiblio` payload.
+   */
+  public queryLogBiblio(sceneId: string, timeoutMs?: number): Promise<any> {
+    const promise = this.registerOperation<any>(
+      'queryLogBiblio',
+      [],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('LogBiblioSnapshot' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.LogBiblioSnapshot;
+        if (event.scene_id !== sceneId) return { matched: false };
+        return { matched: true, value: event.biblio };
+      },
+      timeoutMs,
+    );
+
+    this.send({ QueryLogBiblio: { scene_id: sceneId } });
+    return promise;
+  }
+
+  /**
+   * Requests a log chunk and resolves with its raw entries (Tin values or
+   * tombstones). Decode entries with {@link tinToLogRecord} when needed.
+   */
+  public queryLogChunk(
+    sceneId: string,
+    chunkIndex: number,
+    timeoutMs?: number,
+  ): Promise<Array<any>> {
+    const promise = this.registerOperation<Array<any>>(
+      'queryLogChunk',
+      [],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('LogChunkSnapshot' in frame)) {
+          return { matched: false };
+        }
+        const event = frame.LogChunkSnapshot;
+        if (event.scene_id !== sceneId || Number(event.chunk_index) !== Number(chunkIndex)) {
+          return { matched: false };
+        }
+        return { matched: true, value: event.entries };
+      },
+      timeoutMs,
+    );
+
+    this.send({ QueryLogChunk: { scene_id: sceneId, chunk_index: chunkIndex } });
+    return promise;
+  }
+
+  /**
+   * Requests the character list and resolves with decoded `Character` models.
+   */
+  public queryListCharacters(timeoutMs?: number): Promise<Character[]> {
+    const promise = this.registerOperation<Character[]>(
+      'queryListCharacters',
+      [],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('CharacterList' in frame)) {
+          return { matched: false };
+        }
+        const list: Character[] = [];
+        const characters = frame.CharacterList?.characters ?? {};
+        for (const [id, raw] of Object.entries(characters)) {
+          list.push(tinMapToCharacter(id, raw as Record<string, any>));
+        }
+        return { matched: true, value: list };
+      },
+      timeoutMs,
+    );
+
+    this.send('ListCharacters');
+    return promise;
+  }
+
+  // =========================================================================
   // ServerFrame Incoming Handling
   // =========================================================================
 
@@ -843,15 +2020,55 @@ export class RoomSocket {
       return;
     }
 
+    // Settle any Promise-based operation waiting for this frame. This runs before
+    // the cache/callback handling so callers observe the acknowledgement promptly.
+    this.dispatchPendingOperations(frame);
+
     // 2. SceneList
     if ('SceneList' in frame) {
       this.scenes = frame.SceneList.scenes;
       this.options.onSceneList?.(frame.SceneList.scenes);
     }
 
-    // 3. StateUpdated
+    // 2b. SceneInfo
+    if ('SceneInfo' in frame) {
+      this.options.onSceneInfo?.(frame.SceneInfo);
+    }
+
+    // 2c. SceneCreated / SceneDeleted keep the local scene cache consistent.
+    if ('SceneCreated' in frame) {
+      const { scene_id } = frame.SceneCreated;
+      if (!this.scenes.includes(scene_id)) {
+        this.scenes = [...this.scenes, scene_id];
+      }
+      this.options.onSceneCreated?.(scene_id);
+    }
+
+    if ('SceneDeleted' in frame) {
+      const { scene_id } = frame.SceneDeleted;
+      this.scenes = this.scenes.filter((id) => id !== scene_id);
+      this.stateMap.delete(scene_id);
+      this.options.onSceneDeleted?.(scene_id);
+    }
+
+    // 3. StateSnapshot replaces the cached state of the scene.
+    if ('StateSnapshot' in frame) {
+      const { scene_id, states } = frame.StateSnapshot;
+      const next = new Map<string, any>();
+      const decoded: Record<string, any> = {};
+      for (const [key, value] of Object.entries(states ?? {})) {
+        const plain = tinToJson(value);
+        next.set(key, plain);
+        decoded[key] = plain;
+      }
+      this.stateMap.set(scene_id, next);
+      this.options.onStateSnapshot?.(scene_id, decoded);
+    }
+
+    // 3b. StateUpdated (Tin values are decoded for callers)
     if ('StateUpdated' in frame) {
-      const { scene_id, key, value } = frame.StateUpdated;
+      const { scene_id, key } = frame.StateUpdated;
+      const value = tinToJson(frame.StateUpdated.value);
       let scMap = this.stateMap.get(scene_id);
       if (!scMap) {
         scMap = new Map();
@@ -871,6 +2088,12 @@ export class RoomSocket {
       this.options.onStateDeleted?.(scene_id, key);
     }
 
+    // 4b. LogBiblioSnapshot
+    if ('LogBiblioSnapshot' in frame) {
+      const { scene_id, biblio } = frame.LogBiblioSnapshot;
+      this.options.onLogBiblioSnapshot?.(scene_id, biblio);
+    }
+
     // 5. LogEventAppended
     if ('LogEventAppended' in frame) {
       const { scene_id, chunk_index, position, entry } = frame.LogEventAppended;
@@ -879,6 +2102,22 @@ export class RoomSocket {
         this.chunkLogManager?.appendRecord(record);
         this.options.onLogAppended?.(record);
       }
+    }
+
+    // 5b. LogEventEdited / LogEventDeleted / LogEventRewound
+    if ('LogEventEdited' in frame) {
+      const { scene_id, chunk_index, position, entry } = frame.LogEventEdited;
+      this.options.onLogEventEdited?.(scene_id, chunk_index, position, entry);
+    }
+
+    if ('LogEventDeleted' in frame) {
+      const { scene_id, chunk_index, position } = frame.LogEventDeleted;
+      this.options.onLogEventDeleted?.(scene_id, chunk_index, position);
+    }
+
+    if ('LogEventRewound' in frame) {
+      const { scene_id, chunk_index, position } = frame.LogEventRewound;
+      this.options.onLogEventRewound?.(scene_id, chunk_index, position);
     }
 
     // 6. LogChunkSnapshot
@@ -907,6 +2146,21 @@ export class RoomSocket {
       this.options.onCharacterList?.(charList);
     }
 
+    // 7b. CharacterInfo updates a single character in the local cache.
+    if ('CharacterInfo' in frame) {
+      const { character_id, data } = frame.CharacterInfo;
+      const parsed = parseCharacter(character_id, data);
+      const index = this.characters.findIndex((c) => c.id === String(character_id));
+      if (index >= 0) {
+        const next = [...this.characters];
+        next[index] = parsed;
+        this.characters = next;
+      } else {
+        this.characters = [...this.characters, parsed];
+      }
+      this.options.onCharacterInfo?.(character_id, data);
+    }
+
     // 8. CharacterCreated
     if ('CharacterCreated' in frame) {
       this.options.onCharacterCreated?.(frame.CharacterCreated.character_id);
@@ -922,6 +2176,18 @@ export class RoomSocket {
       const idStr = String(frame.CharacterDeleted.character_id);
       this.characters = this.characters.filter((c) => c.id !== idStr);
       this.options.onCharacterDeleted?.(frame.CharacterDeleted.character_id);
+    }
+
+    // 10b. CharacterMoved
+    if ('CharacterMoved' in frame) {
+      const { character_id, to_scene_id } = frame.CharacterMoved;
+      this.options.onCharacterMoved?.(character_id, to_scene_id);
+    }
+
+    // 10c. WebRtcSignal relays a peer's signaling payload.
+    if ('WebRtcSignal' in frame) {
+      const { from_client_id, payload } = frame.WebRtcSignal;
+      this.options.onWebRtcSignal?.(from_client_id, payload);
     }
 
     // 11. Error
