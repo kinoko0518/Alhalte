@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mount, unmount } from 'svelte';
+import fs from 'node:fs';
+import path from 'node:path';
 import {
   parseLogRecord,
   ChunkLogManager,
@@ -26,6 +28,13 @@ import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 // - process_generast(ptr, len) -> copies input to 1024, appends '!' (0x21), returns (1024n << 32) | (len + 1)
 const VALID_WASM_HEX =
   '0061736d010000000115046000017f60017f017f60027f7f0060027f7f017e030504000102030503010001074505066d656d6f7279020013616c68616c74655f6162695f76657273696f6e000005616c6c6f630001076465616c6c6f6300021070726f636573735f67656e657261737400030a3404040041010b040041000b02000b250041800820002001fc0a000041800820016a41213a0000428008422086200141016aad840b';
+
+const markdownWasm = fs.readFileSync(
+  path.resolve(__dirname, '../public/extensions/markdown.wasm'),
+);
+const dslWasm = fs.readFileSync(
+  path.resolve(__dirname, '../public/extensions/alhalte-dsl.wasm'),
+);
 
 // Polyfill AnimationEvent in jsdom environment if not defined
 if (typeof globalThis.AnimationEvent === 'undefined') {
@@ -801,8 +810,8 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/log-tab 拡張機能Generast左畳み込みとSaignant WASM描画 (Issue #117)
-  it('applies extension pipeline left fold and Saignant WASM rendering to log records in LogTab', async () => {
+  // spec: alhalte-argenterie/log-tab 拡張機能Generast左畳み込みとSaignant WASM描画 (Issue #117, Issue #127)
+  it('applies extension pipeline left fold and Saignant WASM rendering to log records in LogTab without label mismatch', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -814,14 +823,13 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       members: [],
     };
 
-    const validWasm = hexToBytes(VALID_WASM_HEX);
     const extensions: ExtensionItem[] = [
       {
-        id: 'ext-excl',
-        name: '感嘆符付与',
+        id: 'markdown',
+        name: 'Markdown スタイル',
         enabled: true,
         priority: 0,
-        wasmBytes: validWasm,
+        wasmBytes: markdownWasm,
       },
     ];
 
@@ -838,27 +846,44 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       },
     });
 
+    // 1. Japanese plain text: should render without label mismatch error
     chunkManager.appendRecord({
       id: 'msg-fold-1',
       sceneId: 'scene-ext-test',
-      content: 'テストメッセージ',
+      content: 'ほげほげ',
       speaker: '探索者',
       speakerId: 'char-1',
       timestamp: 1000,
     });
 
+    // 2. Markdown text: should render styled bold html
+    chunkManager.appendRecord({
+      id: 'msg-fold-2',
+      sceneId: 'scene-ext-test',
+      content: '**強調テキスト**',
+      speaker: '探索者',
+      speakerId: 'char-1',
+      timestamp: 1001,
+    });
+
     await new Promise((r) => setTimeout(r, 60));
 
-    const contentEl = target.querySelector('[data-testid="msg-content-msg-fold-1"]');
-    expect(contentEl).toBeTruthy();
-    // Extension appends '!' to the input Generast and Saignant renders it to HTML
-    expect(contentEl?.textContent?.trim()).toBe('テストメッセージ!');
+    const content1 = target.querySelector('[data-testid="msg-content-msg-fold-1"]');
+    expect(content1).toBeTruthy();
+    expect(content1?.textContent?.trim()).toBe('ほげほげ');
+    expect(content1?.textContent).not.toContain('label mismatch');
+    expect(content1?.textContent).not.toContain('0xd38f9ce233c2315a');
+
+    const content2 = target.querySelector('[data-testid="msg-content-msg-fold-2"]');
+    expect(content2).toBeTruthy();
+    expect(content2?.innerHTML).toContain('saignant-bold');
+    expect(content2?.textContent?.trim()).toBe('強調テキスト');
 
     unmount(instance);
     target.remove();
   });
 
-  // spec: alhalte-argenterie/log-tab 拡張機能優先度順の左畳み込み適用 (Issue #117)
+  // spec: alhalte-argenterie/log-tab 拡張機能優先度順の左畳み込み適用 (Issue #117, Issue #127)
   it('applies multiple active extensions sequentially in priority order (left fold)', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
@@ -871,21 +896,20 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       members: [],
     };
 
-    const validWasm = hexToBytes(VALID_WASM_HEX);
     const extensions: ExtensionItem[] = [
       {
-        id: 'ext-prio-1',
-        name: '拡張機能1',
+        id: 'alhalte-dsl',
+        name: 'Alhalte DSL',
         enabled: true,
         priority: 0,
-        wasmBytes: validWasm,
+        wasmBytes: dslWasm,
       },
       {
-        id: 'ext-prio-2',
-        name: '拡張機能2',
+        id: 'markdown',
+        name: 'Markdown スタイル',
         enabled: true,
         priority: 1,
-        wasmBytes: validWasm,
+        wasmBytes: markdownWasm,
       },
     ];
 
@@ -905,7 +929,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     chunkManager.appendRecord({
       id: 'msg-prio-1',
       sceneId: 'scene-prio-test',
-      content: 'アタック',
+      content: '**判定** 1D100<=50',
       speaker: '騎士',
       timestamp: 1000,
     });
@@ -914,8 +938,11 @@ describe('Log Tab & Chunk Lazy Loading', () => {
 
     const contentEl = target.querySelector('[data-testid="msg-content-msg-prio-1"]');
     expect(contentEl).toBeTruthy();
-    // Both active extensions append '!' in order: 'アタック' -> 'アタック!' -> 'アタック!!'
-    expect(contentEl?.textContent?.trim()).toBe('アタック!!');
+    // Both active extensions process in left fold:
+    // alhalte-dsl handles dice roll and markdown formats bold
+    expect(contentEl?.innerHTML).toContain('saignant-bold');
+    expect(contentEl?.innerHTML).toContain('1D100');
+    expect(contentEl?.textContent).not.toContain('label mismatch');
 
     unmount(instance);
     target.remove();
@@ -937,14 +964,13 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       isAdmin: true,
     };
 
-    const validWasm = hexToBytes(VALID_WASM_HEX);
     const initialExtensions: ExtensionItem[] = [
       {
-        id: 'ext-dynamic-1',
-        name: 'ダイナミック拡張',
+        id: 'markdown',
+        name: 'Markdown スタイル',
         enabled: true,
         priority: 0,
-        wasmBytes: validWasm,
+        wasmBytes: markdownWasm,
       },
     ];
 
@@ -965,16 +991,17 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     expect(inputEl).toBeTruthy();
     expect(sendBtn).toBeTruthy();
 
-    inputEl!.value = 'こんにちは';
+    inputEl!.value = '**こんにちは**';
     inputEl!.dispatchEvent(new Event('input', { bubbles: true }));
     await new Promise((r) => setTimeout(r, 20));
 
     sendBtn!.click();
     await new Promise((r) => setTimeout(r, 60));
 
-    // Initially with extension enabled, message has '!'
+    // Initially with extension enabled, message has bold styling
     const messagesList = target.querySelector('[data-testid="messages-list"]');
-    expect(messagesList?.textContent).toContain('こんにちは!');
+    expect(messagesList?.innerHTML).toContain('saignant-bold');
+    expect(messagesList?.textContent).toContain('こんにちは');
 
     // Switch to Extensions Tab
     const extTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-extensions"]');
@@ -983,7 +1010,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     await new Promise((r) => setTimeout(r, 30));
 
     // Toggle the extension off
-    const toggleCheckbox = target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-ext-dynamic-1"]');
+    const toggleCheckbox = target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-markdown"]');
     expect(toggleCheckbox).toBeTruthy();
     toggleCheckbox?.click();
     await new Promise((r) => setTimeout(r, 30));
@@ -994,10 +1021,10 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     logTabBtn?.click();
     await new Promise((r) => setTimeout(r, 60));
 
-    // Message should be re-rendered without extension transformation: 'こんにちは' instead of 'こんにちは!'
+    // Message should be re-rendered without extension transformation: raw '**こんにちは**'
     const updatedMessagesList = target.querySelector('[data-testid="messages-list"]');
-    expect(updatedMessagesList?.textContent).toContain('こんにちは');
-    expect(updatedMessagesList?.textContent).not.toContain('こんにちは!');
+    expect(updatedMessagesList?.innerHTML).not.toContain('saignant-bold');
+    expect(updatedMessagesList?.textContent).toContain('**こんにちは**');
 
     unmount(instance);
     target.remove();
@@ -1020,26 +1047,25 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     chunkManager.appendRecord({
       id: 'msg-pre-1',
       sceneId: 'scene-pre-test',
-      content: '過去ログ1',
+      content: '**過去ログ1**',
       speaker: 'ルシア',
       timestamp: 100,
     });
     chunkManager.appendRecord({
       id: 'msg-pre-2',
       sceneId: 'scene-pre-test',
-      content: 'キューログ2',
+      content: '*キューログ2*',
       speaker: 'ベルナルド',
       timestamp: 101,
     });
 
-    const validWasm = hexToBytes(VALID_WASM_HEX);
     const extensions: ExtensionItem[] = [
       {
-        id: 'ext-excl',
-        name: '感嘆符付与',
+        id: 'markdown',
+        name: 'Markdown スタイル',
         enabled: true,
         priority: 0,
-        wasmBytes: validWasm,
+        wasmBytes: markdownWasm,
       },
     ];
 
@@ -1056,8 +1082,10 @@ describe('Log Tab & Chunk Lazy Loading', () => {
 
     const content1 = target.querySelector('[data-testid="msg-content-msg-pre-1"]');
     const content2 = target.querySelector('[data-testid="msg-content-msg-pre-2"]');
-    expect(content1?.textContent?.trim()).toBe('過去ログ1!');
-    expect(content2?.textContent?.trim()).toBe('キューログ2!');
+    expect(content1?.innerHTML).toContain('saignant-bold');
+    expect(content1?.textContent?.trim()).toBe('過去ログ1');
+    expect(content2?.innerHTML).toContain('saignant-italic');
+    expect(content2?.textContent?.trim()).toBe('キューログ2');
 
     unmount(instance);
     target.remove();

@@ -1,5 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { mount, unmount } from 'svelte';
+import fs from 'node:fs';
+import path from 'node:path';
 import { hexToBytes } from '@alhalte/pantry';
 import {
   WasmExtensionInstance,
@@ -301,38 +303,49 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/extensions-abi ログタブ連携による左畳み込みGenerast変換とSaignant HTML生成 (Issue #117)
+  // spec: alhalte-argenterie/extensions-abi ログタブ連携による左畳み込みGenerast変換とSaignant HTML生成 (Issue #117, Issue #127)
   it('integrates extension pipeline left fold with Generast AST and Saignant HTML rendering for log messages', async () => {
     const pipeline = new ExtensionPipeline();
-    const validBytes = hexToBytes(VALID_WASM_HEX);
+    const dslBytes = fs.readFileSync(path.resolve(__dirname, '../public/extensions/alhalte-dsl.wasm'));
+    const markdownBytes = fs.readFileSync(path.resolve(__dirname, '../public/extensions/markdown.wasm'));
 
     const extensions: ExtensionItem[] = [
       {
-        id: 'ext-step-1',
-        name: 'step-1',
+        id: 'alhalte-dsl',
+        name: 'Alhalte DSL',
         enabled: true,
         priority: 0,
-        wasmBytes: validBytes,
+        wasmBytes: dslBytes,
       },
       {
-        id: 'ext-step-2',
-        name: 'step-2',
+        id: 'markdown',
+        name: 'Markdown スタイル',
         enabled: true,
         priority: 1,
-        wasmBytes: validBytes,
+        wasmBytes: markdownBytes,
       },
     ];
 
-    // Build Generast from text through pipeline left fold
-    const ast = await buildGenerastFromText('1D100<=50', extensions, pipeline, 'char-1');
-    expect(ast).toEqual({
-      type: 'string',
-      value: '1D100<=50!!',
-    });
+    // 1. Japanese message "ほげほげ" should not produce label mismatch error (Issue #127)
+    const astHoge = await buildGenerastFromText('ほげほげ', extensions, pipeline, 'char-1');
+    expect(astHoge instanceof Uint8Array).toBe(true);
+    const htmlHoge = await renderGenerast(astHoge);
+    expect(htmlHoge).toBe('ほげほげ');
+    expect(htmlHoge).not.toContain('label mismatch');
+    expect(htmlHoge).not.toContain('0xd38f9ce233c2315a');
 
-    // Render resulting AST through Saignant WASM
-    const html = await renderGenerast(ast);
-    expect(html).toContain('1D100&lt;=50!!');
+    // 2. Dice roll expression '1D100<=50' processed through DSL and rendered by Saignant
+    const astDice = await buildGenerastFromText('1D100<=50', extensions, pipeline, 'char-1');
+    expect(astDice instanceof Uint8Array).toBe(true);
+    const htmlDice = await renderGenerast(astDice);
+    expect(htmlDice).toContain('saignant-diceroll');
+    expect(htmlDice).toContain('100');
+
+    // 3. Markdown styled expression '**重要**' processed through Markdown and rendered by Saignant
+    const astMd = await buildGenerastFromText('**重要**', extensions, pipeline, 'char-1');
+    expect(astMd instanceof Uint8Array).toBe(true);
+    const htmlMd = await renderGenerast(astMd);
+    expect(htmlMd).toContain('<strong class="saignant-bold">重要</strong>');
   });
 
   // spec: alhalte-argenterie/extensions-abi 拡張機能アクションメニューのアンカーボタン隣接配置 (Issue #124)

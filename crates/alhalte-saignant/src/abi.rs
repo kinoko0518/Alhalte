@@ -113,15 +113,27 @@ pub unsafe extern "C" fn render_generast_abi(ptr: *const u8, len: usize) -> u64 
     let resolver = NoopCharacterResolver;
 
     let html = match Tin::from_plaintext(input_bytes) {
-        Ok(tin) => match Generast::from_tin(&tin) {
-            Ok(ast) => render_generast(&ast, &resolver),
-            Err(e) => format!(r#"<span class="saignant-syntax-error">Generast Error: {e}</span>"#),
-        },
-        Err(_) => {
+        Ok(tin) if tin.label == generast::LABEL_ALHALTE_GENERAST => {
+            match Generast::from_tin(&tin) {
+                Ok(ast) => render_generast(&ast, &resolver),
+                Err(_) => match generast::decode_ext_io(&tin) {
+                    Ok((ast, _speaker)) => render_generast(&ast, &resolver),
+                    Err(e) => {
+                        format!(r#"<span class="saignant-syntax-error">Generast Error: {e}</span>"#)
+                    }
+                },
+            }
+        }
+        _ => {
             // Fallback: try raw postcard deserialization of Generast directly
             match postcard::from_bytes::<Generast>(input_bytes) {
                 Ok(ast) => render_generast(&ast, &resolver),
-                Err(e) => format!(r#"<span class="saignant-syntax-error">Tin Error: {e}</span>"#),
+                Err(_) => match postcard::from_bytes::<(Generast, u64)>(input_bytes) {
+                    Ok((ast, _)) => render_generast(&ast, &resolver),
+                    Err(e) => {
+                        format!(r#"<span class="saignant-syntax-error">Tin Error: {e}</span>"#)
+                    }
+                },
             }
         }
     };

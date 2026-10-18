@@ -3,6 +3,7 @@ import { mount, unmount } from 'svelte';
 import CommonFooter from '../src/components/Control/CommonFooter.svelte';
 import type { Character, ExtensionItem } from '../src/types/index.js';
 import type { GenerastAST } from '../src/utils/generast.js';
+import { decodeExtIoTin } from '../src/utils/generast.js';
 import { ExtensionPipeline } from '../src/wasm/runner.js';
 
 describe('CommonFooter Component Rebuild (Issue #54)', () => {
@@ -379,7 +380,12 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     const mockPipeline = new ExtensionPipeline();
     // Spy on executePipeline
     vi.spyOn(mockPipeline, 'executePipeline').mockImplementation(async (_exts, inputBytes) => {
-      const decoded = new TextDecoder().decode(inputBytes);
+      let decoded: string;
+      try {
+        decoded = decodeExtIoTin(inputBytes).text;
+      } catch {
+        decoded = new TextDecoder().decode(inputBytes);
+      }
       // Simulate DSL expansion or dice translation
       return new TextEncoder().encode(`[GENERAST:TRANSFORMED] ${decoded}`);
     });
