@@ -67,6 +67,19 @@
   let listElement = $state<HTMLDivElement | null>(null);
   let renderedContentMap = $state<Record<string, string>>({});
 
+  function handleAnimationEnd(recordId: string, event?: AnimationEvent) {
+    // If multiple animations run (fade-in 150ms and spring-spatial 500ms),
+    // wait until the spatial spring animation finishes before clearing.
+    if (event && event.animationName && event.animationName !== 'np-message-spring-spatial') {
+      return;
+    }
+    if (newRecordIds.has(recordId)) {
+      const next = new Set(newRecordIds);
+      next.delete(recordId);
+      newRecordIds = next;
+    }
+  }
+
   void updateRenderedHtml(messages);
 
   let currentSceneId = scene.id;
@@ -226,6 +239,7 @@
           class:message-entry-new={isNew}
           data-testid="log-record-{record.id}"
           data-is-new={isNew ? 'true' : undefined}
+          onanimationend={(e) => handleAnimationEnd(record.id, e)}
         >
           <!-- Character Avatar / Icon -->
           <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
