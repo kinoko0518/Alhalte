@@ -25,6 +25,10 @@
   import type { BgmSlot, Character, Scene } from '../../../types/index.js';
   import { getNormalizedBgmSlots } from '../../../utils/sceneSettings.js';
   import {
+    applyMenuPosition,
+    getMenuPositionStyle,
+  } from '../../../utils/menuPosition.js';
+  import {
     loadAssets,
     subscribeAssets,
     type AssetItem,
@@ -107,6 +111,23 @@
   let membersMoveListContainer = $state<HTMLElement | null>(null);
   let toggleButtons = $state<Record<string, HTMLElement | undefined>>({});
   let menuElements = $state<Record<string, HTMLElement | undefined>>({});
+
+  $effect(() => {
+    if (
+      activeMemberSplitId &&
+      menuElements[activeMemberSplitId] &&
+      toggleButtons[activeMemberSplitId]
+    ) {
+      return applyMenuPosition(
+        menuElements[activeMemberSplitId],
+        toggleButtons[activeMemberSplitId],
+        {
+          placement: 'bottom-end',
+          anchorName: `--member-scene-anchor-${activeMemberSplitId}`,
+        }
+      );
+    }
+  });
 
   $effect(() => {
     for (const char of characters) {
@@ -697,6 +718,10 @@
                         bind:element={menuElements[char.id]}
                         open={activeMemberSplitId === char.id}
                         anchor={toggleButtons[char.id]}
+                        style={getMenuPositionStyle(toggleButtons[char.id], {
+                          placement: 'bottom-end',
+                          anchorName: `--member-scene-anchor-${char.id}`,
+                        })}
                         data-testid="member-scene-menu-{char.id}"
                         class="member-scene-menu"
                         ontoggle={(e) => {

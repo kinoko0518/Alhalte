@@ -577,11 +577,30 @@ describe('Scene Settings & Juices', () => {
     const toggleBtn = target.querySelector<HTMLButtonElement>('[data-testid="member-split-toggle-char-alice"]');
     expect(toggleBtn).toBeTruthy();
     expect(toggleBtn?.classList.contains('np-icon-button')).toBe(true);
+
+    vi.spyOn(toggleBtn!, 'getBoundingClientRect').mockReturnValue({
+      top: 200,
+      bottom: 236,
+      left: 300,
+      right: 336,
+      width: 36,
+      height: 36,
+      x: 300,
+      y: 200,
+      toJSON: () => {},
+    });
+
     toggleBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    const menu = target.querySelector('[data-testid="member-scene-menu-char-alice"]');
+    const menu = target.querySelector<HTMLElement>('[data-testid="member-scene-menu-char-alice"]');
     expect(menu).toBeTruthy();
+    expect(menu?.style.position).toBe('fixed');
+    expect(menu?.getAttribute('style')).toContain('inset: unset');
+    expect(menu?.style.margin).toBe('0px');
+    expect(menu?.style.top).toBe('240px');
+    expect(toggleBtn?.style.getPropertyValue('anchor-name')).toBe('--member-scene-anchor-char-alice');
+    expect(menu?.style.getPropertyValue('position-anchor')).toBe('--member-scene-anchor-char-alice');
 
     // 5. Check MenuItems for scenes
     const itemA = target.querySelector<HTMLElement>('[data-testid="member-scene-item-char-alice-scene-a"]');

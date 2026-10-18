@@ -554,4 +554,91 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     unmount(instance);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/common-footer キャラクターピッカーメニューおよびその他メニューの直上アンカー配置スタイル (Issue #124)
+  it('positions character picker and more menus adjacent to anchor buttons above footer with position-anchor', async () => {
+    window.innerWidth = 1000;
+    window.innerHeight = 800;
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+      },
+    });
+
+    // 1. Character picker menu positioning
+    const charSelectBtn = target.querySelector<HTMLButtonElement>('[data-testid="character-select-button"]');
+    expect(charSelectBtn).toBeTruthy();
+
+    vi.spyOn(charSelectBtn!, 'getBoundingClientRect').mockReturnValue({
+      top: 680,
+      bottom: 716,
+      left: 100,
+      right: 250,
+      width: 150,
+      height: 36,
+      x: 100,
+      y: 680,
+      toJSON: () => {},
+    });
+
+    charSelectBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const charMenu = target.querySelector<HTMLElement>('[data-testid="character-picker-dropdown"]');
+    expect(charMenu).toBeTruthy();
+    expect(charMenu?.style.position).toBe('fixed');
+    expect(charMenu?.getAttribute('style')).toContain('inset: unset');
+    expect(charMenu?.style.margin).toBe('0px');
+    // bottom = vh (800) - top (680) + offset (4) = 124px
+    expect(charMenu?.style.bottom).toBe('124px');
+    expect(charMenu?.style.left).toBe('100px');
+    expect(charSelectBtn?.style.getPropertyValue('anchor-name')).toBe('--char-picker-anchor');
+    expect(charMenu?.style.getPropertyValue('position-anchor')).toBe('--char-picker-anchor');
+    expect(charMenu?.style.getPropertyValue('--np-menu-position-area')).toBe('top span-right');
+
+    // Close char menu
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="character-picker-dropdown"]')).toBeNull();
+
+    // 2. More options menu positioning
+    const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="footer-more-button"]');
+    expect(moreBtn).toBeTruthy();
+
+    vi.spyOn(moreBtn!, 'getBoundingClientRect').mockReturnValue({
+      top: 680,
+      bottom: 716,
+      left: 920,
+      right: 956,
+      width: 36,
+      height: 36,
+      x: 920,
+      y: 680,
+      toJSON: () => {},
+    });
+
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const moreMenu = target.querySelector<HTMLElement>('[data-testid="footer-more-menu"]');
+    expect(moreMenu).toBeTruthy();
+    expect(moreMenu?.style.position).toBe('fixed');
+    expect(moreMenu?.getAttribute('style')).toContain('inset: unset');
+    expect(moreMenu?.style.margin).toBe('0px');
+    // bottom = vh (800) - top (680) + offset (4) = 124px
+    expect(moreMenu?.style.bottom).toBe('124px');
+    expect(moreBtn?.style.getPropertyValue('anchor-name')).toBe('--footer-more-anchor');
+    expect(moreMenu?.style.getPropertyValue('position-anchor')).toBe('--footer-more-anchor');
+    expect(moreMenu?.style.getPropertyValue('--np-menu-position-area')).toBe('top span-right');
+
+    unmount(instance);
+    target.remove();
+  });
 });

@@ -54,6 +54,10 @@
     createTextGenerastAST,
     type GenerastAST,
   } from '../../utils/generast.js';
+  import {
+    applyMenuPosition,
+    getMenuPositionStyle,
+  } from '../../utils/menuPosition.js';
   import { ExtensionPipeline } from '../../wasm/runner.js';
 
   export type ActiveTab =
@@ -99,8 +103,30 @@
   let textareaElement = $state<HTMLTextAreaElement | null>(null);
   let charBtnElement = $state<HTMLElement | undefined>(undefined);
   let charPickerWrapper = $state<HTMLElement | null>(null);
+  let charPickerMenuEl = $state<HTMLDivElement | undefined>(undefined);
   let moreBtnElement = $state<HTMLElement | undefined>(undefined);
   let moreMenuWrapper = $state<HTMLElement | null>(null);
+  let moreMenuEl = $state<HTMLDivElement | undefined>(undefined);
+
+  $effect(() => {
+    if (isCharPickerOpen && charPickerMenuEl && charBtnElement) {
+      return applyMenuPosition(charPickerMenuEl, charBtnElement, {
+        placement: 'top-start',
+        anchorName: '--char-picker-anchor',
+        useBottomForTopPlacement: true,
+      });
+    }
+  });
+
+  $effect(() => {
+    if (isMoreMenuOpen && moreMenuEl && moreBtnElement) {
+      return applyMenuPosition(moreMenuEl, moreBtnElement, {
+        placement: 'top-end',
+        anchorName: '--footer-more-anchor',
+        useBottomForTopPlacement: true,
+      });
+    }
+  });
 
   const tabItems: Array<{ id: ActiveTab; icon: string; label: string; fullLabel: string }> = [
     { id: 'log', icon: 'forum', label: 'ログ', fullLabel: 'ログタブ' },
@@ -347,8 +373,14 @@
 
       {#if isCharPickerOpen}
         <Menu
+          bind:element={charPickerMenuEl}
           bind:open={isCharPickerOpen}
           anchor={charBtnElement}
+          style={getMenuPositionStyle(charBtnElement, {
+            placement: 'top-start',
+            anchorName: '--char-picker-anchor',
+            useBottomForTopPlacement: true,
+          })}
           class="char-picker-menu"
           data-testid="character-picker-dropdown"
         >
@@ -413,8 +445,14 @@
 
         {#if isMoreMenuOpen}
           <Menu
+            bind:element={moreMenuEl}
             bind:open={isMoreMenuOpen}
             anchor={moreBtnElement}
+            style={getMenuPositionStyle(moreBtnElement, {
+              placement: 'top-end',
+              anchorName: '--footer-more-anchor',
+              useBottomForTopPlacement: true,
+            })}
             class="footer-more-menu"
             data-testid="footer-more-menu"
           >
