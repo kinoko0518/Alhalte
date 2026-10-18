@@ -11,7 +11,7 @@ import { mount, unmount } from 'svelte';
 import AssetPickerModal from '../src/components/Control/AssetPickerModal.svelte';
 import GenericImagePicker from '../src/components/Control/GenericImagePicker.svelte';
 import IconImagePicker from '../src/components/Control/IconImagePicker.svelte';
-import { addAsset, clearAssets } from '../src/utils/assets.js';
+import { addAsset, addAssetFromFile, clearAssets, formatFileSize, loadAssets } from '../src/utils/assets.js';
 
 describe('AssetPickerModal & Image Pickers Integration (Issue #52, #60)', () => {
   beforeEach(() => {
@@ -186,6 +186,126 @@ describe('AssetPickerModal & Image Pickers Integration (Issue #52, #60)', () => 
     pickerBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(modalOpened).toBe(true);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: Issue #108 formatFileSize ユーティリティのテスト
+  it('formats file sizes accurately into human-readable strings (formatFileSize)', () => {
+    expect(formatFileSize(undefined)).toBe('-');
+    expect(formatFileSize(null as any)).toBe('-');
+    expect(formatFileSize(-1)).toBe('-');
+    expect(formatFileSize(NaN)).toBe('-');
+    expect(formatFileSize(0)).toBe('0 B');
+    expect(formatFileSize(512)).toBe('512 B');
+    expect(formatFileSize(1024)).toBe('1.0 KB');
+    expect(formatFileSize(123392)).toBe('120.5 KB'); // 120.5 * 1024 = 123392
+    expect(formatFileSize(1258291)).toBe('1.2 MB'); // 1.2 * 1024 * 1024 ≈ 1258291
+    expect(formatFileSize(1073741824)).toBe('1.0 GB');
+  });
+
+  // spec: Issue #108 addAssetFromFile でのファイルサイズ (file.size) 保存テスト
+  it('stores file.size in AssetItem when addAssetFromFile is called', async () => {
+    const file = new File(['hello alhalte'], 'greeting.png', { type: 'image/png' });
+    // In jsdom or custom environments, file.size is the content size
+    const asset = await addAssetFromFile(file, 'personal', 'image');
+    expect(asset.size).toBe(file.size);
+
+    const loaded = loadAssets();
+    const found = loaded.find((a) => a.id === asset.id);
+    expect(found?.size).toBe(file.size);
+  });
+
+  // spec: Issue #108 M3 filled Cards, NONE card uniform size, file size display, M3 Search, and direct URL removal
+  it('renders filled Cards for NONE and assets, displays file sizes, provides M3 Search, and removes direct URL inputs (Issue #108)', async () => {
+    const sampleAsset1 = addAsset({
+      id: 'asset-sample-1',
+      name: 'ancient-ruins.webp',
+      scope: 'personal',
+      mediaType: 'image',
+      dataUrl: 'data:image/webp;base64,cnVpbnM=',
+      mimeType: 'image/webp',
+      size: 123392, // 120.5 KB
+    });
+
+    const sampleAsset2 = addAsset({
+      id: 'asset-sample-2',
+      name: 'battle-theme.opus',
+      scope: 'personal',
+      mediaType: 'image',
+      dataUrl: 'data:image/webp;base64,dGhlbWU=',
+      mimeType: 'image/webp',
+      size: 1258291, // 1.2 MB
+    });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(AssetPickerModal, {
+      target,
+      props: {
+        open: true,
+        isAdmin: false,
+        initialMediaType: 'image',
+        initialScope: 'personal',
+      },
+    });
+
+    // 1. Direct URL inputs are completely removed
+    expect(target.querySelector('[data-testid="asset-url-input"]')).toBeNull();
+    expect(target.querySelector('[data-testid="asset-apply-url-btn"]')).toBeNull();
+
+    // 2. M3 Expressive Search component is present and filters assets
+    const searchContainer = target.querySelector('[data-testid="asset-search-container"]');
+    const searchInput = target.querySelector<HTMLInputElement>('[data-testid="asset-search-input"]');
+    expect(searchContainer).toBeTruthy();
+    expect(searchContainer?.classList.contains('np-search')).toBe(true);
+    expect(searchContainer?.classList.contains('np-search-contained')).toBe(true);
+    expect(searchInput).toBeTruthy();
+
+    // 3. NONE card is rendered with M3 filled Card and uniform wrapper
+    const noneCardWrapper = target.querySelector<HTMLElement>('[data-testid="asset-card-none"]');
+    expect(noneCardWrapper).toBeTruthy();
+    expect(noneCardWrapper?.classList.contains('asset-card-wrapper')).toBe(true);
+    expect(noneCardWrapper?.classList.contains('none-card-wrapper')).toBe(true);
+
+    const noneFilledCard = noneCardWrapper?.querySelector('.np-card-filled');
+    expect(noneFilledCard).toBeTruthy();
+
+    const noneSizeLabel = noneCardWrapper?.querySelector('.asset-size-label');
+    expect(noneSizeLabel).toBeTruthy();
+    expect(noneSizeLabel?.textContent?.trim()).toBe('-');
+
+    // 4. Asset cards are rendered with M3 filled Card and formatted file sizes
+    const card1 = target.querySelector<HTMLElement>(`[data-testid="asset-card-${sampleAsset1.id}"]`);
+    expect(card1).toBeTruthy();
+    expect(card1?.classList.contains('asset-card-wrapper')).toBe(true);
+    expect(card1?.querySelector('.np-card-filled')).toBeTruthy();
+
+    const sizeLabel1 = card1?.querySelector('.asset-size-label');
+    expect(sizeLabel1).toBeTruthy();
+    expect(sizeLabel1?.textContent?.trim()).toBe('120.5 KB');
+
+    const card2 = target.querySelector<HTMLElement>(`[data-testid="asset-card-${sampleAsset2.id}"]`);
+    expect(card2).toBeTruthy();
+    expect(card2?.querySelector('.np-card-filled')).toBeTruthy();
+
+    const sizeLabel2 = card2?.querySelector('.asset-size-label');
+    expect(sizeLabel2).toBeTruthy();
+    expect(sizeLabel2?.textContent?.trim()).toBe('1.2 MB');
+
+    // 5. Test M3 Search filtering
+    if (searchInput) {
+      searchInput.value = 'ancient';
+      searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+    await new Promise((r) => setTimeout(r, 20));
+
+    // NONE card always remains, sampleAsset1 matches, sampleAsset2 filtered out
+    expect(target.querySelector('[data-testid="asset-card-none"]')).toBeTruthy();
+    expect(target.querySelector(`[data-testid="asset-card-${sampleAsset1.id}"]`)).toBeTruthy();
+    expect(target.querySelector(`[data-testid="asset-card-${sampleAsset2.id}"]`)).toBeNull();
 
     unmount(instance);
     target.remove();

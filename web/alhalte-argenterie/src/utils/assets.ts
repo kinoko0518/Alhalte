@@ -18,6 +18,7 @@ export interface AssetItem {
   mediaType: AssetMediaType;
   dataUrl: string; // Object URL or data URL for preview/playback
   mimeType: string;
+  size?: number; // File size in bytes
   createdAt: number;
 }
 
@@ -60,6 +61,26 @@ export function subscribeAssets(listener: AssetListener): () => void {
 }
 
 /**
+ * Formats a byte size into a human-readable string (e.g. "120.5 KB", "1.2 MB", "-").
+ */
+export function formatFileSize(bytes?: number): string {
+  if (bytes === undefined || bytes === null || Number.isNaN(bytes) || bytes < 0) {
+    return '-';
+  }
+  if (bytes === 0) {
+    return '0 B';
+  }
+  const k = 1024;
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  if (i <= 0) {
+    return `${bytes} B`;
+  }
+  const size = bytes / Math.pow(k, i);
+  return `${size.toFixed(1)} ${units[i] ?? 'B'}`;
+}
+
+/**
  * Loads all stored assets from localStorage (or in-memory fallback), sorted by createdAt ascending.
  */
 export function loadAssets(customStorage?: Storage): AssetItem[] {
@@ -87,6 +108,7 @@ export function loadAssets(customStorage?: Storage): AssetItem[] {
         (item.mediaType === 'image' || item.mediaType === 'audio') &&
         typeof item.dataUrl === 'string' &&
         typeof item.mimeType === 'string' &&
+        (item.size === undefined || typeof item.size === 'number') &&
         typeof item.createdAt === 'number',
     );
     valid.sort((a, b) => a.createdAt - b.createdAt);
@@ -140,7 +162,7 @@ export function getAssetsByMediaType(
  * Adds a new asset item to the store and notifies subscribers.
  */
 export function addAsset(
-  input: Omit<AssetItem, 'id' | 'createdAt'> & { id?: string; createdAt?: number },
+  input: Omit<AssetItem, 'id' | 'createdAt'> & { id?: string; size?: number; createdAt?: number },
   customStorage?: Storage,
 ): AssetItem {
   const existing = loadAssets(customStorage);
@@ -151,6 +173,7 @@ export function addAsset(
     mediaType: input.mediaType,
     dataUrl: input.dataUrl,
     mimeType: input.mimeType || (input.mediaType === 'image' ? 'image/webp' : 'audio/webm'),
+    size: input.size,
     createdAt: input.createdAt ?? Date.now(),
   };
 
@@ -271,6 +294,7 @@ export async function addAssetFromFile(
       mediaType: resolvedMediaType,
       dataUrl,
       mimeType: resolvedMime,
+      size: typeof file.size === 'number' ? file.size : undefined,
     },
     customStorage,
   );
