@@ -46,6 +46,10 @@ pub enum MaitreDError {
     #[error("Invalid tin format: {0}")]
     InvalidTin(String),
 
+    /// Invalid room role.
+    #[error("Invalid room role: {0}")]
+    InvalidRole(String),
+
     /// Invalid request parameters.
     #[error("Bad request: {0}")]
     BadRequest(String),

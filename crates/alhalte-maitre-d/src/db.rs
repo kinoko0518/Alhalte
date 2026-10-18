@@ -37,6 +37,61 @@ pub struct Session {
     pub created_at: i64,
 }
 
+/// Role assigned to an account in a room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomRole {
+    /// Game master / room administrator.
+    Gm,
+    /// Player.
+    Pl,
+    /// Spectator / read-only viewer.
+    Viewer,
+}
+
+impl RoomRole {
+    /// Returns the static string representation of this role.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Gm => "gm",
+            Self::Pl => "pl",
+            Self::Viewer => "viewer",
+        }
+    }
+}
+
+impl std::str::FromStr for RoomRole {
+    type Err = MaitreDError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "gm" => Ok(Self::Gm),
+            "pl" => Ok(Self::Pl),
+            "viewer" => Ok(Self::Viewer),
+            other => Err(MaitreDError::InvalidRole(other.to_string())),
+        }
+    }
+}
+
+impl std::fmt::Display for RoomRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Room permission entry returned by query and listing endpoints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomPermissionItem {
+    /// 64-bit account ID.
+    pub account_id: u64,
+    /// User name / handle name.
+    pub username: String,
+    /// Avatar icon URL if available.
+    pub icon_url: Option<String>,
+    /// Assigned role in the room.
+    pub role: RoomRole,
+}
+
 /// Thread-safe SQLite database manager for accounts and sessions.
 #[derive(Clone)]
 pub struct Database {
@@ -91,6 +146,16 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat);
+
+            CREATE TABLE IF NOT EXISTS room_permissions (
+                room_id TEXT NOT NULL,
+                account_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (room_id, account_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_room_permissions_room ON room_permissions(room_id);
+            CREATE INDEX IF NOT EXISTS idx_room_permissions_account ON room_permissions(account_id);
             ",
         )?;
 
@@ -468,5 +533,212 @@ impl Database {
         )?;
 
         Ok(affected)
+    }
+
+    /// Sets or updates the permission role for an account in a room.
+    pub fn set_room_permission(
+        &self,
+        room_id: &str,
+        account_id: u64,
+        role: RoomRole,
+        now: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        conn.execute(
+            "INSERT INTO room_permissions (room_id, account_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (room_id, account_id) DO UPDATE SET role = excluded.role",
+            params![room_id, account_id as i64, role.as_str(), now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Deletes a permission entry for an account in a room.
+    pub fn delete_room_permission(&self, room_id: &str, account_id: u64) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let affected = conn.execute(
+            "DELETE FROM room_permissions WHERE room_id = ?1 AND account_id = ?2",
+            params![room_id, account_id as i64],
+        )?;
+
+        Ok(affected > 0)
+    }
+
+    /// Retrieves all permissions set for a room, along with user handle name and icon URL.
+    pub fn get_room_permissions(&self, room_id: &str) -> Result<Vec<RoomPermissionItem>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT p.account_id, COALESCE(a.handle_name, ''), a.icon_tin_id, p.role
+             FROM room_permissions p
+             LEFT JOIN accounts a ON p.account_id = a.account_id
+             WHERE p.room_id = ?1
+             ORDER BY p.created_at ASC, p.account_id ASC",
+        )?;
+
+        let mut items = Vec::new();
+        let mut rows = stmt.query(params![room_id])?;
+        while let Some(row) = rows.next()? {
+            let aid: i64 = row.get(0)?;
+            let username: String = row.get(1)?;
+            let icon_blob: Option<Vec<u8>> = row.get(2)?;
+            let role_str: String = row.get(3)?;
+
+            let icon_tin_id = icon_blob.and_then(|b| {
+                if b.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    Some(arr)
+                } else {
+                    None
+                }
+            });
+
+            let icon_url = icon_tin_id.map(|id| format!("/api/cellar/tin/{}", hex::encode(id)));
+            let role = role_str.parse::<RoomRole>()?;
+
+            items.push(RoomPermissionItem {
+                account_id: aid as u64,
+                username,
+                icon_url,
+                role,
+            });
+        }
+
+        Ok(items)
+    }
+
+    /// Checks whether any room permissions are configured for a room.
+    pub fn has_room_permissions(&self, room_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare("SELECT 1 FROM room_permissions WHERE room_id = ?1 LIMIT 1")?;
+        let exists = stmt.query_row(params![room_id], |_| Ok(true)).optional()?;
+        Ok(exists.unwrap_or(false))
+    }
+
+    /// Retrieves the role of a specific account in a room.
+    pub fn get_room_role(&self, room_id: &str, account_id: u64) -> Result<Option<RoomRole>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT role FROM room_permissions WHERE room_id = ?1 AND account_id = ?2 LIMIT 1",
+        )?;
+
+        let role_str: Option<String> = stmt
+            .query_row(params![room_id, account_id as i64], |row| row.get(0))
+            .optional()?;
+
+        match role_str {
+            Some(s) => Ok(Some(s.parse::<RoomRole>()?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Retrieves the first GM account ID configured for a room.
+    pub fn get_room_gm(&self, room_id: &str) -> Result<Option<u64>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT account_id FROM room_permissions WHERE room_id = ?1 AND role = 'gm' ORDER BY created_at ASC LIMIT 1",
+        )?;
+
+        let gm_id: Option<i64> = stmt
+            .query_row(params![room_id], |row| row.get(0))
+            .optional()?;
+
+        Ok(gm_id.map(|id| id as u64))
+    }
+
+    /// Searches accounts by username or account ID.
+    pub fn search_accounts(&self, query: &str) -> Result<Vec<Account>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let parsed_id = query.parse::<i64>().ok();
+        let like_pattern = format!("%{query}%");
+
+        let mut stmt;
+        let mut rows = match parsed_id {
+            Some(id) => {
+                stmt = conn.prepare(
+                    "SELECT account_id, encrypted_sub, handle_name, icon_tin_id, created_at
+                     FROM accounts
+                     WHERE account_id = ?1 OR handle_name LIKE ?2
+                     ORDER BY (account_id = ?1) DESC, account_id ASC
+                     LIMIT 50",
+                )?;
+                stmt.query(params![id, like_pattern])?
+            }
+            None => {
+                stmt = conn.prepare(
+                    "SELECT account_id, encrypted_sub, handle_name, icon_tin_id, created_at
+                     FROM accounts
+                     WHERE handle_name LIKE ?1
+                     ORDER BY account_id ASC
+                     LIMIT 50",
+                )?;
+                stmt.query(params![like_pattern])?
+            }
+        };
+
+        let mut accounts = Vec::new();
+        while let Some(row) = rows.next()? {
+            let account_id: i64 = row.get(0)?;
+            let encrypted_sub: String = row.get(1)?;
+            let handle_name: String = row.get(2)?;
+            let icon_blob: Option<Vec<u8>> = row.get(3)?;
+            let created_at: i64 = row.get(4)?;
+
+            let icon_tin_id = icon_blob.and_then(|b| {
+                if b.len() == 32 {
+                    let mut arr = [0u8; 32];
+                    arr.copy_from_slice(&b);
+                    Some(arr)
+                } else {
+                    None
+                }
+            });
+
+            accounts.push(Account {
+                account_id: account_id as u64,
+                encrypted_sub,
+                handle_name,
+                icon_tin_id,
+                created_at,
+            });
+        }
+
+        Ok(accounts)
     }
 }

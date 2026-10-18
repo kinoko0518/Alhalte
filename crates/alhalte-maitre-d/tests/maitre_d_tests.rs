@@ -11,12 +11,13 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use alhalte_banquette::{ClientFrame, ServerFrame};
 use alhalte_maitre_d::{
-    AppState, DEBUG_SUB_CIPHERTEXT, Database, IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID,
+    AccountSearchItem, AppState, DEBUG_SUB_CIPHERTEXT, Database, IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID,
     IDENT_ALHALTE_MAITRE_D_SESSION_ID, InProcessBanquetteSpawner,
     LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID, MockOAuthProvider,
-    RoomBridgeManager, account_id_from_tin, account_id_to_tin, cleanup_sessions_at,
-    cleanup_sessions_with_cutoff, create_router, decrypt_sub, encrypt_sub, parse_cli_args_from,
-    previous_4am_local, session_id_from_tin, session_id_to_tin,
+    RoomBridgeManager, RoomPermissionItem, RoomRole, SetRoomPermissionRequest, account_id_from_tin,
+    account_id_to_tin, cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
+    decrypt_sub, encrypt_sub, extract_session_id_from_cookie, parse_cli_args_from,
+    parse_session_id_from_cookie_str, previous_4am_local, session_id_from_tin, session_id_to_tin,
 };
 
 // spec: alhalte-maitre-d/labels
@@ -866,4 +867,693 @@ async fn test_room_zip_export_endpoints() {
 
     // Clean up
     ws_stream.close(None).await.unwrap();
+}
+
+// spec: alhalte-maitre-d/cookie-session
+#[test]
+fn test_cookie_session_extraction() {
+    assert_eq!(
+        parse_session_id_from_cookie_str("session_id=12345"),
+        Some(12345)
+    );
+    assert_eq!(
+        parse_session_id_from_cookie_str("theme=dark; session_id=98765; lang=ja"),
+        Some(98765)
+    );
+    assert_eq!(
+        parse_session_id_from_cookie_str("session_id=\"55555\""),
+        Some(55555)
+    );
+    assert_eq!(
+        parse_session_id_from_cookie_str("session_id=notanumber"),
+        None
+    );
+    assert_eq!(parse_session_id_from_cookie_str("other_cookie=12345"), None);
+    assert_eq!(parse_session_id_from_cookie_str(""), None);
+
+    let mut headers = axum::http::HeaderMap::new();
+    assert_eq!(extract_session_id_from_cookie(&headers), None);
+    headers.insert(
+        axum::http::header::COOKIE,
+        "session_id=424242".parse().unwrap(),
+    );
+    assert_eq!(extract_session_id_from_cookie(&headers), Some(424242));
+}
+
+// spec: alhalte-maitre-d/room-permissions-sqlite
+#[test]
+fn test_sqlite_room_permissions() {
+    let db = Database::new_in_memory().unwrap();
+    let acc1 = db
+        .get_or_create_account("sub-1", "Alice", Some([0x11; 32]), 1000)
+        .unwrap();
+    let acc2 = db
+        .get_or_create_account("sub-2", "Bob", None, 1000)
+        .unwrap();
+    let acc3 = db
+        .get_or_create_account("sub-3", "Charlie", None, 1000)
+        .unwrap();
+
+    let room_id = "test-room-1";
+
+    // Initially no permissions
+    assert!(!db.has_room_permissions(room_id).unwrap());
+    assert_eq!(db.get_room_permissions(room_id).unwrap().len(), 0);
+    assert_eq!(db.get_room_role(room_id, acc1.account_id).unwrap(), None);
+
+    // Set GM for Alice
+    db.set_room_permission(room_id, acc1.account_id, RoomRole::Gm, 1000)
+        .unwrap();
+    assert!(db.has_room_permissions(room_id).unwrap());
+    assert_eq!(
+        db.get_room_role(room_id, acc1.account_id).unwrap(),
+        Some(RoomRole::Gm)
+    );
+    assert_eq!(db.get_room_gm(room_id).unwrap(), Some(acc1.account_id));
+
+    // Set PL for Bob and Viewer for Charlie
+    db.set_room_permission(room_id, acc2.account_id, RoomRole::Pl, 1010)
+        .unwrap();
+    db.set_room_permission(room_id, acc3.account_id, RoomRole::Viewer, 1020)
+        .unwrap();
+
+    let perms = db.get_room_permissions(room_id).unwrap();
+    assert_eq!(perms.len(), 3);
+    assert_eq!(perms[0].account_id, acc1.account_id);
+    assert_eq!(perms[0].username, "Alice");
+    assert_eq!(
+        perms[0].icon_url,
+        Some(format!("/api/cellar/tin/{}", hex::encode([0x11; 32])))
+    );
+    assert_eq!(perms[0].role, RoomRole::Gm);
+
+    assert_eq!(perms[1].account_id, acc2.account_id);
+    assert_eq!(perms[1].username, "Bob");
+    assert_eq!(perms[1].icon_url, None);
+    assert_eq!(perms[1].role, RoomRole::Pl);
+
+    assert_eq!(perms[2].account_id, acc3.account_id);
+    assert_eq!(perms[2].role, RoomRole::Viewer);
+
+    // Update Bob's role to Viewer
+    db.set_room_permission(room_id, acc2.account_id, RoomRole::Viewer, 1030)
+        .unwrap();
+    assert_eq!(
+        db.get_room_role(room_id, acc2.account_id).unwrap(),
+        Some(RoomRole::Viewer)
+    );
+
+    // Delete Charlie's permission
+    assert!(db.delete_room_permission(room_id, acc3.account_id).unwrap());
+    assert_eq!(db.get_room_role(room_id, acc3.account_id).unwrap(), None);
+    let perms_after = db.get_room_permissions(room_id).unwrap();
+    assert_eq!(perms_after.len(), 2);
+}
+
+// spec: alhalte-maitre-d/accounts-search-sqlite
+#[test]
+fn test_sqlite_account_search() {
+    let db = Database::new_in_memory().unwrap();
+    let acc1 = db
+        .get_or_create_account("sub-1", "Alice Wonder", None, 1000)
+        .unwrap();
+    let acc2 = db
+        .get_or_create_account("sub-2", "Bob Builder", None, 1000)
+        .unwrap();
+    let acc3 = db
+        .get_or_create_account("sub-3", "Alice Cooper", None, 1000)
+        .unwrap();
+
+    // Substring search for "Alice"
+    let results = db.search_accounts("Alice").unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].account_id, acc1.account_id);
+    assert_eq!(results[1].account_id, acc3.account_id);
+
+    // Numeric search by ID
+    let results_id = db.search_accounts(&acc2.account_id.to_string()).unwrap();
+    assert!(!results_id.is_empty());
+    assert_eq!(results_id[0].account_id, acc2.account_id);
+
+    // No match
+    let results_empty = db.search_accounts("NonExistent").unwrap();
+    assert!(results_empty.is_empty());
+}
+
+// spec: alhalte-maitre-d/accounts-search-api
+#[tokio::test]
+async fn test_accounts_search_endpoint() {
+    let db = Database::new_in_memory().unwrap();
+    let icon_bytes = [0x22u8; 32];
+    let acc1 = db
+        .get_or_create_account("sub-search-1", "Shinji", Some(icon_bytes), 1000)
+        .unwrap();
+    let acc2 = db
+        .get_or_create_account("sub-search-2", "Asuka", None, 1000)
+        .unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        "/tmp", 8,
+    ));
+    let room_manager = RoomBridgeManager::new(spawner);
+    let oauth = Arc::new(MockOAuthProvider::new());
+    let state = AppState::new(db, "salt", oauth, room_manager);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+
+    // 1. Search by name "Shinji"
+    let resp = client
+        .get(format!("http://{addr}/api/accounts/search?q=Shinji"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let items: Vec<AccountSearchItem> = resp.json().await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].account_id, acc1.account_id);
+    assert_eq!(items[0].username, "Shinji");
+    assert_eq!(
+        items[0].icon_url,
+        Some(format!("/api/cellar/tin/{}", hex::encode(icon_bytes)))
+    );
+
+    // 2. Search by ID
+    let resp_id = client
+        .get(format!(
+            "http://{addr}/api/accounts/search?q={}",
+            acc2.account_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_id.status(), reqwest::StatusCode::OK);
+    let items_id: Vec<AccountSearchItem> = resp_id.json().await.unwrap();
+    assert_eq!(items_id.len(), 1);
+    assert_eq!(items_id[0].account_id, acc2.account_id);
+    assert_eq!(items_id[0].username, "Asuka");
+    assert_eq!(items_id[0].icon_url, None);
+
+    // 3. Empty query returns empty array
+    let resp_empty = client
+        .get(format!("http://{addr}/api/accounts/search?q="))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_empty.status(), reqwest::StatusCode::OK);
+    let items_empty: Vec<AccountSearchItem> = resp_empty.json().await.unwrap();
+    assert!(items_empty.is_empty());
+}
+
+// spec: alhalte-maitre-d/room-permissions-api
+#[tokio::test]
+async fn test_room_permissions_rest_api() {
+    let db = Database::new_in_memory().unwrap();
+    let acc1 = db
+        .get_or_create_account("sub-perm-1", "GM_Player", None, 1000)
+        .unwrap();
+    let acc2 = db
+        .get_or_create_account("sub-perm-2", "Normal_Player", None, 1000)
+        .unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        "/tmp", 8,
+    ));
+    let room_manager = RoomBridgeManager::new(spawner);
+    let oauth = Arc::new(MockOAuthProvider::new());
+    let state = AppState::new(db, "salt", oauth, room_manager);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let room_id = "test-perm-room";
+
+    // 1. Initial GET /api/room/{room_id}/permissions returns empty list
+    let get_initial = client
+        .get(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_initial.status(), reqwest::StatusCode::OK);
+    let perms: Vec<RoomPermissionItem> = get_initial.json().await.unwrap();
+    assert!(perms.is_empty());
+
+    // 2. POST /api/room/{room_id}/permissions to add GM
+    let post_gm = client
+        .post(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .json(&SetRoomPermissionRequest {
+            account_id: acc1.account_id,
+            role: RoomRole::Gm,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_gm.status(), reqwest::StatusCode::OK);
+
+    // 3. POST /api/room/{room_id}/permissions to add Player
+    let post_pl = client
+        .post(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .json(&SetRoomPermissionRequest {
+            account_id: acc2.account_id,
+            role: RoomRole::Pl,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_pl.status(), reqwest::StatusCode::OK);
+
+    // 4. POST with non-existent account returns 404
+    let post_unknown = client
+        .post(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .json(&serde_json::json!({
+            "account_id": 99999,
+            "role": "viewer"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // 5. GET /api/room/{room_id}/permissions verifies both permissions
+    let get_resp = client
+        .get(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
+    let perms_list: Vec<RoomPermissionItem> = get_resp.json().await.unwrap();
+    assert_eq!(perms_list.len(), 2);
+    assert_eq!(perms_list[0].account_id, acc1.account_id);
+    assert_eq!(perms_list[0].role, RoomRole::Gm);
+    assert_eq!(perms_list[1].account_id, acc2.account_id);
+    assert_eq!(perms_list[1].role, RoomRole::Pl);
+
+    // 6. DELETE /api/room/{room_id}/permissions/{account_id}
+    let del_resp = client
+        .delete(format!(
+            "http://{addr}/api/room/{room_id}/permissions/{}",
+            acc2.account_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_resp.status(), reqwest::StatusCode::OK);
+
+    // 7. Verify deletion
+    let get_after_del = client
+        .get(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .send()
+        .await
+        .unwrap();
+    let perms_after_del: Vec<RoomPermissionItem> = get_after_del.json().await.unwrap();
+    assert_eq!(perms_after_del.len(), 1);
+    assert_eq!(perms_after_del[0].account_id, acc1.account_id);
+}
+
+// spec: alhalte-maitre-d/websocket-auth-and-done-rejection
+#[tokio::test]
+async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted() {
+    let temp_dir = tempdir().unwrap();
+    let socket_dir = temp_dir.path().to_path_buf();
+
+    let db = Database::new_in_memory().unwrap();
+    let gm = db
+        .get_or_create_account("sub-gm", "GM", None, 1000)
+        .unwrap();
+    let gm_sess = db.create_session(gm.account_id, 1000).unwrap();
+
+    let outsider = db
+        .get_or_create_account("sub-out", "Outsider", None, 1000)
+        .unwrap();
+    let outsider_sess = db.create_session(outsider.account_id, 1000).unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        socket_dir, 8,
+    ));
+    let room_manager = RoomBridgeManager::new(spawner);
+    let oauth = Arc::new(MockOAuthProvider::new());
+    let state = AppState::new(db.clone(), "salt", oauth, room_manager.clone());
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let room_id: u64 = 901;
+
+    // Set permission for GM on room 901
+    db.set_room_permission(&room_id.to_string(), gm.account_id, RoomRole::Gm, 1000)
+        .unwrap();
+
+    // 1. Outsider attempts to connect to private room -> Rejected with 403 Forbidden!
+    let outsider_ws_url = format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
+        outsider.account_id, outsider_sess.session_id
+    );
+    match connect_async(&outsider_ws_url).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+        other => panic!("Expected 403 Forbidden rejection, got: {other:?}"),
+    }
+
+    // 2. Unauthenticated user attempts to connect -> Rejected with 403 Forbidden!
+    let anon_ws_url = format!("ws://{addr}/ws/room/{room_id}");
+    match connect_async(&anon_ws_url).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+        other => panic!("Expected 403 Forbidden rejection, got: {other:?}"),
+    }
+
+    // 3. GM connects successfully
+    let gm_ws_url = format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
+        gm.account_id, gm_sess.session_id
+    );
+    let (mut gm_stream, _) = connect_async(&gm_ws_url).await.unwrap();
+
+    // 4. GM marks the room done (public)
+    let set_done_frame = serde_json::to_string(&ClientFrame::SetDone { done: true }).unwrap();
+    gm_stream
+        .send(WsMessage::Text(set_done_frame.into()))
+        .await
+        .unwrap();
+
+    // Give a brief moment for set_done processing
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 5. Now outsider attempts to connect again -> succeeds because room is done!
+    let (mut outsider_stream, _) = connect_async(&outsider_ws_url).await.unwrap();
+    let list_scenes = serde_json::to_string(&ClientFrame::ListScenes).unwrap();
+    outsider_stream
+        .send(WsMessage::Text(list_scenes.into()))
+        .await
+        .unwrap();
+
+    let mut scene_received = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(t))) =
+            tokio::time::timeout(Duration::from_millis(500), outsider_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::SceneList { scenes }) = serde_json::from_str::<ServerFrame>(&t)
+        {
+            assert!(scenes.contains(&"/".to_string()));
+            scene_received = true;
+            break;
+        }
+    }
+    assert!(scene_received);
+
+    gm_stream.close(None).await.unwrap();
+    outsider_stream.close(None).await.unwrap();
+}
+
+// spec: alhalte-maitre-d/websocket-cookie-session
+#[tokio::test]
+async fn test_websocket_cookie_session_authentication() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+    let temp_dir = tempdir().unwrap();
+    let socket_dir = temp_dir.path().to_path_buf();
+
+    let db = Database::new_in_memory().unwrap();
+    let user = db
+        .get_or_create_account("sub-cookie", "CookieUser", None, 1000)
+        .unwrap();
+    let session = db.create_session(user.account_id, 1000).unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        socket_dir, 8,
+    ));
+    let room_manager = RoomBridgeManager::new(spawner);
+    let oauth = Arc::new(MockOAuthProvider::new());
+    let state = AppState::new(db, "salt", oauth, room_manager);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let room_id: u64 = 902;
+
+    // Construct WebSocket handshake request with Cookie header
+    let ws_url = format!("ws://{addr}/ws/room/{room_id}");
+    let mut req = ws_url.into_client_request().unwrap();
+    req.headers_mut().insert(
+        axum::http::header::COOKIE,
+        format!("session_id={}", session.session_id)
+            .parse()
+            .unwrap(),
+    );
+
+    let (mut ws_stream, _) = connect_async(req).await.unwrap();
+
+    let list_req = serde_json::to_string(&ClientFrame::ListScenes).unwrap();
+    ws_stream
+        .send(WsMessage::Text(list_req.into()))
+        .await
+        .unwrap();
+
+    let mut scene_received = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(t))) =
+            tokio::time::timeout(Duration::from_millis(500), ws_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::SceneList { scenes }) = serde_json::from_str::<ServerFrame>(&t)
+        {
+            assert!(scenes.contains(&"/".to_string()));
+            scene_received = true;
+            break;
+        }
+    }
+    assert!(
+        scene_received,
+        "Failed to connect and query scenes using Cookie session"
+    );
+    ws_stream.close(None).await.unwrap();
+}
+
+// spec: alhalte-maitre-d/websocket-viewer-mutate-blocking
+#[tokio::test]
+async fn test_websocket_viewer_mutate_blocking() {
+    let temp_dir = tempdir().unwrap();
+    let socket_dir = temp_dir.path().to_path_buf();
+
+    let db = Database::new_in_memory().unwrap();
+    let gm = db
+        .get_or_create_account("sub-gm-v", "GM", None, 1000)
+        .unwrap();
+    let gm_sess = db.create_session(gm.account_id, 1000).unwrap();
+
+    let viewer = db
+        .get_or_create_account("sub-viewer", "Audience", None, 1000)
+        .unwrap();
+    let viewer_sess = db.create_session(viewer.account_id, 1000).unwrap();
+
+    let room_id: u64 = 903;
+    let room_id_str = room_id.to_string();
+
+    // Register GM and Viewer permissions
+    db.set_room_permission(&room_id_str, gm.account_id, RoomRole::Gm, 1000)
+        .unwrap();
+    db.set_room_permission(&room_id_str, viewer.account_id, RoomRole::Viewer, 1010)
+        .unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        socket_dir, 8,
+    ));
+    let room_manager = RoomBridgeManager::new(spawner);
+    let oauth = Arc::new(MockOAuthProvider::new());
+    let state = AppState::new(db, "salt", oauth, room_manager);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // 1. Viewer connects
+    let viewer_ws_url = format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
+        viewer.account_id, viewer_sess.session_id
+    );
+    let (mut viewer_stream, _) = connect_async(&viewer_ws_url).await.unwrap();
+
+    // 2. Viewer enters root scene (allowed query / navigation)
+    let enter_frame = serde_json::to_string(&ClientFrame::EnterScene {
+        scene_id: "/".to_string(),
+    })
+    .unwrap();
+    viewer_stream
+        .send(WsMessage::Text(enter_frame.into()))
+        .await
+        .unwrap();
+
+    // 3. Viewer attempts to AppendLog (MUTATE) -> MUST be blocked and return ServerFrame::Error!
+    let append_frame = serde_json::to_string(&ClientFrame::AppendLog {
+        scene_id: "/".to_string(),
+        entry: Some(tin::Tin::from_string("Hello from spectator")),
+    })
+    .unwrap();
+    viewer_stream
+        .send(WsMessage::Text(append_frame.into()))
+        .await
+        .unwrap();
+
+    let mut error_received = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(t))) =
+            tokio::time::timeout(Duration::from_millis(500), viewer_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::Error { code, message }) =
+                serde_json::from_str::<ServerFrame>(&t)
+        {
+            assert_eq!(code, "PermissionDenied");
+            assert!(message.contains("閲覧者"));
+            error_received = true;
+            break;
+        }
+    }
+    assert!(
+        error_received,
+        "Expected AppendLog from viewer to be blocked with PermissionDenied error"
+    );
+
+    // 4. Viewer attempts to UpdateState (MUTATE) -> MUST be blocked
+    let update_state_frame = serde_json::to_string(&ClientFrame::UpdateState {
+        scene_id: "/".to_string(),
+        key: "test::key".to_string(),
+        value: tin::Tin::from_string("evil update"),
+    })
+    .unwrap();
+    viewer_stream
+        .send(WsMessage::Text(update_state_frame.into()))
+        .await
+        .unwrap();
+
+    let mut update_error_received = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(t))) =
+            tokio::time::timeout(Duration::from_millis(500), viewer_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::Error { code, .. }) = serde_json::from_str::<ServerFrame>(&t)
+        {
+            assert_eq!(code, "PermissionDenied");
+            update_error_received = true;
+            break;
+        }
+    }
+    assert!(
+        update_error_received,
+        "Expected UpdateState from viewer to be blocked"
+    );
+
+    // 5. Viewer attempts to DeleteState (MUTATE) -> MUST be blocked
+    let del_state_frame = serde_json::to_string(&ClientFrame::DeleteState {
+        scene_id: "/".to_string(),
+        key: "test::key".to_string(),
+    })
+    .unwrap();
+    viewer_stream
+        .send(WsMessage::Text(del_state_frame.into()))
+        .await
+        .unwrap();
+
+    let mut del_error_received = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(t))) =
+            tokio::time::timeout(Duration::from_millis(500), viewer_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::Error { code, .. }) = serde_json::from_str::<ServerFrame>(&t)
+        {
+            assert_eq!(code, "PermissionDenied");
+            del_error_received = true;
+            break;
+        }
+    }
+    assert!(
+        del_error_received,
+        "Expected DeleteState from viewer to be blocked"
+    );
+
+    // 6. GM connects and mutates state -> succeeds, and viewer receives the broadcast!
+    let gm_ws_url = format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
+        gm.account_id, gm_sess.session_id
+    );
+    let (mut gm_stream, _) = connect_async(&gm_ws_url).await.unwrap();
+
+    // GM enters scene
+    let gm_enter = serde_json::to_string(&ClientFrame::EnterScene {
+        scene_id: "/".to_string(),
+    })
+    .unwrap();
+    gm_stream
+        .send(WsMessage::Text(gm_enter.into()))
+        .await
+        .unwrap();
+
+    // GM updates state
+    let gm_update = serde_json::to_string(&ClientFrame::UpdateState {
+        scene_id: "/".to_string(),
+        key: "system::title".to_string(),
+        value: tin::Tin::from_string("Campaign One"),
+    })
+    .unwrap();
+    gm_stream
+        .send(WsMessage::Text(gm_update.into()))
+        .await
+        .unwrap();
+
+    // Viewer should receive StateUpdated broadcast!
+    let mut viewer_received_broadcast = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(t))) =
+            tokio::time::timeout(Duration::from_millis(500), viewer_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::StateUpdated { scene_id, key, .. }) =
+                serde_json::from_str::<ServerFrame>(&t)
+            && scene_id == "/"
+            && key == "system::title"
+        {
+            viewer_received_broadcast = true;
+            break;
+        }
+    }
+    assert!(
+        viewer_received_broadcast,
+        "Viewer should receive broadcast of StateUpdated from GM"
+    );
+
+    viewer_stream.close(None).await.unwrap();
+    gm_stream.close(None).await.unwrap();
 }
