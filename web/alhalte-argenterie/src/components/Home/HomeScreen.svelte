@@ -23,15 +23,7 @@
     removeVisitedRoom,
     saveVisitedRoom,
   } from '../../utils/home.js';
-  import {
-    applyThemeToDocument,
-    getThemeSettings,
-    setThemeMode,
-    setThemePalette,
-    THEME_PALETTES,
-    type ThemeMode,
-    type ThemePaletteId,
-  } from '../../utils/theme.js';
+  import AccountMenu from '../Control/AccountMenu.svelte';
 
   let {
     baseUrl = typeof window !== 'undefined' ? window.location.origin : 'https://example.com',
@@ -50,24 +42,8 @@
   let generatedUrlData = $state<{ roomId: string; roomKeyHex: string; roomUrl: string } | null>(null);
   let copyNotice = $state('');
 
-  let themeSettings = $state(getThemeSettings());
-
   function loadRooms() {
     recentRooms = getRecentRooms();
-  }
-
-  $effect(() => {
-    applyThemeToDocument(themeSettings);
-  });
-
-  function handleCycleThemeMode() {
-    const order: ThemeMode[] = ['system', 'light', 'dark'];
-    const nextIdx = (order.indexOf(themeSettings.mode) + 1) % order.length;
-    themeSettings = setThemeMode(order[nextIdx]);
-  }
-
-  function handleSelectPalette(paletteId: ThemePaletteId) {
-    themeSettings = setThemePalette(paletteId);
   }
 
   function openCreateDialog() {
@@ -156,37 +132,8 @@
 {/snippet}
 
 {#snippet appBarTrailing()}
-  <div class="theme-controls" data-testid="theme-controls">
-    <div class="palette-swatches" role="group" aria-label="カラーテーマ選択">
-      {#each THEME_PALETTES as palette (palette.id)}
-        <button
-          type="button"
-          class="palette-swatch-btn"
-          class:active={themeSettings.palette === palette.id}
-          style="--_swatch-color: {palette.swatchColor};"
-          onclick={() => handleSelectPalette(palette.id)}
-          aria-label="テーマ: {palette.label}"
-          aria-pressed={themeSettings.palette === palette.id}
-          data-testid="theme-palette-{palette.id}"
-        ></button>
-      {/each}
-    </div>
-
-    <IconButton
-      variant="tonal"
-      size="s"
-      onclick={handleCycleThemeMode}
-      data-testid="theme-mode-toggle"
-      aria-label="表示モード切替 ({themeSettings.mode})"
-    >
-      {#if themeSettings.mode === 'light'}
-        <Icon>light_mode</Icon>
-      {:else if themeSettings.mode === 'dark'}
-        <Icon>dark_mode</Icon>
-      {:else}
-        <Icon>contrast</Icon>
-      {/if}
-    </IconButton>
+  <div class="home-account-controls" data-testid="home-account-controls">
+    <AccountMenu />
   </div>
 {/snippet}
 
@@ -220,10 +167,7 @@
             <Icon>history</Icon>
             <span>訪れた部屋: <strong>{visitedRooms.length}</strong> 件</span>
           </div>
-          <div class="stat-pill">
-            <Icon>palette</Icon>
-            <span>Material 3 Expressive ({themeSettings.palette})</span>
-          </div>
+
         </div>
       </div>
 
@@ -413,37 +357,11 @@
     background: var(--np-color-primary-container);
     color: var(--np-color-on-primary-container);
   }
-  .theme-controls {
+  .home-account-controls {
     display: flex;
     align-items: center;
-    gap: 12px;
+    justify-content: flex-end;
     padding-inline-end: 8px;
-  }
-  .palette-swatches {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 4px 8px;
-    border-radius: var(--np-shape-corner-full);
-    background: var(--np-color-surface-container);
-    border: 1px solid var(--np-color-outline-variant);
-  }
-  .palette-swatch-btn {
-    width: 22px;
-    height: 22px;
-    border-radius: var(--np-shape-corner-full);
-    border: 2px solid transparent;
-    background-color: var(--_swatch-color);
-    cursor: pointer;
-    padding: 0;
-    transition: transform var(--np-motion-expressive-fast-spatial);
-  }
-  .palette-swatch-btn:hover {
-    transform: scale(1.15);
-  }
-  .palette-swatch-btn.active {
-    border-color: var(--np-color-on-surface);
-    transform: scale(1.2);
   }
   .home-content-wrapper {
     width: 100%;

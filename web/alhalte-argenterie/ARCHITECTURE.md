@@ -16,7 +16,9 @@
 | --- | --- |
 | `maitre-d` `/api/rooms/{room_id}/permissions` | 部屋権限の取得・設定・削除（`utils/session.ts`）。 |
 | `maitre-d` `/api/accounts/search` | account 検索。 |
-| `maitre-d` `/api/account/{account_id}` | account 取得・更新。 |
+| `maitre-d` `/api/account/{account_id}` | account 取得・更新。アカウントメニューの表示名・アイコン取得に使う（`utils/account.ts`）。 |
+| `maitre-d` `/auth/google/url` | Google 認可 URL の取得（`utils/account.ts`）。 |
+| `maitre-d` `/auth/google/callback` | 認可コードを session に交換（POST、`utils/account.ts`）。 |
 | `maitre-d` `/api/room/{room_id}/export/zip?type=full|logs` | ZIP ダウンロード（`CommonHeader.svelte`）。 |
 | Vite dev proxy | `/api`、`/room` を `http://127.0.0.1:8080`、`/ws` を `ws://127.0.0.1:8080` へ転送。 |
 
@@ -39,6 +41,7 @@
 | コントロール | `Control/ControlPanel.svelte`、`CommonHeader.svelte`、`CommonFooter.svelte` |
 | タブ | `LogTab`、`SceneGraphTab`、`SceneManagementTab`、`CharacterManagementTab`、`ExtensionManagementTab` |
 | モーダル | `AssetPickerModal`、`CharacterEditModal`、`RoomPermissionModal`、`GenericImagePicker`、`IconImagePicker` |
+| アカウント | `Control/AccountMenu.svelte`、`utils/account.ts` |
 | 接続表示 | `OfflineIndicator.svelte`、`utils/connection.ts` |
 
 横長画面ではフィールド左・コントロール右、縦長画面ではフィールド全体＋ボトムシート。コントロールパネルはサイドシート / ボトムシートの 2 形態と開閉状態を持つ。
@@ -57,6 +60,7 @@
 
 - `localStorage`: account ID、session ID、訪問済み部屋、最近の部屋、アセット（`alhalte_pantry_assets`）、部屋ログのキャッシュ。
 - Cookie: `session_id`（`SameSite=Lax`）。
+- `sessionStorage`: OAuth の `state`、認可後の戻り先 URL（クエリと部屋鍵フラグメントを含む）、OAuth の `redirect_uri`。サインイン中だけ保持し、完了時に削除する。
 - URL フラグメント: 部屋鍵。`generateRoomUrl` は `/rooms/<roomId>#<roomKey>` を作る。
 
 ## 内部フロー
@@ -68,6 +72,16 @@
 3. `RoomSocket` を作り、account / session をクエリに付けて接続する。
 4. `ServerFrame` の `SceneList`、`CharacterList`、`StateUpdated`、`StateDeleted`、`LogEventAppended` などを Svelte の state に反映する。
 5. 403 や「全体公開されていない部屋です」を受けたら `isForbidden` を立て、入室拒否画面を出す。
+
+### アカウントUI / Googleサインイン
+
+1. `AccountMenu` は account ID と session ID の両方が保存されている場合だけサインイン済みとみなす。
+2. サインイン済みなら `GET /api/account/{account_id}` で表示名とアイコン Tin ID を取得し、32 byte の Tin ID から `/api/cellar/tin/<hex>` を組み立ててアバターにする。取得中・取得失敗時はイニシャルまたは `account_circle` を表示する。
+3. アバター押下で M3 Menu を開き、「別のアカウントでログイン」「サインアウト」を出す。サインアウトは localStorage / Cookie / OAuth 用 sessionStorage を消す。部屋鍵フラグメントは保持する。
+4. 未サインインなら Filled tonal の「サインイン」を出す。
+5. サインインは `GET /auth/google/url` で認可 URL を取得し、現在のページ（クエリ・フラグメントを除く URL）へ戻るようリダイレクトする。Google へ遷移する前に、戻り先 URL（部屋鍵を含む）・`state`・`redirect_uri` を sessionStorage に保存する。
+6. アプリ起動時（`main.ts`）に URL の `code` / `state` を検出し、`POST /auth/google/callback` で session に交換する。成功後は account / session を保存し、sessionStorage の戻り先 URL を `history.replaceState` で復元してから `App` を mount する。
+7. 配置はホーム画面の AppBar trailing、フィールド画面の右上、門前払い画面の右上。ホーム画面のテーマ設定 UI は削除し、テーマ選択はコントロールパネル共通ヘッダーの gear menu に集約する。
 
 ### 発言とログ表示
 
@@ -89,7 +103,7 @@
 
 ### 権限 UI
 
-`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。viewer の場合はフッターの送信・ダイス・scene 変更などを無効化する。
+`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。viewer の場合はフッターの送信・ダイス・scene 変更などを無効化する。入室拒否時は門前払い画面を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。門前払い画面の文言とレイアウトは Issue #115 の仕様に従う。
 
 ## 既知の差分・制約
 
@@ -99,3 +113,6 @@
 - Saignant WASM は character resolver を受け取らないため、mention は `Anonymous` になる。
 - `main.ts` の `isAdmin: true` は開発用エントリの既定値。実運用では account / 権限から決定する必要がある。
 - 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。
+- ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
+- OAuth の `redirect_uri` は現在のパス（クエリ・フラグメントを除く）を使う。Google Cloud Console 側でこの URL を登録する必要がある。`state` は sessionStorage に保存した値と照合し、一致しない交換は行わない。
+- `AccountMenu` は account ごとに `GET /api/account/{id}` を呼ぶ。プロフィール取得に失敗してもサインイン状態は維持し、イニシャル表示にフォールバックする。

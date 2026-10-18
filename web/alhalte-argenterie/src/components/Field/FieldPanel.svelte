@@ -16,6 +16,7 @@
     sortCharactersByInitiative,
   } from '../../utils/field.js';
   import { calculateBackgroundDimensions } from '../../utils/backgroundDimension.js';
+  import AccountMenu from '../Control/AccountMenu.svelte';
   import FieldPiece from './FieldPiece.svelte';
 
   let {
@@ -229,6 +230,11 @@
     {/each}
   </div>
 
+  <!-- Top-right overlay: account control (Issue #116) -->
+  <div class="field-top-right-layer" data-testid="field-account-layer">
+    <AccountMenu />
+  </div>
+
   <!-- Top-left overlay: Room name and initiative-ordered character list -->
   <aside class="field-top-left-layer" data-testid="field-overlay-layer">
     <div class="room-name-badge" data-testid="room-name-badge">
@@ -306,6 +312,13 @@
   }
   .field-bg-loader {
     display: none;
+  }
+  .field-top-right-layer {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    z-index: 60;
+    pointer-events: auto;
   }
   .field-top-left-layer {
     position: absolute;
