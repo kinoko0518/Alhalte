@@ -183,5 +183,15 @@ if (typeof window !== 'undefined') {
       },
     });
   }
+
+  // Polyfill URL.createObjectURL / URL.revokeObjectURL for jsdom
+  if (typeof URL !== 'undefined') {
+    if (!URL.createObjectURL) {
+      URL.createObjectURL = () => 'blob:mock-url';
+    }
+    if (!URL.revokeObjectURL) {
+      URL.revokeObjectURL = () => {};
+    }
+  }
 }
 

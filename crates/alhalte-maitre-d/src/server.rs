@@ -200,7 +200,9 @@ pub fn create_router(state: AppState) -> Router {
         router = router.route("/api/debug/account", post(create_debug_account_handler));
     }
 
-    router.with_state(state)
+    router
+        .layer(tower_http::cors::CorsLayer::permissive())
+        .with_state(state)
 }
 
 /// Handles `GET /api/verify-session`.

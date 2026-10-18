@@ -526,5 +526,101 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     // Accessibility: prefers-reduced-motion
     expect(content).toContain('@media (prefers-reduced-motion: reduce)');
   });
+
+  // spec: alhalte-argenterie/log-tab ZIP エクスポートエンドポイントへのフェッチとダウンロード実行 (Issue #66)
+  it('triggers fetch to the correct ZIP export endpoint and executes download when clicking export menu item', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: 'scene-export-test',
+      name: 'エクスポートテストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const mockBlob = new Blob(['PK\x03\x04mock-zip-content'], { type: 'application/zip' });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      blob: async () => mockBlob,
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const createObjectURLMock = vi.fn().mockReturnValue('blob:http://localhost/test-blob-uuid');
+    const revokeObjectURLMock = vi.fn();
+    URL.createObjectURL = createObjectURLMock;
+    URL.revokeObjectURL = revokeObjectURLMock;
+
+    let createdDownloadAnchor: HTMLAnchorElement | null = null;
+    const originalCreateElement = document.createElement.bind(document);
+    const createElementSpy = vi.spyOn(document, 'createElement').mockImplementation((tagName: string, options?: ElementCreationOptions) => {
+      const el = originalCreateElement(tagName, options);
+      if (tagName.toLowerCase() === 'a') {
+        createdDownloadAnchor = el as HTMLAnchorElement;
+      }
+      return el;
+    });
+    const anchorClickSpy = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+
+    let exportedType: 'full' | 'logs' | null = null;
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        roomId: 'room-abc-789',
+        onExportZip: (type) => {
+          exportedType = type;
+        },
+      },
+    });
+
+    // 1. Test clicking full ZIP export item
+    const gearBtn = target.querySelector<HTMLButtonElement>('[data-testid="gear-menu-button"]');
+    gearBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const fullZipItem = target.querySelector<HTMLElement>('[data-testid="zip-export-item"]');
+    expect(fullZipItem).toBeTruthy();
+    fullZipItem?.click();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(exportedType).toBe('full');
+    expect(fetchMock).toHaveBeenCalledWith(`${window.location.origin}/api/room/room-abc-789/export/zip?type=full`);
+    expect(createObjectURLMock).toHaveBeenCalledWith(mockBlob);
+    expect(anchorClickSpy).toHaveBeenCalled();
+    expect(createdDownloadAnchor?.download).toBe('room_room-abc-789_full.zip');
+    expect(revokeObjectURLMock).toHaveBeenCalledWith('blob:http://localhost/test-blob-uuid');
+
+    // 2. Test clicking logs ZIP export item
+    fetchMock.mockClear();
+    createObjectURLMock.mockClear();
+    revokeObjectURLMock.mockClear();
+    anchorClickSpy.mockClear();
+    createdDownloadAnchor = null;
+
+    gearBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const logsZipItem = target.querySelector<HTMLElement>('[data-testid="export-zip-logs-item"]');
+    expect(logsZipItem).toBeTruthy();
+    logsZipItem?.click();
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(exportedType).toBe('logs');
+    expect(fetchMock).toHaveBeenCalledWith(`${window.location.origin}/api/room/room-abc-789/export/zip?type=logs`);
+    expect(createObjectURLMock).toHaveBeenCalledWith(mockBlob);
+    expect(anchorClickSpy).toHaveBeenCalled();
+    expect(createdDownloadAnchor?.download).toBe('room_room-abc-789_logs.zip');
+    expect(revokeObjectURLMock).toHaveBeenCalledWith('blob:http://localhost/test-blob-uuid');
+
+    // Cleanup
+    anchorClickSpy.mockRestore();
+    createElementSpy.mockRestore();
+    vi.unstubAllGlobals();
+    unmount(instance);
+    target.remove();
+  });
 });
+
 

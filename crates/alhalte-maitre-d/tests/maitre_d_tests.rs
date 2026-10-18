@@ -829,6 +829,41 @@ async fn test_room_zip_export_endpoints() {
     let unauth_resp = client.get(&bad_session_url).send().await.unwrap();
     assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    // Test 6: CORS GET request with Origin header receives access-control-allow-origin and ZIP binary
+    let origin_resp = client
+        .get(&full_url)
+        .header("Origin", "http://localhost:5173")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(origin_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        origin_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+    let origin_body = origin_resp.bytes().await.unwrap();
+    assert_eq!(&origin_body[0..4], b"PK\x03\x04");
+
+    // Test 7: CORS OPTIONS preflight request receives access-control-allow-origin
+    let preflight_resp = client
+        .request(reqwest::Method::OPTIONS, &full_url)
+        .header("Origin", "http://localhost:5173")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(preflight_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        preflight_resp
+            .headers()
+            .get("access-control-allow-origin")
+            .unwrap(),
+        "*"
+    );
+
     // Clean up
     ws_stream.close(None).await.unwrap();
 }
