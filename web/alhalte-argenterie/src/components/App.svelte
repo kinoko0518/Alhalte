@@ -27,6 +27,7 @@
     loadDefaultExtensions,
     WasmExtensionInstance,
   } from '../wasm/runner.js';
+  import AccountMenu from './Control/AccountMenu.svelte';
   import AssetPickerModal from './Control/AssetPickerModal.svelte';
   import CharacterEditModal from './Control/CharacterEditModal.svelte';
   import ControlPanel from './Control/ControlPanel.svelte';
@@ -798,6 +799,9 @@
 
   {#if isForbidden}
     <div class="forbidden-screen" data-testid="forbidden-room-screen">
+      <div class="forbidden-account-slot">
+        <AccountMenu />
+      </div>
       <div class="forbidden-card">
         <div class="forbidden-icon-circle" aria-hidden="true">
           <Icon>lock</Icon>
@@ -1205,7 +1209,7 @@
 </div>
 
 <style>
-  /* Forbidden Screen Styles (Issue #94) */
+  /* Forbidden Screen Styles (Issue #94, account control added in Issue #116) */
   .forbidden-screen {
     width: 100%;
     flex: 1;
@@ -1216,6 +1220,13 @@
     background-color: var(--np-color-background);
     padding: 24px;
     box-sizing: border-box;
+    position: relative;
+  }
+  .forbidden-account-slot {
+    position: absolute;
+    top: 16px;
+    right: 16px;
+    z-index: 10;
   }
   .forbidden-card {
     background: var(--np-color-surface-container-high);

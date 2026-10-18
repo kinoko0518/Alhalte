@@ -21,6 +21,8 @@ export * from './utils/character.js';
 export * from './utils/generast.js';
 export * from './utils/connection.js';
 export * from './utils/roomSocket.js';
+export * from './utils/account.js';
+export * from './utils/session.js';
 
 // WebAssembly ABI Host Runner
 export * from './wasm/runner.js';
@@ -29,6 +31,7 @@ export * from './wasm/runner.js';
 export { default as App } from './components/App.svelte';
 export { default as OfflineIndicator } from './components/OfflineIndicator.svelte';
 export { default as HomeScreen } from './components/Home/HomeScreen.svelte';
+export { default as AccountMenu } from './components/Control/AccountMenu.svelte';
 export { default as FieldPanel } from './components/Field/FieldPanel.svelte';
 export { default as FieldPiece } from './components/Field/FieldPiece.svelte';
 export { default as BoardCanvas } from './components/Field/FieldPanel.svelte';

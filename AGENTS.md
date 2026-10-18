@@ -1,8 +1,8 @@
 # AGENTS.md — Alhalte 実装エージェント向け規約
 
 ## 正とするもの
-- 仕様は [ARCHITECTURE.md](ARCHITECTURE.md) が唯一の正。Issue と矛盾する場合は ARCHITECTURE.md を優先し、PR 本文で指摘すること。
-- 仕様に書かれていない判断をした場合は、PR 本文の「判断した点」に必ず列挙する。ARCHITECTURE.md は勝手に書き換えない。
+- 仕様はルート [ARCHITECTURE.md](ARCHITECTURE.md)（全体図・横断規約）と各モジュールの `ARCHITECTURE.md`（責務・公開 API・内部フロー）が正。Issue と矛盾する場合は該当文書を優先し、PR 本文で指摘すること。
+- 仕様に書かれていない判断をした場合は、PR 本文の「判断した点」に必ず列挙する。各 ARCHITECTURE.md は勝手に書き換えない。
 
 ## 環境
 - NixOS。すべてのコマンドは `nix develop -c <cmd>` で実行する（flake.nix の devShell に必要なツールが揃っている）。

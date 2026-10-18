@@ -127,8 +127,8 @@ describe('Home Screen & Room URL', () => {
     expect(getVisitedRooms().map((r) => r.id)).toEqual(['room-3']);
   });
 
-  // spec: alhalte-argenterie/home HomeScreen コンポーネント描画・テーマ選択・オーバーレイ (Issue #32)
-  it('renders rich M3 Expressive HomeScreen, supports theme palette/mode switching, displays visited cards, and opens creation dialog', async () => {
+  // spec: alhalte-argenterie/account 0030 ホーム画面のテーマ設定削除とアカウントUI配置 (Issue #116)
+  it('renders rich M3 Expressive HomeScreen with account controls in place of theme settings, displays visited cards, and opens creation dialog', async () => {
     const testRoom: VisitedRoom = {
       id: 'visited-room-1',
       name: '冒険者ギルド',
@@ -158,25 +158,20 @@ describe('Home Screen & Room URL', () => {
     expect(target.querySelector('.np-app-bar')).toBeTruthy();
     expect(target.querySelector('[data-testid="home-hero-banner"]')).toBeTruthy();
 
-    // Check theme palette and mode switching updates document.documentElement semantic tokens
-    const violetPaletteBtn = target.querySelector<HTMLButtonElement>(
-      '[data-testid="theme-palette-violet"]',
-    );
-    expect(violetPaletteBtn).toBeTruthy();
-    violetPaletteBtn?.click();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(document.documentElement.dataset.themePalette).toBe('violet');
-    expect(document.documentElement.style.getPropertyValue('--np-color-primary')).toContain(
-      '#6750a4',
-    );
+    // Theme settings were removed from the Home screen (Issue #116).
+    expect(target.querySelector('[data-testid="theme-controls"]')).toBeNull();
+    expect(target.querySelector('[data-testid="theme-palette-violet"]')).toBeNull();
+    expect(target.querySelector('[data-testid="theme-mode-toggle"]')).toBeNull();
 
-    const modeToggleBtn = target.querySelector<HTMLButtonElement>(
-      '[data-testid="theme-mode-toggle"]',
+    // Signed-out account control is a Filled tonal 「サインイン」 button.
+    const accountControls = target.querySelector('[data-testid="home-account-controls"]');
+    expect(accountControls).toBeTruthy();
+    const signInBtn = accountControls?.querySelector<HTMLButtonElement>(
+      '[data-testid="account-signin-button"]',
     );
-    expect(modeToggleBtn).toBeTruthy();
-    modeToggleBtn?.click();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(document.documentElement.dataset.theme).toBe('light');
+    expect(signInBtn?.textContent?.trim()).toBe('サインイン');
+    expect(signInBtn?.classList.contains('np-button')).toBe(true);
+    expect(signInBtn?.classList.contains('tonal')).toBe(true);
 
     // Check visited room card is rendered
     expect(target.querySelector('[data-testid="room-card-visited-room-1"]')).toBeTruthy();

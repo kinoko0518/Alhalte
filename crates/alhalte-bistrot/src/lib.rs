@@ -39,7 +39,7 @@
 //!
 //! # Architecture Reference
 //!
-//! See `ARCHITECTURE.md` section `## alhalte-bistrot`.
+//! See `crates/alhalte-bistrot/ARCHITECTURE.md`.
 
 #![deny(unsafe_code)]
 
