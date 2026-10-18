@@ -368,8 +368,8 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     unmount(instance);
   });
 
-  // spec: alhalte-argenterie/permissions 0060 リストにないアカウント・403拒否時の全画面入室拒否メッセージ表示
-  it('displays full-screen forbidden message and blocks room operations when account is not registered', async () => {
+  // spec: alhalte-argenterie/gate 0010 maitre-d の入室拒否時に門前払い画面を表示 (Issue #115)
+  it('displays the gate screen and blocks room operations when maitre-d denies entry', async () => {
     const testRoom: VisitedRoom = {
       id: 'private-room-001',
       name: 'プライベートルーム',
@@ -391,10 +391,16 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     const forbiddenScreen = target.querySelector('[data-testid="forbidden-room-screen"]');
     expect(forbiddenScreen).toBeTruthy();
 
+    const title = target.querySelector('[data-testid="forbidden-title"]');
+    expect(title?.textContent?.trim()).toBe('アカウントに入室権限がありません');
+
     const message = target.querySelector('[data-testid="forbidden-message"]');
     expect(message?.textContent?.trim()).toBe(
-      '全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください',
+      '部屋の管理者に権限をリクエストしてください。正しいアカウントを使っていますか？',
     );
+
+    const signInSwitchBtn = target.querySelector('[data-testid="forbidden-signin-button"]');
+    expect(signInSwitchBtn?.textContent?.trim()).toBe('サインイン・アカウント切り替え');
 
     // Room layout should NOT be displayed
     expect(target.querySelector('[data-testid="room-layout"]')).toBeNull();

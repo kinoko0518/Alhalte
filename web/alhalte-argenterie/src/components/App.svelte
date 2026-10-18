@@ -27,11 +27,11 @@
     loadDefaultExtensions,
     WasmExtensionInstance,
   } from '../wasm/runner.js';
-  import AccountMenu from './Control/AccountMenu.svelte';
   import AssetPickerModal from './Control/AssetPickerModal.svelte';
   import CharacterEditModal from './Control/CharacterEditModal.svelte';
   import ControlPanel from './Control/ControlPanel.svelte';
   import FieldPanel from './Field/FieldPanel.svelte';
+  import GateScreen from './Gate/GateScreen.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
   import OfflineIndicator from './OfflineIndicator.svelte';
   import RoomPermissionModal from './Control/RoomPermissionModal.svelte';
@@ -121,7 +121,6 @@
   let userRole = $state<RoomRole | null>(initialUserRole);
   let isViewer = $derived(explicitIsViewer !== undefined ? explicitIsViewer : userRole === 'viewer');
   let isForbidden = $state(initialIsForbidden);
-  let forbiddenMessage = $state('全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください');
   let isPermissionModalOpen = $state(false);
   let roomPermissions = $state<RoomPermissionItem[]>([...initialPermissions]);
 
@@ -798,35 +797,15 @@
   />
 
   {#if isForbidden}
-    <div class="forbidden-screen" data-testid="forbidden-room-screen">
-      <div class="forbidden-account-slot">
-        <AccountMenu />
-      </div>
-      <div class="forbidden-card">
-        <div class="forbidden-icon-circle" aria-hidden="true">
-          <Icon>lock</Icon>
-        </div>
-        <h2 class="forbidden-title">アクセスが制限されています</h2>
-        <p class="forbidden-message" data-testid="forbidden-message">
-          {forbiddenMessage}
-        </p>
-        <div class="forbidden-actions">
-          <Button
-            variant="filled"
-            onclick={() => {
-              isForbidden = false;
-              currentRoom = null;
-              if (typeof window !== 'undefined' && window.history?.pushState) {
-                window.history.pushState(null, '', '/');
-              }
-            }}
-            data-testid="forbidden-return-home-btn"
-          >
-            ホームに戻る
-          </Button>
-        </div>
-      </div>
-    </div>
+    <GateScreen
+      onReturnHome={() => {
+        isForbidden = false;
+        currentRoom = null;
+        if (typeof window !== 'undefined' && window.history?.pushState) {
+          window.history.pushState(null, '', '/');
+        }
+      }}
+    />
   {:else if !currentRoom}
     <HomeScreen onEnterRoom={handleEnterRoom} onSelectRoom={handleEnterRoom} />
   {:else}
@@ -1209,70 +1188,6 @@
 </div>
 
 <style>
-  /* Forbidden Screen Styles (Issue #94, account control added in Issue #116) */
-  .forbidden-screen {
-    width: 100%;
-    flex: 1;
-    min-height: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    background-color: var(--np-color-background);
-    padding: 24px;
-    box-sizing: border-box;
-    position: relative;
-  }
-  .forbidden-account-slot {
-    position: absolute;
-    top: 16px;
-    right: 16px;
-    z-index: 10;
-  }
-  .forbidden-card {
-    background: var(--np-color-surface-container-high);
-    color: var(--np-color-on-surface);
-    border-radius: var(--np-shape-corner-extra-large, 28px);
-    padding: 40px 32px;
-    max-width: 520px;
-    width: 100%;
-    box-shadow: var(--np-elevation-3);
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    text-align: center;
-    gap: 20px;
-    box-sizing: border-box;
-  }
-  .forbidden-icon-circle {
-    width: 64px;
-    height: 64px;
-    border-radius: var(--np-shape-corner-full, 50%);
-    background: var(--np-color-error-container);
-    color: var(--np-color-on-error-container);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-  }
-  .forbidden-icon-circle :global(.material-symbols-outlined) {
-    font-size: 32px !important;
-  }
-  .forbidden-title {
-    margin: 0;
-    font-size: 1.5rem;
-    font-weight: 700;
-    color: var(--np-color-on-surface);
-  }
-  .forbidden-message {
-    margin: 0;
-    font-size: 1rem;
-    line-height: 1.6;
-    color: var(--np-color-on-surface-variant);
-  }
-  .forbidden-actions {
-    margin-top: 12px;
-    display: flex;
-    justify-content: center;
-  }
   :global(body) {
     margin: 0;
     padding: 0;

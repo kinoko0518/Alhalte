@@ -44,8 +44,8 @@
     onSwitchAccount?: () => void;
   } = $props();
 
-  let signedIn = $state<boolean>(externalSignedIn ?? isSignedIn());
-  let account = $state<AccountProfile | null>(externalAccount);
+  let signedIn = $state<boolean>(isSignedIn());
+  let account = $state<AccountProfile | null>(null);
   let isMenuOpen = $state(false);
   let isBusy = $state(false);
   let authError = $state('');
@@ -58,7 +58,16 @@
   });
 
   $effect(() => {
-    if (!signedIn || account) return;
+    if (externalSignedIn !== undefined) {
+      signedIn = externalSignedIn;
+    }
+    if (externalAccount) {
+      account = externalAccount;
+    }
+  });
+
+  $effect(() => {
+    if (!signedIn || account || externalAccount) return;
     const accountId = getSavedAccountId();
     if (!accountId) {
       signedIn = false;
