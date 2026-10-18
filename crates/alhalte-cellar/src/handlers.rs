@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path as AxPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
 use axum::http::header::{CONTENT_TYPE, HeaderMap};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -14,6 +14,14 @@ use serde::Deserialize;
 use crate::error::CellarError;
 use crate::model::{StoreRequest, StoreResponse, UnregisterRequest, format_tin_id, parse_tin_id};
 use crate::service::CellarService;
+
+/// Maximum accepted request body for tin uploads (64 MiB).
+///
+/// Axum's default limit is 2 MiB, which rejects ordinary room assets and
+/// extension wasm. The proxy in `alhalte-maitre-d` uses the same limit so a
+/// payload that passes the gateway is not rejected by the storage service.
+/// Bodies are still buffered fully in memory by the `Bytes` extractor.
+pub const MAX_STORE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Query parameters for download requests.
 #[derive(Debug, Deserialize)]
@@ -60,6 +68,10 @@ impl IntoResponse for CellarError {
 }
 
 /// Builds the Axum router for the cellar service.
+///
+/// The store upload routes accept bodies up to
+/// [`MAX_STORE_BODY_BYTES`]; Axum's 2 MiB default is too small for room
+/// assets and extension wasm.
 pub fn create_router(service: Arc<CellarService>) -> Router {
     Router::new()
         .route("/health", get(health_check))
@@ -68,14 +80,16 @@ pub fn create_router(service: Arc<CellarService>) -> Router {
             "/store/{tin_id}",
             put(handle_store_upload)
                 .post(handle_store_upload)
-                .delete(handle_unregister_delete),
+                .delete(handle_unregister_delete)
+                .layer(DefaultBodyLimit::max(MAX_STORE_BODY_BYTES)),
         )
         .route(
             "/tin/{tin_id}",
             put(handle_store_upload)
                 .post(handle_store_upload)
                 .get(handle_download)
-                .delete(handle_unregister_delete),
+                .delete(handle_unregister_delete)
+                .layer(DefaultBodyLimit::max(MAX_STORE_BODY_BYTES)),
         )
         .route("/tin/{tin_id}/meta", get(handle_tin_metadata))
         .route("/download/{tin_id}", get(handle_download))

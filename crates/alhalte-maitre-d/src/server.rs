@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path as AxumPath, Query, State};
+use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -246,6 +246,13 @@ pub struct ExportZipQuery {
     pub session_id: Option<u64>,
 }
 
+/// Maximum accepted request body for cellar transfer routes (64 MiB).
+///
+/// Tin payloads (room assets, extension wasm, log chunks) exceed Axum's 2 MiB
+/// default. The proxy and `alhalte-cellar` share this limit; the body is still
+/// buffered fully in memory by the `Bytes` extractor.
+pub const MAX_CELLAR_TRANSFER_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 /// Creates the Axum router for `alhalte-maitre-d`.
 pub fn create_router(state: AppState) -> Router {
     let mut router = Router::new()
@@ -292,11 +299,21 @@ pub fn create_router(state: AppState) -> Router {
             get(export_room_zip_handler),
         )
         .route("/room/{room_id}/export/zip", get(export_room_zip_handler))
-        // Authenticated cellar reverse proxy (see `CellarProxy`)
-        .route("/api/cellar/store", post(cellar_store_check_handler))
+        // Authenticated cellar reverse proxy (see `CellarProxy`).
+        //
+        // Tin payloads can be far larger than Axum's 2 MiB default (a room
+        // asset or extension wasm), so the store routes raise the per-route
+        // body limit. Everything else keeps the default.
+        .route(
+            "/api/cellar/store",
+            post(cellar_store_check_handler)
+                .layer(DefaultBodyLimit::max(MAX_CELLAR_TRANSFER_BODY_BYTES)),
+        )
         .route(
             "/api/cellar/store/{tin_id}",
-            post(cellar_store_upload_handler).put(cellar_store_upload_handler),
+            post(cellar_store_upload_handler)
+                .put(cellar_store_upload_handler)
+                .layer(DefaultBodyLimit::max(MAX_CELLAR_TRANSFER_BODY_BYTES)),
         )
         .route("/api/cellar/tin/{tin_id}", get(cellar_download_handler));
 

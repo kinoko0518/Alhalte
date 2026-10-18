@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Bytes;
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, Path, RawQuery, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,6 +20,10 @@ use alhalte_maitre_d::{AppState, Database, MockOAuthProvider, RoomBridgeManager,
 
 const TIN_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const WRAPPED_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
+
+/// The mock cellar mirrors the real service's 64 MiB upload limit; without it
+/// the mock's own Axum 2 MiB default would reject the >2 MiB regression body.
+const MOCK_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// One request observed by the mock cellar.
 #[derive(Debug, Clone)]
@@ -132,7 +136,9 @@ fn mock_cellar_router(cellar: MockCellar) -> Router {
         .route("/store", post(mock_store_check))
         .route(
             "/store/{tin_id}",
-            post(mock_store_upload).put(mock_store_upload),
+            post(mock_store_upload)
+                .put(mock_store_upload)
+                .layer(DefaultBodyLimit::max(MOCK_MAX_BODY_BYTES)),
         )
         .route("/tin/{tin_id}", get(mock_download))
         .with_state(cellar)
@@ -487,6 +493,38 @@ async fn test_cellar_proxy_upload_forwards_body_and_wrapped_key() {
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[1].method, "PUT");
     assert_eq!(calls[1].body, wire_bytes);
+}
+
+// spec: alhalte-maitre-d/cellar-proxy raises the store body limit above Axum's 2 MiB default (Issue #109 / #146)
+#[tokio::test]
+async fn test_cellar_proxy_accepts_body_larger_than_default_limit() {
+    let mock = MockCellar::new();
+    let cellar_addr = spawn_mock_cellar(mock.clone()).await;
+
+    let (db, _account_id, session_id) = test_identity();
+    let proxy = CellarProxy::new(format!("http://{cellar_addr}")).unwrap();
+    let addr = spawn_maitre_d(db, Some(proxy)).await;
+    let client = reqwest::Client::new();
+
+    // Axum's default request body limit is 2 MiB. A 3 MiB + 1 tin must reach
+    // the cellar intact through the proxy.
+    let wire_bytes = vec![0xA5u8; 3 * 1024 * 1024 + 1];
+
+    let response = client
+        .post(format!("http://{addr}/api/cellar/store/{TIN_ID}"))
+        .header("Cookie", cookie_header(session_id))
+        .header("Content-Type", "application/octet-stream")
+        .body(wire_bytes.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+
+    let calls = mock.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].path, format!("/store/{TIN_ID}"));
+    assert_eq!(calls[0].body.len(), wire_bytes.len());
+    assert_eq!(calls[0].body, wire_bytes);
 }
 
 // spec: alhalte-maitre-d/cellar-proxy rejects malformed tin ids before forwarding
