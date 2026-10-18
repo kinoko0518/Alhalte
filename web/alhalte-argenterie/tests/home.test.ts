@@ -206,6 +206,9 @@ describe('Home Screen & Room URL', () => {
     expect(urlInput?.value).toContain('https://alhalte.example/rooms/');
     expect(urlInput?.value).toContain('#');
 
+    // spec: alhalte-argenterie/home 部屋作成時のニックネーム不要化 (#94)
+    expect(target.querySelector('[data-testid="user-nickname-input"]')).toBeNull();
+
     // Enter room name and click "入室する"
     const nameInput = target.querySelector<HTMLInputElement>('[data-testid="room-name-input"]');
     if (nameInput) {

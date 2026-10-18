@@ -47,7 +47,6 @@
   let visitedRooms = $derived(recentRooms);
   let isCreateDialogOpen = $state(false);
   let newRoomName = $state('');
-  let nickname = $state('');
   let generatedUrlData = $state<{ roomId: string; roomKeyHex: string; roomUrl: string } | null>(null);
   let copyNotice = $state('');
 
@@ -356,16 +355,6 @@
           placeholder="ルーム名"
           bind:value={newRoomName}
           data-testid="room-name-input"
-          class="dialog-text-field"
-        />
-
-        <TextField
-          id="nickname-input"
-          variant="outlined"
-          label="ニックネーム"
-          placeholder="ニックネーム（任意）"
-          bind:value={nickname}
-          data-testid="user-nickname-input"
           class="dialog-text-field"
         />
 

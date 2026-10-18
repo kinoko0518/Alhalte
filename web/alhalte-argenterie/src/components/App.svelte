@@ -33,12 +33,20 @@
   import FieldPanel from './Field/FieldPanel.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
   import OfflineIndicator from './OfflineIndicator.svelte';
+  import RoomPermissionModal from './Control/RoomPermissionModal.svelte';
   import {
     connectionManager as defaultConnectionManager,
     ConnectionManager,
     type ConnectionState,
   } from '../utils/connection.js';
   import { RoomSocket, parseCharacter } from '../utils/roomSocket.js';
+  import {
+    getRoomPermissions,
+    getSavedAccountId,
+    getSavedSessionId,
+    type RoomPermissionItem,
+    type RoomRole,
+  } from '../utils/session.js';
 
   let {
     initialRoom,
@@ -47,6 +55,10 @@
     initialExtensions = [],
     initialMovements = [],
     isAdmin = false,
+    userRole: initialUserRole = null,
+    isViewer: explicitIsViewer,
+    isForbidden: initialIsForbidden = false,
+    initialPermissions = [],
     connectionManager: customConnectionManager,
     connectionState,
     onReconnect,
@@ -60,6 +72,10 @@
     initialExtensions?: ExtensionItem[];
     initialMovements?: SceneMovementEvent[];
     isAdmin?: boolean;
+    userRole?: RoomRole | null;
+    isViewer?: boolean;
+    isForbidden?: boolean;
+    initialPermissions?: RoomPermissionItem[];
     connectionManager?: ConnectionManager;
     connectionState?: ConnectionState;
     onReconnect?: () => Promise<void> | void;
@@ -99,6 +115,15 @@
   let currentRoom = $state<VisitedRoom | null>(
     initialRoom !== undefined ? initialRoom : resolveRoomFromLocation(),
   );
+
+  // User role & permission states (Issue #94)
+  let userRole = $state<RoomRole | null>(initialUserRole);
+  let isViewer = $derived(explicitIsViewer !== undefined ? explicitIsViewer : userRole === 'viewer');
+  let isForbidden = $state(initialIsForbidden);
+  let forbiddenMessage = $state('全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください');
+  let isPermissionModalOpen = $state(false);
+  let roomPermissions = $state<RoomPermissionItem[]>([...initialPermissions]);
+
   let isLandscape = $state(
     typeof window !== 'undefined' ? window.innerWidth >= window.innerHeight : true,
   );
@@ -354,6 +379,32 @@
     }
   });
 
+  $effect(() => {
+    const rId = currentRoom?.id || (currentRoom as any)?.roomId;
+    if (rId && typeof fetch !== 'undefined') {
+      getRoomPermissions(rId)
+        .then((perms) => {
+          roomPermissions = perms;
+          if (perms.length > 0) {
+            const aidStr = getSavedAccountId();
+            const aid = aidStr ? Number(aidStr) : 0;
+            const myPerm = aid ? perms.find((p) => p.account_id === aid) : undefined;
+            if (myPerm) {
+              userRole = myPerm.role;
+            } else if (!isAdmin && !currentRoom?.isAdmin) {
+              userRole = null;
+              isForbidden = true;
+            }
+          }
+        })
+        .catch((err) => {
+          if (err?.message?.includes('403')) {
+            isForbidden = true;
+          }
+        });
+    }
+  });
+
   let roomSocket = $state<RoomSocket | null>(customRoomSocket ?? null);
   let pendingOfflineMessages = $state<Array<{ sceneId: string; record: LogRecord }>>([]);
   let pendingOfflineStates = $state<Map<string, { sceneId: string; key: string; value: any }>>(new Map());
@@ -386,10 +437,21 @@
       const socket = new RoomSocket({
         roomId,
         url: currentRoom?.url || (currentRoom as any)?.roomUrl,
+        accountId: getSavedAccountId() ?? undefined,
+        sessionId: getSavedSessionId() ?? undefined,
         connectionManager: activeConnectionManager,
         chunkLogManager: chunkManager,
         initialSceneId: currentSceneId,
         autoConnect: true,
+        onError: (err) => {
+          if (
+            err.message?.includes('全体公開されていない部屋です') ||
+            err.code === '403' ||
+            err.code === 'FORBIDDEN'
+          ) {
+            isForbidden = true;
+          }
+        },
       });
       roomSocket = socket;
 
@@ -467,13 +529,21 @@
       }
       if ('StateDeleted' in frame) {
         const { scene_id, key } = frame.StateDeleted;
-        const targetScene = scenes.find((s) => s.id === scene_id);
         if (targetScene) {
           if (key === 'std::bgm') {
             targetScene.juices.bgm1 = undefined;
           } else if (key === 'std::b-img') {
             targetScene.juices.bgImage = undefined;
           }
+        }
+      }
+      if ('Error' in frame) {
+        if (
+          frame.Error.message?.includes('全体公開されていない部屋です') ||
+          frame.Error.code === '403' ||
+          frame.Error.code === 'FORBIDDEN'
+        ) {
+          isForbidden = true;
         }
       }
     });
@@ -514,6 +584,7 @@
   }
 
   function handleCreateScene(name: string, inheritJuice: boolean) {
+    if (isViewer) return;
     const newId = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const newScene: Scene = {
       id: newId,
@@ -528,6 +599,7 @@
   }
 
   function handleDeleteScene(sceneId: string) {
+    if (isViewer) return;
     if (scenes.length <= 1) return; // Keep at least one scene
     scenes = scenes.filter((s) => s.id !== sceneId);
     if (currentSceneId === sceneId) {
@@ -537,6 +609,7 @@
   }
 
   function handleMoveMember(characterId: string, targetSceneName: string) {
+    if (isViewer) return;
     const prevScene = scenes.find((s) => s.members.includes(characterId)) || currentScene;
     const res = moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
     scenes = res.updatedScenes;
@@ -560,6 +633,7 @@
   }
 
   function handleTogglePiece(characterId: string) {
+    if (isViewer) return;
     characters = characters.map((c) => {
       if (c.id === characterId) {
         const nextPlaced = !c.placedAsPiece;
@@ -583,6 +657,7 @@
   }
 
   function handlePieceMove(characterId: string, position: { x: number; y: number }) {
+    if (isViewer) return;
     characters = characters.map((c) => {
       if (c.id === characterId) {
         return {
@@ -604,6 +679,7 @@
   }
 
   function handleCreateCharacter(char: Character) {
+    if (isViewer) return;
     characters.push(char);
     if (!currentScene.members.includes(char.id)) {
       currentScene.members.push(char.id);
@@ -613,12 +689,14 @@
   }
 
   function handleUpdateCharacter(char: Character) {
+    if (isViewer) return;
     characters = characters.map((c) => (c.id === char.id ? char : c));
     const numId = Number(char.id);
     roomSocket?.updateCharacter(Number.isNaN(numId) ? 0 : numId, char);
   }
 
   function handleDeleteCharacter(charId: string) {
+    if (isViewer) return;
     characters = characters.filter((c) => c.id !== charId);
     for (const sc of scenes) {
       sc.members = sc.members.filter((id) => id !== charId);
@@ -628,12 +706,14 @@
   }
 
   function handleTransformChange(id: string, t: ViewTransform) {
+    if (isViewer) return;
     const sc = scenes.find((s) => s.id === id);
     if (sc) sc.viewTransform = t;
     roomSocket?.updateState(id, 'view::transform', t);
   }
 
   function handleUploadExtension() {
+    if (isViewer) return;
     extensionFileInput?.click();
   }
 
@@ -667,6 +747,7 @@
   }
 
   function handleSendMessage(text: string, characterId?: string) {
+    if (isViewer) return;
     const char = characters.find((c) => c.id === characterId);
     const speaker = char?.name || 'Anonymous';
     const record: LogRecord = {
@@ -715,7 +796,34 @@
     onReconnect={handleReconnectFromIndicator}
   />
 
-  {#if !currentRoom}
+  {#if isForbidden}
+    <div class="forbidden-screen" data-testid="forbidden-room-screen">
+      <div class="forbidden-card">
+        <div class="forbidden-icon-circle" aria-hidden="true">
+          <Icon>lock</Icon>
+        </div>
+        <h2 class="forbidden-title">アクセスが制限されています</h2>
+        <p class="forbidden-message" data-testid="forbidden-message">
+          {forbiddenMessage}
+        </p>
+        <div class="forbidden-actions">
+          <Button
+            variant="filled"
+            onclick={() => {
+              isForbidden = false;
+              currentRoom = null;
+              if (typeof window !== 'undefined' && window.history?.pushState) {
+                window.history.pushState(null, '', '/');
+              }
+            }}
+            data-testid="forbidden-return-home-btn"
+          >
+            ホームに戻る
+          </Button>
+        </div>
+      </div>
+    </div>
+  {:else if !currentRoom}
     <HomeScreen onEnterRoom={handleEnterRoom} onSelectRoom={handleEnterRoom} />
   {:else}
     <div
@@ -775,6 +883,7 @@
                   {accessibleSceneIds}
                   {selectedCharacterId}
                   isAdmin={isAdmin || currentRoom.isAdmin}
+                  {isViewer}
                   {chunkManager}
                   onCollapse={() => (isControlSheetOpen = false)}
                   onSelectScene={handleSelectScene}
@@ -794,6 +903,7 @@
                   onDeleteSceneLogs={handleDeleteSceneLogs}
                   onRequestDeleteCharacter={handleRequestDeleteCharacter}
                   roomId={currentRoom.id || (currentRoom as any).roomId}
+                  onManagePermissions={() => (isPermissionModalOpen = true)}
                   onSetDone={(done) => roomSocket?.setDone(done)}
                   onRequestAssetPicker={handleRequestAssetPicker}
                   onRequestEditCharacter={handleRequestEditCharacter}
@@ -855,6 +965,7 @@
                 {accessibleSceneIds}
                 {selectedCharacterId}
                 isAdmin={isAdmin || currentRoom.isAdmin}
+                {isViewer}
                 {chunkManager}
                 onCollapse={() => (isControlSheetOpen = false)}
                 onSelectScene={handleSelectScene}
@@ -874,6 +985,7 @@
                 onDeleteSceneLogs={handleDeleteSceneLogs}
                 onRequestDeleteCharacter={handleRequestDeleteCharacter}
                 roomId={currentRoom.id || (currentRoom as any).roomId}
+                onManagePermissions={() => (isPermissionModalOpen = true)}
                 onSetDone={(done) => roomSocket?.setDone(done)}
                 onRequestAssetPicker={handleRequestAssetPicker}
                 onRequestEditCharacter={handleRequestEditCharacter}
@@ -1069,9 +1181,84 @@
       />
     </div>
   {/if}
+
+  <!-- Room Permission Management Modal (Issue #94) -->
+  {#if isPermissionModalOpen && (currentRoom?.id || (currentRoom as any)?.roomId)}
+    <RoomPermissionModal
+      roomId={currentRoom.id || (currentRoom as any).roomId}
+      initialPermissions={roomPermissions}
+      isOpen={isPermissionModalOpen}
+      onClose={() => (isPermissionModalOpen = false)}
+      onPermissionsChange={(perms) => {
+        roomPermissions = perms;
+        const aidStr = getSavedAccountId();
+        const aid = aidStr ? Number(aidStr) : 0;
+        const myPerm = aid ? perms.find((p) => p.account_id === aid) : undefined;
+        if (myPerm) {
+          userRole = myPerm.role;
+        }
+      }}
+    />
+  {/if}
 </div>
 
 <style>
+  /* Forbidden Screen Styles (Issue #94) */
+  .forbidden-screen {
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: var(--np-color-background);
+    padding: 24px;
+    box-sizing: border-box;
+  }
+  .forbidden-card {
+    background: var(--np-color-surface-container-high);
+    color: var(--np-color-on-surface);
+    border-radius: var(--np-shape-corner-extra-large, 28px);
+    padding: 40px 32px;
+    max-width: 520px;
+    width: 100%;
+    box-shadow: var(--np-elevation-3);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 20px;
+    box-sizing: border-box;
+  }
+  .forbidden-icon-circle {
+    width: 64px;
+    height: 64px;
+    border-radius: var(--np-shape-corner-full, 50%);
+    background: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .forbidden-icon-circle :global(.material-symbols-outlined) {
+    font-size: 32px !important;
+  }
+  .forbidden-title {
+    margin: 0;
+    font-size: 1.5rem;
+    font-weight: 700;
+    color: var(--np-color-on-surface);
+  }
+  .forbidden-message {
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.6;
+    color: var(--np-color-on-surface-variant);
+  }
+  .forbidden-actions {
+    margin-top: 12px;
+    display: flex;
+    justify-content: center;
+  }
   :global(body) {
     margin: 0;
     padding: 0;

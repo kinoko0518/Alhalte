@@ -95,12 +95,12 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
     const roomUrlInput = target.querySelector<HTMLInputElement>('[data-testid="room-url-input"]');
 
     expect(roomNameInput).toBeTruthy();
-    expect(nicknameInput).toBeTruthy();
+    // Issue #94: 部屋作成時のニックネーム不要化
+    expect(nicknameInput).toBeNull();
     expect(roomUrlInput).toBeTruthy();
 
     // Verify all are M3 Outlined TextFields
     expect(roomNameInput?.closest('.np-field')?.classList.contains('np-field-outlined')).toBe(true);
-    expect(nicknameInput?.closest('.np-field')?.classList.contains('np-field-outlined')).toBe(true);
     expect(roomUrlInput?.closest('.np-field')?.classList.contains('np-field-outlined')).toBe(true);
 
     // Verify roomUrlInput is readonly
