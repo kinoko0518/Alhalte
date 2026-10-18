@@ -90,16 +90,54 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     expect(logBtn?.classList.contains('selected')).toBe(true);
     const logLabel = logBtn?.querySelector('.tab-btn-label');
     expect(logLabel?.classList.contains('expanded')).toBe(true);
+    expect(logLabel?.classList.contains('tab-label-text')).toBe(true);
     expect(logLabel?.textContent?.trim()).toBe('ログ');
 
     const graphBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-graph"]');
     expect(graphBtn?.classList.contains('selected')).toBe(false);
     const graphLabel = graphBtn?.querySelector('.tab-btn-label');
     expect(graphLabel?.classList.contains('collapsed')).toBe(true);
+    expect(graphLabel?.classList.contains('tab-label-text')).toBe(true);
 
     // Clicking graph tab triggers onTabChange
     graphBtn?.click();
     expect(currentTab).toBe('graph');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/common-footer Issue #91: タブ遷移アニメーションの最適化とButtonGroupプレスアニメーション競合解消
+  it('ensures smooth tab transitions without ButtonGroup press animation interference (#91)', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    let currentTab: string = 'log';
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        onTabChange: (tab) => {
+          currentTab = tab;
+        },
+      },
+    });
+
+    const tabs = ['log', 'graph', 'settings', 'characters', 'extensions'];
+    for (const tabId of tabs) {
+      const btn = target.querySelector<HTMLButtonElement>(`[data-testid="tab-btn-${tabId}"]`);
+      expect(btn).toBeTruthy();
+
+      // Trigger pointerdown to test press behavior
+      btn?.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+      // With expandedRatio={0}, inline style.width should NOT be added
+      expect(btn?.style.width).toBe('');
+
+      btn?.click();
+      expect(currentTab).toBe(tabId);
+    }
 
     unmount(instance);
     target.remove();

@@ -290,6 +290,7 @@
       size="s"
       selection="single"
       value={activeTab}
+      expandedRatio={0}
       class="tab-button-group"
     >
       {#each tabItems as tab (tab.id)}
@@ -306,7 +307,7 @@
           {#snippet start()}
             <Icon>{tab.icon}</Icon>
           {/snippet}
-          <span class={['tab-btn-label', isSelected ? 'expanded' : 'collapsed']}>
+          <span class={['tab-btn-label tab-label-text', isSelected ? 'expanded' : 'collapsed']}>
             {tab.label}
           </span>
         </Button>
@@ -500,12 +501,18 @@
     box-sizing: border-box;
     position: relative;
     z-index: 100;
+    flex-shrink: 0;
   }
 
   /* 1. Tabs Button Group Row */
   .tabs-row {
     width: 100%;
     overflow-x: auto;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .tabs-row::-webkit-scrollbar {
+    display: none;
   }
   .tabs-row :global(.tab-button-group) {
     display: flex;
@@ -514,31 +521,38 @@
     align-items: center;
   }
   .tabs-row :global(.tab-group-btn) {
-    flex: 0 0 auto;
-    transition: flex var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
+    flex-grow: 0;
+    flex-shrink: 0;
+    flex-basis: auto;
+    transition: flex-grow var(--np-motion-expressive-fast-spatial, 200ms ease),
                 background-color var(--np-motion-expressive-fast-effects, 200ms ease),
                 color var(--np-motion-expressive-fast-effects, 200ms ease);
     overflow: hidden;
     white-space: nowrap;
+    will-change: flex-grow;
   }
   .tabs-row :global(.tab-group-btn.selected) {
-    flex: 1 1 auto;
+    flex-grow: 1;
   }
-  .tab-btn-label {
+  .tab-btn-label,
+  :global(.tab-label-text) {
     display: inline-block;
-    transition: max-width var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
+    transition: max-width var(--np-motion-expressive-fast-spatial, 200ms ease),
                 opacity var(--np-motion-expressive-fast-effects, 200ms ease),
                 margin var(--np-motion-expressive-fast-effects, 200ms ease);
     overflow: hidden;
     white-space: nowrap;
     vertical-align: middle;
+    will-change: max-width, opacity;
   }
-  .tab-btn-label.collapsed {
+  .tab-btn-label.collapsed,
+  :global(.tab-label-text.collapsed) {
     max-width: 0;
     opacity: 0;
     margin: 0;
   }
-  .tab-btn-label.expanded {
+  .tab-btn-label.expanded,
+  :global(.tab-label-text.expanded) {
     max-width: 120px;
     opacity: 1;
     margin-left: 6px;

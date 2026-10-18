@@ -270,4 +270,43 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
 
     unmount(instance);
   });
+
+  // spec: alhalte-argenterie/control-panel Issue #87: 縦画面時の偶数タブ・奇数タブにおける余白均一化
+  it('maintains consistent footer layout and uniform bottom margins across all tabs in portrait mode (#87)', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const instance = mount(App, {
+      target,
+      props: { initialRoom: dummyRoom },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const bottomSheet = target.querySelector<HTMLDialogElement>('[data-testid="portrait-sheet-dialog"]');
+    expect(bottomSheet).toBeTruthy();
+    expect(bottomSheet?.hasAttribute('open')).toBe(true);
+
+    const contentWrapper = bottomSheet?.querySelector<HTMLElement>('.bottom-sheet-content-wrapper');
+    expect(contentWrapper).toBeTruthy();
+
+    const tabs = ['log', 'graph', 'settings', 'characters', 'extensions'];
+    for (const tabId of tabs) {
+      const tabBtn = target.querySelector<HTMLButtonElement>(`[data-testid="tab-btn-${tabId}"]`);
+      expect(tabBtn).toBeTruthy();
+      tabBtn?.click();
+      await new Promise((r) => setTimeout(r, 20));
+
+      const footer = target.querySelector<HTMLElement>('[data-testid="common-footer"]');
+      expect(footer).toBeTruthy();
+      const input = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+      expect(input).toBeTruthy();
+
+      const controlPanel = target.querySelector<HTMLElement>('[data-testid="control-panel"]');
+      expect(controlPanel).toBeTruthy();
+      expect(contentWrapper?.contains(controlPanel!)).toBe(true);
+      expect(controlPanel?.contains(footer!)).toBe(true);
+    }
+
+    unmount(instance);
+  });
 });

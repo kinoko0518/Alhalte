@@ -227,9 +227,11 @@
     padding: 4px 8px;
     background: var(--np-color-surface-container);
     border-bottom: 1px solid var(--np-color-outline-variant);
+    flex-shrink: 0;
   }
   .tab-content-area {
     flex: 1;
+    min-height: 0;
     overflow: hidden;
     position: relative;
   }
