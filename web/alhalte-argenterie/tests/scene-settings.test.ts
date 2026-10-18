@@ -188,7 +188,7 @@ describe('Scene Settings & Juices', () => {
     expect(slider2?.closest('.np-slider')).toBeTruthy();
     expect(slider3?.closest('.np-slider')).toBeTruthy();
 
-    // Check Management heading and buttons (Issue #57: Move members M button & Square M action buttons)
+    // Check Management heading, action buttons, and embedded move members section (Issue #92)
     expect(target.querySelector('[data-testid="heading-management"]')).toBeTruthy();
     const colCreate = target.querySelector<HTMLElement>('[data-testid="action-col-create"]');
     const colDeleteLogs = target.querySelector<HTMLElement>('[data-testid="action-col-delete-logs"]');
@@ -197,12 +197,13 @@ describe('Scene Settings & Juices', () => {
     expect(colDeleteLogs?.style.flex).toContain('3.2');
     expect(colDeleteScene?.style.flex).toContain('2.2');
 
-    const moveBtn = target.querySelector('[data-testid="open-move-members-btn"]');
+    const moveSection = target.querySelector('[data-testid="move-members-section"]');
+    expect(moveSection).toBeTruthy();
+    expect(target.querySelector('[data-testid="move-members-title"]')?.textContent).toContain('メンバーを移動');
+
     const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-create-scene-btn"]');
     const deleteLogsBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-logs-btn"]');
     const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-scene-btn"]');
-    expect(moveBtn?.classList.contains('np-button')).toBe(true);
-    expect(moveBtn?.classList.contains('m')).toBe(true);
     expect(createBtn?.classList.contains('np-button')).toBe(true);
     expect(createBtn?.classList.contains('m')).toBe(true);
     expect(createBtn?.classList.contains('square')).toBe(true);

@@ -49,8 +49,8 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
     clearAssets();
   });
 
-  // spec: alhalte-argenterie/scene-settings メンバー移動ボタン M3 Button size="m" とダイアログ展開 (Issue #57)
-  it('renders "メンバーを移動" button as M3 Button with size="m", and opens move members dialog on click', async () => {
+  // spec: alhalte-argenterie/scene-settings メンバー移動UIのインライン埋め込みと移動実行 (Issue #92)
+  it('embeds "メンバーを移動" UI directly into SceneSettingsTab without modal overlay, and moves member on click', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -73,23 +73,29 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
 
     await new Promise((r) => setTimeout(r, 20));
 
-    // Verify "メンバーを移動" button exists and is an M3 Button with size="m"
-    const moveBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-move-members-btn"]');
-    expect(moveBtn).toBeTruthy();
-    expect(moveBtn?.classList.contains('np-button')).toBe(true);
-    expect(moveBtn?.classList.contains('m')).toBe(true);
-    expect(moveBtn?.textContent).toContain('メンバーを移動');
+    // Verify embedded "メンバーを移動" section and title exist inline in the tab
+    const moveSection = target.querySelector('[data-testid="move-members-section"]');
+    expect(moveSection).toBeTruthy();
+    expect(target.querySelector('[data-testid="move-members-title"]')?.textContent).toContain('メンバーを移動');
 
-    // Dialog is not open initially
+    // Dialog overlay is NOT rendered or used
     expect(target.querySelector('[data-testid="move-members-overlay"]')).toBeNull();
 
-    // Click button to open dialog
-    moveBtn?.click();
+    // Verify members list and member row are rendered directly in tab
+    const moveList = target.querySelector('[data-testid="members-move-list"]');
+    expect(moveList).toBeTruthy();
+
+    const moveRow = target.querySelector(`[data-testid="move-row-${testChar.id}"]`);
+    expect(moveRow).toBeTruthy();
+
+    // Verify split dropdown toggle works
+    const splitToggle = target.querySelector<HTMLButtonElement>(`[data-testid="member-split-toggle-${testChar.id}"]`);
+    expect(splitToggle).toBeTruthy();
+    splitToggle?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    const moveOverlay = target.querySelector('[data-testid="move-members-overlay"]');
-    expect(moveOverlay).toBeTruthy();
-    expect(target.querySelector('[data-testid="move-members-title"]')?.textContent).toContain('メンバーを移動');
+    const dropdown = target.querySelector(`[data-testid="member-scene-dropdown-${testChar.id}"]`);
+    expect(dropdown).toBeTruthy();
 
     // Change target scene and click apply
     const targetInput = target.querySelector<HTMLInputElement>(`[data-testid="member-target-input-${testChar.id}"]`);
@@ -101,6 +107,7 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
 
     const applyBtn = target.querySelector<HTMLButtonElement>(`[data-testid="apply-move-btn-${testChar.id}"]`);
     expect(applyBtn).toBeTruthy();
+    expect(applyBtn?.classList.contains('np-button')).toBe(true);
     applyBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
