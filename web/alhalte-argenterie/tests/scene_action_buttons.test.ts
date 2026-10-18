@@ -81,29 +81,37 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
     // Dialog overlay is NOT rendered or used
     expect(target.querySelector('[data-testid="move-members-overlay"]')).toBeNull();
 
-    // Verify members list and member row are rendered directly in tab
+    // Verify members list and member row are rendered directly in tab as M3 Segmented List
     const moveList = target.querySelector('[data-testid="members-move-list"]');
     expect(moveList).toBeTruthy();
+    expect(moveList?.tagName.toLowerCase()).toBe('ul');
+    expect(moveList?.classList.contains('members-segmented-list')).toBe(true);
 
     const moveRow = target.querySelector(`[data-testid="move-row-${testChar.id}"]`);
     expect(moveRow).toBeTruthy();
+    expect(moveRow?.classList.contains('np-item')).toBe(true);
+    expect(moveRow?.classList.contains('member-segmented-item')).toBe(true);
 
-    // Verify split dropdown toggle works
+    // Verify M3 Menu toggle works
     const splitToggle = target.querySelector<HTMLButtonElement>(`[data-testid="member-split-toggle-${testChar.id}"]`);
     expect(splitToggle).toBeTruthy();
+    expect(splitToggle?.classList.contains('np-icon-button')).toBe(true);
     splitToggle?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    const dropdown = target.querySelector(`[data-testid="member-scene-dropdown-${testChar.id}"]`);
-    expect(dropdown).toBeTruthy();
+    const menu = target.querySelector(`[data-testid="member-scene-menu-${testChar.id}"]`);
+    expect(menu).toBeTruthy();
 
-    // Change target scene and click apply
+    // Select scene from Menu
+    const sceneItem = target.querySelector<HTMLElement>(`[data-testid="member-scene-item-${testChar.id}-${scene2.id}"]`);
+    expect(sceneItem).toBeTruthy();
+    sceneItem?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Verify target scene is set
     const targetInput = target.querySelector<HTMLInputElement>(`[data-testid="member-target-input-${testChar.id}"]`);
     expect(targetInput).toBeTruthy();
-    if (targetInput) {
-      targetInput.value = 'ダンジョンシーン';
-      targetInput.dispatchEvent(new Event('input', { bubbles: true }));
-    }
+    expect(targetInput?.value).toBe('ダンジョンシーン');
 
     const applyBtn = target.querySelector<HTMLButtonElement>(`[data-testid="apply-move-btn-${testChar.id}"]`);
     expect(applyBtn).toBeTruthy();

@@ -476,4 +476,131 @@ describe('Scene Settings & Juices', () => {
     unmount(instance);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/scene-settings M3 Expressive Segmented List and Menu for member move (Issue #110)
+  it('renders members move list as M3 Expressive Segmented List with List, ListItem, and noph-ui Menu/MenuItem for scene selection', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const char1: Character = {
+      id: 'char-alice',
+      name: 'アリス',
+      initiative: 10,
+      description: '魔法使い',
+      reference: '',
+      statuses: [],
+      parameters: [],
+      chatPalette: '',
+      hideStatus: false,
+      placedAsPiece: false,
+      iconUrl: 'https://alhalte.example/alice.png',
+    };
+    const char2: Character = {
+      id: 'char-bob',
+      name: 'ボブ',
+      initiative: 8,
+      description: '戦士',
+      reference: '',
+      statuses: [],
+      parameters: [],
+      chatPalette: '',
+      hideStatus: false,
+      placedAsPiece: false,
+    };
+
+    const scA: Scene = {
+      id: 'scene-a',
+      name: '町',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: ['char-alice'],
+    };
+    const scB: Scene = {
+      id: 'scene-b',
+      name: '森',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: ['char-bob'],
+    };
+
+    let movedCharId: string | undefined;
+    let movedTargetScene: string | undefined;
+
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene: scA,
+        allScenes: [scA, scB],
+        characters: [char1, char2],
+        isAdmin: true,
+        onMoveMember: (cid, targetSc) => {
+          movedCharId = cid;
+          movedTargetScene = targetSc;
+        },
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 1. Verify List container has segmented list classes and role/tag
+    const listEl = target.querySelector<HTMLUListElement>('[data-testid="members-move-list"]');
+    expect(listEl).toBeTruthy();
+    expect(listEl?.tagName.toLowerCase()).toBe('ul');
+    expect(listEl?.classList.contains('members-segmented-list')).toBe(true);
+
+    // 2. Verify each ListItem
+    const item1 = target.querySelector('[data-testid="move-row-char-alice"]');
+    expect(item1).toBeTruthy();
+    expect(item1?.classList.contains('np-item')).toBe(true);
+    expect(item1?.classList.contains('member-segmented-item')).toBe(true);
+
+    // 3. Avatar, name, current scene
+    const avatarImg = target.querySelector<HTMLImageElement>('[data-testid="member-avatar-char-alice"]');
+    expect(avatarImg?.src).toContain('alice.png');
+    expect(target.querySelector('[data-testid="member-name-char-alice"]')?.textContent).toBe('アリス');
+    expect(target.querySelector('[data-testid="member-current-scene-char-alice"]')?.textContent).toContain('町');
+
+    // 4. Open Menu using toggle button
+    const toggleBtn = target.querySelector<HTMLButtonElement>('[data-testid="member-split-toggle-char-alice"]');
+    expect(toggleBtn).toBeTruthy();
+    expect(toggleBtn?.classList.contains('np-icon-button')).toBe(true);
+    toggleBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const menu = target.querySelector('[data-testid="member-scene-menu-char-alice"]');
+    expect(menu).toBeTruthy();
+
+    // 5. Check MenuItems for scenes
+    const itemA = target.querySelector<HTMLElement>('[data-testid="member-scene-item-char-alice-scene-a"]');
+    const itemB = target.querySelector<HTMLElement>('[data-testid="member-scene-item-char-alice-scene-b"]');
+    expect(itemA).toBeTruthy();
+    expect(itemB).toBeTruthy();
+    expect(itemA?.textContent).toContain('町');
+    expect(itemB?.textContent).toContain('森');
+
+    // 6. Select "森"
+    itemB?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const targetInput = target.querySelector<HTMLInputElement>('[data-testid="member-target-input-char-alice"]');
+    expect(targetInput?.value).toBe('森');
+
+    // 7. Click move button
+    const moveBtn = target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-char-alice"]');
+    moveBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(movedCharId).toBe('char-alice');
+    expect(movedTargetScene).toBe('森');
+
+    // 8. Test outside click closes menu
+    toggleBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    // Click outside
+    window.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    unmount(instance);
+    target.remove();
+  });
 });
