@@ -334,5 +334,59 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     const html = await renderGenerast(ast);
     expect(html).toContain('1D100&lt;=50!!');
   });
+
+  // spec: alhalte-argenterie/extensions-abi 拡張機能アクションメニューのアンカーボタン隣接配置 (Issue #124)
+  it('positions extension action menu directly adjacent to more button with position-anchor', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const extensions: ExtensionItem[] = [
+      {
+        id: 'ext-test',
+        name: 'Test Extension',
+        enabled: true,
+        priority: 0,
+      },
+    ];
+
+    const instance = mount(ExtensionManagementTab, {
+      target,
+      props: {
+        extensions,
+        isAdmin: true,
+      },
+    });
+
+    const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="ext-more-btn-ext-test"]');
+    expect(moreBtn).toBeTruthy();
+
+    vi.spyOn(moreBtn!, 'getBoundingClientRect').mockReturnValue({
+      top: 150,
+      bottom: 186,
+      left: 600,
+      right: 636,
+      width: 36,
+      height: 36,
+      x: 600,
+      y: 150,
+      toJSON: () => {},
+    });
+
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const menu = target.querySelector<HTMLElement>('[data-testid="ext-menu-ext-test"]');
+    expect(menu).toBeTruthy();
+    expect(menu?.style.position).toBe('fixed');
+    expect(menu?.getAttribute('style')).toContain('inset: unset');
+    expect(menu?.style.margin).toBe('0px');
+    // top = bottom (186) + offset (4) = 190px
+    expect(menu?.style.top).toBe('190px');
+    expect(moreBtn?.style.getPropertyValue('anchor-name')).toBe('--ext-menu-anchor-ext-test');
+    expect(menu?.style.getPropertyValue('position-anchor')).toBe('--ext-menu-anchor-ext-test');
+
+    unmount(instance);
+    target.remove();
+  });
 });
 

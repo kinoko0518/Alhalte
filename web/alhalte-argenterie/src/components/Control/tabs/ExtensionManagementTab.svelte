@@ -14,6 +14,10 @@
     reorderExtensions,
     toggleExtension,
   } from '../../../wasm/runner.js';
+  import {
+    applyMenuPosition,
+    getMenuPositionStyle,
+  } from '../../../utils/menuPosition.js';
 
   let {
     extensions = [],
@@ -33,6 +37,20 @@
 
   let activeMenuExtId = $state<string | null>(null);
   let moreButtonElements = $state<Record<string, HTMLElement | undefined>>({});
+  let menuElements = $state<Record<string, HTMLDivElement | undefined>>({});
+
+  $effect(() => {
+    if (activeMenuExtId && menuElements[activeMenuExtId] && moreButtonElements[activeMenuExtId]) {
+      return applyMenuPosition(
+        menuElements[activeMenuExtId],
+        moreButtonElements[activeMenuExtId],
+        {
+          placement: 'bottom-end',
+          anchorName: `--ext-menu-anchor-${activeMenuExtId}`,
+        }
+      );
+    }
+  });
 
   function handleToggle(id: string) {
     if (!canManageExtensions(isAdmin)) return;
@@ -192,8 +210,14 @@
                     <Icon>more_vert</Icon>
                   </IconButton>
                   <Menu
+                    bind:element={menuElements[ext.id]}
                     open={activeMenuExtId === ext.id}
                     anchor={moreButtonElements[ext.id]}
+                    style={getMenuPositionStyle(moreButtonElements[ext.id], {
+                      placement: 'bottom-end',
+                      anchorName: `--ext-menu-anchor-${ext.id}`,
+                    })}
+                    data-testid="ext-menu-{ext.id}"
                     ontoggle={(e) => {
                       if (!e.newState || e.newState === 'closed') {
                         if (activeMenuExtId === ext.id) activeMenuExtId = null;

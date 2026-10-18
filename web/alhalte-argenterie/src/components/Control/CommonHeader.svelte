@@ -20,6 +20,10 @@
     setThemePalette,
     type ThemePaletteId,
   } from '../../utils/theme.js';
+  import {
+    applyMenuPosition,
+    getMenuPositionStyle,
+  } from '../../utils/menuPosition.js';
 
   let {
     scene,
@@ -58,6 +62,16 @@
   // Gear menu state
   let isGearMenuOpen = $state(false);
   let gearButtonEl = $state<HTMLButtonElement | null>(null);
+  let gearMenuEl = $state<HTMLDivElement | undefined>(undefined);
+
+  $effect(() => {
+    if (isGearMenuOpen && gearMenuEl && gearButtonEl) {
+      return applyMenuPosition(gearMenuEl, gearButtonEl, {
+        placement: 'bottom-end',
+        anchorName: '--gear-menu-anchor',
+      });
+    }
+  });
 
   // Theme settings
   let currentPaletteId = $state<ThemePaletteId>(getThemeSettings().palette);
@@ -206,8 +220,13 @@
 
     {#if isGearMenuOpen}
       <Menu
+        bind:element={gearMenuEl}
         open={isGearMenuOpen}
         anchor={gearButtonEl}
+        style={getMenuPositionStyle(gearButtonEl, {
+          placement: 'bottom-end',
+          anchorName: '--gear-menu-anchor',
+        })}
         ontoggle={(e) => {
           if (!e.newState || e.newState === 'closed') {
             isGearMenuOpen = false;
