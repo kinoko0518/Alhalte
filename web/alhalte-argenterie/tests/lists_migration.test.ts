@@ -158,9 +158,29 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
     expect(moreBtn?.getAttribute('aria-label')).toBe('その他');
     expect(moreBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('more_vert');
 
+    vi.spyOn(moreBtn!, 'getBoundingClientRect').mockReturnValue({
+      top: 150,
+      bottom: 186,
+      left: 500,
+      right: 536,
+      width: 36,
+      height: 36,
+      x: 500,
+      y: 150,
+      toJSON: () => {},
+    });
+
     // Click "その他" to open Menu
     moreBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
+
+    const extMenu = target.querySelector<HTMLElement>('[data-testid="ext-menu-ext-dice"]');
+    expect(extMenu).toBeTruthy();
+    expect(extMenu?.style.position).toBe('fixed');
+    expect(extMenu?.getAttribute('style')).toContain('position: fixed !important');
+    expect(extMenu?.getAttribute('style')).toContain('position-area: none !important');
+    expect(extMenu?.getAttribute('style')).toContain('position-try-fallbacks: none !important');
+    expect(extMenu?.style.top).toBe('190px');
 
     // Delete MenuItem
     const deleteMenuItem = target.querySelector<HTMLElement>('[data-testid="ext-delete-btn-ext-dice"]');

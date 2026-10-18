@@ -3,13 +3,29 @@
  *
  * Solves Issue #124:
  * HTML Popover API with CSS Anchor Positioning defaults to top-center of the screen
- * when anchor positioning is unsupported or unconfigured (due to User-Agent styles
- * `inset: 0; margin: auto;`).
+ * when anchor positioning is unsupported, or centers via `@position-try --np-menu-over-anchor`
+ * (`align-self: center`, `position-area: span-all`) when Chrome/Blink anchor positioning
+ * detects collision or unsupported anchor features.
  *
  * This utility calculates the anchor's viewport bounding rect and applies
- * explicit inline styles (`position: fixed; inset: unset; margin: 0; top/bottom/left/right`)
- * ensuring the Menu appears directly adjacent to the anchor trigger button
- * across all browsers and environments.
+ * explicit inline styles with `!important` to completely override Anchor Positioning
+ * auto-centering fallbacks and interference:
+ *   position: fixed !important;
+ *   inset: unset !important;
+ *   margin: 0 !important;
+ *   position-area: none !important;
+ *   position-try-fallbacks: none !important;
+ *   align-self: unset !important;
+ *   justify-self: unset !important;
+ *
+ * It binds directly to anchor boundaries:
+ *   - bottom placement: `top: ${anchorRect.bottom + offset}px !important;`
+ *   - top placement: `bottom: ${(vh - anchorRect.top + offset)}px !important;`
+ *   - end placement: `right: ${(vw - anchorRect.right)}px !important;`
+ *   - start placement: `left: ${anchorRect.left}px !important;`
+ *
+ * This eliminates size estimation discrepancies (e.g. small delete menus appearing
+ * far below the 3-dots button) and prevents right-center or top-center drift.
  */
 
 export type MenuPlacement =
@@ -36,7 +52,7 @@ export interface MenuPositionOptions {
   estimatedHeight?: number;
   /** Whether to use bottom property instead of top when placed above anchor. Default: true */
   useBottomForTopPlacement?: boolean;
-  /** Whether to use right property instead of left when end-aligned. Default: false */
+  /** Whether to use right property instead of left when end-aligned. Default: true */
   useRightForEndPlacement?: boolean;
 }
 
@@ -45,6 +61,7 @@ export interface ComputedMenuPosition {
   bottom?: number;
   left?: number;
   right?: number;
+  maxHeight?: number;
   isTop: boolean;
   styleString: string;
 }
@@ -62,7 +79,7 @@ export function computeMenuPosition(
   const estimatedWidth = options.estimatedWidth ?? 180;
   const estimatedHeight = options.estimatedHeight ?? 200;
   const useBottomForTop = options.useBottomForTopPlacement ?? true;
-  const useRightForEnd = options.useRightForEndPlacement ?? false;
+  const useRightForEnd = options.useRightForEndPlacement ?? true;
 
   const vw = typeof window !== 'undefined'
     ? (window.innerWidth || document.documentElement?.clientWidth || 1024)
@@ -73,11 +90,15 @@ export function computeMenuPosition(
 
   if (!anchor) {
     const fallbackStyles = [
-      'position: fixed',
-      'inset: unset',
-      'margin: 0',
-      `top: ${margin}px`,
-      `left: ${margin}px`,
+      'position: fixed !important',
+      'inset: unset !important',
+      'margin: 0 !important',
+      'position-area: none !important',
+      'position-try-fallbacks: none !important',
+      'align-self: unset !important',
+      'justify-self: unset !important',
+      `top: ${margin}px !important`,
+      `left: ${margin}px !important`,
     ];
     if (options.anchorName) {
       fallbackStyles.push(`position-anchor: ${options.anchorName}`);
@@ -141,47 +162,75 @@ export function computeMenuPosition(
     top = Math.round(anchorRect.bottom + offset);
   }
 
+  const availableHeight = isTop ? spaceAbove : spaceBelow;
+  const maxHeight = Math.max(0, Math.floor(availableHeight));
+
   // Determine horizontal alignment
   let left: number | undefined;
   let right: number | undefined;
   const isEndAligned = placement.endsWith('-end');
 
   if (useRightForEnd && isEndAligned) {
-    right = Math.round(vw - anchorRect.right);
-    right = Math.max(margin, Math.min(right, vw - menuWidth - margin));
+    let r = Math.round(vw - anchorRect.right);
+    r = Math.max(margin, r);
+    if (vw >= menuWidth + margin * 2) {
+      r = Math.min(r, vw - menuWidth - margin);
+    }
+    right = r;
   } else if (isEndAligned) {
     left = anchorRect.right - menuWidth;
     left = Math.round(Math.max(margin, Math.min(left, vw - menuWidth - margin)));
   } else if (placement.endsWith('-start')) {
-    left = anchorRect.left;
-    left = Math.round(Math.max(margin, Math.min(left, vw - menuWidth - margin)));
+    let l = Math.round(anchorRect.left);
+    l = Math.max(margin, l);
+    if (vw >= menuWidth + margin * 2) {
+      l = Math.min(l, vw - menuWidth - margin);
+    }
+    left = l;
   } else {
     // Auto horizontal alignment:
     if (anchorRect.left + menuWidth > vw - margin) {
-      left = anchorRect.right - menuWidth;
+      let r = Math.round(vw - anchorRect.right);
+      r = Math.max(margin, r);
+      if (vw >= menuWidth + margin * 2) {
+        r = Math.min(r, vw - menuWidth - margin);
+      }
+      right = r;
     } else {
-      left = anchorRect.left;
+      let l = Math.round(anchorRect.left);
+      l = Math.max(margin, l);
+      if (vw >= menuWidth + margin * 2) {
+        l = Math.min(l, vw - menuWidth - margin);
+      }
+      left = l;
     }
-    left = Math.round(Math.max(margin, Math.min(left, vw - menuWidth - margin)));
   }
 
   const styleParts: string[] = [
-    'position: fixed',
-    'inset: unset',
-    'margin: 0',
+    'position: fixed !important',
+    'inset: unset !important',
+    'margin: 0 !important',
+    'position-area: none !important',
+    'position-try-fallbacks: none !important',
+    'align-self: unset !important',
+    'justify-self: unset !important',
   ];
 
   if (bottom !== undefined) {
-    styleParts.push(`bottom: ${bottom}px`);
+    styleParts.push(`bottom: ${bottom}px !important`);
   }
   if (top !== undefined) {
-    styleParts.push(`top: ${top}px`);
+    styleParts.push(`top: ${top}px !important`);
   }
   if (left !== undefined) {
-    styleParts.push(`left: ${left}px`);
+    styleParts.push(`left: ${left}px !important`);
   }
   if (right !== undefined) {
-    styleParts.push(`right: ${right}px`);
+    styleParts.push(`right: ${right}px !important`);
+  }
+  if (maxHeight !== undefined) {
+    styleParts.push(`max-height: ${maxHeight}px !important`);
+    styleParts.push('overflow-y: auto !important');
   }
 
   if (options.anchorName) {
@@ -196,6 +245,7 @@ export function computeMenuPosition(
     bottom,
     left,
     right,
+    maxHeight,
     isTop,
     styleString: styleParts.join('; ') + ';',
   };
@@ -236,24 +286,34 @@ export function applyMenuPosition(
   const update = () => {
     if (!menu || !anchor) return;
     const result = computeMenuPosition(anchor, menu, options);
-    menu.style.position = 'fixed';
-    menu.style.inset = 'unset';
-    menu.style.margin = '0';
+
+    menu.style.setProperty('position', 'fixed', 'important');
+    menu.style.setProperty('inset', 'unset', 'important');
+    menu.style.setProperty('margin', '0', 'important');
+    menu.style.setProperty('position-area', 'none', 'important');
+    menu.style.setProperty('position-try-fallbacks', 'none', 'important');
+    menu.style.setProperty('align-self', 'unset', 'important');
+    menu.style.setProperty('justify-self', 'unset', 'important');
+
     if (result.top !== undefined) {
-      menu.style.top = `${result.top}px`;
+      menu.style.setProperty('top', `${result.top}px`, 'important');
       menu.style.removeProperty('bottom');
     }
     if (result.bottom !== undefined) {
-      menu.style.bottom = `${result.bottom}px`;
+      menu.style.setProperty('bottom', `${result.bottom}px`, 'important');
       menu.style.removeProperty('top');
     }
     if (result.left !== undefined) {
-      menu.style.left = `${result.left}px`;
+      menu.style.setProperty('left', `${result.left}px`, 'important');
       menu.style.removeProperty('right');
     }
     if (result.right !== undefined) {
-      menu.style.right = `${result.right}px`;
+      menu.style.setProperty('right', `${result.right}px`, 'important');
       menu.style.removeProperty('left');
+    }
+    if (result.maxHeight !== undefined) {
+      menu.style.setProperty('max-height', `${result.maxHeight}px`, 'important');
+      menu.style.setProperty('overflow-y', 'auto', 'important');
     }
     if (options.anchorName) {
       menu.style.setProperty('position-anchor', options.anchorName);

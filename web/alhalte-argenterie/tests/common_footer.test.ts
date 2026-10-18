@@ -600,8 +600,13 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     const charMenu = target.querySelector<HTMLElement>('[data-testid="character-picker-dropdown"]');
     expect(charMenu).toBeTruthy();
     expect(charMenu?.style.position).toBe('fixed');
+    expect(charMenu?.getAttribute('style')).toContain('position: fixed !important');
     expect(charMenu?.getAttribute('style')).toContain('inset: unset');
     expect(charMenu?.style.margin).toBe('0px');
+    expect(charMenu?.getAttribute('style')).toContain('position-area: none !important');
+    expect(charMenu?.getAttribute('style')).toContain('position-try-fallbacks: none !important');
+    expect(charMenu?.getAttribute('style')).toContain('align-self: unset !important');
+    expect(charMenu?.getAttribute('style')).toContain('justify-self: unset !important');
     // bottom = vh (800) - top (680) + offset (4) = 124px
     expect(charMenu?.style.bottom).toBe('124px');
     expect(charMenu?.style.left).toBe('100px');
@@ -636,10 +641,17 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     const moreMenu = target.querySelector<HTMLElement>('[data-testid="footer-more-menu"]');
     expect(moreMenu).toBeTruthy();
     expect(moreMenu?.style.position).toBe('fixed');
+    expect(moreMenu?.getAttribute('style')).toContain('position: fixed !important');
     expect(moreMenu?.getAttribute('style')).toContain('inset: unset');
     expect(moreMenu?.style.margin).toBe('0px');
+    expect(moreMenu?.getAttribute('style')).toContain('position-area: none !important');
+    expect(moreMenu?.getAttribute('style')).toContain('position-try-fallbacks: none !important');
+    expect(moreMenu?.getAttribute('style')).toContain('align-self: unset !important');
+    expect(moreMenu?.getAttribute('style')).toContain('justify-self: unset !important');
     // bottom = vh (800) - top (680) + offset (4) = 124px
     expect(moreMenu?.style.bottom).toBe('124px');
+    // right = vw (1000) - right (956) = 44px
+    expect(moreMenu?.style.right).toBe('44px');
     expect(moreBtn?.style.getPropertyValue('anchor-name')).toBe('--footer-more-anchor');
     expect(moreMenu?.style.getPropertyValue('position-anchor')).toBe('--footer-more-anchor');
     expect(moreMenu?.style.getPropertyValue('--np-menu-position-area')).toBe('top span-right');
