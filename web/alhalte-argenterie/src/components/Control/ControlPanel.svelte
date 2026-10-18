@@ -47,7 +47,9 @@
     onExportZip,
     onCollapse,
     roomId,
+    isViewer = false,
     onSetDone,
+    onManagePermissions,
     onRequestDeleteScene,
     onRequestDeleteSceneLogs,
     onDeleteSceneLogs,
@@ -63,6 +65,7 @@
     accessibleSceneIds?: Set<string>;
     selectedCharacterId?: string;
     isAdmin?: boolean;
+    isViewer?: boolean;
     chunkManager?: ChunkLogManager;
     onTabChange?: (tab: ActiveTab) => void;
     onSelectScene?: (sceneId: string) => void;
@@ -82,6 +85,7 @@
     onCollapse?: () => void;
     roomId?: string;
     onSetDone?: (done: boolean) => void;
+    onManagePermissions?: () => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
     onRequestDeleteSceneLogs?: (scene: { id: string; name: string }) => void;
     onDeleteSceneLogs?: (sceneId: string) => void;
@@ -133,6 +137,7 @@
     onRenameScene={() => (activeTab = 'settings')}
     onDeleteScene={() => (activeTab = 'settings')}
     onManageMembers={() => (activeTab = 'settings')}
+    {onManagePermissions}
     {onSetDone}
   />
 
@@ -211,6 +216,7 @@
     {characters}
     {extensions}
     {selectedCharacterId}
+    {isViewer}
     onTabChange={handleTabChange}
     {onSelectCharacter}
     {onSendMessage}

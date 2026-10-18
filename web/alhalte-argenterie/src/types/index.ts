@@ -205,4 +205,10 @@ export type {
   RoomSocketOptions,
 } from '../utils/roomSocket.js';
 
+export type {
+  RoomRole,
+  AccountSearchItem,
+  RoomPermissionItem,
+} from '../utils/session.js';
+
 

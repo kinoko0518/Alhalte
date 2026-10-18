@@ -33,6 +33,7 @@
     onRenameScene,
     onDeleteScene,
     onManageMembers,
+    onManagePermissions,
     onSetDone,
   }: {
     scene: Scene;
@@ -46,6 +47,7 @@
     onRenameScene?: () => void;
     onDeleteScene?: () => void;
     onManageMembers?: () => void;
+    onManagePermissions?: () => void;
     onSetDone?: (done: boolean) => void;
   } = $props();
 
@@ -62,7 +64,6 @@
 
   // Fullscreen Dialogs state
   let isDoneWarningOpen = $state(false);
-  let isMemberManagementOpen = $state(false);
 
   let availableScenes = $derived(allScenes.length > 0 ? allScenes : [scene]);
 
@@ -243,33 +244,12 @@
           <MenuItem
             onclick={() => {
               isGearMenuOpen = false;
-              onRenameScene?.();
+              onManagePermissions?.();
             }}
-            data-testid="rename-scene-item"
-          >
-            {#snippet start()}<Icon>edit</Icon>{/snippet}
-            シーン名変更
-          </MenuItem>
-          <MenuItem
-            onclick={() => {
-              isGearMenuOpen = false;
-              onDeleteScene?.();
-            }}
-            data-testid="delete-scene-item"
-          >
-            {#snippet start()}<Icon>delete</Icon>{/snippet}
-            シーン削除
-          </MenuItem>
-          <MenuItem
-            onclick={() => {
-              isGearMenuOpen = false;
-              isMemberManagementOpen = true;
-              onManageMembers?.();
-            }}
-            data-testid="manage-members-item"
+            data-testid="manage-permissions-item"
           >
             {#snippet start()}<Icon>admin_panel_settings</Icon>{/snippet}
-            シーンメンバー管理
+            部屋の権限管理
           </MenuItem>
           <MenuItem
             onclick={() => {
@@ -363,55 +343,6 @@
             公開する
           </Button>
         </div>
-      </div>
-    </div>
-  </div>
-{/if}
-
-<!-- Member Management Dialog -->
-{#if isMemberManagementOpen}
-  <div
-    class="fullscreen-dialog-overlay"
-    data-testid="member-management-dialog"
-    onclick={(e) => {
-      if (e.target === e.currentTarget) isMemberManagementOpen = false;
-    }}
-  >
-    <div
-      class="dialog-box"
-      data-testid="member-management-box"
-      role="dialog"
-      aria-modal="true"
-    >
-      <h2 class="dialog-title-centered" data-testid="member-management-title">
-        メンバー権限を管理
-      </h2>
-      <div class="members-list-preview" data-testid="member-management-content">
-        {#if characters.length === 0}
-          <p class="empty-notice">キャラクターはいません</p>
-        {:else}
-          {#each characters as char (char.id)}
-            <div class="member-row" data-testid="member-row-{char.id}">
-              <div class="member-name-group">
-                <span
-                  class="member-dot"
-                  style={char.color ? `background-color: ${char.color};` : ''}
-                ></span>
-                <span class="member-name">{char.name}</span>
-              </div>
-              <span class="member-role-badge">{isAdmin ? '管理者' : 'メンバー'}</span>
-            </div>
-          {/each}
-        {/if}
-      </div>
-      <div class="dialog-footer-right">
-        <Button
-          variant="text"
-          onclick={() => (isMemberManagementOpen = false)}
-          data-testid="close-members-dialog-btn"
-        >
-          閉じる
-        </Button>
       </div>
     </div>
   </div>

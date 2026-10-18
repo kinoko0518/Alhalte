@@ -33,6 +33,7 @@
     onRenameScene,
     onDeleteScene,
     onManageMembers,
+    onManagePermissions,
     onSetDone,
     onRequestAssetPicker,
     hideHeader = false,
@@ -49,6 +50,7 @@
     onRenameScene?: () => void;
     onDeleteScene?: () => void;
     onManageMembers?: () => void;
+    onManagePermissions?: () => void;
     onSetDone?: (done: boolean) => void;
     onRequestAssetPicker?: (options: {
       mediaType: AssetMediaType;
@@ -198,6 +200,7 @@
       {onRenameScene}
       {onDeleteScene}
       {onManageMembers}
+      {onManagePermissions}
       {onSetDone}
     />
   {/if}

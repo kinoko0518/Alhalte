@@ -146,7 +146,7 @@ describe('Saignant WASM & LogTab M3 Expressive Integration (Issue #55)', () => {
     expect(gearMenu).toBeTruthy();
     expect(target.querySelector('[data-testid="zip-export-item"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="export-zip-logs-item"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="manage-members-item"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="manage-permissions-item"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="set-done-item"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="theme-section-header"]')).toBeTruthy();
 

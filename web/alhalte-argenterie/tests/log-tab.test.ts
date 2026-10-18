@@ -134,11 +134,12 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="gear-menu-button"]')?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    // Admin options must be present
+    // Admin options: Issue #94 replaces rename/delete/members with manage-permissions-item
     expect(target.querySelector('[data-testid="admin-section-label"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="rename-scene-item"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="delete-scene-item"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="manage-members-item"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="manage-permissions-item"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="rename-scene-item"]')).toBeNull();
+    expect(target.querySelector('[data-testid="delete-scene-item"]')).toBeNull();
+    expect(target.querySelector('[data-testid="manage-members-item"]')).toBeNull();
 
     unmount(instanceAdmin);
     target.remove();

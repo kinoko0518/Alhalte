@@ -71,6 +71,7 @@
     extensionPipeline = new ExtensionPipeline(),
     selectedCharacterId,
     showDicePicker = $bindable(true),
+    isViewer = false,
     onTabChange,
     onSelectCharacter,
     onSendMessage,
@@ -83,6 +84,7 @@
     extensionPipeline?: ExtensionPipeline;
     selectedCharacterId?: string;
     showDicePicker?: boolean;
+    isViewer?: boolean;
     onTabChange?: (tab: ActiveTab) => void;
     onSelectCharacter?: (charId: string) => void;
     onSendMessage?: (text: string, characterId?: string, generast?: GenerastAST) => void;
@@ -135,6 +137,7 @@
   }
 
   function handleInsertDice(dice: string) {
+    if (isViewer) return;
     if (textareaElement) {
       const start = textareaElement.selectionStart ?? messageInput.length;
       const end = textareaElement.selectionEnd ?? messageInput.length;
@@ -154,6 +157,7 @@
   }
 
   function handleSend() {
+    if (isViewer) return;
     const rawText = messageInput.trim();
     if (!rawText) return;
 
@@ -181,6 +185,7 @@
 
 
   function handleKeyDown(e: KeyboardEvent) {
+    if (isViewer) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
       handleSend();
@@ -377,8 +382,9 @@
         size="s"
         class="send-btn"
         onclick={handleSend}
+        disabled={isViewer}
         aria-label="送信"
-        title="送信"
+        title={isViewer ? '閲覧者は送信できません' : '送信'}
         data-testid="send-message-button"
       >
         {#snippet start()}
@@ -439,6 +445,7 @@
           variant="text"
           size="m"
           onclick={() => handleInsertDice(dice)}
+          disabled={isViewer}
           aria-label={dice}
           aria-describedby={`tooltip-dice-${dice.toLowerCase()}`}
           data-testid={`dice-btn-${dice.toLowerCase()}`}
@@ -453,7 +460,7 @@
 
   <!-- Input field wrapper with chat palette suggestion overlay -->
   <div class="input-wrapper" data-testid="footer-input-wrapper">
-    {#if suggestions.length > 0}
+    {#if suggestions.length > 0 && !isViewer}
       <div
         class="chat-palette-suggestions"
         data-testid="chat-palette-suggestions"
@@ -477,7 +484,8 @@
       minLines={4}
       maxLines={10}
       rows={4}
-      placeholder="メッセージを入力..."
+      disabled={isViewer}
+      placeholder={isViewer ? '閲覧者モードのためメッセージは送信できません' : 'メッセージを入力...'}
       bind:value={messageInput}
       bind:inputElement={textareaElement}
       oninput={() => {
