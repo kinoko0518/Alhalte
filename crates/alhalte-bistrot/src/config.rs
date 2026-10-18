@@ -141,6 +141,16 @@ impl BistrotConfig {
         format!("http://{host}:{}/", self.argenterie.port)
     }
 
+    /// Resolves the HTTP URL for `cellar`.
+    pub fn cellar_url(&self) -> String {
+        let host = if self.restaurant.host == "0.0.0.0" || self.restaurant.host == "::" {
+            "127.0.0.1"
+        } else {
+            &self.restaurant.host
+        };
+        format!("http://{host}:{}", self.cellar.port)
+    }
+
     /// Resolves the SQLite database path for `maitre-d`.
     pub fn maitre_d_db_path(&self) -> PathBuf {
         self.maitre_d
@@ -318,6 +328,14 @@ pub struct MaitreDConfig {
     /// Optional directory for banquette communication sockets. Defaults to restaurant `socket_dir`.
     #[serde(default, alias = "socket_dir")]
     pub socket_dir: Option<PathBuf>,
+
+    /// Optional path to `alhalte-banquette` binary.
+    #[serde(default, alias = "banquette_bin")]
+    pub banquette_bin: Option<PathBuf>,
+
+    /// Optional explicit URL for the cellar storage service. Defaults to cellar port on restaurant host.
+    #[serde(default, alias = "cellar_url")]
+    pub cellar_url: Option<String>,
 }
 
 /// Configuration for `alhalte-cellar` (file storage and tin deduplication).

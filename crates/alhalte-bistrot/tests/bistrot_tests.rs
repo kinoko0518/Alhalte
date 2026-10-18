@@ -298,6 +298,8 @@ fn test_generate_maitre_d_args() {
             client_secret: "google-secret".to_string(),
             salt: "instancesalt".to_string(),
             socket_dir: None,
+            banquette_bin: None,
+            cellar_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -328,8 +330,20 @@ fn test_generate_maitre_d_args() {
             "instancesalt",
             "--socket-dir",
             "/run/sockets",
+            "--cellar-url",
+            "http://127.0.0.1:8081",
         ]
     );
+
+    // With explicit banquette_bin and cellar_url overrides
+    let mut custom_config = config.clone();
+    custom_config.maitre_d.banquette_bin = Some(PathBuf::from("/usr/bin/alhalte-banquette"));
+    custom_config.maitre_d.cellar_url = Some("http://cellar.internal:9000".to_string());
+    let custom_args = generate_maitre_d_args(&custom_config);
+    assert!(custom_args.contains(&"--cellar-url".to_string()));
+    assert!(custom_args.contains(&"http://cellar.internal:9000".to_string()));
+    assert!(custom_args.contains(&"--banquette-bin".to_string()));
+    assert!(custom_args.contains(&"/usr/bin/alhalte-banquette".to_string()));
 }
 
 // spec: alhalte-cellar/anti-oracle
@@ -344,6 +358,8 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             client_secret: "secret".to_string(),
             salt: "salt".to_string(),
             socket_dir: None,
+            banquette_bin: None,
+            cellar_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -408,6 +424,8 @@ fn test_generate_banquette_args() {
             client_secret: "sec".to_string(),
             salt: "salt".to_string(),
             socket_dir: None,
+            banquette_bin: None,
+            cellar_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -447,6 +465,8 @@ fn test_generate_all_args_and_module_args() {
             client_secret: "sec".to_string(),
             salt: "salt".to_string(),
             socket_dir: None,
+            banquette_bin: None,
+            cellar_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -497,6 +517,8 @@ fn test_systemd_generator() {
             client_secret: "google-secret".to_string(),
             salt: "salt-value".to_string(),
             socket_dir: None,
+            banquette_bin: None,
+            cellar_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
