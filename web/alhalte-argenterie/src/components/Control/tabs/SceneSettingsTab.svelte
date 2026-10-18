@@ -545,7 +545,7 @@
       <div class="move-members-row" data-testid="move-members-row">
         <Button
           variant="filled"
-          size="l"
+          size="m"
           class="move-members-btn"
           onclick={openMoveMembersDialog}
           data-testid="open-move-members-btn"
@@ -579,7 +579,7 @@
           <Button
             variant="tonal"
             shape="square"
-            size="l"
+            size="m"
             class="action-square-btn create-scene-btn"
             onclick={() => (isCreateSceneOpen = true)}
             aria-label="シーンを新規作成"
@@ -604,7 +604,7 @@
           <Button
             variant="tonal"
             shape="square"
-            size="l"
+            size="m"
             class="action-square-btn delete-logs-btn destructive-tonal-btn"
             onclick={handleDeleteLogsButtonClick}
             aria-label="シーンのログを削除"
@@ -629,7 +629,7 @@
           <Button
             variant="tonal"
             shape="square"
-            size="l"
+            size="m"
             class="action-square-btn delete-scene-btn delete-scene-tonal-btn destructive-tonal-btn"
             onclick={handleDeleteButtonClick}
             aria-label="シーンを削除"

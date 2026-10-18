@@ -49,8 +49,8 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
     clearAssets();
   });
 
-  // spec: alhalte-argenterie/scene-settings メンバー移動ボタン M3 Button size="l" とダイアログ展開 (Issue #57)
-  it('renders "メンバーを移動" button as M3 Button with size="l", and opens move members dialog on click', async () => {
+  // spec: alhalte-argenterie/scene-settings メンバー移動ボタン M3 Button size="m" とダイアログ展開 (Issue #57)
+  it('renders "メンバーを移動" button as M3 Button with size="m", and opens move members dialog on click', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -73,11 +73,11 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
 
     await new Promise((r) => setTimeout(r, 20));
 
-    // Verify "メンバーを移動" button exists and is an M3 Button with size="l"
+    // Verify "メンバーを移動" button exists and is an M3 Button with size="m"
     const moveBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-move-members-btn"]');
     expect(moveBtn).toBeTruthy();
     expect(moveBtn?.classList.contains('np-button')).toBe(true);
-    expect(moveBtn?.classList.contains('l')).toBe(true);
+    expect(moveBtn?.classList.contains('m')).toBe(true);
     expect(moveBtn?.textContent).toContain('メンバーを移動');
 
     // Dialog is not open initially
@@ -111,8 +111,8 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/scene-settings 3つのスクエアLアクションボタン群の並び、初期比率、ホバー展開 (Issue #57)
-  it('renders 3 Square L action buttons side-by-side with left-larger initial ratio and smooth hover expansion showing text labels', async () => {
+  // spec: alhalte-argenterie/scene-settings 3つのスクエアMアクションボタン群の並び、初期比率、ホバー展開 (Issue #57)
+  it('renders 3 Square M action buttons side-by-side with left-larger initial ratio and smooth hover expansion showing text labels', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -139,21 +139,21 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
     expect(colDeleteLogs).toBeTruthy();
     expect(colDeleteScene).toBeTruthy();
 
-    // 2. Verify all buttons are M3 Button with shape="square" and size="l"
+    // 2. Verify all buttons are M3 Button with shape="square" and size="m"
     const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="open-create-scene-btn"]');
     const deleteLogsBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-logs-btn"]');
     const deleteSceneBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-scene-btn"]');
 
     expect(createBtn?.classList.contains('np-button')).toBe(true);
-    expect(createBtn?.classList.contains('l')).toBe(true);
+    expect(createBtn?.classList.contains('m')).toBe(true);
     expect(createBtn?.classList.contains('square')).toBe(true);
 
     expect(deleteLogsBtn?.classList.contains('np-button')).toBe(true);
-    expect(deleteLogsBtn?.classList.contains('l')).toBe(true);
+    expect(deleteLogsBtn?.classList.contains('m')).toBe(true);
     expect(deleteLogsBtn?.classList.contains('square')).toBe(true);
 
     expect(deleteSceneBtn?.classList.contains('np-button')).toBe(true);
-    expect(deleteSceneBtn?.classList.contains('l')).toBe(true);
+    expect(deleteSceneBtn?.classList.contains('m')).toBe(true);
     expect(deleteSceneBtn?.classList.contains('square')).toBe(true);
 
     // 3. Verify initial ratios: left is largest, middle is medium, right is smallest

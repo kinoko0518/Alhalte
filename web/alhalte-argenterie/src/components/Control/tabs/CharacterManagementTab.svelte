@@ -232,8 +232,8 @@
             <IconButton
               variant="text"
               onclick={() => openDeleteConfirm(char)}
-              aria-label="駒を削除"
-              title="駒を削除"
+              aria-label="キャラクターを削除"
+              title="キャラクターを削除"
               data-testid="delete-char-btn-{char.id}"
             >
               <Icon>delete</Icon>

@@ -83,8 +83,8 @@ describe('Chat Palette Suggestion & Common Footer', () => {
     expect(target.querySelector('.np-tabs')).toBeTruthy();
     const expectedTabs = [
       { id: 'log', icon: 'forum', label: 'ログタブ' },
-      { id: 'graph', icon: 'account_tree', label: 'シーンタブ' },
-      { id: 'settings', icon: 'tune', label: 'シーン設定タブ' },
+      { id: 'graph', icon: 'account_tree', label: 'シーングラフタブ' },
+      { id: 'settings', icon: 'tune', label: 'シーン管理タブ' },
       { id: 'characters', icon: 'group', label: 'キャラクター管理タブ' },
       { id: 'extensions', icon: 'extension', label: '拡張機能管理タブ' },
     ];

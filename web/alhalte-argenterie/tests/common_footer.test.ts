@@ -41,8 +41,8 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     document.body.innerHTML = '';
   });
 
-  // spec: alhalte-argenterie/common-footer タブ選択 L ボタングループの描画・選択時アニメーション構造・Tooltip
-  it('renders L standard ButtonGroup tabs with smooth expand transition structure and Tooltips', async () => {
+  // spec: alhalte-argenterie/common-footer タブ選択 S ボタングループの描画・選択時アニメーション構造・Tooltip
+  it('renders S standard ButtonGroup tabs with smooth expand transition structure and Tooltips', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -59,15 +59,15 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
       },
     });
 
-    // Verify ButtonGroup container with size L
+    // Verify ButtonGroup container with size S
     const btnGroup = target.querySelector('.np-button-group');
     expect(btnGroup).toBeTruthy();
     expect(btnGroup?.classList.contains('standard')).toBe(true);
 
     const expectedTabs = [
       { id: 'log', icon: 'forum', label: 'ログ', fullLabel: 'ログタブ' },
-      { id: 'graph', icon: 'account_tree', label: 'シーン', fullLabel: 'シーンタブ' },
-      { id: 'settings', icon: 'tune', label: '設定', fullLabel: 'シーン設定タブ' },
+      { id: 'graph', icon: 'account_tree', label: 'シーングラフ', fullLabel: 'シーングラフタブ' },
+      { id: 'settings', icon: 'tune', label: 'シーン管理', fullLabel: 'シーン管理タブ' },
       { id: 'characters', icon: 'group', label: 'キャラクター', fullLabel: 'キャラクター管理タブ' },
       { id: 'extensions', icon: 'extension', label: '拡張機能', fullLabel: '拡張機能管理タブ' },
     ];
@@ -75,7 +75,7 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     for (const tab of expectedTabs) {
       const tabBtn = target.querySelector<HTMLButtonElement>(`[data-testid="tab-btn-${tab.id}"]`);
       expect(tabBtn).toBeTruthy();
-      expect(tabBtn?.classList.contains('l')).toBe(true); // Size L button
+      expect(tabBtn?.classList.contains('s')).toBe(true); // Size S button
       expect(tabBtn?.getAttribute('aria-label')).toBe(tab.fullLabel);
       expect(tabBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe(tab.icon);
 
