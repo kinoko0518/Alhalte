@@ -273,11 +273,11 @@
   class="common-footer-container"
   data-testid="common-footer"
 >
-  <!-- 1. Tab Selection Button Group (L Size, standard, smooth horizontal expand on select) -->
+  <!-- 1. Tab Selection Button Group (smooth horizontal expand on select) -->
   <div class="tabs-row np-tabs" data-testid="tab-buttons-row">
     <ButtonGroup
       variant="standard"
-      size="l"
+      size="s"
       selection="single"
       value={activeTab}
       class="tab-button-group"
@@ -285,7 +285,7 @@
       {#each tabItems as tab (tab.id)}
         {@const isSelected = activeTab === tab.id}
         <Button
-          size="l"
+          size="s"
           variant={isSelected ? 'filled' : 'outlined'}
           class={['tab-group-btn np-tab', isSelected && 'selected']}
           onclick={() => handleTabClick(tab.id)}
@@ -305,12 +305,12 @@
     </ButtonGroup>
   </div>
 
-  <!-- 2. Character selection Filled tonal button & Right-aligned Send button -->
+  <!-- Character selection button & Right-aligned Send button -->
   <div class="character-action-row" data-testid="character-action-row">
     <div class="char-picker-container" bind:this={charPickerWrapper}>
       <Button
         variant="tonal"
-        size="m"
+        size="s"
         class="character-select-tonal-btn"
         onclick={() => (isCharPickerOpen = !isCharPickerOpen)}
         aria-haspopup="menu"
@@ -359,11 +359,11 @@
       {/if}
     </div>
 
-    <!-- Right-aligned Send Button (M3 Filled Button) -->
+    <!-- Right-aligned Send Button -->
     <div class="send-action-wrapper">
       <Button
         variant="filled"
-        size="m"
+        size="s"
         class="send-btn"
         onclick={handleSend}
         aria-label="送信"
@@ -378,7 +378,7 @@
     </div>
   </div>
 
-  <!-- 3. Dice buttons row (Center-aligned standard IconButtons for 8 dice) -->
+  <!-- Dice buttons row (Center-aligned) -->
   <div class="dice-buttons-row" data-testid="dice-buttons-row">
     {#each diceList as dice (dice)}
       <IconButton
@@ -396,7 +396,7 @@
     {/each}
   </div>
 
-  <!-- 4. Input field wrapper with chat palette suggestion overlay -->
+  <!-- Input field wrapper with chat palette suggestion overlay -->
   <div class="input-wrapper" data-testid="footer-input-wrapper">
     {#if suggestions.length > 0}
       <div
