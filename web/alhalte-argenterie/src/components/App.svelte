@@ -2099,6 +2099,7 @@
         initialScope={activeOverlay.initialScope}
         isAdmin={isAdmin || (currentRoom ? currentRoom.isAdmin : false)}
         {roomSocket}
+        roomKey={extensionRoomKey}
         roomId={currentRoom?.id}
         onSelect={(url, asset) => {
           activeOverlay?.onSelect(url, asset);
