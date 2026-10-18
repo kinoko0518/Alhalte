@@ -16,10 +16,17 @@
  *   so unrelated tests settle; set {@link FakeRoomSocket.autoAnswerLogQueries}
  *   to `false` to drive them manually via {@link FakeRoomSocket.resolveLogBiblio}
  *   / {@link FakeRoomSocket.resolveLogChunk}.
+ * - `queryState` / `requestUpdateState` / `requestDeleteState` — the room asset
+ *   metadata path (Issue #109 / sub-issue #141). Queries answer with
+ *   {@link FakeRoomSocket.stateSnapshot}; writes resolve immediately unless
+ *   {@link FakeRoomSocket.autoAnswerStateWrites} is off, in which case the test
+ *   settles them through {@link FakeRoomSocket.resolveStateWrite} /
+ *   {@link FakeRoomSocket.rejectStateWrite} /
+ *   {@link FakeRoomSocket.rejectDeleteState}.
  *
  * References:
- * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`
- * - GitHub Issue #109 / sub-issue #139, #140
+ * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`, `### アセット`
+ * - GitHub Issue #109 / sub-issue #139, #140, #141
  */
 import type { ChunkLogManager } from '../../src/utils/log.js';
 import type { RoomSocket } from '../../src/utils/roomSocket.js';
@@ -39,6 +46,27 @@ interface BiblioCall {
 interface ChunkCall {
   sceneId: string;
   chunkIndex: number;
+}
+
+/** One recorded `requestUpdateState` call. */
+export interface StateWriteCall {
+  sceneId: string;
+  key: string;
+  value: unknown;
+}
+
+/** One recorded `requestDeleteState` call. */
+export interface StateDeleteCall {
+  sceneId: string;
+  key: string;
+}
+
+interface PendingStateOperation {
+  kind: 'update' | 'delete';
+  sceneId: string;
+  key: string;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
 }
 
 interface PendingLogQuery {
@@ -61,12 +89,24 @@ export class FakeRoomSocket {
    * and answer the recorded calls themselves.
    */
   autoAnswerLogQueries = true;
+  /** Scene state answered by `queryState` (already Tin-decoded values). */
+  stateSnapshot: Record<string, unknown> = {};
+  /**
+   * When `true` (the default) state writes / deletes resolve immediately.
+   * Set to `false` to drive them with {@link FakeRoomSocket.resolveStateWrite}
+   * / {@link FakeRoomSocket.rejectStateWrite} /
+   * {@link FakeRoomSocket.rejectDeleteState}.
+   */
+  autoAnswerStateWrites = true;
 
   readonly requestAppendLogCalls: AppendCall[] = [];
   readonly appendLogCalls: AppendCall[] = [];
   readonly updateStates: Array<{ sceneId: string; key: string; value: unknown }> = [];
   readonly queryLogBiblioCalls: BiblioCall[] = [];
   readonly queryLogChunkCalls: ChunkCall[] = [];
+  readonly queryStateCalls: Array<{ sceneId: string }> = [];
+  readonly requestUpdateStateCalls: StateWriteCall[] = [];
+  readonly requestDeleteStateCalls: StateDeleteCall[] = [];
 
   private readonly listeners = new Set<FrameListener>();
   private readonly pending: Array<{
@@ -76,6 +116,7 @@ export class FakeRoomSocket {
     reject: (error: unknown) => void;
   }> = [];
   private readonly pendingLogQueries: PendingLogQuery[] = [];
+  private readonly pendingStateOperations: PendingStateOperation[] = [];
 
   setChunkLogManager(manager?: ChunkLogManager): void {
     this.chunkManager = manager ?? null;
@@ -105,6 +146,80 @@ export class FakeRoomSocket {
   }
 
   deleteState(): void {}
+
+  /**
+   * Answers a scene state query with {@link FakeRoomSocket.stateSnapshot}.
+   */
+  queryState(sceneId: string): Promise<Record<string, unknown>> {
+    this.queryStateCalls.push({ sceneId });
+    return Promise.resolve({ ...this.stateSnapshot });
+  }
+
+  /**
+   * Records a room asset metadata write (`asset::<id>`).
+   *
+   * Resolves with a `StateUpdated`-shaped ack by default so the upload path
+   * settles; disable {@link FakeRoomSocket.autoAnswerStateWrites} to settle it
+   * manually.
+   */
+  requestUpdateState(sceneId: string, key: string, value: unknown): Promise<unknown> {
+    this.requestUpdateStateCalls.push({ sceneId, key, value });
+    if (this.autoAnswerStateWrites) {
+      return Promise.resolve({ scene_id: sceneId, key, value });
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingStateOperations.push({ kind: 'update', sceneId, key, resolve, reject });
+    });
+  }
+
+  /**
+   * Records a room asset metadata delete (`asset::<id>`).
+   */
+  requestDeleteState(sceneId: string, key: string): Promise<unknown> {
+    this.requestDeleteStateCalls.push({ sceneId, key });
+    if (this.autoAnswerStateWrites) {
+      return Promise.resolve({ scene_id: sceneId, key });
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingStateOperations.push({ kind: 'delete', sceneId, key, resolve, reject });
+    });
+  }
+
+  /** Number of state writes / deletes still waiting for a manual answer. */
+  get pendingStateOperationCount(): number {
+    return this.pendingStateOperations.length;
+  }
+
+  /**
+   * Resolves the oldest pending state write (or delete) ack.
+   */
+  resolveStateWrite(): void {
+    const operation = this.pendingStateOperations.shift();
+    if (!operation) throw new Error('FakeRoomSocket: no pending state operation');
+    operation.resolve({ scene_id: operation.sceneId, key: operation.key });
+  }
+
+  /**
+   * Rejects the oldest pending state write ack (e.g. with an
+   * `OperationTimeoutError`).
+   */
+  rejectStateWrite(error: unknown): void {
+    this.takeStateOperation('update').reject(error);
+  }
+
+  /** Rejects the oldest pending state delete ack (e.g. `PermissionDenied`). */
+  rejectDeleteState(error: unknown): void {
+    this.takeStateOperation('delete').reject(error);
+  }
+
+  private takeStateOperation(kind: 'update' | 'delete'): PendingStateOperation {
+    const operation = this.pendingStateOperations.find((pending) => pending.kind === kind);
+    if (!operation) {
+      throw new Error(`FakeRoomSocket: no pending state ${kind}`);
+    }
+    this.pendingStateOperations.splice(this.pendingStateOperations.indexOf(operation), 1);
+    return operation;
+  }
 
   enterScene(): void {}
 

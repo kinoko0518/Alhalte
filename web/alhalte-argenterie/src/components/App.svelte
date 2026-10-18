@@ -1311,6 +1311,8 @@
         initialMediaType={activeOverlay.mediaType}
         initialScope={activeOverlay.initialScope}
         isAdmin={isAdmin || (currentRoom ? currentRoom.isAdmin : false)}
+        {roomSocket}
+        roomId={currentRoom?.id}
         onSelect={(url, asset) => {
           activeOverlay?.onSelect(url, asset);
           activeOverlay = null;

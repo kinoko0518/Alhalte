@@ -3,7 +3,7 @@
    * Asset Picker Overlay Modal Component.
    *
    * References:
-   * - ARCHITECTURE.md: `## alhalte-pantry`, `## alhalte-argenterie`
+   * - ARCHITECTURE.md: `## alhalte-pantry`, `## alhalte-argenterie -> ### アセット`
    * - Issue #28:
    *   ［
    *     （（自分のアセット｜部屋のアセット※部屋の管理者のみ選択可能。選択不能時はグレーアウト）（画像｜音声） 右寄せボタン”アップロード”）
@@ -11,25 +11,37 @@
    *     ...
    *     （右寄せボタン”キャンセル”）
    *   ］
+   * - Issue #109 / #141: アップロード中はカード内に波線 `LinearProgress`、
+   *   失敗時はカード内に失敗文言と再試行、モーダルを開くたびに部屋アセットを同期。
    */
-  import { Button, Card, IconButton, Search, SegmentedButton } from 'noph-ui';
+  import { untrack } from 'svelte';
+  import { Button, Card, IconButton, LinearProgress, Search, SegmentedButton } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import {
-    addAssetFromFile,
+    ASSET_STATE_KEY_PREFIX,
+    ASSET_STATE_SCENE_ID,
     formatFileSize,
     loadAssets,
     removeAsset,
+    retryAssetUpload,
     subscribeAssets,
+    syncRoomAssets,
+    uploadAssetFromFile,
     type AssetItem,
     type AssetMediaType,
     type AssetScope,
   } from '../../utils/assets.js';
+  import { getRoomKeyFromLocation } from '../../utils/cellarTransfer.js';
+  import type { RoomSocket } from '../../utils/roomSocket.js';
 
   let {
     open = true,
     initialMediaType = 'image',
     initialScope = 'personal',
     isAdmin = false,
+    roomSocket = null,
+    roomKey = getRoomKeyFromLocation(),
+    roomId,
     onSelect,
     onClose,
   }: {
@@ -37,6 +49,12 @@
     initialMediaType?: AssetMediaType;
     initialScope?: AssetScope;
     isAdmin?: boolean;
+    /** Room socket used to sync / publish room asset metadata (Issue #141). */
+    roomSocket?: RoomSocket | null;
+    /** 32-byte room key; defaults to the URL fragment (`#<64 hex>`). */
+    roomKey?: Uint8Array | null;
+    /** Room id, only used for diagnostic logging. */
+    roomId?: string;
     onSelect?: (dataUrl: string | undefined, asset?: AssetItem) => void;
     onClose?: () => void;
   } = $props();
@@ -48,6 +66,11 @@
   let allAssets = $state<AssetItem[]>(loadAssets());
   let fileInputEl = $state<HTMLInputElement | null>(null);
   let searchQuery = $state('');
+  /** Latest room-scope delete error; the card stays until the retry succeeds. */
+  let deleteError = $state<string | undefined>(undefined);
+  // Sync runs once per open transition (not on every reactive tick).
+  let lastSyncOpen = false;
+  let syncInFlight = false;
 
   // Sync initialMediaType when modal opens or prop changes
   $effect(() => {
@@ -69,6 +92,39 @@
     });
     return unsubscribe;
   });
+
+  // Sync room assets every time the picker opens (Issue #141). A failure is
+  // intentionally quiet: the local cache stays usable (the report records it).
+  $effect(() => {
+    if (!open) {
+      lastSyncOpen = false;
+      return;
+    }
+    if (lastSyncOpen) return;
+    lastSyncOpen = true;
+    untrack(() => {
+      void runRoomAssetSync();
+    });
+  });
+
+  async function runRoomAssetSync(): Promise<void> {
+    if (!roomSocket || syncInFlight) return;
+    syncInFlight = true;
+    try {
+      const result = await syncRoomAssets(roomSocket, roomKey);
+      if (result.syncFailed) {
+        console.warn(
+          `Asset sync failed${roomId ? ` (room ${roomId})` : ''}: ${result.error ?? 'unknown error'}`,
+        );
+      }
+    } catch (error) {
+      // `syncRoomAssets` reports failures in its result; this is a safety net so
+      // opening the picker can never break the UI.
+      console.warn('Asset sync failed unexpectedly:', error);
+    } finally {
+      syncInFlight = false;
+    }
+  }
 
   let filteredAssets = $derived(
     allAssets.filter((item) => {
@@ -127,14 +183,47 @@
   }
 
   function handleSelectAsset(asset: AssetItem) {
+    // A transfer in flight owns the card; a failed download may have no preview.
+    if (asset.uploadState === 'uploading') return;
+    if (!asset.dataUrl) return;
     onSelect?.(asset.dataUrl, asset);
     onClose?.();
   }
 
-  function handleDeleteAsset(e: MouseEvent, id: string) {
+  async function handleDeleteAsset(e: MouseEvent, asset: AssetItem) {
     e.stopPropagation();
-    if (scope === 'room' && !isAdmin) return;
-    removeAsset(id);
+    if (asset.uploadState === 'uploading') return;
+    if (asset.scope === 'room' && !isAdmin) return;
+    deleteError = undefined;
+    if (
+      asset.scope === 'room' &&
+      roomSocket &&
+      typeof roomSocket.requestDeleteState === 'function'
+    ) {
+      // Publish the removal first: a failed delete keeps the card so the user
+      // can retry instead of silently resurrecting the asset on the next sync.
+      try {
+        await roomSocket.requestDeleteState(
+          ASSET_STATE_SCENE_ID,
+          `${ASSET_STATE_KEY_PREFIX}${asset.id}`,
+        );
+      } catch (error) {
+        console.warn('Failed to delete the room asset metadata:', error);
+        deleteError = 'アセットの削除に失敗しました';
+        return;
+      }
+    }
+    removeAsset(asset.id);
+  }
+
+  async function handleRetryUpload(e: MouseEvent, asset: AssetItem) {
+    e.stopPropagation();
+    if (asset.uploadState === 'uploading') return;
+    try {
+      await retryAssetUpload(asset, { roomKey, roomSocket });
+    } catch (error) {
+      console.warn('Asset retry failed unexpectedly:', error);
+    }
   }
 
   async function handleFileInputChange(e: Event) {
@@ -145,13 +234,28 @@
     const fileList = input?.files ?? fileInputEl?.files;
     if (!fileList || fileList.length === 0) return;
     const files = Array.from(fileList);
-    for (const file of files) {
-      await addAssetFromFile(file, scope, mediaType);
-    }
+    // Reset before uploading so picking the same file again still fires `change`.
     try {
       if (input) input.value = '';
     } catch {
       // Ignore read-only files property in test environments
+    }
+
+    const targetScope = scope;
+    const targetMediaType = mediaType;
+    // Sequential: each card appears immediately (uploading state) and later
+    // files never compete with an in-flight one for the single progress slot.
+    for (const file of files) {
+      try {
+        await uploadAssetFromFile(file, targetScope, targetMediaType, {
+          roomKey,
+          roomSocket,
+        });
+      } catch (error) {
+        // `uploadAssetFromFile` reports failures on the card; this only guards
+        // against unexpected programming errors.
+        console.warn('Asset upload failed unexpectedly:', error);
+      }
     }
   }
 
@@ -264,8 +368,11 @@
         {#each filteredAssets as asset (asset.id)}
           <div
             class="asset-card-wrapper"
+            class:asset-card-uploading={asset.uploadState === 'uploading'}
             role="button"
-            tabindex="0"
+            tabindex={asset.uploadState === 'uploading' ? -1 : 0}
+            aria-busy={asset.uploadState === 'uploading'}
+            aria-disabled={asset.uploadState === 'uploading'}
             onclick={() => handleSelectAsset(asset)}
             onkeydown={(e) => (e.key === 'Enter' || e.key === ' ') && handleSelectAsset(asset)}
             data-testid="asset-card-{asset.id}"
@@ -274,15 +381,59 @@
               <div class="asset-card-body">
                 <div class="asset-preview">
                   {#if asset.mediaType === 'image'}
-                    <img
-                      class="asset-thumb-img"
-                      src={asset.dataUrl}
-                      alt={asset.name}
-                      data-testid="asset-thumb-{asset.id}"
-                    />
+                    {#if asset.dataUrl}
+                      <img
+                        class="asset-thumb-img"
+                        src={asset.dataUrl}
+                        alt={asset.name}
+                        data-testid="asset-thumb-{asset.id}"
+                      />
+                    {:else}
+                      <div class="audio-preview-icon" data-testid="asset-image-fallback-{asset.id}">
+                        <Icon>image_not_supported</Icon>
+                      </div>
+                    {/if}
                   {:else}
                     <div class="audio-preview-icon" data-testid="asset-audio-icon-{asset.id}">
                       <Icon>music_note</Icon>
+                    </div>
+                  {/if}
+
+                  {#if asset.uploadState === 'uploading'}
+                    {@const progressKnown =
+                      typeof asset.uploadProgress === 'number' &&
+                      Number.isFinite(asset.uploadProgress)}
+                    <!-- Real XHR progress only: determinate when reported, wavy
+                      indeterminate until the first upload event. -->
+                    <div
+                      class="asset-transfer asset-transfer-progress"
+                      data-testid="asset-upload-progress-{asset.id}"
+                    >
+                      <LinearProgress
+                        wavy
+                        track={false}
+                        indeterminate={!progressKnown}
+                        value={asset.uploadProgress ?? 0}
+                        max={1}
+                        aria-label="{asset.name}をアップロード中"
+                      />
+                    </div>
+                  {:else if asset.uploadState === 'failed'}
+                    <div
+                      class="asset-transfer asset-transfer-failed"
+                      data-testid="asset-upload-failed-{asset.id}"
+                    >
+                      <span class="asset-transfer-message" title={asset.uploadError ?? ''}>
+                        アップロードに失敗しました
+                      </span>
+                      <Button
+                        variant="text"
+                        size="xs"
+                        onclick={(e: MouseEvent) => handleRetryUpload(e, asset)}
+                        data-testid="asset-retry-btn-{asset.id}"
+                      >
+                        再試行
+                      </Button>
                     </div>
                   {/if}
                 </div>
@@ -295,8 +446,9 @@
                     variant="text"
                     size="xs"
                     aria-label="{asset.name}を削除"
-                    disabled={scope === 'room' && !isAdmin}
-                    onclick={(e: MouseEvent) => handleDeleteAsset(e, asset.id)}
+                    disabled={(scope === 'room' && !isAdmin) ||
+                      asset.uploadState === 'uploading'}
+                    onclick={(e: MouseEvent) => handleDeleteAsset(e, asset)}
                     data-testid="asset-delete-btn-{asset.id}"
                   >
                     <Icon>delete</Icon>
@@ -311,6 +463,13 @@
       <!-- Bottom Bar:
         （右寄せボタン”キャンセル”）
       -->
+      <!-- Room-scope delete failure: the card stays so the user can retry. -->
+      {#if deleteError}
+        <div class="asset-picker-notice" role="alert" data-testid="asset-picker-notice">
+          {deleteError}
+        </div>
+      {/if}
+
       <div class="asset-picker-bottombar" data-testid="asset-picker-bottombar">
         <Button
           variant="text"
@@ -439,6 +598,7 @@
   }
 
   .asset-preview {
+    position: relative;
     flex: 1;
     display: flex;
     align-items: center;
@@ -448,6 +608,56 @@
     overflow: hidden;
     min-height: 96px;
     width: 100%;
+  }
+
+  .asset-card-uploading {
+    cursor: progress;
+  }
+
+  /* Per-card transfer affordances (Issue #141): a real-progress bar while
+     uploading, and a failure strip with a retry action. */
+  .asset-transfer {
+    position: absolute;
+    left: 0;
+    right: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 4px;
+    box-sizing: border-box;
+    background: var(--np-color-surface-container);
+    color: var(--np-color-on-surface);
+  }
+
+  .asset-transfer-progress {
+    bottom: 0;
+    padding: 8px 10px;
+    border-top: 1px solid var(--np-color-outline-variant);
+  }
+
+  .asset-transfer-failed {
+    inset: 0;
+    align-items: center;
+    justify-content: center;
+    padding: 8px;
+    text-align: center;
+    background: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+  }
+
+  .asset-transfer-message {
+    font-size: 0.7rem;
+    font-weight: 600;
+    line-height: 1.3;
+  }
+
+  .asset-picker-notice {
+    padding: 8px 12px;
+    border-radius: var(--np-shape-corner-small, 8px);
+    background: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+    font-size: 0.8rem;
+    font-weight: 600;
   }
 
   .none-preview {
