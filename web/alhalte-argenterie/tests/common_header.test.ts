@@ -83,13 +83,21 @@ describe('CommonHeader Component & Gear Menu Positioning (Issue #124)', () => {
     // Verify positioning styles are applied:
     // 1. position: fixed
     expect(menu?.style.position).toBe('fixed');
+    expect(menu?.getAttribute('style')).toContain('position: fixed !important');
     // 2. inset: unset
     expect(menu?.getAttribute('style')).toContain('inset: unset');
     // 3. margin: 0
     expect(menu?.style.margin).toBe('0px');
     // 4. top is adjacent to button bottom (46 + offset 4 = 50px)
     expect(menu?.style.top).toBe('50px');
-    // 5. anchor name on button and position-anchor on menu
+    // 5. right is aligned to anchor right (1200 - 1186 = 14px)
+    expect(menu?.style.right).toBe('14px');
+    // 6. Anchor positioning overrides
+    expect(menu?.getAttribute('style')).toContain('position-area: none !important');
+    expect(menu?.getAttribute('style')).toContain('position-try-fallbacks: none !important');
+    expect(menu?.getAttribute('style')).toContain('align-self: unset !important');
+    expect(menu?.getAttribute('style')).toContain('justify-self: unset !important');
+    // 7. anchor name on button and position-anchor on menu
     expect(gearBtn?.style.getPropertyValue('anchor-name')).toBe('--gear-menu-anchor');
     expect(menu?.style.getPropertyValue('position-anchor')).toBe('--gear-menu-anchor');
     expect(menu?.style.getPropertyValue('--np-menu-position-area')).toBe('bottom span-right');

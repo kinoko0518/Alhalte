@@ -596,9 +596,14 @@ describe('Scene Settings & Juices', () => {
     const menu = target.querySelector<HTMLElement>('[data-testid="member-scene-menu-char-alice"]');
     expect(menu).toBeTruthy();
     expect(menu?.style.position).toBe('fixed');
+    expect(menu?.getAttribute('style')).toContain('position: fixed !important');
     expect(menu?.getAttribute('style')).toContain('inset: unset');
     expect(menu?.style.margin).toBe('0px');
     expect(menu?.style.top).toBe('240px');
+    expect(menu?.getAttribute('style')).toContain('position-area: none !important');
+    expect(menu?.getAttribute('style')).toContain('position-try-fallbacks: none !important');
+    expect(menu?.getAttribute('style')).toContain('align-self: unset !important');
+    expect(menu?.getAttribute('style')).toContain('justify-self: unset !important');
     expect(toggleBtn?.style.getPropertyValue('anchor-name')).toBe('--member-scene-anchor-char-alice');
     expect(menu?.style.getPropertyValue('position-anchor')).toBe('--member-scene-anchor-char-alice');
 
