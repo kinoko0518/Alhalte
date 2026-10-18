@@ -386,6 +386,25 @@ describe('Fullscreen Warnings & Overlays Viewport Hoisting (Issue #60)', () => {
     // Verify dark scrim overlay style
     expect(editPanel?.classList.contains('character-edit-overlay')).toBe(true);
 
+    // Verify Issue #129 enhancements: M3 Switches, Dividers, descriptions, and scroll container
+    const hideStatusInput = editPanel?.querySelector<HTMLInputElement>('[data-testid="edit-hide-status-toggle"]');
+    expect(hideStatusInput?.getAttribute('role')).toBe('switch');
+    expect(hideStatusInput?.closest('.np-switch')).toBeTruthy();
+
+    const narrativeInput = editPanel?.querySelector<HTMLInputElement>('[data-testid="edit-narrative-toggle"]');
+    expect(narrativeInput?.getAttribute('role')).toBe('switch');
+    expect(narrativeInput?.closest('.np-switch')).toBeTruthy();
+
+    expect(editPanel?.querySelector('[data-testid="status-section-desc"]')?.textContent).toBe(
+      '体力などのゲーム中に頻繁に更新される値です。',
+    );
+    expect(editPanel?.querySelector('[data-testid="param-section-desc"]')?.textContent).toBe(
+      '筋力、知力などゲーム中めったに更新されない値です。',
+    );
+    expect(editPanel?.querySelectorAll('.np-divider').length).toBeGreaterThanOrEqual(6);
+    expect(editPanel?.style.overflowY).toBe('auto');
+    expect(editPanel?.querySelector<HTMLElement>('.edit-dialog-content')?.style.maxHeight).toBe('85vh');
+
     // Click outside on scrim to close
     editPanel?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await new Promise((r) => setTimeout(r, 30));

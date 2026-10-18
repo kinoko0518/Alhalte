@@ -321,6 +321,7 @@ export function parseCharacter(id: string | number, raw: any): Character {
     parameters: Array.isArray(raw?.parameters) ? raw.parameters : [],
     chatPalette: typeof raw?.chatPalette === 'string' ? raw.chatPalette : '',
     hideStatus: Boolean(raw?.hideStatus),
+    isNarrative: Boolean(raw?.isNarrative),
     placedAsPiece: Boolean(raw?.placedAsPiece),
     piecePosition:
       raw?.piecePosition &&
