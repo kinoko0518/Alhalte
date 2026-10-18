@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use alhalte_banquette::{
@@ -36,6 +36,8 @@ pub struct RoomBridge {
     pending_exports: Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
     /// Monotonic counter for export request IDs.
     export_counter: Arc<AtomicU64>,
+    /// Done flag indicating whether room is fully public.
+    is_done: Arc<AtomicBool>,
 }
 
 impl RoomBridge {
@@ -52,6 +54,7 @@ impl RoomBridge {
         let client_scenes = Arc::new(RwLock::new(HashMap::new()));
         let pending_exports = Arc::new(RwLock::new(HashMap::new()));
         let export_counter = Arc::new(AtomicU64::new(1));
+        let is_done = Arc::new(AtomicBool::new(false));
         let (to_banquette_tx, mut to_banquette_rx) =
             mpsc::unbounded_channel::<MaitreDToBanquette>();
 
@@ -141,6 +144,7 @@ impl RoomBridge {
             to_banquette_tx,
             pending_exports,
             export_counter,
+            is_done,
         }
     }
 
@@ -259,6 +263,24 @@ impl RoomBridge {
             .send(MaitreDToBanquette::ClientDisconnected { client_id });
     }
 
+    /// Returns whether this room is marked as done (fully public).
+    pub fn is_done(&self) -> bool {
+        self.is_done.load(Ordering::Relaxed)
+    }
+
+    /// Sets the done flag for this room.
+    pub fn set_done(&self, done: bool) {
+        self.is_done.store(done, Ordering::Relaxed);
+    }
+
+    /// Sends a ServerFrame to a specific connected client.
+    pub async fn send_to_client(&self, client_id: u64, frame: ServerFrame) {
+        let cl = self.clients.read().await;
+        if let Some(tx) = cl.get(&client_id) {
+            let _ = tx.send(frame).await;
+        }
+    }
+
     /// Forwards a client frame to the room's `banquette` process.
     pub fn send_client_frame(&self, client_id: u64, frame: ClientFrame) {
         // Track scene movements locally
@@ -275,6 +297,9 @@ impl RoomBridge {
                 tokio::spawn(async move {
                     scenes.write().await.remove(&client_id);
                 });
+            }
+            ClientFrame::SetDone { done } => {
+                self.is_done.store(*done, Ordering::Relaxed);
             }
             _ => {}
         }
@@ -329,6 +354,7 @@ impl RoomBridge {
 pub struct RoomBridgeManager {
     rooms: Arc<RwLock<HashMap<u64, Arc<RoomBridge>>>>,
     spawner: Arc<dyn BanquetteSpawner>,
+    room_done_status: Arc<RwLock<HashMap<u64, bool>>>,
 }
 
 impl RoomBridgeManager {
@@ -337,6 +363,7 @@ impl RoomBridgeManager {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
             spawner,
+            room_done_status: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -346,6 +373,14 @@ impl RoomBridgeManager {
         if let Some(bridge) = rooms.get(&room_id) {
             return Arc::clone(bridge);
         }
+
+        let initial_done = self
+            .room_done_status
+            .read()
+            .await
+            .get(&room_id)
+            .copied()
+            .unwrap_or(false);
 
         let rooms_ref = Arc::clone(&self.rooms);
         let on_term = move |rid: u64| {
@@ -361,6 +396,7 @@ impl RoomBridgeManager {
             Arc::clone(&self.spawner),
             on_term,
         ));
+        bridge.set_done(initial_done);
 
         rooms.insert(room_id, Arc::clone(&bridge));
         bridge
@@ -370,5 +406,28 @@ impl RoomBridgeManager {
     pub async fn remove_room(&self, room_id: u64) {
         let mut rooms = self.rooms.write().await;
         rooms.remove(&room_id);
+    }
+
+    /// Checks whether a room is marked as done (fully public).
+    pub async fn is_room_done(&self, room_id: u64) -> bool {
+        let rooms = self.rooms.read().await;
+        if let Some(bridge) = rooms.get(&room_id) {
+            bridge.is_done()
+        } else {
+            let statuses = self.room_done_status.read().await;
+            statuses.get(&room_id).copied().unwrap_or(false)
+        }
+    }
+
+    /// Sets the done flag for a room in memory.
+    pub async fn set_room_done(&self, room_id: u64, done: bool) {
+        {
+            let mut statuses = self.room_done_status.write().await;
+            statuses.insert(room_id, done);
+        }
+        let rooms = self.rooms.read().await;
+        if let Some(bridge) = rooms.get(&room_id) {
+            bridge.set_done(done);
+        }
     }
 }

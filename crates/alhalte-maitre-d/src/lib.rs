@@ -47,7 +47,7 @@ pub mod spawner;
 
 pub use cli::{CliArgs, parse_cli_args, parse_cli_args_from};
 pub use crypto::{DEBUG_SUB_CIPHERTEXT, decrypt_sub, encrypt_sub};
-pub use db::{Account, Database, Session};
+pub use db::{Account, Database, RoomPermissionItem, RoomRole, Session};
 pub use error::{MaitreDError, Result};
 pub use gateway::{RoomBridge, RoomBridgeManager};
 pub use labels::{
@@ -57,7 +57,9 @@ pub use labels::{
 };
 pub use oauth::{GoogleOAuthProvider, GoogleUserInfo, MockOAuthProvider, OAuthProvider};
 pub use server::{
-    AppState, AuthResponse, VerifySessionQuery, VerifySessionResponse, create_router,
+    AccountSearchItem, AppState, AuthResponse, SearchAccountsQuery, SetRoomPermissionRequest,
+    VerifySessionQuery, VerifySessionResponse, create_router, extract_session_id_from_cookie,
+    is_mutate_frame, parse_session_id_from_cookie_str,
 };
 pub use session::{
     cleanup_sessions_at, cleanup_sessions_with_cutoff, duration_until_next_4am, previous_4am_local,
