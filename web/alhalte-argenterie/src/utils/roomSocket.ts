@@ -341,7 +341,9 @@ export class RoomSocket {
   private connectionManager: ConnectionManager;
   private chunkLogManager?: ChunkLogManager;
   private socket: WebSocket | null = null;
-  private outgoingQueue: ClientFrame[] = [];
+  private messageQueue: ClientFrame[] = [];
+  private pendingStateChanges: Map<string, ClientFrame> = new Map();
+  private otherOutgoingQueue: ClientFrame[] = [];
   private intentionalClose = false;
   private isReconnecting = false;
   private reconnectAttempts = 0;
@@ -575,12 +577,73 @@ export class RoomSocket {
     }
   }
 
-  private flushQueue(): void {
+  /**
+   * Flushes queued frames upon successful reconnection:
+   * 1. Transmits deduplicated final state changes (UpdateState / DeleteState).
+   * 2. Bulk-transmits queued chat messages in FIFO order (AppendLog).
+   * 3. Transmits any other pending frames.
+   */
+  public flushQueue(): void {
     if (!this.isConnected || !this.socket) return;
-    while (this.outgoingQueue.length > 0) {
-      const frame = this.outgoingQueue.shift()!;
+
+    // 1. Final state changes
+    for (const [, stateFrame] of this.pendingStateChanges) {
+      this.socket.send(JSON.stringify(stateFrame));
+    }
+    this.pendingStateChanges.clear();
+
+    // 2. Bulk send queued messages
+    while (this.messageQueue.length > 0) {
+      const msgFrame = this.messageQueue.shift()!;
+      this.socket.send(JSON.stringify(msgFrame));
+    }
+
+    // 3. Other queued frames
+    while (this.otherOutgoingQueue.length > 0) {
+      const frame = this.otherOutgoingQueue.shift()!;
       this.socket.send(JSON.stringify(frame));
     }
+  }
+
+  /**
+   * Returns all pending queued frames (state updates, messages, and other commands).
+   */
+  public get outgoingQueue(): ClientFrame[] {
+    return [
+      ...Array.from(this.pendingStateChanges.values()),
+      ...this.messageQueue,
+      ...this.otherOutgoingQueue,
+    ];
+  }
+
+  /**
+   * Returns a copy of the current offline message queue.
+   */
+  public getMessageQueue(): ClientFrame[] {
+    return [...this.messageQueue];
+  }
+
+  /**
+   * Returns count of queued offline messages.
+   */
+  public getPendingMessageCount(): number {
+    return this.messageQueue.length;
+  }
+
+  /**
+   * Returns a copy of the pending offline state changes (deduplicated final states).
+   */
+  public getPendingStateChanges(): Map<string, ClientFrame> {
+    return new Map(this.pendingStateChanges);
+  }
+
+  /**
+   * Clears all pending offline queues.
+   */
+  public clearPendingQueues(): void {
+    this.messageQueue = [];
+    this.pendingStateChanges.clear();
+    this.otherOutgoingQueue = [];
   }
 
   // =========================================================================
@@ -588,14 +651,39 @@ export class RoomSocket {
   // =========================================================================
 
   /**
-   * Sends an arbitrary ClientFrame to the server (or queues it if connecting).
+   * Sends an arbitrary ClientFrame to the server (or queues it if offline).
+   * - AppendLog frames are queued in messageQueue (preserving FIFO order for bulk send upon reconnect).
+   * - UpdateState and DeleteState frames are keyed by scene_id and key in pendingStateChanges (deduplicating to sync only final state).
+   * - Other frames are kept in otherOutgoingQueue.
    */
   public send(frame: ClientFrame): void {
     if (this.isConnected && this.socket) {
       this.socket.send(JSON.stringify(frame));
-    } else {
-      this.outgoingQueue.push(frame);
+      return;
     }
+
+    if (typeof frame === 'object' && frame !== null) {
+      if ('AppendLog' in frame) {
+        this.messageQueue.push(frame);
+        return;
+      }
+      if ('UpdateState' in frame && frame.UpdateState) {
+        const { scene_id, key } = frame.UpdateState;
+        this.pendingStateChanges.set(`${scene_id}:::${key}`, frame);
+        return;
+      }
+      if ('DeleteState' in frame && frame.DeleteState) {
+        const { scene_id, key } = frame.DeleteState;
+        this.pendingStateChanges.set(`${scene_id}:::${key}`, frame);
+        return;
+      }
+      if ('EnterScene' in frame && frame.EnterScene) {
+        this.currentSceneId = frame.EnterScene.scene_id;
+        return;
+      }
+    }
+
+    this.otherOutgoingQueue.push(frame);
   }
 
   /**

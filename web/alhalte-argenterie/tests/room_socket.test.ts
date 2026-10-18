@@ -318,6 +318,93 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       expect(messages).toContainEqual({ EnterScene: { scene_id: 'queue-scene' } });
       expect(messages.some((m) => m?.AppendLog?.scene_id === 'queue-scene')).toBe(true);
     });
+
+    // spec: alhalte-argenterie/roomSocket offline message queueing & bulk sending (Issue #88)
+    it('accumulates chat messages in queue while disconnected and bulk-sends upon reconnecting', () => {
+      const socket = new RoomSocket({
+        roomId: 'room-msg-queue',
+        webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+      });
+
+      expect(socket.getPendingMessageCount()).toBe(0);
+
+      // Append multiple messages while disconnected
+      socket.appendLog('scene-1', { content: 'First message', speaker: 'Alice' });
+      socket.appendLog('scene-1', { content: 'Second message', speaker: 'Bob' });
+      socket.appendLog('scene-1', { content: 'Third message', speaker: 'Charlie' });
+
+      expect(socket.getPendingMessageCount()).toBe(3);
+      const queue = socket.getMessageQueue();
+      expect(queue).toHaveLength(3);
+
+      // Connect socket
+      socket.connect();
+      const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+      ws.open();
+
+      // Messages should be bulk-sent in FIFO order
+      const sentFrames = ws.sentMessages.map((m) => JSON.parse(m));
+      const appendLogs = sentFrames.filter((f) => typeof f === 'object' && f !== null && 'AppendLog' in f);
+      expect(appendLogs).toHaveLength(3);
+      expect(socket.getPendingMessageCount()).toBe(0);
+    });
+
+    // spec: alhalte-argenterie/roomSocket offline state changes final state sync (Issue #88)
+    it('deduplicates offline state updates and transmits only the final state upon reconnecting', () => {
+      const socket = new RoomSocket({
+        roomId: 'room-state-sync',
+        webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+      });
+
+      // Update piece position multiple times while offline
+      socket.updateState('scene-1', 'piece::hero::pos', { x: 10, y: 10 });
+      socket.updateState('scene-1', 'piece::hero::pos', { x: 50, y: 50 });
+      socket.updateState('scene-1', 'piece::hero::pos', { x: 200, y: 350 });
+
+      // Update BGM and then delete it
+      socket.updateState('scene-1', 'std::bgm', 'bgm-temp');
+      socket.deleteState('scene-1', 'std::bgm');
+
+      // Update another key
+      socket.updateState('scene-1', 'view::transform', { x: 0, y: 0, scale: 1.5 });
+
+      // Pending state map should only contain deduplicated final values
+      const pendingMap = socket.getPendingStateChanges();
+      expect(pendingMap.size).toBe(3);
+      expect(pendingMap.get('scene-1:::piece::hero::pos')).toEqual({
+        UpdateState: {
+          scene_id: 'scene-1',
+          key: 'piece::hero::pos',
+          value: { x: 200, y: 350 },
+        },
+      });
+      expect(pendingMap.get('scene-1:::std::bgm')).toEqual({
+        DeleteState: {
+          scene_id: 'scene-1',
+          key: 'std::bgm',
+        },
+      });
+
+      // Connect
+      socket.connect();
+      const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+      ws.open();
+
+      // Sent frames should only have the 3 final updates (not the intermediate 10,10 or 50,50 or bgm-temp)
+      const sentFrames = ws.sentMessages.map((m) => JSON.parse(m));
+      const heroPosUpdates = sentFrames.filter(
+        (f) => f?.UpdateState?.key === 'piece::hero::pos',
+      );
+      expect(heroPosUpdates).toHaveLength(1);
+      expect(heroPosUpdates[0].UpdateState.value).toEqual({ x: 200, y: 350 });
+
+      const bgmUpdates = sentFrames.filter((f) => f?.UpdateState?.key === 'std::bgm');
+      expect(bgmUpdates).toHaveLength(0); // Overwritten by DeleteState
+      const bgmDeletes = sentFrames.filter((f) => f?.DeleteState?.key === 'std::bgm');
+      expect(bgmDeletes).toHaveLength(1);
+
+      expect(socket.getPendingStateChanges().size).toBe(0);
+    });
   });
 
   // spec: roomSocket ServerFrame reception & state synchronization

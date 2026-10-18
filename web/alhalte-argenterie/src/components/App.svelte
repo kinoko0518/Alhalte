@@ -355,6 +355,25 @@
   });
 
   let roomSocket = $state<RoomSocket | null>(customRoomSocket ?? null);
+  let pendingOfflineMessages = $state<Array<{ sceneId: string; record: LogRecord }>>([]);
+  let pendingOfflineStates = $state<Map<string, { sceneId: string; key: string; value: any }>>(new Map());
+
+  $effect(() => {
+    if (roomSocket) {
+      if (pendingOfflineStates.size > 0) {
+        for (const [, st] of pendingOfflineStates) {
+          roomSocket.updateState(st.sceneId, st.key, st.value);
+        }
+        pendingOfflineStates.clear();
+      }
+      if (pendingOfflineMessages.length > 0) {
+        for (const item of pendingOfflineMessages) {
+          roomSocket.appendLog(item.sceneId, item.record);
+        }
+        pendingOfflineMessages = [];
+      }
+    }
+  });
 
   $effect(() => {
     if (customRoomSocket) {
@@ -544,7 +563,15 @@
     characters = characters.map((c) => {
       if (c.id === characterId) {
         const nextPlaced = !c.placedAsPiece;
-        roomSocket?.updateState(currentScene.id, `piece::${characterId}::placed`, nextPlaced);
+        if (roomSocket) {
+          roomSocket.updateState(currentScene.id, `piece::${characterId}::placed`, nextPlaced);
+        } else {
+          pendingOfflineStates.set(`${currentScene.id}:::piece::${characterId}::placed`, {
+            sceneId: currentScene.id,
+            key: `piece::${characterId}::placed`,
+            value: nextPlaced,
+          });
+        }
         return {
           ...c,
           placedAsPiece: nextPlaced,
@@ -565,7 +592,15 @@
       }
       return c;
     });
-    roomSocket?.updateState(currentScene.id, `piece::${characterId}::pos`, position);
+    if (roomSocket) {
+      roomSocket.updateState(currentScene.id, `piece::${characterId}::pos`, position);
+    } else {
+      pendingOfflineStates.set(`${currentScene.id}:::piece::${characterId}::pos`, {
+        sceneId: currentScene.id,
+        key: `piece::${characterId}::pos`,
+        value: position,
+      });
+    }
   }
 
   function handleCreateCharacter(char: Character) {
@@ -647,7 +682,11 @@
     if (currentRoom?.id) {
       persistRoomLogs(currentRoom.id);
     }
-    roomSocket?.appendLog(currentScene.id, record);
+    if (roomSocket) {
+      roomSocket.appendLog(currentScene.id, record);
+    } else {
+      pendingOfflineMessages.push({ sceneId: currentScene.id, record });
+    }
 
     if (extensions.some((ext) => ext.enabled && ext.wasmBytes)) {
       const initialBytes = new TextEncoder().encode(text);
