@@ -10,7 +10,9 @@
   import { Icon } from 'noph-ui/icons';
   import type { Character, ExtensionItem, Scene } from '../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
+  import type { ConnectionState } from '../../utils/connection.js';
   import { ChunkLogManager } from '../../utils/log.js';
+  import type { RoomSocket } from '../../utils/roomSocket.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
   import { ExtensionPipeline } from '../../wasm/runner.js';
   import CommonFooter, { type ActiveTab } from './CommonFooter.svelte';
@@ -60,6 +62,8 @@
     onRequestDeleteCharacter,
     onRequestAssetPicker,
     onRequestEditCharacter,
+    roomSocket = null,
+    connectionState,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -105,6 +109,13 @@
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
     onRequestEditCharacter?: (char: Character) => void;
+    /**
+     * Forwarded to `LogTab`: the room socket used for the eager latest-chunk
+     * load (Issue #109 / #140).
+     */
+    roomSocket?: RoomSocket | null;
+    /** Forwarded to `LogTab`: retries a queued log load when it becomes `connected`. */
+    connectionState?: ConnectionState;
   } = $props();
 
   let activeTab = $state<ActiveTab>('log');
@@ -162,6 +173,8 @@
         {roomId}
         {isAdmin}
         {chunkManager}
+        {roomSocket}
+        {connectionState}
         {onCollapse}
         {onSelectScene}
         {onExportZip}

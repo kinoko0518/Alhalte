@@ -66,6 +66,73 @@ export function parseLogRecord(raw: Record<string, unknown>, idPrefix = 'log'): 
 }
 
 /**
+ * Head of a scene log biblio: the newest appended entry.
+ */
+export interface LogBiblioHead {
+  /** Index of the chunk that holds the newest entry. */
+  chunkIndex: number;
+  /** Position of the newest entry inside that chunk. */
+  position: number;
+}
+
+/**
+ * Reads a non-negative integer from a JSON value (number, bigint, or numeric
+ * string). Returns `null` for anything else.
+ */
+function toIndex(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value >= 0 ? value : null;
+  }
+  if (typeof value === 'bigint') {
+    return value >= 0n && value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : null;
+  }
+  if (typeof value === 'string' && /^\d+$/.test(value.trim())) {
+    return Number(value.trim());
+  }
+  return null;
+}
+
+/**
+ * Extracts the head `(chunk_index, position)` from a `LogBiblio` payload.
+ *
+ * banquette serializes `LogBiblio.head` as a Rust tuple, i.e. a two-element
+ * JSON array `[chunk_index, position]`. Some payloads wrap the same pair in an
+ * object (`{ chunk_index, position }` or `{ chunkIndex, position }`), so both
+ * shapes are accepted. A missing or malformed head means "no entries yet" and
+ * resolves to `null`; the caller treats that as an already-empty log.
+ *
+ * This is the read-side companion of `RoomSocket.queryLogBiblio`: the wire
+ * format is `{ chunks: [32-byte tin ids], head: [chunk_index, position] }`.
+ *
+ * References:
+ * - ARCHITECTURE.md: `## alhalte-banquette -> #### log`
+ * - GitHub Issue #109 / sub-issue #140: `ログタブの最新チャンク自動読み込み`
+ */
+export function readLogBiblioHead(biblio: unknown): LogBiblioHead | null {
+  if (!biblio || typeof biblio !== 'object') return null;
+
+  const head = (biblio as Record<string, unknown>).head;
+  if (head === null || head === undefined) return null;
+
+  let rawChunkIndex: unknown;
+  let rawPosition: unknown;
+  if (Array.isArray(head)) {
+    rawChunkIndex = head[0];
+    rawPosition = head[1];
+  } else if (typeof head === 'object') {
+    const record = head as Record<string, unknown>;
+    rawChunkIndex = record.chunk_index ?? record.chunkIndex;
+    rawPosition = record.position;
+  } else {
+    return null;
+  }
+
+  const chunkIndex = toIndex(rawChunkIndex);
+  if (chunkIndex === null) return null;
+  return { chunkIndex, position: toIndex(rawPosition) ?? 0 };
+}
+
+/**
  * Manages lazy loading and caching of log chunks for scenes.
  */
 export class ChunkLogManager {

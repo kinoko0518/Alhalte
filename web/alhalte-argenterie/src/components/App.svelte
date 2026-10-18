@@ -1039,6 +1039,8 @@
                   sending={isSending}
                   {pendingMessageCount}
                   {chunkManager}
+                  {roomSocket}
+                  connectionState={currentConnectionState}
                   onCollapse={() => (isControlSheetOpen = false)}
                   onSelectScene={handleSelectScene}
                   onSelectCharacter={(id) => (selectedCharacterId = id)}
@@ -1124,6 +1126,8 @@
                 sending={isSending}
                 {pendingMessageCount}
                 {chunkManager}
+                {roomSocket}
+                connectionState={currentConnectionState}
                 onCollapse={() => (isControlSheetOpen = false)}
                 onSelectScene={handleSelectScene}
                 onSelectCharacter={(id) => (selectedCharacterId = id)}
