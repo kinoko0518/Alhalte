@@ -28,12 +28,18 @@
  *   recorded in {@link FakeRoomSocket.requestChangeBgmCalls} and settled with
  *   {@link FakeRoomSocket.resolveChangeBgm} /
  *   {@link FakeRoomSocket.rejectChangeBgm}.
+ * - `requestCreateScene` / `requestDeleteScene` / `requestRewindLog` /
+ *   `requestMoveCharacter` — the scene management actions
+ *   (Issue #109 / sub-issue #143). They resolve immediately unless
+ *   {@link FakeRoomSocket.autoAnswerSceneActions} is off, in which case the test
+ *   settles them through {@link FakeRoomSocket.resolveSceneAction} /
+ *   {@link FakeRoomSocket.rejectSceneAction}.
  * - `emitFrame` — pushes an arbitrary `ServerFrame` to the subscribers so an
  *   App-level test can drive `StateUpdated` / `StateDeleted`.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`, `### アセット`
- * - GitHub Issue #109 / sub-issue #139, #140, #141, #142
+ * - GitHub Issue #109 / sub-issue #139, #140, #141, #142, #143
  */
 import type { ChunkLogManager } from '../../src/utils/log.js';
 import type { RoomSocket } from '../../src/utils/roomSocket.js';
@@ -73,6 +79,40 @@ export interface ChangeBgmCall {
   sceneId: string;
   slot: number;
   tinId: string | null;
+}
+
+/** One recorded `requestCreateScene` call (Issue #109 / #143). */
+export interface CreateSceneCall {
+  sceneId: string;
+  inheritJuices: boolean;
+}
+
+/** One recorded `requestDeleteScene` call (Issue #109 / #143). */
+export interface DeleteSceneCall {
+  sceneId: string;
+}
+
+/** One recorded `requestRewindLog` call (Issue #109 / #143). */
+export interface RewindLogCall {
+  sceneId: string;
+  chunkIndex: number;
+  position: number;
+}
+
+/** One recorded `requestMoveCharacter` call (Issue #109 / #143). */
+export interface MoveCharacterCall {
+  characterId: number;
+  toSceneId: string;
+}
+
+/** Kind of a scene action held back by {@link FakeRoomSocket.autoAnswerSceneActions}. */
+export type SceneActionKind = 'create' | 'delete' | 'rewind' | 'move';
+
+interface PendingSceneAction {
+  kind: SceneActionKind;
+  label: string;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
 }
 
 interface PendingStateOperation {
@@ -120,6 +160,12 @@ export class FakeRoomSocket {
    * {@link FakeRoomSocket.rejectDeleteState}.
    */
   autoAnswerStateWrites = true;
+  /**
+   * When `true` (the default) scene management requests resolve immediately.
+   * Set to `false` to drive them with {@link FakeRoomSocket.resolveSceneAction}
+   * / {@link FakeRoomSocket.rejectSceneAction} (Issue #109 / #143).
+   */
+  autoAnswerSceneActions = true;
 
   readonly requestAppendLogCalls: AppendCall[] = [];
   readonly appendLogCalls: AppendCall[] = [];
@@ -130,6 +176,10 @@ export class FakeRoomSocket {
   readonly requestUpdateStateCalls: StateWriteCall[] = [];
   readonly requestDeleteStateCalls: StateDeleteCall[] = [];
   readonly requestChangeBgmCalls: ChangeBgmCall[] = [];
+  readonly requestCreateSceneCalls: CreateSceneCall[] = [];
+  readonly requestDeleteSceneCalls: DeleteSceneCall[] = [];
+  readonly requestRewindLogCalls: RewindLogCall[] = [];
+  readonly requestMoveCharacterCalls: MoveCharacterCall[] = [];
 
   private readonly listeners = new Set<FrameListener>();
   private readonly pending: Array<{
@@ -141,6 +191,7 @@ export class FakeRoomSocket {
   private readonly pendingLogQueries: PendingLogQuery[] = [];
   private readonly pendingStateOperations: PendingStateOperation[] = [];
   private readonly pendingChangeBgmOperations: PendingChangeBgmOperation[] = [];
+  private readonly pendingSceneActions: PendingSceneAction[] = [];
 
   setChunkLogManager(manager?: ChunkLogManager): void {
     this.chunkManager = manager ?? null;
@@ -234,6 +285,92 @@ export class FakeRoomSocket {
   /** Number of `ChangeBgm` writes still waiting for a manual answer. */
   get pendingChangeBgmCount(): number {
     return this.pendingChangeBgmOperations.length;
+  }
+
+  // -------------------------------------------------------------------------
+  // Scene management actions (Issue #109 / sub-issue #143)
+  // -------------------------------------------------------------------------
+
+  /** Records a `CreateScene` request (resolves with the `SceneCreated` ack shape). */
+  requestCreateScene(sceneId: string, inheritJuices = false): Promise<unknown> {
+    this.requestCreateSceneCalls.push({ sceneId, inheritJuices });
+    if (this.autoAnswerSceneActions) return Promise.resolve({ scene_id: sceneId });
+    return this.holdSceneAction('create', `create:${sceneId}`);
+  }
+
+  /** Records a `DeleteScene` request (resolves with the `SceneDeleted` ack shape). */
+  requestDeleteScene(sceneId: string, _timeoutMs?: number): Promise<unknown> {
+    this.requestDeleteSceneCalls.push({ sceneId });
+    if (this.autoAnswerSceneActions) return Promise.resolve({ scene_id: sceneId });
+    return this.holdSceneAction('delete', `delete:${sceneId}`);
+  }
+
+  /** Records a `RewindLog` request (resolves with the `LogEventRewound` ack shape). */
+  requestRewindLog(
+    sceneId: string,
+    chunkIndex: number,
+    position: number,
+    _timeoutMs?: number,
+  ): Promise<unknown> {
+    this.requestRewindLogCalls.push({ sceneId, chunkIndex, position });
+    if (this.autoAnswerSceneActions) {
+      return Promise.resolve({ scene_id: sceneId, chunk_index: chunkIndex, position });
+    }
+    return this.holdSceneAction('rewind', `rewind:${sceneId}`);
+  }
+
+  /** Records a `MoveCharacter` request (resolves with the `CharacterMoved` ack shape). */
+  requestMoveCharacter(
+    characterId: number,
+    toSceneId: string,
+    _timeoutMs?: number,
+  ): Promise<unknown> {
+    this.requestMoveCharacterCalls.push({ characterId, toSceneId });
+    if (this.autoAnswerSceneActions) {
+      return Promise.resolve({ character_id: characterId, to_scene_id: toSceneId });
+    }
+    return this.holdSceneAction('move', `move:${characterId}:${toSceneId}`);
+  }
+
+  /** Number of scene actions still waiting for a manual answer. */
+  get pendingSceneActionCount(): number {
+    return this.pendingSceneActions.length;
+  }
+
+  /** Labels of the scene actions still waiting, oldest first. */
+  get pendingSceneActionLabels(): string[] {
+    return this.pendingSceneActions.map((action) => action.label);
+  }
+
+  /**
+   * Resolves the oldest pending scene action, optionally only one of `kind`.
+   */
+  resolveSceneAction(kind?: SceneActionKind): void {
+    this.takeSceneAction(kind).resolve({});
+  }
+
+  /**
+   * Rejects the oldest pending scene action (e.g. with an
+   * `OperationTimeoutError`), optionally only one of `kind`.
+   */
+  rejectSceneAction(error: unknown, kind?: SceneActionKind): void {
+    this.takeSceneAction(kind).reject(error);
+  }
+
+  private holdSceneAction(kind: SceneActionKind, label: string): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      this.pendingSceneActions.push({ kind, label, resolve, reject });
+    });
+  }
+
+  private takeSceneAction(kind?: SceneActionKind): PendingSceneAction {
+    const index = this.pendingSceneActions.findIndex(
+      (action) => kind === undefined || action.kind === kind,
+    );
+    if (index < 0) {
+      throw new Error(`FakeRoomSocket: no pending scene action${kind ? ` (${kind})` : ''}`);
+    }
+    return this.pendingSceneActions.splice(index, 1)[0];
   }
 
   /**

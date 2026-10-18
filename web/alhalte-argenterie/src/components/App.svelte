@@ -216,13 +216,6 @@
     };
   }
 
-  function handleDeleteSceneLogs(sceneId: string) {
-    chunkManager.clearSceneRecords(sceneId);
-    if (currentRoom?.id) {
-      persistRoomLogs(currentRoom.id);
-    }
-  }
-
   function handleRequestDeleteCharacter(char: { id: string; name: string }) {
     activeOverlay = {
       type: 'delete-character',
@@ -730,29 +723,146 @@
     scenes = nextScenes;
   }
 
+  // ---------------------------------------------------------------------------
+  // Scene management actions (Issue #109 / sub-issue #143)
+  // ---------------------------------------------------------------------------
+  /** Failure text mirrored into `SceneSettingsTab` under the management controls. */
+  const SCENE_ACTION_ERROR_MESSAGE = 'サーバーと通信できませんでした';
+
+  /**
+   * Id of the scene action in flight (`create`, `delete-logs`, `delete-scene`
+   * or `move:<characterId>`), or `null` when idle.
+   *
+   * `SceneSettingsTab` swaps the pressed icon for a wavy `CircularProgress`
+   * while the id matches, so a single string is enough to drive the spinner of
+   * every management control.
+   */
+  let sceneActionPending = $state<string | null>(null);
+  /** Failure message of the last scene action, or `null` while healthy. */
+  let sceneActionError = $state<string | null>(null);
+
+  /**
+   * Scene ids created by this client after a `SceneCreated` ack that a
+   * `SceneList` may not list yet.
+   *
+   * The server broadcasts `SceneList` when it creates a scene, but a list that
+   * was already in flight when the ack arrived can predate the new id. Those
+   * scenes are protected from the removal pass until the server lists them.
+   */
+  const pendingSceneListIds = new Set<string>();
+
+  /**
+   * Starts a scene action: clears the previous error and marks the action
+   * pending. Returns `false` when another scene action is already in flight,
+   * which serializes the management operations (double activation is a no-op).
+   */
+  function beginSceneAction(actionId: string): boolean {
+    if (sceneActionPending !== null) return false;
+    sceneActionError = null;
+    sceneActionPending = actionId;
+    return true;
+  }
+
+  /** Reports a failed scene action and returns `false` for the caller. */
+  function failSceneAction(error: unknown, action: string): false {
+    console.warn(`[App] Scene action "${action}" failed:`, error);
+    sceneActionError = SCENE_ACTION_ERROR_MESSAGE;
+    return false;
+  }
+
+  /** Local model of a scene id announced by `SceneList`. */
+  function createPlaceholderScene(sceneId: string): Scene {
+    return {
+      id: sceneId,
+      name: sceneId === '/' ? 'メインシーン' : sceneId,
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+  }
+
+  /**
+   * Removes a scene from the local model.
+   *
+   * The root scene `/` always exists server-side and the last remaining scene
+   * is kept so the field always has something to render. When the removed
+   * scene was current, the selection falls back to `/` (or the first scene).
+   * Its cached log records are dropped as well because deleting a scene deletes
+   * its logs on the server.
+   */
+  function removeSceneLocally(sceneId: string): boolean {
+    if (sceneId === '/') return false;
+    if (scenes.length <= 1) return false;
+    if (!scenes.some((scene) => scene.id === sceneId)) return false;
+
+    const next = scenes.filter((scene) => scene.id !== sceneId);
+    scenes = next;
+    pendingSceneListIds.delete(sceneId);
+    chunkManager.clearSceneRecords(sceneId);
+    if (currentSceneId === sceneId) {
+      currentSceneId = (next.find((scene) => scene.id === '/') ?? next[0]).id;
+    }
+    return true;
+  }
+
+  /**
+   * Applies a `SceneList` frame (Issue #109 / sub-issue #143).
+   *
+   * Unlike the previous revision this is authoritative in both directions: it
+   * adds unknown scenes, removes scenes the server no longer lists, and
+   * re-points `currentSceneId` when the current scene vanished. `/` and scenes
+   * still waiting for a list that includes a fresh `SceneCreated` id are kept.
+   */
+  function applySceneList(rawSceneIds: unknown) {
+    if (!Array.isArray(rawSceneIds) || rawSceneIds.length === 0) return;
+    const serverIds = new Set(rawSceneIds.map((id) => String(id)));
+    const next: Scene[] = [];
+    let changed = false;
+
+    for (const scene of scenes) {
+      if (serverIds.has(scene.id)) {
+        pendingSceneListIds.delete(scene.id);
+        next.push(scene);
+        continue;
+      }
+      // Never drop the root scene nor a scene this client has just created and
+      // the server has already acknowledged.
+      if (scene.id === '/' || pendingSceneListIds.has(scene.id)) {
+        next.push(scene);
+        continue;
+      }
+      changed = true;
+    }
+
+    for (const sceneId of serverIds) {
+      if (next.some((scene) => scene.id === sceneId)) continue;
+      next.push(createPlaceholderScene(sceneId));
+      changed = true;
+    }
+
+    if (changed) scenes = next;
+
+    if (!next.some((scene) => scene.id === currentSceneId)) {
+      const fallback = next.find((scene) => scene.id === '/') ?? next[0];
+      if (fallback) {
+        currentSceneId = fallback.id;
+        roomSocket?.enterScene(fallback.id);
+      }
+    }
+  }
+
   $effect(() => {
     if (!roomSocket) return;
     roomSocket.setChunkLogManager(chunkManager);
     const unsubscribe = roomSocket.subscribe((frame) => {
       if (typeof frame !== 'object' || frame === null) return;
       if ('SceneList' in frame) {
-        const sceneIds = frame.SceneList.scenes;
-        const existingIds = new Set(scenes.map((s) => s.id));
-        const newScenes = [...scenes];
-        let changed = false;
-        for (const sId of sceneIds) {
-          if (!existingIds.has(sId)) {
-            newScenes.push({
-              id: sId,
-              name: sId === '/' ? 'メインシーン' : sId,
-              juices: createDefaultJuices(),
-              viewTransform: { x: 0, y: 0, scale: 1 },
-              members: [],
-            });
-            changed = true;
-          }
-        }
-        if (changed) scenes = newScenes;
+        applySceneList(frame.SceneList.scenes);
+      }
+      // Second safeguard for a deletion: the broadcast also removes the scene
+      // even when this client did not issue the `DeleteScene` request.
+      if ('SceneDeleted' in frame) {
+        removeSceneLocally(String(frame.SceneDeleted.scene_id));
       }
       if ('CharacterList' in frame) {
         const charList: Character[] = [];
@@ -850,53 +960,178 @@
     }
   }
 
-  function handleCreateScene(name: string, inheritJuice: boolean) {
+  /**
+   * Creates a scene and selects it (Issue #109 / sub-issue #143).
+   *
+   * The id is generated exactly as before. Without a connected socket the
+   * historical local-only behaviour is kept (push + select). With a socket the
+   * local model changes only after the `SceneCreated` ack; `SceneList` may add
+   * the same id first, so the insertion dedupes by id and keeps the typed name.
+   */
+  async function handleCreateScene(name: string, inheritJuice: boolean): Promise<boolean | void> {
     if (isViewer) return;
-    const newId = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-    const newScene: Scene = {
-      id: newId,
-      name,
-      juices: inheritJuice ? inheritJuices(currentScene.juices) : createDefaultJuices(),
-      viewTransform: { x: 0, y: 0, scale: 1 },
-      members: [],
-    };
-    scenes.push(newScene);
-    currentSceneId = newId;
-    roomSocket?.createScene(newId, inheritJuice);
+    if (!beginSceneAction('create')) return;
+
+    try {
+      const newId = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const juices = inheritJuice ? inheritJuices(currentScene.juices) : createDefaultJuices();
+      const socket = roomSocket;
+
+      if (!socket || !socket.isConnected) {
+        scenes = [
+          ...scenes,
+          { id: newId, name, juices, viewTransform: { x: 0, y: 0, scale: 1 }, members: [] },
+        ];
+        currentSceneId = newId;
+        return true;
+      }
+
+      await socket.requestCreateScene(newId, inheritJuice);
+
+      pendingSceneListIds.add(newId);
+      const alreadyListed = scenes.find((scene) => scene.id === newId);
+      if (alreadyListed) {
+        // A `SceneList` broadcast created the placeholder while we were waiting.
+        alreadyListed.name = name;
+        alreadyListed.juices = juices;
+      } else {
+        scenes = [
+          ...scenes,
+          { id: newId, name, juices, viewTransform: { x: 0, y: 0, scale: 1 }, members: [] },
+        ];
+      }
+      currentSceneId = newId;
+      return true;
+    } catch (error) {
+      return failSceneAction(error, 'create');
+    } finally {
+      sceneActionPending = null;
+    }
   }
 
-  function handleDeleteScene(sceneId: string) {
+  /**
+   * Deletes a scene (Issue #109 / sub-issue #143).
+   *
+   * The "keep at least one scene" guard is unchanged. Without a connected
+   * socket the scene is removed locally as before; with a socket the removal
+   * waits for the `SceneDeleted` ack and a failure leaves the list untouched.
+   */
+  async function handleDeleteScene(sceneId: string): Promise<boolean | void> {
     if (isViewer) return;
     if (scenes.length <= 1) return; // Keep at least one scene
-    scenes = scenes.filter((s) => s.id !== sceneId);
-    if (currentSceneId === sceneId) {
-      currentSceneId = scenes[0].id;
+    if (!beginSceneAction('delete-scene')) return;
+
+    try {
+      const socket = roomSocket;
+      if (!socket || !socket.isConnected) {
+        removeSceneLocally(sceneId);
+        return true;
+      }
+
+      await socket.requestDeleteScene(sceneId);
+      removeSceneLocally(sceneId);
+      return true;
+    } catch (error) {
+      return failSceneAction(error, 'delete-scene');
+    } finally {
+      sceneActionPending = null;
     }
-    roomSocket?.deleteScene(sceneId);
   }
 
-  function handleMoveMember(characterId: string, targetSceneName: string) {
-    if (isViewer) return;
-    const prevScene = scenes.find((s) => s.members.includes(characterId)) || currentScene;
-    const res = moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
-    scenes = res.updatedScenes;
-    currentSceneId = res.targetScene.id;
+  /**
+   * Deletes every log of a scene (Issue #109 / sub-issue #143).
+   *
+   * The local chunk cache is cleared only after `requestRewindLog(sceneId, 0, 0)`
+   * is acknowledged, so a timeout no longer loses the cached conversation.
+   * Without a connected socket the historical local-only clear is kept.
+   */
+  async function handleDeleteSceneLogs(sceneId: string): Promise<boolean | void> {
+    if (!beginSceneAction('delete-logs')) return;
 
-    // Record movement in movements list
+    try {
+      const socket = roomSocket;
+      if (socket && socket.isConnected) {
+        await socket.requestRewindLog(sceneId, 0, 0);
+      }
+      chunkManager.clearSceneRecords(sceneId);
+      if (currentRoom?.id) {
+        persistRoomLogs(currentRoom.id);
+      }
+      return true;
+    } catch (error) {
+      return failSceneAction(error, 'delete-logs');
+    } finally {
+      sceneActionPending = null;
+    }
+  }
+
+  /** Commits an acknowledged member move to `scenes`, `currentSceneId` and `movements`. */
+  function commitMemberMove(
+    characterId: string,
+    fromSceneId: string,
+    result: ReturnType<typeof moveMemberToScene>,
+  ) {
+    scenes = result.updatedScenes;
+    currentSceneId = result.targetScene.id;
+
     const char = characters.find((c) => c.id === characterId);
     movements.push({
       characterId,
       characterName: char?.name || 'Unknown',
-      fromSceneId: prevScene.id,
-      toSceneId: res.targetScene.id,
+      fromSceneId,
+      toSceneId: result.targetScene.id,
       timestamp: Math.floor(Date.now() / 1000),
     });
+  }
 
-    const numericCharId = Number(characterId);
-    if (!Number.isNaN(numericCharId)) {
-      roomSocket?.moveCharacter(numericCharId, res.targetScene.id);
+  /**
+   * Moves a character to another scene (Issue #109 / sub-issue #143).
+   *
+   * The target scene id (and the implicitly created scene for an unknown name)
+   * is computed before the request because `MoveCharacter` carries it, but the
+   * local model is only replaced after the ack. The room-state mirror
+   * `character::<id>::scene` is kept and is best effort: the `CharacterMoved`
+   * ack is authoritative, so a rejected state write only logs a warning.
+   */
+  async function handleMoveMember(
+    characterId: string,
+    targetSceneName: string,
+  ): Promise<boolean | void> {
+    if (isViewer) return;
+    if (!beginSceneAction(`move:${characterId}`)) return;
+
+    try {
+      const fromSceneId =
+        (scenes.find((scene) => scene.members.includes(characterId)) || currentScene).id;
+      const result = moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
+      const socket = roomSocket;
+      const numericCharId = Number(characterId);
+
+      if (!socket || !socket.isConnected) {
+        commitMemberMove(characterId, fromSceneId, result);
+        return true;
+      }
+
+      if (!Number.isNaN(numericCharId)) {
+        await socket.requestMoveCharacter(numericCharId, result.targetScene.id);
+      }
+      try {
+        await socket.requestUpdateState(
+          result.targetScene.id,
+          `character::${characterId}::scene`,
+          result.targetScene.id,
+        );
+      } catch (stateError) {
+        console.warn('[App] Failed to mirror the member move into the room state:', stateError);
+      }
+
+      commitMemberMove(characterId, fromSceneId, result);
+      return true;
+    } catch (error) {
+      return failSceneAction(error, 'move');
+    } finally {
+      sceneActionPending = null;
     }
-    roomSocket?.updateState(res.targetScene.id, `character::${characterId}::scene`, res.targetScene.id);
   }
 
   function handleTogglePiece(characterId: string) {
@@ -1168,6 +1403,8 @@
                   {isViewer}
                   sending={isSending}
                   {pendingMessageCount}
+                  {sceneActionPending}
+                  {sceneActionError}
                   {chunkManager}
                   {roomSocket}
                   connectionState={currentConnectionState}
@@ -1256,6 +1493,8 @@
                 {isViewer}
                 sending={isSending}
                 {pendingMessageCount}
+                {sceneActionPending}
+                {sceneActionError}
                 {chunkManager}
                 {roomSocket}
                 connectionState={currentConnectionState}
@@ -1339,10 +1578,14 @@
               <Button
                 variant="filled"
                 class="delete-scene-tonal-btn"
+                disabled={sceneActionPending !== null}
                 onclick={() => {
                   if (activeOverlay?.type === 'delete-scene') {
-                    handleDeleteScene(activeOverlay.sceneId);
+                    const { sceneId } = activeOverlay;
+                    // Close immediately so the spinner shows on the management
+                    // icon; a failure appears under the management controls.
                     activeOverlay = null;
+                    void handleDeleteScene(sceneId);
                   }
                 }}
                 data-testid="graph-confirm-delete-btn"
@@ -1385,10 +1628,12 @@
             <Button
               variant="filled"
               class="delete-scene-tonal-btn"
+              disabled={sceneActionPending !== null}
               onclick={() => {
                 if (activeOverlay?.type === 'delete-scene-logs') {
-                  handleDeleteSceneLogs(activeOverlay.sceneId);
+                  const { sceneId } = activeOverlay;
                   activeOverlay = null;
+                  void handleDeleteSceneLogs(sceneId);
                 }
               }}
               data-testid="confirm-delete-logs-button"

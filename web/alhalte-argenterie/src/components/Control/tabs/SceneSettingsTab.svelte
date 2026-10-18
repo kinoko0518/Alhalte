@@ -53,6 +53,8 @@
     onDeleteSceneLogs,
     onRequestAssetPicker,
     roomSocket = null,
+    sceneActionPending = null,
+    sceneActionError = null,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -60,12 +62,18 @@
     isAdmin?: boolean;
     onUpdateScene?: (scene: Scene) => void;
     onSelectScene?: (sceneId: string) => void;
-    onCreateScene?: (name: string, inheritJuice: boolean) => void;
-    onDeleteScene?: (sceneId: string) => void;
-    onMoveMember?: (characterId: string, targetSceneName: string) => void;
+    onCreateScene?: (
+      name: string,
+      inheritJuice: boolean,
+    ) => Promise<boolean | void> | boolean | void;
+    onDeleteScene?: (sceneId: string) => Promise<boolean | void> | boolean | void;
+    onMoveMember?: (
+      characterId: string,
+      targetSceneName: string,
+    ) => Promise<boolean | void> | boolean | void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
     onRequestDeleteSceneLogs?: (scene: { id: string; name: string }) => void;
-    onDeleteSceneLogs?: (sceneId: string) => void;
+    onDeleteSceneLogs?: (sceneId: string) => Promise<boolean | void> | boolean | void;
     onRequestAssetPicker?: (options: {
       mediaType: AssetMediaType;
       initialScope?: AssetScope;
@@ -76,6 +84,14 @@
      * When absent or disconnected the component keeps its local-only behaviour.
      */
     roomSocket?: RoomSocket | null;
+    /**
+     * Scene action whose control is replaced by a wavy `CircularProgress`
+     * (`create` / `delete-logs` / `delete-scene` / `move:<characterId>`),
+     * owned by `App` (Issue #109 / sub-issue #143).
+     */
+    sceneActionPending?: string | null;
+    /** Failure text rendered under the management controls (Issue #109 / #143). */
+    sceneActionError?: string | null;
   } = $props();
 
   // Asset picker state
@@ -550,20 +566,84 @@
     onUpdateScene?.(currentScene);
   }
 
-  function handleCreateSceneSubmit() {
-    if (!newSceneName.trim()) return;
-    onCreateScene?.(newSceneName.trim(), inheritJuiceToggle);
-    newSceneName = '';
-    isCreateSceneOpen = false;
+  // ---------------------------------------------------------------------------
+  // Management actions (Issue #109 / sub-issue #143)
+  // ---------------------------------------------------------------------------
+  /** Failure text shown centered under the management controls. */
+  const SCENE_ACTION_COMMUNICATION_ERROR = 'サーバーと通信できませんでした';
+  /**
+   * Action this tab initiated itself. `App` owns the pending/error state for
+   * the server round trip; this local mirror keeps the spinner and the error
+   * working when the tab is used standalone (tests, storybook-like usage).
+   */
+  let localPendingAction = $state<string | null>(null);
+  let localActionError = $state<string | null>(null);
+
+  /** Pending action: `App`'s state wins, the local one covers local initiation. */
+  let effectivePendingAction = $derived(sceneActionPending ?? localPendingAction);
+  /** Failure text: `App`'s message wins, the local one covers `false` returns. */
+  let effectiveActionError = $derived(sceneActionError || localActionError);
+
+  function isSceneActionPending(actionId: string): boolean {
+    return effectivePendingAction === actionId;
   }
 
-  function handleMoveMemberApply(charId: string) {
+  function isAnySceneActionPending(): boolean {
+    return effectivePendingAction !== null;
+  }
+
+  /**
+   * Runs an action initiated by this tab.
+   *
+   * The callback may be synchronous (legacy tests) or return a Promise. A
+   * callback returning `false` — or rejecting — is a failure: the communication
+   * error is shown and no local state is mutated. `App` also reports its own
+   * failure through `sceneActionError`, so both paths show the same message.
+   */
+  async function runSceneAction(
+    actionId: string,
+    action: (() => Promise<boolean | void> | boolean | void) | undefined,
+  ): Promise<void> {
+    if (isAnySceneActionPending()) return;
+    localActionError = null;
+    localPendingAction = actionId;
+    try {
+      const result = await action?.();
+      if (result === false) {
+        localActionError = SCENE_ACTION_COMMUNICATION_ERROR;
+      }
+    } catch (error) {
+      console.warn(`[SceneSettingsTab] Scene action "${actionId}" failed:`, error);
+      localActionError = SCENE_ACTION_COMMUNICATION_ERROR;
+    } finally {
+      localPendingAction = null;
+    }
+  }
+
+  async function handleCreateSceneSubmit() {
+    const name = newSceneName.trim();
+    if (!name || isAnySceneActionPending()) return;
+    const inheritJuice = inheritJuiceToggle;
+    // Close the dialog and clear the field immediately, like before, so the
+    // spinner is visible on the management icon while the server answers.
+    newSceneName = '';
+    isCreateSceneOpen = false;
+    await runSceneAction(
+      'create',
+      onCreateScene ? () => onCreateScene(name, inheritJuice) : undefined,
+    );
+  }
+
+  async function handleMoveMemberApply(charId: string) {
     const targetName =
       memberTargetSceneNames[charId] ||
       allScenes.find((s) => s.members.includes(charId))?.name ||
       currentScene.name;
-    if (!targetName) return;
-    onMoveMember?.(charId, targetName);
+    if (!targetName || isAnySceneActionPending()) return;
+    await runSceneAction(
+      `move:${charId}`,
+      onMoveMember ? () => onMoveMember(charId, targetName) : undefined,
+    );
   }
 
   function handleDeleteButtonClick() {
@@ -577,9 +657,12 @@
     }
   }
 
-  function handleDeleteConfirm() {
+  async function handleDeleteConfirm() {
     isDeleteConfirmOpen = false;
-    onDeleteScene?.(currentScene.id);
+    await runSceneAction(
+      'delete-scene',
+      onDeleteScene ? () => onDeleteScene(currentScene.id) : undefined,
+    );
   }
 
   function handleDeleteLogsButtonClick() {
@@ -593,9 +676,12 @@
     }
   }
 
-  function handleDeleteLogsConfirm() {
+  async function handleDeleteLogsConfirm() {
     isDeleteLogsConfirmOpen = false;
-    onDeleteSceneLogs?.(currentScene.id);
+    await runSceneAction(
+      'delete-logs',
+      onDeleteSceneLogs ? () => onDeleteSceneLogs(currentScene.id) : undefined,
+    );
   }
 
   function handleWindowClick(e: MouseEvent) {
@@ -816,11 +902,23 @@
             size="m"
             class="action-square-btn create-scene-btn"
             onclick={() => (isCreateSceneOpen = true)}
+            disabled={isAnySceneActionPending()}
             aria-label="シーンを新規作成"
             data-testid="open-create-scene-btn"
           >
             {#snippet start()}
-              <Icon>add</Icon>
+              {#if isSceneActionPending('create')}
+                <CircularProgress
+                  indeterminate
+                  wavy
+                  track={false}
+                  class="scene-action-progress"
+                  data-testid="create-action-pending"
+                  aria-label="送信中"
+                />
+              {:else}
+                <Icon>add</Icon>
+              {/if}
             {/snippet}
             <span class="action-btn-label" data-testid="create-scene-label">シーンを新規作成</span>
           </Button>
@@ -841,11 +939,23 @@
             size="m"
             class="action-square-btn delete-logs-btn destructive-tonal-btn"
             onclick={handleDeleteLogsButtonClick}
+            disabled={isAnySceneActionPending()}
             aria-label="シーンのログを削除"
             data-testid="delete-logs-btn"
           >
             {#snippet start()}
-              <Icon>delete_sweep</Icon>
+              {#if isSceneActionPending('delete-logs')}
+                <CircularProgress
+                  indeterminate
+                  wavy
+                  track={false}
+                  class="scene-action-progress"
+                  data-testid="delete-logs-action-pending"
+                  aria-label="送信中"
+                />
+              {:else}
+                <Icon>delete_sweep</Icon>
+              {/if}
             {/snippet}
             <span class="action-btn-label" data-testid="delete-logs-label">ログを削除</span>
           </Button>
@@ -866,11 +976,23 @@
             size="m"
             class="action-square-btn delete-scene-btn delete-scene-tonal-btn destructive-tonal-btn"
             onclick={handleDeleteButtonClick}
+            disabled={isAnySceneActionPending()}
             aria-label="シーンを削除"
             data-testid="delete-scene-btn"
           >
             {#snippet start()}
-              <Icon>delete</Icon>
+              {#if isSceneActionPending('delete-scene')}
+                <CircularProgress
+                  indeterminate
+                  wavy
+                  track={false}
+                  class="scene-action-progress"
+                  data-testid="delete-scene-action-pending"
+                  aria-label="送信中"
+                />
+              {:else}
+                <Icon>delete</Icon>
+              {/if}
             {/snippet}
             <span class="action-btn-label" data-testid="delete-scene-label">シーンを削除</span>
           </Button>
@@ -987,9 +1109,21 @@
                       size="m"
                       class="apply-move-btn"
                       onclick={() => handleMoveMemberApply(char.id)}
+                      disabled={isAnySceneActionPending()}
                       data-testid="apply-move-btn-{char.id}"
                     >
-                      移動
+                      {#if isSceneActionPending(`move:${char.id}`)}
+                        <CircularProgress
+                          indeterminate
+                          wavy
+                          track={false}
+                          class="scene-action-progress"
+                          data-testid="move-action-pending-{char.id}"
+                          aria-label="送信中"
+                        />
+                      {:else}
+                        移動
+                      {/if}
                     </Button>
                   </div>
                 {/snippet}
@@ -999,6 +1133,13 @@
         {/if}
       </div>
     </div>
+
+    <!-- 管理操作の失敗表示: 管理コントロール群の下に中央寄せで出す (Issue #109 / #143) -->
+    {#if effectiveActionError}
+      <p class="scene-action-error" role="status" data-testid="scene-action-error">
+        {effectiveActionError}
+      </p>
+    {/if}
   </div>
 
   <!-- Overlay: シーンを新規作成 -->
@@ -1281,6 +1422,19 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+  }
+  /* 管理操作の送信中インジケーター (Issue #109 / #143): 波線の CircularProgress */
+  :global(.scene-action-progress) {
+    --np-circular-progress-size: 1.25rem;
+  }
+  /* 管理操作の失敗表示: 管理コントロール群の下に中央寄せ (Issue #109 / #143) */
+  .scene-action-error {
+    margin: 0;
+    padding: 0 8px;
+    text-align: center;
+    font-size: 0.85rem;
+    line-height: 1.3;
+    color: var(--np-color-error);
   }
   .move-members-section {
     display: flex;

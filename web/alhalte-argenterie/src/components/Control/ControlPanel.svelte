@@ -64,6 +64,8 @@
     onRequestEditCharacter,
     roomSocket = null,
     connectionState,
+    sceneActionPending = null,
+    sceneActionError = null,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -116,6 +118,14 @@
     roomSocket?: RoomSocket | null;
     /** Forwarded to `LogTab`: retries a queued log load when it becomes `connected`. */
     connectionState?: ConnectionState;
+    /**
+     * Forwarded to `SceneSettingsTab`: the scene action whose control shows a
+     * wavy `CircularProgress` while the server acknowledges it
+     * (Issue #109 / sub-issue #143).
+     */
+    sceneActionPending?: string | null;
+    /** Forwarded to `SceneSettingsTab`: scene-action failure text (Issue #109 / #143). */
+    sceneActionError?: string | null;
   } = $props();
 
   let activeTab = $state<ActiveTab>('log');
@@ -212,6 +222,8 @@
         {onDeleteSceneLogs}
         {onRequestAssetPicker}
         {roomSocket}
+        {sceneActionPending}
+        {sceneActionError}
       />
     {:else if activeTab === 'characters'}
       <CharacterManagementTab
