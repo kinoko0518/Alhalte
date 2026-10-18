@@ -7,7 +7,19 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    */
-  import { Button, Carousel, CarouselItem, IconButton, Slider, Switch, TextField } from 'noph-ui';
+  import {
+    Button,
+    Carousel,
+    CarouselItem,
+    IconButton,
+    List,
+    ListItem,
+    Menu,
+    MenuItem,
+    Slider,
+    Switch,
+    TextField,
+  } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import GenericImagePicker from '../GenericImagePicker.svelte';
   import type { BgmSlot, Character, Scene } from '../../../types/index.js';
@@ -93,6 +105,8 @@
   let memberTargetSceneNames = $state<Record<string, string>>(initializeMemberTargets());
   let activeMemberSplitId = $state<string | null>(null);
   let membersMoveListContainer = $state<HTMLElement | null>(null);
+  let toggleButtons = $state<Record<string, HTMLElement | undefined>>({});
+  let menuElements = $state<Record<string, HTMLElement | undefined>>({});
 
   $effect(() => {
     for (const char of characters) {
@@ -346,9 +360,16 @@
   }
 
   function handleWindowClick(e: MouseEvent) {
-    if (activeMemberSplitId && membersMoveListContainer && !membersMoveListContainer.contains(e.target as Node)) {
-      activeMemberSplitId = null;
+    if (!activeMemberSplitId) return;
+    const target = e.target;
+    if (target instanceof Node) {
+      const activeToggle = toggleButtons[activeMemberSplitId];
+      const activeMenu = menuElements[activeMemberSplitId];
+      if (activeToggle?.contains(target) || activeMenu?.contains(target)) {
+        return;
+      }
     }
+    activeMemberSplitId = null;
   }
 </script>
 
@@ -598,7 +619,7 @@
         </div>
       </div>
 
-      <!-- メンバーを移動: シーン設定タブ内インライン埋め込み (Issue #92) -->
+      <!-- メンバーを移動: Material 3 Expressive Segmented List & Menu (Issue #110) -->
       <div class="move-members-section" data-testid="move-members-section">
         <div class="move-members-header">
           <div class="move-members-title-group">
@@ -610,90 +631,110 @@
           </span>
         </div>
 
-        <div
-          class="members-move-list"
-          bind:this={membersMoveListContainer}
-          data-testid="members-move-list"
-        >
-          {#if characters.length === 0}
-            <div class="empty-members-message" data-testid="empty-members-message">
-              部屋にキャラクターがいません
-            </div>
-          {:else}
+        {#if characters.length === 0}
+          <div class="empty-members-message" data-testid="empty-members-message">
+            部屋にキャラクターがいません
+          </div>
+        {:else}
+          <List
+            class="members-move-list members-segmented-list"
+            bind:element={membersMoveListContainer}
+            data-testid="members-move-list"
+          >
             {#each characters as char (char.id)}
               {@const currentSc = allScenes.find((s) => s.members.includes(char.id))}
-              <div class="member-move-row" data-testid="move-row-{char.id}">
-                <div class="member-info">
+              <ListItem
+                type="text"
+                class="member-move-row member-segmented-item"
+                data-testid="move-row-{char.id}"
+              >
+                {#snippet avatar()}
                   <img
                     class="member-avatar"
                     src={char.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
                     alt={char.name}
+                    data-testid="member-avatar-{char.id}"
                   />
-                  <div class="member-details">
-                    <span class="member-name">{char.name}</span>
-                    <span class="member-current-scene">
-                      {currentSc ? `現在: ${currentSc.name}` : '未所属'}
-                    </span>
-                  </div>
-                </div>
+                {/snippet}
 
-                <div class="member-move-controls">
-                  <div class="split-select-wrapper">
-                    <TextField
-                      variant="outlined"
-                      label="移動先"
-                      placeholder="シーン名"
-                      bind:value={memberTargetSceneNames[char.id]}
-                      data-testid="member-target-input-{char.id}"
-                      class="member-target-field"
-                    />
-                    <button
-                      type="button"
-                      class="inline-arrow-btn"
-                      onclick={() => {
-                        activeMemberSplitId =
-                          activeMemberSplitId === char.id ? null : char.id;
-                      }}
-                      data-testid="member-split-toggle-{char.id}"
-                      aria-label="移動先シーン候補を選択"
-                      title="シーン一覧"
-                    >
-                      ▼
-                    </button>
+                <span class="member-name" data-testid="member-name-{char.id}">{char.name}</span>
 
-                    {#if activeMemberSplitId === char.id}
-                      <div class="inline-scene-dropdown" data-testid="member-scene-dropdown-{char.id}">
+                {#snippet supportingText()}
+                  <span class="member-current-scene" data-testid="member-current-scene-{char.id}">
+                    {currentSc ? `現在: ${currentSc.name}` : '未所属'}
+                  </span>
+                {/snippet}
+
+                {#snippet end()}
+                  <div class="member-move-controls" onclick={(e) => e.stopPropagation()}>
+                    <div class="split-select-wrapper">
+                      <TextField
+                        variant="outlined"
+                        label="移動先"
+                        placeholder="シーン名"
+                        bind:value={memberTargetSceneNames[char.id]}
+                        data-testid="member-target-input-{char.id}"
+                        class="member-target-field"
+                      />
+                      <IconButton
+                        variant="tonal"
+                        size="s"
+                        onclick={(e) => {
+                          e.stopPropagation();
+                          activeMemberSplitId =
+                            activeMemberSplitId === char.id ? null : char.id;
+                        }}
+                        bind:element={toggleButtons[char.id]}
+                        data-testid="member-split-toggle-{char.id}"
+                        aria-label="移動先シーン候補を選択"
+                        title="シーン一覧"
+                        class="member-scene-toggle-btn"
+                      >
+                        <Icon>arrow_drop_down</Icon>
+                      </IconButton>
+
+                      <Menu
+                        bind:element={menuElements[char.id]}
+                        open={activeMemberSplitId === char.id}
+                        anchor={toggleButtons[char.id]}
+                        data-testid="member-scene-menu-{char.id}"
+                        class="member-scene-menu"
+                        ontoggle={(e) => {
+                          if (!e.newState || e.newState === 'closed') {
+                            if (activeMemberSplitId === char.id) activeMemberSplitId = null;
+                          }
+                        }}
+                      >
                         {#each allScenes as sc (sc.id)}
-                          <button
-                            type="button"
-                            class="dropdown-scene-opt"
-                            class:active-opt={sc.name === memberTargetSceneNames[char.id]}
+                          <MenuItem
+                            selected={sc.name === memberTargetSceneNames[char.id]}
                             onclick={() => {
                               memberTargetSceneNames[char.id] = sc.name;
                               activeMemberSplitId = null;
                             }}
+                            data-testid="member-scene-item-{char.id}-{sc.id}"
                           >
                             {sc.name}
-                          </button>
+                          </MenuItem>
                         {/each}
-                      </div>
-                    {/if}
-                  </div>
+                      </Menu>
+                    </div>
 
-                  <Button
-                    variant="tonal"
-                    size="m"
-                    class="apply-move-btn"
-                    onclick={() => handleMoveMemberApply(char.id)}
-                    data-testid="apply-move-btn-{char.id}"
-                  >
-                    移動
-                  </Button>
-                </div>
-              </div>
+                    <Button
+                      variant="tonal"
+                      size="m"
+                      class="apply-move-btn"
+                      onclick={() => handleMoveMemberApply(char.id)}
+                      data-testid="apply-move-btn-{char.id}"
+                    >
+                      移動
+                    </Button>
+                  </div>
+                {/snippet}
+              </ListItem>
             {/each}
-          {/if}
-        </div>
+          </List>
+        {/if}
       </div>
     </div>
   </div>
@@ -1131,45 +1172,64 @@
     gap: 8px;
     margin-top: 8px;
   }
-  .members-move-list {
+  :global(.members-segmented-list) {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    max-height: 320px;
+    max-height: 340px;
     overflow-y: auto;
+    padding: 0;
+    margin: 0;
+    list-style: none;
   }
-  .member-move-row {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 10px;
+  :global(.member-segmented-item.np-item) {
+    display: grid !important;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto;
+    gap: 8px 12px;
+    align-items: center;
+    width: 100%;
+    min-height: unset !important;
+    padding: 12px !important;
     background: var(--np-color-surface-container-low);
     border: 1px solid var(--np-color-outline-variant);
-    border-radius: var(--np-shape-corner-small);
-    transition: background var(--np-motion-expressive-fast-effects, 150ms ease);
+    border-radius: var(--np-shape-corner-medium, 12px);
+    box-sizing: border-box;
+    transition: background-color var(--np-motion-expressive-fast-effects, 150ms ease),
+                border-color var(--np-motion-expressive-fast-effects, 150ms ease);
+    cursor: default !important;
   }
-  .member-move-row:hover {
-    background: var(--np-color-surface);
+  :global(.member-segmented-item.np-item:hover) {
+    background: var(--np-color-surface-container);
   }
-  .member-info {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    min-width: 0;
-  }
-  .member-avatar {
+  :global(.member-segmented-item .np-item-avatar) {
+    grid-column: 1;
+    grid-row: 1;
     width: 36px;
     height: 36px;
     border-radius: var(--np-shape-corner-full);
-    object-fit: cover;
-    flex-shrink: 0;
     border: 1px solid var(--np-color-outline-variant);
+    overflow: hidden;
   }
-  .member-details {
+  :global(.member-segmented-item .np-item-text) {
+    grid-column: 2;
+    grid-row: 1;
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    min-width: 0;
-    flex: 1;
+  }
+  :global(.member-segmented-item .np-item-end) {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    display: flex;
+  }
+  .member-avatar {
+    width: 100%;
+    height: 100%;
+    border-radius: var(--np-shape-corner-full);
+    object-fit: cover;
+    flex-shrink: 0;
   }
   .member-name {
     font-size: 0.9rem;
@@ -1190,63 +1250,26 @@
     display: flex;
     align-items: center;
     gap: 8px;
+    width: 100%;
   }
   .split-select-wrapper {
     position: relative;
     flex: 1;
     display: flex;
     align-items: center;
+    gap: 6px;
     min-width: 0;
   }
   .split-select-wrapper :global(.member-target-field) {
-    width: 100%;
+    flex: 1;
+    min-width: 0;
   }
-  .inline-arrow-btn {
-    position: absolute;
-    right: 6px;
-    background: none;
-    border: none;
-    cursor: pointer;
-    font-size: 0.75rem;
-    padding: 6px;
-    color: var(--np-color-on-surface-variant);
-    border-radius: var(--np-shape-corner-extra-small);
+  :global(.member-scene-toggle-btn) {
+    flex-shrink: 0;
   }
-  .inline-arrow-btn:hover {
-    background: var(--np-color-surface-container-highest);
-  }
-  .inline-scene-dropdown {
-    position: absolute;
-    top: 100%;
-    left: 0;
-    right: 0;
-    margin-top: 4px;
-    background: var(--np-color-surface-container-high);
-    border: 1px solid var(--np-color-outline-variant);
-    border-radius: var(--np-shape-corner-small);
-    box-shadow: var(--np-elevation-2);
-    z-index: 300;
-    max-height: 160px;
+  :global(.member-scene-menu) {
+    max-height: 200px;
     overflow-y: auto;
-  }
-  .dropdown-scene-opt {
-    display: block;
-    width: 100%;
-    padding: 8px 12px;
-    border: none;
-    background: none;
-    text-align: left;
-    font-size: 0.85rem;
-    cursor: pointer;
-    color: var(--np-color-on-surface);
-  }
-  .dropdown-scene-opt:hover {
-    background: var(--np-color-surface-container-highest);
-  }
-  .dropdown-scene-opt.active-opt {
-    font-weight: 700;
-    color: var(--np-color-primary);
-    background: var(--np-color-primary-container);
   }
   :global(.apply-move-btn) {
     flex-shrink: 0;
