@@ -3,10 +3,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -31,12 +33,20 @@ pub struct AppState {
     pub oauth: Arc<dyn OAuthProvider>,
     /// WebSocket room demuxer manager.
     pub room_manager: RoomBridgeManager,
+    /// Optional authenticated reverse proxy to `alhalte-cellar` (`/api/cellar/*`).
+    ///
+    /// When `None`, the proxied routes answer `503 Service Unavailable`; no other
+    /// route is affected.
+    pub cellar: Option<CellarProxy>,
     /// Client ID monotonic counter.
     client_counter: Arc<AtomicU64>,
 }
 
 impl AppState {
-    /// Creates a new [`AppState`].
+    /// Creates a new [`AppState`] without a cellar proxy.
+    ///
+    /// Use [`AppState::with_cellar_proxy`] (or [`AppState::with_cellar_url`]) to
+    /// enable the `/api/cellar/*` routes.
     pub fn new(
         db: Database,
         salt: impl Into<String>,
@@ -48,8 +58,27 @@ impl AppState {
             salt: salt.into(),
             oauth,
             room_manager,
+            cellar: None,
             client_counter: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Attaches an authenticated cellar reverse proxy configuration.
+    #[must_use]
+    pub fn with_cellar_proxy(mut self, proxy: CellarProxy) -> Self {
+        self.cellar = Some(proxy);
+        self
+    }
+
+    /// Attaches a cellar reverse proxy pointing at `cellar_url` (`--cellar-url`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CellarProxyError::InvalidBaseUrl`] when `cellar_url` is not an
+    /// absolute `http` / `https` URL, or [`CellarProxyError::Client`] when the
+    /// underlying HTTP client cannot be built.
+    pub fn with_cellar_url(self, cellar_url: impl Into<String>) -> Result<Self, CellarProxyError> {
+        Ok(self.with_cellar_proxy(CellarProxy::new(cellar_url)?))
     }
 
     /// Allocates a new unique client ID for a WebSocket connection.
@@ -262,7 +291,14 @@ pub fn create_router(state: AppState) -> Router {
             "/api/room/{room_id}/export/zip",
             get(export_room_zip_handler),
         )
-        .route("/room/{room_id}/export/zip", get(export_room_zip_handler));
+        .route("/room/{room_id}/export/zip", get(export_room_zip_handler))
+        // Authenticated cellar reverse proxy (see `CellarProxy`)
+        .route("/api/cellar/store", post(cellar_store_check_handler))
+        .route(
+            "/api/cellar/store/{tin_id}",
+            post(cellar_store_upload_handler).put(cellar_store_upload_handler),
+        )
+        .route("/api/cellar/tin/{tin_id}", get(cellar_download_handler));
 
     #[cfg(debug_assertions)]
     {
@@ -826,6 +862,7 @@ pub fn is_mutate_frame(frame: &ClientFrame) -> bool {
             | ClientFrame::UpdateCharacter { .. }
             | ClientFrame::DeleteCharacter { .. }
             | ClientFrame::MoveCharacter { .. }
+            | ClientFrame::ChangeBgm { .. }
     )
 }
 
@@ -1293,4 +1330,479 @@ async fn export_room_zip_handler(
     }
 
     (StatusCode::OK, resp_headers, zip_bytes).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated cellar reverse proxy
+// ---------------------------------------------------------------------------
+
+/// Default upstream timeout applied by [`CellarProxy::new`].
+///
+/// The browser side aborts at 8 s (`DEFAULT_OPERATION_TIMEOUT_MS` in
+/// `web/alhalte-argenterie/src/utils/cellarTransfer.ts`); this value is only a
+/// backstop so a hung `alhalte-cellar` cannot pin a maitre-d task forever.
+pub const DEFAULT_CELLAR_PROXY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Upstream response headers that are copied back to the browser.
+///
+/// Everything else (including `server`, `date`, and any internal address) is
+/// dropped so the proxy never leaks `alhalte-cellar` details.
+const FORWARDED_RESPONSE_HEADERS: [&str; 3] = [
+    "content-type",
+    "content-disposition",
+    "x-alhalte-wrapped-key",
+];
+
+/// Errors raised while building a [`CellarProxy`].
+#[derive(Debug, thiserror::Error)]
+pub enum CellarProxyError {
+    /// The configured cellar base URL is not an absolute `http` / `https` URL.
+    #[error("cellar base URL must be an absolute http(s) URL")]
+    InvalidBaseUrl,
+
+    /// The underlying HTTP client could not be initialized.
+    #[error("failed to initialize the cellar HTTP client")]
+    Client(#[source] reqwest::Error),
+}
+
+/// Configuration for the authenticated `/api/cellar/*` reverse proxy.
+///
+/// The browser never talks to `alhalte-cellar` directly: it calls maitre-d,
+/// which resolves the caller from the session and injects the
+/// `X-Alhalte-Owner` / `X-Alhalte-Session-Id` headers itself. Client-supplied
+/// ownership is therefore never trusted.
+#[derive(Clone, Debug)]
+pub struct CellarProxy {
+    /// Base URL of the cellar service, without a trailing slash.
+    base_url: String,
+    /// HTTP client used for upstream calls.
+    client: reqwest::Client,
+}
+
+impl CellarProxy {
+    /// Creates a proxy for the cellar listening at `base_url`.
+    ///
+    /// `base_url` may carry a path prefix (for example `http://127.0.0.1:8081`),
+    /// which is prepended to every forwarded path. `/api/cellar` routes are
+    /// mapped to `/store`, `/store/{tin_id}`, and `/tin/{tin_id}` on that base.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CellarProxyError::InvalidBaseUrl`] for non-absolute or
+    /// non-HTTP(S) URLs and [`CellarProxyError::Client`] when the HTTP client
+    /// cannot be initialized.
+    pub fn new(base_url: impl Into<String>) -> Result<Self, CellarProxyError> {
+        let trimmed = base_url.into().trim().trim_end_matches('/').to_string();
+        let parsed = reqwest::Url::parse(&trimmed).map_err(|_| CellarProxyError::InvalidBaseUrl)?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(CellarProxyError::InvalidBaseUrl);
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_CELLAR_PROXY_TIMEOUT)
+            .build()
+            .map_err(CellarProxyError::Client)?;
+
+        Ok(Self {
+            base_url: trimmed,
+            client,
+        })
+    }
+
+    /// Replaces the HTTP client (used by tests to shorten the upstream timeout).
+    #[must_use]
+    pub fn with_client(mut self, client: reqwest::Client) -> Self {
+        self.client = client;
+        self
+    }
+
+    /// Returns the configured cellar base URL.
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Joins a cellar path (`/store`, `/tin/{id}`, ...) onto the base URL.
+    fn endpoint(&self, path: &str) -> String {
+        format!("{}{}", self.base_url, path)
+    }
+}
+
+/// Query parameters accepted by the proxied cellar routes.
+///
+/// They are used only to authenticate the caller (compatibility with the
+/// existing `/api/room/{room_id}/export/zip` convention) and are **never**
+/// forwarded upstream, so a client cannot smuggle `owner` / `session_id` past
+/// the proxy.
+#[derive(Debug, Default, Deserialize)]
+pub struct CellarProxyQuery {
+    /// Owning account ID claimed by the caller.
+    pub owner: Option<u64>,
+    /// Owning account ID claimed by the caller (alias of `owner`).
+    pub account_id: Option<u64>,
+    /// Session ID claimed by the caller.
+    pub session_id: Option<u64>,
+}
+
+/// Failure modes when resolving the authenticated caller of a proxied request.
+#[derive(Debug, thiserror::Error)]
+pub enum CellarAuthError {
+    /// No session identifier was supplied by cookie, header, or query.
+    #[error("missing session identifier")]
+    MissingSession,
+
+    /// The session is unknown, expired, or belongs to another account.
+    #[error("invalid session or account")]
+    InvalidSession,
+
+    /// The claimed account ID contradicts the session.
+    #[error("account identifier does not match the session")]
+    AccountMismatch,
+
+    /// The account database could not be read.
+    #[error("account lookup failed")]
+    Database(#[source] crate::error::MaitreDError),
+}
+
+/// Authenticated identity forwarded to `alhalte-cellar`.
+struct CallerCredentials {
+    /// Account ID owning the session.
+    account_id: u64,
+    /// Session used to authenticate the request.
+    session_id: u64,
+}
+
+/// Reads a `u64` from an `X-Alhalte-*` header.
+fn header_as_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Resolves the authenticated caller from the session cookie / headers /
+/// query and verifies it against the account database.
+///
+/// The account returned is always derived from the session row; a client
+/// supplied `account_id` is only accepted when it agrees with that session.
+fn resolve_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &CellarProxyQuery,
+) -> Result<CallerCredentials, CellarAuthError> {
+    let session_id = query
+        .session_id
+        .or_else(|| header_as_u64(headers, "X-Alhalte-Session"))
+        .or_else(|| extract_session_id_from_cookie(headers))
+        .ok_or(CellarAuthError::MissingSession)?;
+
+    let claimed_account = query
+        .owner
+        .or(query.account_id)
+        .or_else(|| header_as_u64(headers, "X-Alhalte-Account"));
+
+    let session_account = state
+        .db
+        .get_session(session_id)
+        .map_err(CellarAuthError::Database)?
+        .ok_or(CellarAuthError::InvalidSession)?
+        .account_id;
+
+    if let Some(claimed) = claimed_account
+        && claimed != session_account
+    {
+        return Err(CellarAuthError::AccountMismatch);
+    }
+
+    match state.db.is_session_valid(session_account, session_id) {
+        Ok(true) => Ok(CallerCredentials {
+            account_id: session_account,
+            session_id,
+        }),
+        Ok(false) => Err(CellarAuthError::InvalidSession),
+        Err(e) => Err(CellarAuthError::Database(e)),
+    }
+}
+
+/// Maps a [`CellarAuthError`] to an HTTP response without leaking internals.
+fn auth_error_response(err: CellarAuthError) -> Response {
+    match err {
+        CellarAuthError::Database(source) => {
+            tracing::error!("cellar proxy account lookup failed: {source}");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "account lookup failed" })),
+            )
+                .into_response()
+        }
+        CellarAuthError::AccountMismatch => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "account_id does not match the session" })),
+        )
+            .into_response(),
+        CellarAuthError::MissingSession | CellarAuthError::InvalidSession => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid session or account" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Response returned when the proxy has no `--cellar-url` configured.
+fn proxy_not_configured_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "cellar proxy is not configured" })),
+    )
+        .into_response()
+}
+
+/// Maps a transport level [`reqwest::Error`] to `504` / `502`.
+///
+/// The upstream URL, host, and port are intentionally absent from the body.
+fn upstream_error_response(err: &reqwest::Error) -> Response {
+    if err.is_timeout() {
+        tracing::warn!("cellar upstream timed out: {err}");
+        (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(serde_json::json!({ "error": "cellar upstream timed out" })),
+        )
+            .into_response()
+    } else {
+        tracing::warn!("cellar upstream request failed: {err}");
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "error": "cellar upstream request failed" })),
+        )
+            .into_response()
+    }
+}
+
+/// Headers that identify the caller to `alhalte-cellar`.
+fn owner_headers(caller: &CallerCredentials) -> Vec<(&'static str, String)> {
+    vec![
+        ("X-Alhalte-Owner", caller.account_id.to_string()),
+        ("X-Alhalte-Session-Id", caller.session_id.to_string()),
+    ]
+}
+
+/// Validates a 64-character hex tin ID taken from the request path.
+///
+/// Rejecting anything else keeps path traversal (`..`) and other upstream path
+/// injections out of the proxy before a request is even built.
+fn normalize_tin_id(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(trimmed.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+/// Sends one request to `alhalte-cellar` and mirrors the response back.
+///
+/// The upstream status and body are preserved verbatim (including the
+/// non-standard `210` / `211` / `212` store codes). Only the headers listed in
+/// [`FORWARDED_RESPONSE_HEADERS`] are copied; transport failures become `502`
+/// / `504`.
+async fn forward_cellar_request(
+    proxy: &CellarProxy,
+    method: reqwest::Method,
+    path: &str,
+    headers: Vec<(&'static str, String)>,
+    body: Option<Bytes>,
+) -> Response {
+    let url = proxy.endpoint(path);
+    let mut request = proxy.client.request(method, url);
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+    if let Some(body) = body {
+        request = request.body(body);
+    }
+
+    let upstream = match request.send().await {
+        Ok(response) => response,
+        Err(err) => return upstream_error_response(&err),
+    };
+
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+
+    let mut response_headers = HeaderMap::new();
+    for name in FORWARDED_RESPONSE_HEADERS {
+        if let Some(value) = upstream.headers().get(name)
+            && let Ok(value) = axum::http::HeaderValue::from_bytes(value.as_bytes())
+        {
+            response_headers.insert(name, value);
+        }
+    }
+
+    match upstream.bytes().await {
+        Ok(body) => (status, response_headers, body).into_response(),
+        Err(err) => upstream_error_response(&err),
+    }
+}
+
+/// Handles `POST /api/cellar/store` (cellar `POST /store`).
+///
+/// The JSON body is forwarded with `owner` / `session_id` overwritten by the
+/// authenticated values, so the 210 / 211 / 212 handshake always runs against
+/// the caller's own account.
+async fn cellar_store_check_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CellarProxyQuery>,
+    body: Bytes,
+) -> Response {
+    let Some(proxy) = state.cellar.as_ref() else {
+        return proxy_not_configured_response();
+    };
+
+    let caller = match resolve_caller(&state, &headers, &query) {
+        Ok(caller) => caller,
+        Err(err) => return auth_error_response(err),
+    };
+
+    let mut payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload @ serde_json::Value::Object(_)) => payload,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "request body must be a JSON object" })),
+            )
+                .into_response();
+        }
+    };
+
+    if let Some(map) = payload.as_object_mut() {
+        map.insert(
+            "owner".to_string(),
+            serde_json::Value::from(caller.account_id),
+        );
+        map.insert(
+            "session_id".to_string(),
+            serde_json::Value::from(caller.session_id),
+        );
+    }
+
+    let body = match serde_json::to_vec(&payload) {
+        Ok(body) => body,
+        Err(err) => {
+            tracing::error!("failed to re-serialize cellar store request: {err}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid store request" })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut upstream_headers = owner_headers(&caller);
+    upstream_headers.push(("Content-Type", "application/json".to_string()));
+
+    forward_cellar_request(
+        proxy,
+        reqwest::Method::POST,
+        "/store",
+        upstream_headers,
+        Some(Bytes::from(body)),
+    )
+    .await
+}
+
+/// Handles `POST|PUT /api/cellar/store/{tin_id}` (cellar `POST|PUT /store/{tin_id}`).
+///
+/// `X-Alhalte-Wrapped-Key` is forwarded as-is; ownership always comes from the
+/// session, never from the request.
+async fn cellar_store_upload_handler(
+    State(state): State<AppState>,
+    AxumPath(tin_id): AxumPath<String>,
+    method: Method,
+    headers: HeaderMap,
+    Query(query): Query<CellarProxyQuery>,
+    body: Bytes,
+) -> Response {
+    let Some(proxy) = state.cellar.as_ref() else {
+        return proxy_not_configured_response();
+    };
+
+    let Some(tin_id) = normalize_tin_id(&tin_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "tin_id must be 64 hex characters" })),
+        )
+            .into_response();
+    };
+
+    let caller = match resolve_caller(&state, &headers, &query) {
+        Ok(caller) => caller,
+        Err(err) => return auth_error_response(err),
+    };
+
+    let mut upstream_headers = owner_headers(&caller);
+    if let Some(wrapped_key) = headers
+        .get("X-Alhalte-Wrapped-Key")
+        .and_then(|v| v.to_str().ok())
+    {
+        upstream_headers.push(("X-Alhalte-Wrapped-Key", wrapped_key.to_string()));
+    }
+    if let Some(content_type) = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+    {
+        upstream_headers.push(("Content-Type", content_type.to_string()));
+    }
+
+    let upstream_method = if method == Method::PUT {
+        reqwest::Method::PUT
+    } else {
+        reqwest::Method::POST
+    };
+
+    forward_cellar_request(
+        proxy,
+        upstream_method,
+        &format!("/store/{tin_id}"),
+        upstream_headers,
+        Some(body),
+    )
+    .await
+}
+
+/// Handles `GET /api/cellar/tin/{tin_id}` (cellar `GET /tin/{tin_id}`).
+///
+/// The raw tin bytes and the `X-Alhalte-Wrapped-Key` response header are
+/// forwarded so `pantry` can decrypt with the room key.
+async fn cellar_download_handler(
+    State(state): State<AppState>,
+    AxumPath(tin_id): AxumPath<String>,
+    headers: HeaderMap,
+    Query(query): Query<CellarProxyQuery>,
+) -> Response {
+    let Some(proxy) = state.cellar.as_ref() else {
+        return proxy_not_configured_response();
+    };
+
+    let Some(tin_id) = normalize_tin_id(&tin_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "tin_id must be 64 hex characters" })),
+        )
+            .into_response();
+    };
+
+    let caller = match resolve_caller(&state, &headers, &query) {
+        Ok(caller) => caller,
+        Err(err) => return auth_error_response(err),
+    };
+
+    forward_cellar_request(
+        proxy,
+        reqwest::Method::GET,
+        &format!("/tin/{tin_id}"),
+        owner_headers(&caller),
+        None,
+    )
+    .await
 }
