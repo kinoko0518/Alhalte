@@ -75,11 +75,11 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
     pieceBtn?.click();
     expect(toggledPieceId).toBe('char-warrior');
 
-    // Verify "駒を削除" IconButton
+    // Verify "キャラクターを削除" IconButton
     const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-warrior"]');
     expect(deleteBtn).toBeTruthy();
     expect(deleteBtn?.classList.contains('np-icon-button')).toBe(true);
-    expect(deleteBtn?.getAttribute('aria-label')).toBe('駒を削除');
+    expect(deleteBtn?.getAttribute('aria-label')).toBe('キャラクターを削除');
     expect(deleteBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('delete');
 
     deleteBtn?.click();

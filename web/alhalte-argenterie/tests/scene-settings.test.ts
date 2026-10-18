@@ -188,7 +188,7 @@ describe('Scene Settings & Juices', () => {
     expect(slider2?.closest('.np-slider')).toBeTruthy();
     expect(slider3?.closest('.np-slider')).toBeTruthy();
 
-    // Check Management heading and buttons (Issue #57: Move members L button & Square L action buttons)
+    // Check Management heading and buttons (Issue #57: Move members M button & Square M action buttons)
     expect(target.querySelector('[data-testid="heading-management"]')).toBeTruthy();
     const colCreate = target.querySelector<HTMLElement>('[data-testid="action-col-create"]');
     const colDeleteLogs = target.querySelector<HTMLElement>('[data-testid="action-col-delete-logs"]');
@@ -202,15 +202,15 @@ describe('Scene Settings & Juices', () => {
     const deleteLogsBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-logs-btn"]');
     const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-scene-btn"]');
     expect(moveBtn?.classList.contains('np-button')).toBe(true);
-    expect(moveBtn?.classList.contains('l')).toBe(true);
+    expect(moveBtn?.classList.contains('m')).toBe(true);
     expect(createBtn?.classList.contains('np-button')).toBe(true);
-    expect(createBtn?.classList.contains('l')).toBe(true);
+    expect(createBtn?.classList.contains('m')).toBe(true);
     expect(createBtn?.classList.contains('square')).toBe(true);
     expect(deleteLogsBtn?.classList.contains('np-button')).toBe(true);
-    expect(deleteLogsBtn?.classList.contains('l')).toBe(true);
+    expect(deleteLogsBtn?.classList.contains('m')).toBe(true);
     expect(deleteLogsBtn?.classList.contains('square')).toBe(true);
     expect(deleteBtn?.classList.contains('np-button')).toBe(true);
-    expect(deleteBtn?.classList.contains('l')).toBe(true);
+    expect(deleteBtn?.classList.contains('m')).toBe(true);
     expect(deleteBtn?.classList.contains('square')).toBe(true);
     expect(deleteBtn?.classList.contains('delete-scene-tonal-btn')).toBe(true);
 

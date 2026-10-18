@@ -96,8 +96,8 @@ describe('App Layout (Material 3 Expressive)', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/footer シーン管理タブを廃止しシーングラフタブを「シーンタブ」に改名 (Issue #30)
-  it('renders 5 tabs in the control panel footer with シーンタブ and without シーン管理タブ', () => {
+  // spec: alhalte-argenterie/footer シーン管理タブとシーングラフタブの名称 (Issue #93)
+  it('renders 5 tabs in the control panel footer with シーングラフタブ and シーン管理タブ', () => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1200 });
     Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
 
@@ -119,9 +119,13 @@ describe('App Layout (Material 3 Expressive)', () => {
 
     const sceneTabBtn = target.querySelector('[data-testid="tab-btn-graph"]');
     expect(sceneTabBtn).toBeTruthy();
-    expect(sceneTabBtn?.textContent?.trim()).toBe('シーンタブ');
+    expect(sceneTabBtn?.textContent?.trim()).toBe('シーングラフタブ');
 
-    // Scene management tab button must not exist
+    const settingsTabBtn = target.querySelector('[data-testid="tab-btn-settings"]');
+    expect(settingsTabBtn).toBeTruthy();
+    expect(settingsTabBtn?.textContent?.trim()).toBe('シーン管理タブ');
+
+    // Deprecated scene management tab button must not exist
     expect(target.querySelector('[data-testid="tab-btn-scenes"]')).toBeNull();
 
     unmount(instance);

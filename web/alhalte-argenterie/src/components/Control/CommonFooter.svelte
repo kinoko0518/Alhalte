@@ -95,8 +95,8 @@
 
   const tabItems: Array<{ id: ActiveTab; icon: string; label: string; fullLabel: string }> = [
     { id: 'log', icon: 'forum', label: 'ログ', fullLabel: 'ログタブ' },
-    { id: 'graph', icon: 'account_tree', label: 'シーン', fullLabel: 'シーンタブ' },
-    { id: 'settings', icon: 'tune', label: '設定', fullLabel: 'シーン設定タブ' },
+    { id: 'graph', icon: 'account_tree', label: 'シーングラフ', fullLabel: 'シーングラフタブ' },
+    { id: 'settings', icon: 'tune', label: 'シーン管理', fullLabel: 'シーン管理タブ' },
     { id: 'characters', icon: 'group', label: 'キャラクター', fullLabel: 'キャラクター管理タブ' },
     { id: 'extensions', icon: 'extension', label: '拡張機能', fullLabel: '拡張機能管理タブ' },
   ];
