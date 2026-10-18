@@ -47,7 +47,7 @@
     onDeleteCharacter,
     onTogglePiece,
     onUpdateExtensions,
-    onUploadExtension,
+    onRegisterExtension,
     onExportZip,
     onCollapse,
     roomId,
@@ -66,6 +66,7 @@
     onRefreshCharacters,
     pendingCharacterCount,
     roomSocket = null,
+    roomKey,
     connectionState,
     sceneActionPending = null,
     sceneActionError = null,
@@ -94,7 +95,8 @@
     onDeleteCharacter?: (characterId: string) => void;
     onTogglePiece?: (characterId: string) => void;
     onUpdateExtensions?: (extensions: ExtensionItem[]) => void;
-    onUploadExtension?: () => void;
+    /** Registers downloaded / uploaded wasm with the pipeline (Issue #109 / #145). */
+    onRegisterExtension?: (id: string, wasmBytes: Uint8Array) => void;
     onExportZip?: (type: 'full' | 'logs') => void;
     onCollapse?: () => void;
     roomId?: string;
@@ -125,6 +127,11 @@
      * `SceneSettingsTab` (acknowledged BGM state changes, Issue #109 / #142).
      */
     roomSocket?: RoomSocket | null;
+    /**
+     * Forwarded to `ExtensionManagementTab`: 32-byte room key for the wasm
+     * cellar transfer (Issue #109 / sub-issue #145).
+     */
+    roomKey?: Uint8Array | null;
     /** Forwarded to `LogTab`: retries a queued log load when it becomes `connected`. */
     connectionState?: ConnectionState;
     /**
@@ -255,8 +262,11 @@
       <ExtensionManagementTab
         {extensions}
         {isAdmin}
+        {roomSocket}
+        {connectionState}
+        {roomKey}
         {onUpdateExtensions}
-        {onUploadExtension}
+        {onRegisterExtension}
       />
     {/if}
   </div>

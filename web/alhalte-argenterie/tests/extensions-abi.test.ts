@@ -17,6 +17,7 @@ import ExtensionManagementTab from '../src/components/Control/tabs/ExtensionMana
 import type { ExtensionItem } from '../src/types/index.js';
 import { buildGenerastFromText } from '../src/utils/generast.js';
 import { renderGenerast } from '../src/utils/saignant.js';
+import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
 
 // Valid WebAssembly binary implementing:
 // - memory (1 page)
@@ -367,6 +368,9 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
       props: {
         extensions,
         isAdmin: true,
+        // The tab is inert when it has no socket (Issue #109 / #145), so drive
+        // the menu on a connected one.
+        roomSocket: asRoomSocket(new FakeRoomSocket()),
       },
     });
 

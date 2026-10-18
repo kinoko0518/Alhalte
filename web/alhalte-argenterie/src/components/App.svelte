@@ -48,6 +48,7 @@
     tinToJson,
   } from '../utils/roomSocket.js';
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
+  import { getRoomKeyFromLocation } from '../utils/cellarTransfer.js';
   import {
     getRoomPermissions,
     getSavedAccountId,
@@ -73,6 +74,7 @@
     debugMode,
     debugAlwaysShow = false,
     roomSocket: customRoomSocket,
+    roomKey,
   }: {
     initialRoom?: VisitedRoom | null;
     initialScenes?: Scene[];
@@ -90,6 +92,12 @@
     debugMode?: boolean;
     debugAlwaysShow?: boolean;
     roomSocket?: RoomSocket;
+    /**
+     * 32-byte room key used to encrypt / decrypt extension wasm in the cellar
+     * (Issue #109 / sub-issue #145). Defaults to the URL fragment; tests and
+     * embedders can inject one.
+     */
+    roomKey?: Uint8Array | null;
   } = $props();
 
   let activeConnectionManager = $derived(customConnectionManager ?? defaultConnectionManager);
@@ -167,7 +175,21 @@
   );
   let movements = $state<SceneMovementEvent[]>(initialMovements);
   let selectedCharacterId = $state<string | undefined>(characters[0]?.id);
-  let extensionFileInput: HTMLInputElement | null = $state(null);
+
+  /**
+   * Room key used for extension wasm cellar transfers (Issue #109 / #145).
+   *
+   * Defaults to the URL fragment (`#<64 hex>`), never leaves the browser.
+   */
+  let extensionRoomKey = $derived(
+    roomKey === undefined ? getRoomKeyFromLocation() : roomKey,
+  );
+  /**
+   * True once the extension tab handed back an authoritative list. It stops the
+   * asynchronous `loadDefaultExtensions()` fallback from overwriting metadata
+   * that was already merged from the server.
+   */
+  let extensionStateApplied = false;
 
   let accessibleSceneIds = $derived.by(() => {
     return new Set(scenes.map((s) => s.id));
@@ -378,9 +400,22 @@
     updateOrientation();
     if (initialExtensions.length === 0) {
       loadDefaultExtensions().then((loaded) => {
-        if (loaded.length > 0) {
+        if (loaded.length === 0) return;
+        if (!extensionStateApplied) {
           extensions = loaded;
+          return;
         }
+        // The tab already merged the room state. Keep that authoritative list
+        // and only fill in wasm bodies it does not have yet (the manifest is the
+        // only source of the official `.wasm` files).
+        const loadedById = new Map(loaded.map((ext) => [ext.id, ext]));
+        extensions = extensions.map((ext) => {
+          const official = loadedById.get(ext.id);
+          if (!ext.wasmBytes && official?.wasmBytes) {
+            return { ...ext, wasmBytes: official.wasmBytes };
+          }
+          return ext;
+        });
       });
     }
     if (typeof window !== 'undefined') {
@@ -1571,37 +1606,42 @@
     roomSocket?.updateState(id, 'view::transform', t);
   }
 
-  function handleUploadExtension() {
-    if (isViewer) return;
-    extensionFileInput?.click();
+  // ---------------------------------------------------------------------------
+  // Extension synchronization (Issue #109 / sub-issue #145)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Replaces the extension list after the tab got every server acknowledgement.
+   *
+   * `extensions` stays the single source of truth: the tab never mutates it
+   * directly, and this handler is the only writer for server-backed changes.
+   * Pipeline registrations of deleted ids are dropped so a removed extension
+   * cannot keep executing from a stale instance.
+   */
+  function handleUpdateExtensions(next: ExtensionItem[]): void {
+    if (!Array.isArray(next)) return;
+    extensionStateApplied = true;
+
+    const nextIds = new Set(next.map((ext) => ext.id));
+    for (const previous of extensions) {
+      if (!nextIds.has(previous.id)) {
+        extensionPipeline.unregisterInstance(previous.id);
+      }
+    }
+    extensions = next;
   }
 
-  async function handleExtensionFileChange(e: Event) {
-    const input = e.currentTarget as HTMLInputElement;
-    const file = input.files?.[0];
-    if (!file) return;
-
+  /**
+   * Registers a downloaded / uploaded wasm instance with the pipeline so the
+   * extension can actually run even when its bytes never came from
+   * `loadDefaultExtensions`.
+   */
+  async function handleRegisterExtension(id: string, wasmBytes: Uint8Array): Promise<void> {
     try {
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      const instance = await WasmExtensionInstance.instantiate(bytes);
-      const intro = instance.selfIntroduction();
-      const id = `ext-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+      const instance = await WasmExtensionInstance.instantiate(wasmBytes);
       extensionPipeline.registerInstance(id, instance);
-
-      const newExt: ExtensionItem = {
-        id,
-        name: intro?.name || file.name.replace(/\.wasm$/i, ''),
-        iconSvg: intro?.iconSvg,
-        description: intro?.description,
-        enabled: true,
-        priority: extensions.length,
-        wasmBytes: bytes,
-      };
-      extensions = [...extensions, newExt];
     } catch (err) {
-      console.error('Failed to load uploaded extension wasm:', err);
-    } finally {
-      input.value = '';
+      console.error(`Failed to instantiate the extension "${id}":`, err);
     }
   }
 
@@ -1683,15 +1723,6 @@
 </script>
 
 <div class="alhalte-app-root" data-testid="alhalte-app">
-  <input
-    type="file"
-    accept=".wasm,application/wasm"
-    bind:this={extensionFileInput}
-    onchange={handleExtensionFileChange}
-    style="display: none;"
-    data-testid="extension-file-input"
-  />
-
   <!-- Server connection / offline detection indicator placed in flow above panels on y-axis (Issue #111) -->
   <OfflineIndicator
     connectionState={currentConnectionState}
@@ -1790,8 +1821,9 @@
                   onCreateCharacter={handleCreateCharacter}
                   onDeleteCharacter={handleDeleteCharacter}
                   onTogglePiece={handleTogglePiece}
-                  onUpdateExtensions={(exts) => (extensions = exts)}
-                  onUploadExtension={handleUploadExtension}
+                  onUpdateExtensions={handleUpdateExtensions}
+                  onRegisterExtension={handleRegisterExtension}
+                  roomKey={extensionRoomKey}
                   onSendMessage={handleSendMessage}
                   onRequestDeleteScene={handleRequestDeleteScene}
                   onRequestDeleteSceneLogs={handleRequestDeleteSceneLogs}
@@ -1883,8 +1915,9 @@
                 onCreateCharacter={handleCreateCharacter}
                 onDeleteCharacter={handleDeleteCharacter}
                 onTogglePiece={handleTogglePiece}
-                onUpdateExtensions={(exts) => (extensions = exts)}
-                onUploadExtension={handleUploadExtension}
+                onUpdateExtensions={handleUpdateExtensions}
+                onRegisterExtension={handleRegisterExtension}
+                roomKey={extensionRoomKey}
                 onSendMessage={handleSendMessage}
                 onRequestDeleteScene={handleRequestDeleteScene}
                 onRequestDeleteSceneLogs={handleRequestDeleteSceneLogs}

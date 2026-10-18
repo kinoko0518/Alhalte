@@ -17,9 +17,13 @@
  *   to `false` to drive them manually via {@link FakeRoomSocket.resolveLogBiblio}
  *   / {@link FakeRoomSocket.resolveLogChunk}.
  * - `queryState` / `requestUpdateState` / `requestDeleteState` — the room asset
- *   metadata path (Issue #109 / sub-issue #141) and the BGM state path
- *   (Issue #109 / sub-issue #142). Queries answer with
- *   {@link FakeRoomSocket.stateSnapshot}; writes resolve immediately unless
+ *   metadata path (Issue #109 / sub-issue #141), the BGM state path
+ *   (Issue #109 / sub-issue #142) and the extension state path
+ *   (Issue #109 / sub-issue #145). Queries answer with
+ *   {@link FakeRoomSocket.stateSnapshot} unless
+ *   {@link FakeRoomSocket.autoAnswerStateQueries} is off, in which case the test
+ *   settles them through {@link FakeRoomSocket.resolveStateQuery} /
+ *   {@link FakeRoomSocket.rejectStateQuery}; writes resolve immediately unless
  *   {@link FakeRoomSocket.autoAnswerStateWrites} is off, in which case the test
  *   settles them through {@link FakeRoomSocket.resolveStateWrite} /
  *   {@link FakeRoomSocket.rejectStateWrite} /
@@ -49,7 +53,7 @@
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`, `### アセット`
- * - GitHub Issue #109 / sub-issue #139, #140, #141, #142, #143, #144
+ * - GitHub Issue #109 / sub-issue #139, #140, #141, #142, #143, #144, #145
  */
 import type { ChunkLogManager } from '../../src/utils/log.js';
 import type { RoomSocket } from '../../src/utils/roomSocket.js';
@@ -193,6 +197,13 @@ export class FakeRoomSocket {
   /** Scene state answered by `queryState` (already Tin-decoded values). */
   stateSnapshot: Record<string, unknown> = {};
   /**
+   * When `true` (the default) `queryState` resolves immediately with
+   * {@link FakeRoomSocket.stateSnapshot}. Set to `false` to hold the tab-open
+   * query and settle it through {@link FakeRoomSocket.resolveStateQuery} /
+   * {@link FakeRoomSocket.rejectStateQuery} (Issue #109 / #145).
+   */
+  autoAnswerStateQueries = true;
+  /**
    * When `true` (the default) state writes / deletes resolve immediately.
    * Set to `false` to drive them with {@link FakeRoomSocket.resolveStateWrite}
    * / {@link FakeRoomSocket.rejectStateWrite} /
@@ -253,6 +264,11 @@ export class FakeRoomSocket {
   }> = [];
   private readonly pendingLogQueries: PendingLogQuery[] = [];
   private readonly pendingStateOperations: PendingStateOperation[] = [];
+  private readonly pendingStateQueries: Array<{
+    sceneId: string;
+    resolve: (value: Record<string, unknown>) => void;
+    reject: (error: unknown) => void;
+  }> = [];
   private readonly pendingChangeBgmOperations: PendingChangeBgmOperation[] = [];
   private readonly pendingSceneActions: PendingSceneAction[] = [];
   private readonly pendingListCharacterQueries: Array<{
@@ -291,11 +307,54 @@ export class FakeRoomSocket {
   deleteState(): void {}
 
   /**
-   * Answers a scene state query with {@link FakeRoomSocket.stateSnapshot}.
+   * Answers a scene state query with {@link FakeRoomSocket.stateSnapshot}, or
+   * holds it when {@link FakeRoomSocket.autoAnswerStateQueries} is off.
    */
   queryState(sceneId: string): Promise<Record<string, unknown>> {
     this.queryStateCalls.push({ sceneId });
-    return Promise.resolve({ ...this.stateSnapshot });
+    if (this.autoAnswerStateQueries) {
+      return Promise.resolve({ ...this.stateSnapshot });
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingStateQueries.push({ sceneId, resolve, reject });
+    });
+  }
+
+  /** Number of scene state queries held for a manual answer. */
+  get pendingStateQueryCount(): number {
+    return this.pendingStateQueries.length;
+  }
+
+  /**
+   * Resolves the oldest held `queryState` call (optionally one for `sceneId`)
+   * with the given decoded state map.
+   */
+  resolveStateQuery(states: Record<string, unknown>, sceneId?: string): void {
+    this.takeStateQuery(sceneId).resolve({ ...states });
+  }
+
+  /**
+   * Rejects the oldest held `queryState` call (e.g. with an
+   * `OperationTimeoutError`), simulating the offline state.
+   */
+  rejectStateQuery(error: unknown, sceneId?: string): void {
+    this.takeStateQuery(sceneId).reject(error);
+  }
+
+  private takeStateQuery(sceneId?: string): {
+    sceneId: string;
+    resolve: (value: Record<string, unknown>) => void;
+    reject: (error: unknown) => void;
+  } {
+    const index = this.pendingStateQueries.findIndex(
+      (query) => sceneId === undefined || query.sceneId === sceneId,
+    );
+    if (index < 0) {
+      throw new Error(
+        `FakeRoomSocket: no pending state query${sceneId ? ` (${sceneId})` : ''}`,
+      );
+    }
+    return this.pendingStateQueries.splice(index, 1)[0];
   }
 
   /**
