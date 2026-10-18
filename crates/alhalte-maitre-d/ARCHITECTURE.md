@@ -24,6 +24,9 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | `GET` / `POST` | `/api/room/{room_id}/permissions` | 部屋の権限一覧取得・追加/更新。 |
 | `DELETE` | `/api/room/{room_id}/permissions/{account_id}` | 権限削除。 |
 | `GET` | `/api/room/{room_id}/export/zip?type=full|logs` | 部屋またはログの ZIP。 |
+| `POST` | `/api/cellar/store` | 認証付き cellar proxy。cellar の `POST /store`（210/211/212 の store check）へ転送する。 |
+| `POST` / `PUT` | `/api/cellar/store/{tin_id}` | 認証付き cellar proxy。Tin 本体を cellar の `POST` / `PUT /store/{tin_id}` へ転送する。 |
+| `GET` | `/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。本体と `X-Alhalte-Wrapped-Key` を返す。 |
 | `POST` | `/api/debug/account` | debug ビルドのみ。`sub = "0"` の account を作る。 |
 
 `/accounts/search`、`/room/{room_id}/permissions`、`/room/{room_id}/export/zip` など、`/api` なしの別名も登録されている。CORS は `CorsLayer::permissive()`。
@@ -46,6 +49,9 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | Google OAuth | `accounts.google.com` の認可 URL、`oauth2.googleapis.com/token`、`tokeninfo`。 |
 | `alhalte-banquette` | UNIX ソケット。`ProcessBanquetteSpawner` または `InProcessBanquetteSpawner` が起動し、長さ前置 postcard で通信する。 |
 | `alhalte-kitchen` | ZIP export のためにライブラリとして呼ぶ。 |
+| `alhalte-cellar` | `--cellar-url` を base に `/api/cellar/*` を HTTP で転送する（`CellarProxy`）。 |
+
+`/api/cellar/store`、`/api/cellar/store/{tin_id}` は Axum 既定の 2 MiB を超える Tin（アセット・拡張 wasm）を通すため、`DefaultBodyLimit::max(64 MiB)` を route 単位で設定する。他の route は既定のまま。
 
 CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--unix-socket`。
 
@@ -87,7 +93,15 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 6. クライアントからの `ClientFrame` は JSON または postcard で受け取り、viewer の mutate を遮断してから bridge へ渡す。
 7. banquette からの `ServerFrame` は client_id 宛、scene 宛、room 全体宛に振り分ける。
 
-`is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetDone`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter` を mutate とみなす。
+`is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetDone`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter`、`ChangeBgm` を mutate とみなす。
+
+### cellar proxy
+
+1. `resolve_caller` が Cookie `session_id` / クエリ / ヘッダから session を解決し、DB から account を引く。リクエストの `owner` / `session_id` は使わない。
+2. `/api/cellar/store` の JSON body は `owner` / `session_id` を session 由来の値で上書きしてから cellar へ送る。クライアントは owner を詐称できない。
+3. `/api/cellar/store/{tin_id}` は `X-Alhalte-Owner` / `X-Alhalte-Session-Id` を付与し、`X-Alhalte-Wrapped-Key` と `Content-Type` を透過する。`tin_id` は 64 hex を検証してから転送する。
+4. `GET /api/cellar/tin/{tin_id}` は `X-Alhalte-Wrapped-Key` をレスポンスへ透過する。
+5. 上流の status / body はそのまま返し、接続失敗は 502、timeout は 504 に変換して内部 URL を漏らさない。cellar 未設定時は 503。
 
 ### 権限管理
 
@@ -123,4 +137,5 @@ room_permissions(room_id TEXT, account_id INTEGER, role TEXT, created_at INTEGER
 - `RoomBridgeManager` の `room_done_status` は in-memory で、再起動すると失われる。永続化は `banquette` の room state 側に委ねる。
 - debug account は `encrypted_sub = "0"` で作られ、`decrypt_sub` も `"0"` を特別扱いする。debug ビルド限定。
 - CORS は permissive。本番運用では reverse proxy 側で制限する前提。
+- cellar proxy はリクエスト / レスポンスを全量メモリにバッファする（`reqwest` / `Bytes`、上限 64 MiB）。大きな Tin ほど maitre-d のメモリを消費する。
 
