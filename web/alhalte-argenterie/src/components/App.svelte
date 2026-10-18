@@ -1189,9 +1189,11 @@
   }
   .bottom-sheet-content-wrapper {
     height: 100%;
-    min-height: calc(100vh - 56px);
+    max-height: 100%;
+    min-height: 0;
     display: flex;
     flex-direction: column;
+    flex: 1;
     overflow: hidden;
   }
   .reopen-sheet-floating.portrait-reopen {
