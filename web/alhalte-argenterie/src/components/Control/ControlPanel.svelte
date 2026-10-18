@@ -62,6 +62,9 @@
     onRequestDeleteCharacter,
     onRequestAssetPicker,
     onRequestEditCharacter,
+    onRequestCreateCharacter,
+    onRefreshCharacters,
+    pendingCharacterCount,
     roomSocket = null,
     connectionState,
     sceneActionPending = null,
@@ -111,6 +114,12 @@
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
     onRequestEditCharacter?: (char: Character) => void;
+    /** Forwards a new-character draft to the hoisted root editor (Issue #109 / #144). */
+    onRequestCreateCharacter?: (draft: Character) => void;
+    /** Hands the authoritative `ListCharacters` result back to `App` (Issue #109 / #144). */
+    onRefreshCharacters?: (characters: Character[]) => void;
+    /** Forwards the `character` outbox count to the tab's queue notice (Issue #109 / #144). */
+    pendingCharacterCount?: number;
     /**
      * Forwarded to `LogTab` (eager latest-chunk load, Issue #109 / #140) and to
      * `SceneSettingsTab` (acknowledged BGM state changes, Issue #109 / #142).
@@ -236,6 +245,11 @@
         {onRequestDeleteCharacter}
         {onRequestAssetPicker}
         {onRequestEditCharacter}
+        {onRequestCreateCharacter}
+        {onRefreshCharacters}
+        {pendingCharacterCount}
+        {roomSocket}
+        {roomId}
       />
     {:else if activeTab === 'extensions'}
       <ExtensionManagementTab

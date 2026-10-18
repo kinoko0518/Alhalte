@@ -47,7 +47,7 @@
     parseCharacter,
     tinToJson,
   } from '../utils/roomSocket.js';
-  import { getOutbox } from '../utils/outbox.js';
+  import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
   import {
     getRoomPermissions,
     getSavedAccountId,
@@ -239,8 +239,40 @@
 
   let activeCharacterEdit = $state<Character | null>(null);
 
+  /** Opens the hoisted editor on an existing character. */
   function handleRequestEditCharacter(char: Character) {
     activeCharacterEdit = char;
+    characterEditIsNew = false;
+    characterSaveError = null;
+    characterSaving = false;
+  }
+
+  /**
+   * Opens the hoisted editor on a brand-new draft (Issue #109 / #144).
+   *
+   * Nothing is created or sent yet: the character enters the model only after
+   * the server allocates an id (or after the outbox flush does).
+   */
+  function handleRequestCreateCharacter(draft: Character) {
+    if (isViewer) return;
+    activeCharacterEdit = draft;
+    characterEditIsNew = true;
+    characterSaveError = null;
+    characterSaving = false;
+  }
+
+  /** Closes the root editor and clears its transient save state. */
+  function closeCharacterEditPanel() {
+    activeCharacterEdit = null;
+    characterEditIsNew = false;
+    characterSaveError = null;
+    characterSaving = false;
+  }
+
+  /** `onClose` of the root editor: a save in flight cannot be cancelled. */
+  function handleCloseCharacterEdit() {
+    if (characterSaving) return;
+    closeCharacterEditPanel();
   }
 
   const chunkManager = new ChunkLogManager();
@@ -487,6 +519,11 @@
     isFlushingOutbox = true;
     try {
       await getOutbox().flush(roomId, async (entry) => {
+        if (entry.kind === 'character') {
+          // Character CRUD, queued while offline or after a save timeout
+          // (Issue #109 / sub-issue #144).
+          return flushCharacterOutboxEntry(entry);
+        }
         if (entry.kind !== 'message') {
           // Other kinds are owned by the features that queued them.
           return false;
@@ -513,6 +550,7 @@
     } finally {
       isFlushingOutbox = false;
       await refreshPendingMessageCount();
+      await refreshPendingCharacterCount();
     }
   }
 
@@ -535,6 +573,214 @@
       return;
     }
     void refreshPendingMessageCount();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Character synchronization (Issue #109 / sub-issue #144)
+  // ---------------------------------------------------------------------------
+  /** Number of character operations waiting in the durable outbox. */
+  let pendingCharacterCount = $state(0);
+  /** True from the save request until its acknowledgement (or queue fallback). */
+  let characterSaving = $state(false);
+  /** Non-retryable save failure rendered inside the still-open edit panel. */
+  let characterSaveError = $state<string | null>(null);
+  /** True while the root edit panel edits a draft that was never sent. */
+  let characterEditIsNew = $state(false);
+
+  /** Payload persisted in a `kind: 'character'` outbox entry. */
+  type QueuedCharacterPayload = {
+    operation: 'create' | 'update' | 'delete';
+    character?: Character;
+    characterId?: string;
+  };
+
+  const CHARACTER_SAVE_FAILED_MESSAGE = '保存できませんでした。時間をおいて再試行してください。';
+  const CHARACTER_PERMISSION_DENIED_MESSAGE = 'キャラクターを編集する権限がありません。';
+
+  /** True for a server rejection that retrying will not fix. */
+  function isPermissionDeniedError(err: unknown): boolean {
+    return err instanceof ServerOperationError && err.code === 'PermissionDenied';
+  }
+
+  /**
+   * True when the operation is worth replaying later: a timeout, a socket that
+   * dropped before the ack, or any other server error except permission denial.
+   * Mirrors the send-path classification in {@link handleSendMessage}.
+   */
+  function isRetryableCharacterError(err: unknown): boolean {
+    return (
+      err instanceof OperationTimeoutError ||
+      (err instanceof ServerOperationError && !isPermissionDeniedError(err))
+    );
+  }
+
+  /** Reads the server-allocated id from a `CharacterCreated` / `CharacterUpdated` ack. */
+  function serverCharacterId(
+    ack: { character_id?: unknown } | null | undefined,
+    fallback: string,
+  ): string {
+    const id = ack?.character_id;
+    return typeof id === 'number' || typeof id === 'string' ? String(id) : fallback;
+  }
+
+  /**
+   * Re-reads how many `kind: 'character'` entries the active room has queued and
+   * republishes the count for the tab's `OfflineQueueNotice`.
+   */
+  async function refreshPendingCharacterCount(): Promise<void> {
+    const roomId = getActiveRoomId();
+    if (!roomId) {
+      pendingCharacterCount = 0;
+      return;
+    }
+    try {
+      const pending = await getOutbox().list(roomId, 'character');
+      pendingCharacterCount = pending.length;
+    } catch (err) {
+      console.warn('Failed to read the character outbox:', err);
+    }
+  }
+
+  /**
+   * Persists a character operation that could not be delivered into the durable
+   * outbox (30-day TTL, see `outbox.ts`) and refreshes the queue notice count.
+   *
+   * Returns `false` when persistence itself failed; the caller then keeps the
+   * edit panel open instead of silently losing the edit.
+   */
+  async function queueCharacterOperation(
+    roomId: string,
+    payload: QueuedCharacterPayload,
+  ): Promise<boolean> {
+    try {
+      await getOutbox().enqueue({ roomId, kind: 'character', payload });
+    } catch (err) {
+      console.error('Failed to queue the character operation:', err);
+      return false;
+    }
+    await refreshPendingCharacterCount();
+    return true;
+  }
+
+  /** Replaces the local list with the authoritative `CharacterList`. */
+  function applyCharacterList(list: Character[]): void {
+    // Replace even when the list is empty: the server list is authoritative and
+    // a room may legitimately end up with zero characters.
+    characters = list;
+    // Keep the selected character valid (or fall back to the first one).
+    if (!selectedCharacterId || !characters.some((c) => c.id === selectedCharacterId)) {
+      selectedCharacterId = characters[0]?.id;
+    }
+  }
+
+  /** Applies an acknowledged creation, replacing the draft id with the server id. */
+  function applyCreatedCharacter(draft: Character, serverId: string): void {
+    const created: Character = { ...draft, id: serverId };
+    const index = characters.findIndex((c) => c.id === serverId || c.id === draft.id);
+    if (index >= 0) {
+      characters = characters.map((c, i) => (i === index ? created : c));
+    } else {
+      characters = [...characters, created];
+    }
+    if (!selectedCharacterId || selectedCharacterId === draft.id) {
+      selectedCharacterId = serverId;
+    }
+    // Legacy `handleCreateCharacter` also joined the current scene; keep parity
+    // now that the membership change happens only after the ack.
+    if (!currentScene.members.includes(serverId)) {
+      currentScene.members.push(serverId);
+    }
+  }
+
+  /** Applies an acknowledged update, replacing the record by id. */
+  function applyUpdatedCharacter(character: Character, serverId: string = character.id): void {
+    const updated: Character = { ...character, id: serverId };
+    const index = characters.findIndex((c) => c.id === character.id || c.id === serverId);
+    if (index >= 0) {
+      characters = characters.map((c, i) => (i === index ? updated : c));
+    } else {
+      characters = [...characters, updated];
+    }
+    if (selectedCharacterId === character.id) selectedCharacterId = serverId;
+  }
+
+  /** Removes a character and its scene memberships from the local model. */
+  function removeCharacterLocally(characterId: string): void {
+    characters = characters.filter((c) => c.id !== characterId);
+    for (const sc of scenes) {
+      sc.members = sc.members.filter((id) => id !== characterId);
+    }
+    if (selectedCharacterId === characterId) {
+      selectedCharacterId = characters[0]?.id;
+    }
+  }
+
+  /**
+   * Replays one queued `kind: 'character'` entry from the outbox.
+   *
+   * Returns `true` only after the server acknowledgement, which lets
+   * `Outbox.flush` delete the entry. A retryable failure returns `false` (the
+   * entry stays queued for the next reconnect); a non-retryable failure throws,
+   * which also leaves it queued — mirroring the message flush contract.
+   */
+  async function flushCharacterOutboxEntry(entry: OutboxEntry): Promise<boolean> {
+    const payload = entry.payload as QueuedCharacterPayload | null | undefined;
+    const operation = payload?.operation;
+    const socket = roomSocket;
+    if (!socket || !socket.isConnected) {
+      // No ack possible: keep the entry queued.
+      throw new Error('room socket is not connected');
+    }
+
+    try {
+      if (operation === 'create') {
+        const character = payload?.character;
+        if (!character || typeof character !== 'object') {
+          console.warn('Dropping a malformed outbox character entry:', entry.id);
+          return true;
+        }
+        const ack = await socket.requestCreateCharacter(character);
+        applyCreatedCharacter(character, serverCharacterId(ack, character.id));
+        return true;
+      }
+      if (operation === 'update') {
+        const character = payload?.character;
+        if (!character || typeof character !== 'object') {
+          console.warn('Dropping a malformed outbox character entry:', entry.id);
+          return true;
+        }
+        const ack = await socket.requestUpdateCharacter(Number(character.id), character);
+        applyUpdatedCharacter(character, serverCharacterId(ack, character.id));
+        return true;
+      }
+      if (operation === 'delete') {
+        const characterId = payload?.characterId;
+        if (typeof characterId !== 'string' || characterId.length === 0) {
+          console.warn('Dropping a malformed outbox character entry:', entry.id);
+          return true;
+        }
+        await socket.requestDeleteCharacter(Number(characterId));
+        removeCharacterLocally(characterId);
+        return true;
+      }
+      // Unknown operation: nothing can replay it, so drop it instead of
+      // blocking every later entry forever.
+      console.warn('Dropping an unknown outbox character entry:', entry.id, operation);
+      return true;
+    } catch (err) {
+      if (isRetryableCharacterError(err)) return false;
+      throw err;
+    }
+  }
+
+  // Keep the character queue notice count in sync with the active room.
+  $effect(() => {
+    const roomId = currentRoom?.id || (currentRoom as any)?.roomId;
+    if (!roomId) {
+      pendingCharacterCount = 0;
+      return;
+    }
+    void refreshPendingCharacterCount();
   });
 
   // Persist the room log cache from a `chunkManager` subscription: the
@@ -871,19 +1117,12 @@
             charList.push(parseCharacter(id, raw));
           }
         }
-        if (charList.length > 0) {
-          characters = charList;
-          if (!selectedCharacterId && characters.length > 0) {
-            selectedCharacterId = characters[0].id;
-          }
-        }
+        // The server list is authoritative: replace even when it is empty
+        // (Issue #109 / #144) and keep the selection valid.
+        applyCharacterList(charList);
       }
       if ('CharacterDeleted' in frame) {
-        const idStr = String(frame.CharacterDeleted.character_id);
-        characters = characters.filter((c) => c.id !== idStr);
-        for (const sc of scenes) {
-          sc.members = sc.members.filter((id) => id !== idStr);
-        }
+        removeCharacterLocally(String(frame.CharacterDeleted.character_id));
       }
       if ('StateUpdated' in frame) {
         const { scene_id, key, value } = frame.StateUpdated;
@@ -1166,6 +1405,11 @@
     roomSocket?.updateState(currentScene.id, `piece::${characterId}::pos`, position);
   }
 
+  /**
+   * Legacy optimistic create (no server ack), kept for the tab's standalone
+   * inline editor fallback. The hoisted editor goes through
+   * {@link handleSaveCharacter} instead.
+   */
   function handleCreateCharacter(char: Character) {
     if (isViewer) return;
     characters.push(char);
@@ -1176,6 +1420,7 @@
     roomSocket?.createCharacter(Number.isNaN(numId) ? Date.now() : numId, char);
   }
 
+  /** Legacy optimistic update, kept for the tab's standalone inline editor fallback. */
   function handleUpdateCharacter(char: Character) {
     if (isViewer) return;
     characters = characters.map((c) => (c.id === char.id ? char : c));
@@ -1183,14 +1428,140 @@
     roomSocket?.updateCharacter(Number.isNaN(numId) ? 0 : numId, char);
   }
 
-  function handleDeleteCharacter(charId: string) {
+  /**
+   * Saves the hoisted editor's character (Issue #109 / sub-issue #144).
+   *
+   * - No room id and no socket: legacy local create/update (standalone tests).
+   * - Connected: the panel is disabled (`characterSaving`) and the save awaits
+   *   the server ack. Create applies the server-allocated id; update replaces
+   *   the record by id. The panel closes only on success.
+   * - Timeout / retryable ack failure: the operation is enqueued in the durable
+   *   `kind: 'character'` outbox (30-day TTL), the panel closes and the tab
+   *   flips to its queueing state via `pendingCharacterCount`.
+   * - `PermissionDenied` / other non-retryable failure: the panel stays open
+   *   with `characterSaveError`.
+   * - Offline but in a room: enqueue directly, never through `RoomSocket`'s
+   *   in-memory queue (it would resend the frame on reconnect and double send).
+   */
+  async function handleSaveCharacter(updated: Character): Promise<void> {
     if (isViewer) return;
-    characters = characters.filter((c) => c.id !== charId);
-    for (const sc of scenes) {
-      sc.members = sc.members.filter((id) => id !== charId);
+    if (characterSaving) return; // guard against a double submit
+
+    const isCreate = characterEditIsNew;
+    const roomId = getActiveRoomId();
+    const socket = roomSocket;
+    const isConnected = !!socket && socket.isConnected;
+
+    characterSaveError = null;
+
+    // Mounted without a room or a socket (tests / standalone): local only.
+    if (!roomId && !socket) {
+      if (isCreate) applyCreatedCharacter(updated, updated.id);
+      else applyUpdatedCharacter(updated);
+      closeCharacterEditPanel();
+      return;
     }
-    const numId = Number(charId);
-    roomSocket?.deleteCharacter(Number.isNaN(numId) ? 0 : numId);
+
+    characterSaving = true;
+    try {
+      if (!socket || !isConnected) {
+        if (!roomId) {
+          // A socket exists but there is no room to key an outbox entry by.
+          if (isCreate) applyCreatedCharacter(updated, updated.id);
+          else applyUpdatedCharacter(updated);
+          closeCharacterEditPanel();
+          return;
+        }
+        // Offline / no socket: straight to the durable outbox.
+        const queued = await queueCharacterOperation(roomId, {
+          operation: isCreate ? 'create' : 'update',
+          character: updated,
+        });
+        if (!queued) {
+          characterSaveError = CHARACTER_SAVE_FAILED_MESSAGE;
+          return;
+        }
+        closeCharacterEditPanel();
+        return;
+      }
+
+      try {
+        if (isCreate) {
+          const ack = await socket.requestCreateCharacter(updated);
+          applyCreatedCharacter(updated, serverCharacterId(ack, updated.id));
+        } else {
+          const ack = await socket.requestUpdateCharacter(Number(updated.id), updated);
+          applyUpdatedCharacter(updated, serverCharacterId(ack, updated.id));
+        }
+        closeCharacterEditPanel();
+      } catch (err) {
+        if (isRetryableCharacterError(err) && roomId) {
+          // The frame may have left the socket, but no ack arrived: replay it
+          // from the outbox on reconnect instead of losing the edit.
+          const queued = await queueCharacterOperation(roomId, {
+            operation: isCreate ? 'create' : 'update',
+            character: updated,
+          });
+          if (!queued) {
+            characterSaveError = CHARACTER_SAVE_FAILED_MESSAGE;
+            return;
+          }
+          closeCharacterEditPanel();
+          return;
+        }
+        console.error('Failed to save the character:', err);
+        characterSaveError = isPermissionDeniedError(err)
+          ? CHARACTER_PERMISSION_DENIED_MESSAGE
+          : CHARACTER_SAVE_FAILED_MESSAGE;
+      }
+    } finally {
+      characterSaving = false;
+    }
+  }
+
+  /**
+   * Deletes a character after the server acknowledgement (Issue #109 / #144).
+   *
+   * - Connected: `requestDeleteCharacter` first; the row disappears only on ack.
+   * - Offline / timeout in a room: a `delete` operation is queued and the row is
+   *   kept locally — the server still has it, and the flush removes it on the
+   *   next connect (a local removal would resurrect on the next `CharacterList`).
+   * - No room / no socket: local removal (legacy standalone behaviour).
+   */
+  async function handleDeleteCharacter(charId: string) {
+    if (isViewer) return;
+
+    const roomId = getActiveRoomId();
+    const socket = roomSocket;
+    const isConnected = !!socket && socket.isConnected;
+
+    if (!socket || !isConnected) {
+      if (!roomId) {
+        removeCharacterLocally(charId);
+        return;
+      }
+      const queued = await queueCharacterOperation(roomId, {
+        operation: 'delete',
+        characterId: charId,
+      });
+      if (!queued) console.error('Failed to queue the character deletion:', charId);
+      return;
+    }
+
+    try {
+      await socket.requestDeleteCharacter(Number(charId));
+      removeCharacterLocally(charId);
+    } catch (err) {
+      if (isRetryableCharacterError(err) && roomId) {
+        const queued = await queueCharacterOperation(roomId, {
+          operation: 'delete',
+          characterId: charId,
+        });
+        if (!queued) console.error('Failed to queue the character deletion:', charId);
+        return;
+      }
+      console.error('Failed to delete the character:', err);
+    }
   }
 
   function handleTransformChange(id: string, t: ViewTransform) {
@@ -1431,6 +1802,9 @@
                   onSetDone={(done) => roomSocket?.setDone(done)}
                   onRequestAssetPicker={handleRequestAssetPicker}
                   onRequestEditCharacter={handleRequestEditCharacter}
+                  onRequestCreateCharacter={handleRequestCreateCharacter}
+                  onRefreshCharacters={applyCharacterList}
+                  {pendingCharacterCount}
                 />
               </div>
             </div>
@@ -1521,6 +1895,9 @@
                 onSetDone={(done) => roomSocket?.setDone(done)}
                 onRequestAssetPicker={handleRequestAssetPicker}
                 onRequestEditCharacter={handleRequestEditCharacter}
+                onRequestCreateCharacter={handleRequestCreateCharacter}
+                onRefreshCharacters={applyCharacterList}
+                {pendingCharacterCount}
               />
             </div>
           </Sheet>
@@ -1667,7 +2044,7 @@
             class="danger-confirm-btn"
             onclick={() => {
               if (activeOverlay?.type === 'delete-character') {
-                handleDeleteCharacter(activeOverlay.characterId);
+                void handleDeleteCharacter(activeOverlay.characterId);
                 activeOverlay = null;
               }
             }}
@@ -1701,7 +2078,10 @@
     </div>
   {/if}
 
-  <!-- Character Edit Modal at Root Viewport Level (Issue #60) -->
+  <!-- Character Edit Modal at Root Viewport Level (Issue #60).
+       Save state machine: disabled panel + wavy spinner while the server
+       acknowledges; close only on success or after the operation was queued
+       (Issue #109 / #144). -->
   {#if activeCharacterEdit}
     <div
       class="root-character-edit-wrapper"
@@ -1710,14 +2090,11 @@
       <CharacterEditModal
         character={activeCharacterEdit}
         isAdmin={isAdmin || (currentRoom ? currentRoom.isAdmin : false)}
+        saving={characterSaving}
+        error={characterSaveError}
         onRequestAssetPicker={handleRequestAssetPicker}
-        onSave={(updated) => {
-          handleUpdateCharacter(updated);
-          activeCharacterEdit = null;
-        }}
-        onClose={() => {
-          activeCharacterEdit = null;
-        }}
+        onSave={handleSaveCharacter}
+        onClose={handleCloseCharacterEdit}
       />
     </div>
   {/if}

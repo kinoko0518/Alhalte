@@ -8,7 +8,8 @@
    * - GitHub Issue #60: キャラクター編集モーダルの全画面化（ビューポート最前面 scrim 上の中央表示）
    * - GitHub Issue #129: キャラクター編集画面についての提言（M3 Switch, M3 Divider, 地の文トグル, 説明文, スクロール対応）
    */
-  import { Button, Divider, Switch, TextField } from 'noph-ui';
+  import { Button, CircularProgress, Divider, Switch, TextField } from 'noph-ui';
+  import { Icon } from 'noph-ui/icons';
   import type { Character } from '../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
   import AssetPickerModal from './AssetPickerModal.svelte';
@@ -17,18 +18,33 @@
   let {
     character,
     isAdmin = false,
+    saving = false,
+    error = null,
     onRequestAssetPicker,
     onSave,
     onClose,
   }: {
     character: Character;
     isAdmin?: boolean;
+    /**
+     * True while the save is waiting for the server acknowledgement. The whole
+     * edit panel is inert (`aria-busy`, disabled `fieldset`), the backdrop no
+     * longer closes it, and the save icon becomes a wavy `CircularProgress`
+     * (the `Button` `loading` slot is not wavy, so it is not used).
+     */
+    saving?: boolean;
+    /**
+     * Failure text rendered inside the panel. The panel stays open so the user
+     * can retry or cancel; the parent owns the message (permission denied etc.).
+     */
+    error?: string | null;
     onRequestAssetPicker?: (options: {
       mediaType: AssetMediaType;
       initialScope?: AssetScope;
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
-    onSave?: (updated: Character) => void;
+    /** Save handler; when it returns a Promise the panel awaits the server ack. */
+    onSave?: (updated: Character) => void | Promise<void>;
     onClose?: () => void;
   } = $props();
 
@@ -82,8 +98,27 @@
     editingCharacter.iconUrl = dataUrl;
   }
 
-  function handleSave() {
-    onSave?.(JSON.parse(JSON.stringify(editingCharacter)));
+  /** Non-reactive guard: prevents a double save before the `saving` prop flips. */
+  let isSubmitting = false;
+
+  /**
+   * Hands the edited character to the parent and awaits its Promise.
+   *
+   * The panel never closes itself: the parent closes it only after the server
+   * acknowledged the save (or after the operation was queued in the outbox).
+   * A rejected parent handler is swallowed here — the parent owns the
+   * `error` prop that explains the failure.
+   */
+  async function handleSave() {
+    if (saving || isSubmitting) return;
+    isSubmitting = true;
+    try {
+      await onSave?.(JSON.parse(JSON.stringify(editingCharacter)));
+    } catch (err) {
+      console.error('Failed to save the character:', err);
+    } finally {
+      isSubmitting = false;
+    }
   }
 </script>
 
@@ -91,14 +126,26 @@
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="character-edit-overlay edit-panel-overlay fullscreen-dialog-overlay"
+  class:is-saving={saving}
   data-testid="character-edit-panel"
+  data-saving={saving ? 'true' : undefined}
+  aria-busy={saving ? 'true' : undefined}
   style="overflow-y: auto; overscroll-behavior: contain;"
   onclick={(e) => {
+    // While the save is in flight the backdrop must not close the panel: the
+    // parent decides whether the save succeeded or was queued.
+    if (saving) return;
     if (e.target === e.currentTarget) onClose?.();
   }}
 >
-  <div
+  <!-- A wrapping `fieldset` disables every nested M3 control (inputs, switches,
+       add/remove buttons, avatar picker) while the server acknowledges the save.
+       `fieldset` is used because it reaches components that do not expose a
+       `disabled` prop, without touching each of them. -->
+  <fieldset
     class="edit-dialog-content"
+    class:is-saving={saving}
+    disabled={saving}
     style="overflow-y: auto; max-height: 85vh; overscroll-behavior: contain;"
   >
     <h2 class="edit-header-centered" data-testid="edit-dialog-title">キャラクター編集</h2>
@@ -317,13 +364,50 @@
     <Divider />
 
     <!-- Dialog buttons -->
+    {#if error}
+      <!-- Non-retryable failure (e.g. PermissionDenied): keep the panel open
+           with the edited values so the user can react. -->
+      <p class="char-save-error" role="alert" data-testid="character-save-error">
+        {error}
+      </p>
+    {/if}
+
+    <!-- Dialog buttons: while saving, both are disabled and the save icon is a
+         wavy indeterminate M3 CircularProgress (Issue #109 / #144). -->
     <div class="dialog-actions">
-      <Button variant="text" onclick={() => onClose?.()} data-testid="cancel-character-btn">キャンセル</Button>
-      <Button variant="filled" onclick={handleSave} data-testid="save-character-btn">
+      <Button
+        variant="text"
+        onclick={() => onClose?.()}
+        disabled={saving}
+        data-testid="cancel-character-btn"
+      >
+        キャンセル
+      </Button>
+      <Button
+        variant="filled"
+        onclick={handleSave}
+        disabled={saving}
+        aria-busy={saving ? 'true' : undefined}
+        data-testid="save-character-btn"
+      >
+        {#snippet start()}
+          {#if saving}
+            <CircularProgress
+              indeterminate
+              wavy
+              track={false}
+              class="save-progress"
+              data-testid="character-save-progress"
+              aria-label="保存中"
+            />
+          {:else}
+            <Icon>save</Icon>
+          {/if}
+        {/snippet}
         保存する
       </Button>
     </div>
-  </div>
+  </fieldset>
 </div>
 
 {#if isAssetPickerOpen}
@@ -364,6 +448,39 @@
     flex-direction: column;
     gap: 14px;
     margin: auto;
+    /* Reset the user-agent `fieldset` chrome: it is used only for its
+       `disabled` propagation, not for grouping semantics. */
+    border: 0;
+    min-width: 0;
+  }
+  /*
+   * Saving state (Issue #109 / #144): dim the panel with a surface mix so the
+   * wavy spinner reads as the only live control. Only semantic M3 tokens.
+   */
+  .edit-dialog-content.is-saving {
+    background: color-mix(
+      in srgb,
+      var(--np-color-surface-container-high) 82%,
+      var(--np-color-surface)
+    );
+    cursor: progress;
+  }
+  .character-edit-overlay.is-saving {
+    cursor: progress;
+  }
+  /* The spinner renders inside the M3 Button's start slot (component root),
+     so the size override must be global (same pattern as SceneSettingsTab). */
+  :global(.save-progress) {
+    --np-circular-progress-size: 1.25rem;
+  }
+  .char-save-error {
+    margin: 0;
+    padding: 8px 12px;
+    border-radius: var(--np-shape-corner-small, 8px);
+    background: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+    font-size: 0.85rem;
+    line-height: 1.4;
   }
   .edit-header-centered {
     margin: 0;

@@ -34,16 +34,26 @@
  *   {@link FakeRoomSocket.autoAnswerSceneActions} is off, in which case the test
  *   settles them through {@link FakeRoomSocket.resolveSceneAction} /
  *   {@link FakeRoomSocket.rejectSceneAction}.
+ * - `queryListCharacters` / `requestCreateCharacter` / `requestUpdateCharacter`
+ *   / `requestDeleteCharacter` — the character tab and editor
+ *   (Issue #109 / sub-issue #144). The query answers with
+ *   {@link FakeRoomSocket.characterListSnapshot} unless
+ *   {@link FakeRoomSocket.autoAnswerCharacterQueries} is off; the writes answer
+ *   immediately unless {@link FakeRoomSocket.autoAnswerCharacterRequests} is
+ *   off, in which case the test settles them with
+ *   {@link FakeRoomSocket.resolveCharacterRequest} /
+ *   {@link FakeRoomSocket.rejectCharacterRequest}. Creates allocate ids from
+ *   {@link FakeRoomSocket.nextCharacterId}, mirroring `CharacterCreated`.
  * - `emitFrame` — pushes an arbitrary `ServerFrame` to the subscribers so an
  *   App-level test can drive `StateUpdated` / `StateDeleted`.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`, `### アセット`
- * - GitHub Issue #109 / sub-issue #139, #140, #141, #142, #143
+ * - GitHub Issue #109 / sub-issue #139, #140, #141, #142, #143, #144
  */
 import type { ChunkLogManager } from '../../src/utils/log.js';
 import type { RoomSocket } from '../../src/utils/roomSocket.js';
-import type { LogRecord } from '../../src/types/index.js';
+import type { Character, LogRecord } from '../../src/types/index.js';
 
 type FrameListener = (frame: unknown) => void;
 
@@ -108,6 +118,35 @@ export interface MoveCharacterCall {
 /** Kind of a scene action held back by {@link FakeRoomSocket.autoAnswerSceneActions}. */
 export type SceneActionKind = 'create' | 'delete' | 'rewind' | 'move';
 
+/** Kind of a character request held back by {@link FakeRoomSocket.autoAnswerCharacterRequests}. */
+export type CharacterRequestKind = 'create' | 'update' | 'delete';
+
+/** One recorded `requestCreateCharacter` call (Issue #109 / #144). */
+export interface CreateCharacterCall {
+  character: Character;
+  /** Id the matching `CharacterCreated` ack will carry. */
+  allocatedId: number;
+}
+
+/** One recorded `requestUpdateCharacter` call (Issue #109 / #144). */
+export interface UpdateCharacterCall {
+  characterId: number;
+  character: Character;
+}
+
+/** One recorded `requestDeleteCharacter` call (Issue #109 / #144). */
+export interface DeleteCharacterCall {
+  characterId: number;
+}
+
+interface PendingCharacterRequest {
+  kind: CharacterRequestKind;
+  /** Server-allocated id used by a successful create ack. */
+  allocatedId: number;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
+}
+
 interface PendingSceneAction {
   kind: SceneActionKind;
   label: string;
@@ -166,6 +205,26 @@ export class FakeRoomSocket {
    * / {@link FakeRoomSocket.rejectSceneAction} (Issue #109 / #143).
    */
   autoAnswerSceneActions = true;
+  /** List answered by `queryListCharacters` (Issue #109 / #144). */
+  characterListSnapshot: Character[] = [];
+  /**
+   * When `true` (the default) the tab-open `ListCharacters` query resolves
+   * immediately with {@link FakeRoomSocket.characterListSnapshot}. Set to
+   * `false` to hold it and answer through
+   * {@link FakeRoomSocket.resolveCharacterListQuery} /
+   * {@link FakeRoomSocket.rejectCharacterListQuery}.
+   */
+  autoAnswerCharacterQueries = true;
+  /**
+   * When `true` (the default) character create/update/delete requests resolve
+   * immediately (creates allocate ids from
+   * {@link FakeRoomSocket.nextCharacterId}). Set to `false` to settle them with
+   * {@link FakeRoomSocket.resolveCharacterRequest} /
+   * {@link FakeRoomSocket.rejectCharacterRequest}.
+   */
+  autoAnswerCharacterRequests = true;
+  /** Id allocated by the next successful `requestCreateCharacter` ack. */
+  nextCharacterId = 1000;
 
   readonly requestAppendLogCalls: AppendCall[] = [];
   readonly appendLogCalls: AppendCall[] = [];
@@ -180,6 +239,10 @@ export class FakeRoomSocket {
   readonly requestDeleteSceneCalls: DeleteSceneCall[] = [];
   readonly requestRewindLogCalls: RewindLogCall[] = [];
   readonly requestMoveCharacterCalls: MoveCharacterCall[] = [];
+  readonly queryListCharactersCalls: unknown[] = [];
+  readonly requestCreateCharacterCalls: CreateCharacterCall[] = [];
+  readonly requestUpdateCharacterCalls: UpdateCharacterCall[] = [];
+  readonly requestDeleteCharacterCalls: DeleteCharacterCall[] = [];
 
   private readonly listeners = new Set<FrameListener>();
   private readonly pending: Array<{
@@ -192,6 +255,11 @@ export class FakeRoomSocket {
   private readonly pendingStateOperations: PendingStateOperation[] = [];
   private readonly pendingChangeBgmOperations: PendingChangeBgmOperation[] = [];
   private readonly pendingSceneActions: PendingSceneAction[] = [];
+  private readonly pendingListCharacterQueries: Array<{
+    resolve: (value: Character[]) => void;
+    reject: (error: unknown) => void;
+  }> = [];
+  private readonly pendingCharacterRequests: PendingCharacterRequest[] = [];
 
   setChunkLogManager(manager?: ChunkLogManager): void {
     this.chunkManager = manager ?? null;
@@ -371,6 +439,121 @@ export class FakeRoomSocket {
       throw new Error(`FakeRoomSocket: no pending scene action${kind ? ` (${kind})` : ''}`);
     }
     return this.pendingSceneActions.splice(index, 1)[0];
+  }
+
+  // -------------------------------------------------------------------------
+  // Character tab & editor (Issue #109 / sub-issue #144)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Records the tab-open `ListCharacters` request and answers with
+   * {@link FakeRoomSocket.characterListSnapshot}, or holds it when
+   * {@link FakeRoomSocket.autoAnswerCharacterQueries} is off.
+   */
+  queryListCharacters(_timeoutMs?: number): Promise<Character[]> {
+    this.queryListCharactersCalls.push({});
+    if (this.autoAnswerCharacterQueries) {
+      return Promise.resolve(this.characterListSnapshot.map((char) => ({ ...char })));
+    }
+    return new Promise((resolve, reject) => {
+      this.pendingListCharacterQueries.push({ resolve, reject });
+    });
+  }
+
+  /** Number of held `ListCharacters` queries. */
+  get pendingListCharacterQueryCount(): number {
+    return this.pendingListCharacterQueries.length;
+  }
+
+  /** Resolves the oldest held `ListCharacters` query. */
+  resolveCharacterListQuery(characters: Character[]): void {
+    const pending = this.pendingListCharacterQueries.shift();
+    if (!pending) throw new Error('FakeRoomSocket: no pending ListCharacters query');
+    pending.resolve(characters);
+  }
+
+  /** Rejects the oldest held `ListCharacters` query (e.g. with a timeout). */
+  rejectCharacterListQuery(error: unknown): void {
+    const pending = this.pendingListCharacterQueries.shift();
+    if (!pending) throw new Error('FakeRoomSocket: no pending ListCharacters query');
+    pending.reject(error);
+  }
+
+  /**
+   * Records a `CreateCharacter` request and resolves with a `CharacterCreated`
+   * ack carrying {@link FakeRoomSocket.nextCharacterId}, or holds it when
+   * {@link FakeRoomSocket.autoAnswerCharacterRequests} is off.
+   */
+  requestCreateCharacter(character: Character, _timeoutMs?: number): Promise<unknown> {
+    const allocatedId = this.nextCharacterId++;
+    this.requestCreateCharacterCalls.push({ character, allocatedId });
+    if (this.autoAnswerCharacterRequests) {
+      return Promise.resolve({ character_id: allocatedId });
+    }
+    return this.holdCharacterRequest('create', allocatedId);
+  }
+
+  /** Records an `UpdateCharacter` request and resolves with a `CharacterUpdated` ack. */
+  requestUpdateCharacter(
+    characterId: number,
+    character: Character,
+    _timeoutMs?: number,
+  ): Promise<unknown> {
+    this.requestUpdateCharacterCalls.push({ characterId, character });
+    if (this.autoAnswerCharacterRequests) {
+      return Promise.resolve({ character_id: characterId });
+    }
+    return this.holdCharacterRequest('update', characterId);
+  }
+
+  /** Records a `DeleteCharacter` request and resolves with a `CharacterDeleted` ack. */
+  requestDeleteCharacter(characterId: number, _timeoutMs?: number): Promise<unknown> {
+    this.requestDeleteCharacterCalls.push({ characterId });
+    if (this.autoAnswerCharacterRequests) {
+      return Promise.resolve({ character_id: characterId });
+    }
+    return this.holdCharacterRequest('delete', characterId);
+  }
+
+  /** Number of character create/update/delete requests still waiting for a manual answer. */
+  get pendingCharacterRequestCount(): number {
+    return this.pendingCharacterRequests.length;
+  }
+
+  /**
+   * Resolves the oldest held character request, optionally only one of `kind`.
+   * A create resolves with the id allocated when the request was recorded.
+   */
+  resolveCharacterRequest(kind?: CharacterRequestKind): void {
+    const { request } = this.takeCharacterRequest(kind);
+    request.resolve({ character_id: request.allocatedId });
+  }
+
+  /** Rejects the oldest held character request (e.g. with a timeout / permission error). */
+  rejectCharacterRequest(error: unknown, kind?: CharacterRequestKind): void {
+    this.takeCharacterRequest(kind).request.reject(error);
+  }
+
+  private holdCharacterRequest(
+    kind: CharacterRequestKind,
+    allocatedId: number,
+  ): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      this.pendingCharacterRequests.push({ kind, allocatedId, resolve, reject });
+    });
+  }
+
+  private takeCharacterRequest(kind?: CharacterRequestKind): {
+    request: PendingCharacterRequest;
+  } {
+    const index = this.pendingCharacterRequests.findIndex(
+      (request) => kind === undefined || request.kind === kind,
+    );
+    if (index < 0) {
+      throw new Error(`FakeRoomSocket: no pending character request${kind ? ` (${kind})` : ''}`);
+    }
+    const [request] = this.pendingCharacterRequests.splice(index, 1);
+    return { request };
   }
 
   /**
