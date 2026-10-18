@@ -13,6 +13,18 @@ import { DEFAULT_OFFICIAL_EXTENSIONS, loadDefaultExtensions } from '../src/wasm/
 import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 
+// Polyfill AnimationEvent in jsdom environment if not defined
+if (typeof globalThis.AnimationEvent === 'undefined') {
+  class MockAnimationEvent extends Event {
+    animationName: string;
+    constructor(type: string, init?: { animationName?: string; bubbles?: boolean; cancelable?: boolean }) {
+      super(type, init);
+      this.animationName = init?.animationName ?? '';
+    }
+  }
+  (globalThis as unknown as { AnimationEvent: typeof MockAnimationEvent }).AnimationEvent = MockAnimationEvent;
+}
+
 describe('Log Tab & Chunk Lazy Loading', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -619,6 +631,158 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     anchorClickSpy.mockRestore();
     createElementSpy.mockRestore();
     vi.unstubAllGlobals();
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab アニメーション終了時の新規メッセージクラス解除と再オープン時のアニメーション抑止 (Issue #112)
+  it('removes animation class and data-is-new attribute upon animationend, preventing re-animation when reopening panel', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: 'scene-animation-end',
+      name: 'アニメーション解除テストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const chunkManager = new ChunkLogManager();
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        chunkManager,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Append new message
+    chunkManager.appendRecord({
+      id: 'msg-end-1',
+      sceneId: 'scene-animation-end',
+      content: 'アニメーション終了テスト',
+      speaker: 'ルシア',
+      timestamp: 2000,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const msgEl = target.querySelector('[data-testid="log-record-msg-end-1"]');
+    expect(msgEl).toBeTruthy();
+    expect(msgEl?.classList.contains('message-entry-new')).toBe(true);
+    expect(msgEl?.getAttribute('data-is-new')).toBe('true');
+
+    // 1. Dispatch animationend for faster fade-in effect (150ms).
+    // Spatial spring animation (500ms) is still running, so new class should NOT be removed yet.
+    msgEl?.dispatchEvent(new AnimationEvent('animationend', { animationName: 'np-message-fade-in' }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(msgEl?.classList.contains('message-entry-new')).toBe(true);
+    expect(msgEl?.getAttribute('data-is-new')).toBe('true');
+
+    // 2. Dispatch animationend for spatial spring animation (500ms).
+    // Animation is now fully complete, so message-entry-new class and data-is-new should be removed.
+    msgEl?.dispatchEvent(new AnimationEvent('animationend', { animationName: 'np-message-spring-spatial' }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(msgEl?.classList.contains('message-entry-new')).toBe(false);
+    expect(msgEl?.getAttribute('data-is-new')).toBeNull();
+
+    // 3. Append another message and verify animationend without animationName also clears it naturally
+    chunkManager.appendRecord({
+      id: 'msg-end-2',
+      sceneId: 'scene-animation-end',
+      content: 'アニメーション終了テスト2',
+      speaker: 'ベルナルド',
+      timestamp: 2001,
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const msgEl2 = target.querySelector('[data-testid="log-record-msg-end-2"]');
+    expect(msgEl2?.classList.contains('message-entry-new')).toBe(true);
+    expect(msgEl2?.getAttribute('data-is-new')).toBe('true');
+
+    msgEl2?.dispatchEvent(new Event('animationend'));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(msgEl2?.classList.contains('message-entry-new')).toBe(false);
+    expect(msgEl2?.getAttribute('data-is-new')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/room コントロールパネルの再オープン時に最後のメッセージのアニメーションが再トリガーされないこと (Issue #112)
+  it('does not re-trigger animation on the last message when closing and reopening the control panel after animation ends', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testRoom: VisitedRoom = {
+      id: 'room-reopen-test',
+      name: 'コントロールパネル再オープン部屋',
+      url: 'https://alhalte.example/rooms/room-reopen-test#key',
+      lastVisited: Date.now(),
+      isAdmin: true,
+    };
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: testRoom,
+        isAdmin: true,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+
+    const inputEl = target.querySelector<HTMLInputElement>('[data-testid="chat-input-field"]');
+    const sendBtn = target.querySelector<HTMLElement>('[data-testid="send-message-button"]');
+    expect(inputEl).toBeTruthy();
+    expect(sendBtn).toBeTruthy();
+
+    // Send a message
+    inputEl!.value = 'こんにちは！';
+    inputEl!.dispatchEvent(new Event('input', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    sendBtn!.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const msgEl = target.querySelector('.message-entry.message-entry-new');
+    expect(msgEl).toBeTruthy();
+    expect(msgEl?.getAttribute('data-is-new')).toBe('true');
+
+    // Finish animation
+    msgEl?.dispatchEvent(new AnimationEvent('animationend', { animationName: 'np-message-spring-spatial' }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(msgEl?.classList.contains('message-entry-new')).toBe(false);
+    expect(msgEl?.getAttribute('data-is-new')).toBeNull();
+
+    // Collapse the Side Sheet
+    const collapseBtn = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
+    expect(collapseBtn).toBeTruthy();
+    collapseBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Reopen the Side Sheet
+    const reopenBtn = target.querySelector<HTMLButtonElement>('[data-testid="reopen-sheet-button"]');
+    expect(reopenBtn).toBeTruthy();
+    reopenBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Check that the last message still does NOT have the message-entry-new class or data-is-new attribute
+    const reopenedMsgEl = target.querySelector('.messages-list .message-entry');
+    expect(reopenedMsgEl).toBeTruthy();
+    expect(reopenedMsgEl?.classList.contains('message-entry-new')).toBe(false);
+    expect(reopenedMsgEl?.getAttribute('data-is-new')).toBeNull();
+    expect(target.querySelector('.message-entry.message-entry-new')).toBeNull();
+
     unmount(instance);
     target.remove();
   });
