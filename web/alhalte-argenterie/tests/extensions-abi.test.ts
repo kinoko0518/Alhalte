@@ -13,6 +13,8 @@ import {
 } from '../src/wasm/runner.js';
 import ExtensionManagementTab from '../src/components/Control/tabs/ExtensionManagementTab.svelte';
 import type { ExtensionItem } from '../src/types/index.js';
+import { buildGenerastFromText } from '../src/utils/generast.js';
+import { renderGenerast } from '../src/utils/saignant.js';
 
 // Valid WebAssembly binary implementing:
 // - memory (1 page)
@@ -297,6 +299,40 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
 
     unmount(mounted);
     target.remove();
+  });
+
+  // spec: alhalte-argenterie/extensions-abi ログタブ連携による左畳み込みGenerast変換とSaignant HTML生成 (Issue #117)
+  it('integrates extension pipeline left fold with Generast AST and Saignant HTML rendering for log messages', async () => {
+    const pipeline = new ExtensionPipeline();
+    const validBytes = hexToBytes(VALID_WASM_HEX);
+
+    const extensions: ExtensionItem[] = [
+      {
+        id: 'ext-step-1',
+        name: 'step-1',
+        enabled: true,
+        priority: 0,
+        wasmBytes: validBytes,
+      },
+      {
+        id: 'ext-step-2',
+        name: 'step-2',
+        enabled: true,
+        priority: 1,
+        wasmBytes: validBytes,
+      },
+    ];
+
+    // Build Generast from text through pipeline left fold
+    const ast = await buildGenerastFromText('1D100<=50', extensions, pipeline, 'char-1');
+    expect(ast).toEqual({
+      type: 'string',
+      value: '1D100<=50!!',
+    });
+
+    // Render resulting AST through Saignant WASM
+    const html = await renderGenerast(ast);
+    expect(html).toContain('1D100&lt;=50!!');
   });
 });
 

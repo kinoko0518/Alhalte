@@ -9,9 +9,23 @@ import {
 } from '../src/utils/log.js';
 import LogTab from '../src/components/Control/tabs/LogTab.svelte';
 import App from '../src/components/App.svelte';
-import { DEFAULT_OFFICIAL_EXTENSIONS, loadDefaultExtensions } from '../src/wasm/runner.js';
-import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
+import { hexToBytes } from '@alhalte/pantry';
+import {
+  DEFAULT_OFFICIAL_EXTENSIONS,
+  ExtensionPipeline,
+  loadDefaultExtensions,
+} from '../src/wasm/runner.js';
+import type { Character, ExtensionItem, Scene, VisitedRoom } from '../src/types/index.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
+
+// Valid WebAssembly binary implementing:
+// - memory (1 page)
+// - alhalte_abi_version() -> 1
+// - alloc(len) -> 0
+// - dealloc(ptr, len) -> void
+// - process_generast(ptr, len) -> copies input to 1024, appends '!' (0x21), returns (1024n << 32) | (len + 1)
+const VALID_WASM_HEX =
+  '0061736d010000000115046000017f60017f017f60027f7f0060027f7f017e030504000102030503010001074505066d656d6f7279020013616c68616c74655f6162695f76657273696f6e000005616c6c6f630001076465616c6c6f6300021070726f636573735f67656e657261737400030a3404040041010b040041000b02000b250041800820002001fc0a000041800820016a41213a0000428008422086200141016aad840b';
 
 // Polyfill AnimationEvent in jsdom environment if not defined
 if (typeof globalThis.AnimationEvent === 'undefined') {
@@ -782,6 +796,268 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     expect(reopenedMsgEl?.classList.contains('message-entry-new')).toBe(false);
     expect(reopenedMsgEl?.getAttribute('data-is-new')).toBeNull();
     expect(target.querySelector('.message-entry.message-entry-new')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab 拡張機能Generast左畳み込みとSaignant WASM描画 (Issue #117)
+  it('applies extension pipeline left fold and Saignant WASM rendering to log records in LogTab', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: 'scene-ext-test',
+      name: '拡張機能テストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const validWasm = hexToBytes(VALID_WASM_HEX);
+    const extensions: ExtensionItem[] = [
+      {
+        id: 'ext-excl',
+        name: '感嘆符付与',
+        enabled: true,
+        priority: 0,
+        wasmBytes: validWasm,
+      },
+    ];
+
+    const chunkManager = new ChunkLogManager();
+    const pipeline = new ExtensionPipeline();
+
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        extensions,
+        extensionPipeline: pipeline,
+        chunkManager,
+      },
+    });
+
+    chunkManager.appendRecord({
+      id: 'msg-fold-1',
+      sceneId: 'scene-ext-test',
+      content: 'テストメッセージ',
+      speaker: '探索者',
+      speakerId: 'char-1',
+      timestamp: 1000,
+    });
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    const contentEl = target.querySelector('[data-testid="msg-content-msg-fold-1"]');
+    expect(contentEl).toBeTruthy();
+    // Extension appends '!' to the input Generast and Saignant renders it to HTML
+    expect(contentEl?.textContent?.trim()).toBe('テストメッセージ!');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab 拡張機能優先度順の左畳み込み適用 (Issue #117)
+  it('applies multiple active extensions sequentially in priority order (left fold)', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: 'scene-prio-test',
+      name: '優先度テストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const validWasm = hexToBytes(VALID_WASM_HEX);
+    const extensions: ExtensionItem[] = [
+      {
+        id: 'ext-prio-1',
+        name: '拡張機能1',
+        enabled: true,
+        priority: 0,
+        wasmBytes: validWasm,
+      },
+      {
+        id: 'ext-prio-2',
+        name: '拡張機能2',
+        enabled: true,
+        priority: 1,
+        wasmBytes: validWasm,
+      },
+    ];
+
+    const chunkManager = new ChunkLogManager();
+    const pipeline = new ExtensionPipeline();
+
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        extensions,
+        extensionPipeline: pipeline,
+        chunkManager,
+      },
+    });
+
+    chunkManager.appendRecord({
+      id: 'msg-prio-1',
+      sceneId: 'scene-prio-test',
+      content: 'アタック',
+      speaker: '騎士',
+      timestamp: 1000,
+    });
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    const contentEl = target.querySelector('[data-testid="msg-content-msg-prio-1"]');
+    expect(contentEl).toBeTruthy();
+    // Both active extensions append '!' in order: 'アタック' -> 'アタック!' -> 'アタック!!'
+    expect(contentEl?.textContent?.trim()).toBe('アタック!!');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab 拡張機能の有効化・無効化・更新時のログ描画キャッシュ更新 (Issue #117)
+  it('invalidates rendered HTML cache and re-renders log messages when extensions are updated or toggled in App', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testRoom: VisitedRoom = {
+      id: 'room-ext-toggle-test',
+      name: '拡張機能切替部屋',
+      url: 'https://alhalte.example/rooms/room-ext-toggle-test#key',
+      lastVisited: Date.now(),
+      isAdmin: true,
+    };
+
+    const validWasm = hexToBytes(VALID_WASM_HEX);
+    const initialExtensions: ExtensionItem[] = [
+      {
+        id: 'ext-dynamic-1',
+        name: 'ダイナミック拡張',
+        enabled: true,
+        priority: 0,
+        wasmBytes: validWasm,
+      },
+    ];
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: testRoom,
+        initialExtensions,
+        isAdmin: true,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Send a message
+    const inputEl = target.querySelector<HTMLInputElement>('[data-testid="chat-input-field"]');
+    const sendBtn = target.querySelector<HTMLElement>('[data-testid="send-message-button"]');
+    expect(inputEl).toBeTruthy();
+    expect(sendBtn).toBeTruthy();
+
+    inputEl!.value = 'こんにちは';
+    inputEl!.dispatchEvent(new Event('input', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    sendBtn!.click();
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Initially with extension enabled, message has '!'
+    const messagesList = target.querySelector('[data-testid="messages-list"]');
+    expect(messagesList?.textContent).toContain('こんにちは!');
+
+    // Switch to Extensions Tab
+    const extTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-extensions"]');
+    expect(extTabBtn).toBeTruthy();
+    extTabBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Toggle the extension off
+    const toggleCheckbox = target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-ext-dynamic-1"]');
+    expect(toggleCheckbox).toBeTruthy();
+    toggleCheckbox?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    // Switch back to Log Tab
+    const logTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-log"]');
+    expect(logTabBtn).toBeTruthy();
+    logTabBtn?.click();
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Message should be re-rendered without extension transformation: 'こんにちは' instead of 'こんにちは!'
+    const updatedMessagesList = target.querySelector('[data-testid="messages-list"]');
+    expect(updatedMessagesList?.textContent).toContain('こんにちは');
+    expect(updatedMessagesList?.textContent).not.toContain('こんにちは!');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab 既存およびキュー積載ログへの左畳み込み適用 (Issue #117)
+  it('applies Generast left fold and Saignant HTML rendering to pre-existing and queued records upon mounting LogTab', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const testScene: Scene = {
+      id: 'scene-pre-test',
+      name: '事前ログテストシーン',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+
+    const chunkManager = new ChunkLogManager();
+    chunkManager.appendRecord({
+      id: 'msg-pre-1',
+      sceneId: 'scene-pre-test',
+      content: '過去ログ1',
+      speaker: 'ルシア',
+      timestamp: 100,
+    });
+    chunkManager.appendRecord({
+      id: 'msg-pre-2',
+      sceneId: 'scene-pre-test',
+      content: 'キューログ2',
+      speaker: 'ベルナルド',
+      timestamp: 101,
+    });
+
+    const validWasm = hexToBytes(VALID_WASM_HEX);
+    const extensions: ExtensionItem[] = [
+      {
+        id: 'ext-excl',
+        name: '感嘆符付与',
+        enabled: true,
+        priority: 0,
+        wasmBytes: validWasm,
+      },
+    ];
+
+    const instance = mount(LogTab, {
+      target,
+      props: {
+        scene: testScene,
+        extensions,
+        chunkManager,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    const content1 = target.querySelector('[data-testid="msg-content-msg-pre-1"]');
+    const content2 = target.querySelector('[data-testid="msg-content-msg-pre-2"]');
+    expect(content1?.textContent?.trim()).toBe('過去ログ1!');
+    expect(content2?.textContent?.trim()).toBe('キューログ2!');
 
     unmount(instance);
     target.remove();

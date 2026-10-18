@@ -879,6 +879,7 @@
                   allScenes={scenes}
                   {characters}
                   {extensions}
+                  {extensionPipeline}
                   {movements}
                   {accessibleSceneIds}
                   {selectedCharacterId}
@@ -961,6 +962,7 @@
                 allScenes={scenes}
                 {characters}
                 {extensions}
+                {extensionPipeline}
                 {movements}
                 {accessibleSceneIds}
                 {selectedCharacterId}
