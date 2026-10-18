@@ -79,8 +79,8 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     unmount(instance);
   });
 
-  // spec: alhalte-argenterie/control-panel Issue #63: パネルの折りたたみ／展開トグルボタン（chevron）全タブ共通動作
-  it('supports toggling collapse/expand with chevron buttons across all tabs in landscape mode', async () => {
+  // spec: alhalte-argenterie/control-panel Issue #89: リサイズハンドルの謎ボタン撤去、共通ヘッダーの左トナルボタンによる閉鎖、右上再オープンボタン
+  it('removes mystery button from resize handle, and supports closing via CommonHeader tonal button and reopening via top-right button across all tabs', async () => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1200 });
     Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
 
@@ -93,16 +93,25 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     const sideSheet = target.querySelector<HTMLDialogElement>('[data-testid="landscape-side-sheet"]');
     expect(sideSheet?.hasAttribute('open')).toBe(true);
 
-    // Check chevron toggle button in resize bar
-    const toggleBtn = target.querySelector<HTMLButtonElement>('[data-testid="side-sheet-toggle-button"]');
-    expect(toggleBtn).toBeTruthy();
+    // 1. Verify mystery button in resize handle is removed
+    const resizeHandle = target.querySelector<HTMLElement>('[data-testid="side-sheet-resize-handle"]');
+    expect(resizeHandle).toBeTruthy();
+    expect(resizeHandle?.querySelector('.side-sheet-toggle-btn')).toBeNull();
 
-    // Toggle close
-    toggleBtn?.click();
+    // 2. Check CommonHeader left collapse button: size s, tonal, square, wide, right_panel_close
+    const collapseBtn = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
+    expect(collapseBtn).toBeTruthy();
+    expect(collapseBtn?.textContent).toContain('right_panel_close');
+    expect(collapseBtn?.classList.contains('tonal')).toBe(true);
+    expect(collapseBtn?.classList.contains('square')).toBe(true);
+    expect(collapseBtn?.classList.contains('wide')).toBe(true);
+
+    // 3. Close via CommonHeader collapse button
+    collapseBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(sideSheet?.hasAttribute('open')).toBe(false);
 
-    // Reopen using reopen button (which has chevron_left)
+    // 4. Reopen using floating button at top right (with chevron_left)
     const reopenBtn = target.querySelector<HTMLButtonElement>('[data-testid="reopen-sheet-button"]');
     expect(reopenBtn).toBeTruthy();
     expect(reopenBtn?.textContent).toContain('chevron_left');
@@ -110,16 +119,94 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(sideSheet?.hasAttribute('open')).toBe(true);
 
-    // Switch to Scene Tab and verify toggle still collapses sheet
+    // 5. Switch to Scene Tab and verify CommonHeader left collapse button is present and works
     const sceneTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-graph"]');
     sceneTabBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    const toggleBtnScene = target.querySelector<HTMLButtonElement>('[data-testid="side-sheet-toggle-button"]');
-    expect(toggleBtnScene).toBeTruthy();
-    toggleBtnScene?.click();
+    const commonHeaderScene = target.querySelector('[data-testid="common-header"]');
+    expect(commonHeaderScene).toBeTruthy();
+
+    const collapseBtnScene = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
+    expect(collapseBtnScene).toBeTruthy();
+    collapseBtnScene?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(sideSheet?.hasAttribute('open')).toBe(false);
+
+    // Reopen again from scene tab
+    const reopenBtnScene = target.querySelector<HTMLButtonElement>('[data-testid="reopen-sheet-button"]');
+    expect(reopenBtnScene).toBeTruthy();
+    reopenBtnScene?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(sideSheet?.hasAttribute('open')).toBe(true);
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/control-panel Issue #89: コントロールパネル共通ヘッダー（左のパネル閉じボタン、中央のSearchドック、右の歯車メニュー、横並びテーマ円）
+  it('renders CommonHeader with left tonal close button, center docked Search scene selector, and right gear menu with horizontal theme color circles', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1200 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const instance = mount(App, {
+      target,
+      props: { initialRoom: dummyRoom },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    // CommonHeader exists
+    const commonHeader = target.querySelector('[data-testid="common-header"]');
+    expect(commonHeader).toBeTruthy();
+
+    // Left: Panel close button
+    const collapseBtn = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
+    expect(collapseBtn).toBeTruthy();
+    expect(collapseBtn?.textContent).toContain('right_panel_close');
+
+    // Center: Search docked layout
+    const searchAnchor = target.querySelector('[data-testid="scene-search-anchor"]');
+    const searchInput = target.querySelector<HTMLInputElement>('[data-testid="scene-search-input"]');
+    expect(searchAnchor).toBeTruthy();
+    expect(searchInput).toBeTruthy();
+    expect(searchInput?.placeholder).toBe('メインシーン');
+
+    // Focus search input -> docked scene candidates appear
+    searchInput?.focus();
+    await new Promise((r) => setTimeout(r, 30));
+    const searchMenu = target.querySelector('[data-testid="scene-search-menu"]');
+    expect(searchMenu).toBeTruthy();
+    const mainSceneItem = target.querySelector('[data-testid="scene-search-item-/"]');
+    expect(mainSceneItem).toBeTruthy();
+    expect(mainSceneItem?.textContent).toContain('メインシーン');
+
+    // Right: Gear button
+    const gearBtn = target.querySelector<HTMLButtonElement>('[data-testid="gear-menu-button"]');
+    expect(gearBtn).toBeTruthy();
+    gearBtn?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const gearMenu = target.querySelector('[data-testid="gear-dropdown-menu"]');
+    expect(gearMenu).toBeTruthy();
+    expect(target.querySelector('[data-testid="zip-export-item"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="export-zip-logs-item"]')).toBeTruthy();
+
+    // Theme selector: horizontal theme color circles row (not vertical menu items)
+    const themeCirclesRow = target.querySelector('[data-testid="theme-circles-row"]');
+    expect(themeCirclesRow).toBeTruthy();
+    expect(themeCirclesRow?.getAttribute('role')).toBe('radiogroup');
+
+    // Verify color circles exist
+    const circles = themeCirclesRow?.querySelectorAll('.theme-color-circle');
+    expect(circles?.length).toBeGreaterThanOrEqual(5);
+
+    // Click a theme color circle (e.g., emerald)
+    const emeraldCircle = target.querySelector<HTMLButtonElement>('[data-testid="theme-item-emerald"]');
+    expect(emeraldCircle).toBeTruthy();
+    emeraldCircle?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Verify theme changed on document
+    expect(document.documentElement.dataset.themePalette).toBe('emerald');
 
     unmount(instance);
   });

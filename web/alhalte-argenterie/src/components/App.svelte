@@ -723,21 +723,6 @@
                 onpointerdown={handleSideResizeDown}
               >
                 <div class="side-sheet-resize-pill"></div>
-                <div class="side-sheet-toggle-wrapper">
-                  <IconButton
-                    variant="tonal"
-                    size="xs"
-                    class="side-sheet-toggle-btn"
-                    data-testid="side-sheet-toggle-button"
-                    onclick={(e) => {
-                      e.stopPropagation();
-                      isControlSheetOpen = false;
-                    }}
-                    aria-label="コントロールパネルを閉じる"
-                  >
-                    <Icon>chevron_right</Icon>
-                  </IconButton>
-                </div>
               </div>
 
               <!-- Main Control Panel -->
@@ -1086,15 +1071,29 @@
     height: 100%;
     position: relative;
     z-index: 200;
+    transition: width var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1));
   }
   .landscape-control :global(.landscape-side-sheet) {
-    min-width: 10vw !important;
     height: 100%;
     border-left: 1px solid var(--np-color-outline-variant);
     box-shadow: var(--np-elevation-2);
+    overflow: hidden;
+    transition:
+      width var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
+      min-width var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
+      border-color var(--np-motion-expressive-fast-effects, 200ms ease);
+  }
+  .landscape-control:not(.collapsed) :global(.landscape-side-sheet) {
+    min-width: 10vw;
   }
   .landscape-control :global(.landscape-side-sheet.is-resizing) {
     transition: none !important;
+  }
+  .landscape-control.collapsed :global(.landscape-side-sheet) {
+    width: 0 !important;
+    min-width: 0 !important;
+    border-left: none !important;
+    box-shadow: none !important;
   }
   .landscape-control :global(.landscape-side-sheet .np-sheet-content) {
     padding: 0;
@@ -1153,12 +1152,6 @@
     height: 48px;
     background: var(--np-color-primary);
   }
-  .side-sheet-toggle-wrapper {
-    position: absolute;
-    top: 8px;
-    left: 50%;
-    transform: translateX(-50%);
-  }
   .side-sheet-content-wrapper {
     flex: 1;
     min-width: 0;
@@ -1171,7 +1164,18 @@
     position: fixed;
     top: 16px;
     right: 16px;
-    z-index: 300;
+    z-index: 1500;
+    animation: reopenFadeIn var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) forwards;
+  }
+  @keyframes reopenFadeIn {
+    from {
+      opacity: 0;
+      transform: translateX(20px) scale(0.9);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(0) scale(1);
+    }
   }
   .room-layout-container.portrait {
     flex-direction: column;
