@@ -57,6 +57,7 @@ export interface Character {
   parameters: CharacterParameter[];
   chatPalette: string;
   hideStatus: boolean;
+  isNarrative?: boolean;
   placedAsPiece?: boolean;
   piecePosition?: { x: number; y: number };
 }

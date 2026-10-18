@@ -170,4 +170,90 @@ describe('Character Management & CharacterEditModal Hoisting (Issue #52, #60)', 
     unmount(instance);
     target.remove();
   });
+
+  // spec: Issue #129 キャラクター編集モーダルのM3 Expressive Switch (hideStatus, isNarrative)、M3 Divider、説明文、縦スクロール
+  it('renders CharacterEditModal with M3 Switches (hideStatus, isNarrative), Dividers, section descriptions, and scrollable container', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    let savedChar: Character | null = null;
+
+    const instance = mount(CharacterEditModal, {
+      target,
+      props: {
+        character: heroChar,
+        isAdmin: true,
+        onSave: (c) => {
+          savedChar = c;
+        },
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    // 1. Section description texts
+    const statusDesc = target.querySelector('[data-testid="status-section-desc"]');
+    expect(statusDesc).toBeTruthy();
+    expect(statusDesc?.textContent).toBe('体力などのゲーム中に頻繁に更新される値です。');
+
+    const paramDesc = target.querySelector('[data-testid="param-section-desc"]');
+    expect(paramDesc).toBeTruthy();
+    expect(paramDesc?.textContent).toBe('筋力、知力などゲーム中めったに更新されない値です。');
+
+    // 2. M3 Dividers (.np-divider)
+    const dividers = target.querySelectorAll('.np-divider');
+    expect(dividers.length).toBeGreaterThanOrEqual(6);
+
+    // Verify sub-sections contain divider under header & description
+    const statusSection = target.querySelector('.sub-section');
+    expect(statusSection?.querySelector('.np-divider')).toBeTruthy();
+
+    // 3. M3 Switch for "ステータスを秘匿"
+    const hideStatusInput = target.querySelector<HTMLInputElement>('[data-testid="edit-hide-status-toggle"]');
+    expect(hideStatusInput).toBeTruthy();
+    expect(hideStatusInput?.getAttribute('role')).toBe('switch');
+    expect(hideStatusInput?.getAttribute('aria-label')).toBe('ステータスを秘匿');
+    expect(hideStatusInput?.closest('.np-switch')).toBeTruthy();
+    expect(hideStatusInput?.checked).toBe(false);
+
+    // Toggle hide status
+    hideStatusInput?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(hideStatusInput?.checked).toBe(true);
+
+    // 4. M3 Switch for "地の文" (narrative toggle)
+    const narrativeInput = target.querySelector<HTMLInputElement>('[data-testid="edit-narrative-toggle"]');
+    expect(narrativeInput).toBeTruthy();
+    expect(narrativeInput?.getAttribute('role')).toBe('switch');
+    expect(narrativeInput?.getAttribute('aria-label')).toBe('地の文');
+    expect(narrativeInput?.closest('.np-switch')).toBeTruthy();
+    expect(narrativeInput?.checked).toBe(false);
+
+    // Toggle narrative
+    narrativeInput?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(narrativeInput?.checked).toBe(true);
+
+    // 5. Scrollable container structure
+    const overlay = target.querySelector<HTMLElement>('[data-testid="character-edit-panel"]');
+    expect(overlay).toBeTruthy();
+    expect(overlay?.style.overflowY).toBe('auto');
+    expect(overlay?.style.overscrollBehavior).toBe('contain');
+
+    const dialogContent = target.querySelector<HTMLElement>('.edit-dialog-content');
+    expect(dialogContent).toBeTruthy();
+    expect(dialogContent?.style.overflowY).toBe('auto');
+    expect(dialogContent?.style.maxHeight).toBe('85vh');
+    expect(dialogContent?.style.overscrollBehavior).toBe('contain');
+
+    // 6. Save and verify updated properties
+    target.querySelector<HTMLButtonElement>('[data-testid="save-character-btn"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(savedChar?.hideStatus).toBe(true);
+    expect(savedChar?.isNarrative).toBe(true);
+
+    unmount(instance);
+    target.remove();
+  });
 });

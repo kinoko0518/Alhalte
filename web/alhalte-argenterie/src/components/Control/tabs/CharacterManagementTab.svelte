@@ -49,6 +49,7 @@
     parameters: [],
     chatPalette: '',
     hideStatus: false,
+    isNarrative: false,
   });
   let isDeleteConfirmOpen = $state(false);
   let characterToDelete = $state<Character | null>(null);
@@ -90,6 +91,7 @@
       parameters: [],
       chatPalette: '',
       hideStatus: false,
+      isNarrative: false,
       placedAsPiece: false,
     };
     onCreateCharacter?.(newChar);
