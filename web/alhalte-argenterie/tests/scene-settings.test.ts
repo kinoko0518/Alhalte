@@ -159,9 +159,9 @@ describe('Scene Settings & Juices', () => {
       },
     });
 
-    // Check scene name split button
+    // Check scene name input (dropdown toggle removed per Issue #107)
     expect(target.querySelector('[data-testid="scene-name-input"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="scene-split-dropdown-toggle"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="scene-split-dropdown-toggle"]')).toBeNull();
 
     // Check Juices headings and controls
     expect(target.querySelector('[data-testid="heading-juices"]')).toBeTruthy();
@@ -446,8 +446,8 @@ describe('Scene Settings & Juices', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/scene-settings シーン選択ドロップダウンの外側クリック閉じ (Issue #31)
-  it('closes scene split dropdown menu when clicking outside', async () => {
+  // spec: alhalte-argenterie/scene-settings シーン管理固有のシーン選択UI削除 (Issue #107)
+  it('does not render scene split dropdown menu or toggle in SceneSettingsTab (delegated to CommonHeader)', () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -468,20 +468,10 @@ describe('Scene Settings & Juices', () => {
       },
     });
 
-    const toggleBtn = target.querySelector<HTMLButtonElement>(
-      '[data-testid="scene-split-dropdown-toggle"]',
-    );
-    expect(toggleBtn).toBeTruthy();
-    toggleBtn?.click();
-    await new Promise((r) => setTimeout(r, 20));
-
-    expect(target.querySelector('[data-testid="scene-split-menu"]')).toBeTruthy();
-
-    // Click outside on document.body
-    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
-    await new Promise((r) => setTimeout(r, 20));
-
+    expect(target.querySelector('[data-testid="scene-split-dropdown-toggle"]')).toBeNull();
     expect(target.querySelector('[data-testid="scene-split-menu"]')).toBeNull();
+    // Scene name input is present as a standalone editing field
+    expect(target.querySelector('[data-testid="scene-name-input"]')).toBeTruthy();
 
     unmount(instance);
     target.remove();
