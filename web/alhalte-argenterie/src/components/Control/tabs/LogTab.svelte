@@ -9,14 +9,20 @@
    * - GitHub Issue #55: `feat(argenterie): ログタブの共通ヘッダー (Search)、ZIP 出力、キャラカラー Pill、Saignant WASM 描画`
    */
   import { untrack } from 'svelte';
-  import type { Character, LogRecord, Scene } from '../../../types/index.js';
+  import type { Character, ExtensionItem, LogRecord, Scene } from '../../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../../utils/assets.js';
+  import {
+    buildGenerastFromText,
+    type GenerastAST,
+  } from '../../../utils/generast.js';
   import { ChunkLogManager } from '../../../utils/log.js';
   import {
+    clearSaignantCache,
     initSaignant,
     renderGenerast,
     renderGenerastSync,
   } from '../../../utils/saignant.js';
+  import { ExtensionPipeline } from '../../../wasm/runner.js';
   import CommonHeader from '../CommonHeader.svelte';
   import IconImagePicker from '../IconImagePicker.svelte';
 
@@ -24,6 +30,8 @@
     scene,
     allScenes = [],
     characters = [],
+    extensions = [],
+    extensionPipeline = new ExtensionPipeline(),
     roomId,
     isAdmin = false,
     chunkManager = new ChunkLogManager(),
@@ -41,6 +49,8 @@
     scene: Scene;
     allScenes?: Scene[];
     characters?: Character[];
+    extensions?: ExtensionItem[];
+    extensionPipeline?: ExtensionPipeline;
     roomId?: string;
     isAdmin?: boolean;
     chunkManager?: ChunkLogManager;
@@ -66,6 +76,7 @@
   let messages = $state<LogRecord[]>(chunkManager.getLoadedRecords(scene.id));
   let listElement = $state<HTMLDivElement | null>(null);
   let renderedContentMap = $state<Record<string, string>>({});
+  let renderVersion = 0;
 
   function handleAnimationEnd(recordId: string, event?: AnimationEvent) {
     // If multiple animations run (fade-in 150ms and spring-spatial 500ms),
@@ -89,22 +100,65 @@
   });
 
   async function updateRenderedHtml(recs: LogRecord[]) {
+    const currentVersion = ++renderVersion;
     const nextMap = { ...renderedContentMap };
     let changed = false;
     for (const r of recs) {
       if (!nextMap[r.id]) {
         try {
-          nextMap[r.id] = await renderGenerast(r.content);
+          const ast = await buildGenerastFromText(
+            r.content,
+            extensions,
+            extensionPipeline,
+            r.speakerId,
+          );
+          if (renderVersion !== currentVersion) {
+            return;
+          }
+          nextMap[r.id] = await renderGenerast(ast);
         } catch {
           nextMap[r.id] = renderGenerastSync(r.content);
         }
         changed = true;
       }
     }
+    if (renderVersion !== currentVersion) {
+      return;
+    }
     if (changed) {
       renderedContentMap = nextMap;
     }
   }
+
+  let extensionsSignature = $derived(
+    extensions
+      .map(
+        (e) =>
+          `${e.id}:${e.enabled}:${e.priority}:${e.wasmBytes ? e.wasmBytes.length : 0}`,
+      )
+      .join(';'),
+  );
+  let lastExtensionsSignature = extensions
+    .map(
+      (e) =>
+        `${e.id}:${e.enabled}:${e.priority}:${e.wasmBytes ? e.wasmBytes.length : 0}`,
+    )
+    .join(';');
+  let lastPipeline = extensionPipeline;
+
+  $effect(() => {
+    const currentSig = extensionsSignature;
+    const currentPipe = extensionPipeline;
+    if (currentSig !== lastExtensionsSignature || currentPipe !== lastPipeline) {
+      lastExtensionsSignature = currentSig;
+      lastPipeline = currentPipe;
+      untrack(() => {
+        clearSaignantCache();
+        renderedContentMap = {};
+        void updateRenderedHtml(messages);
+      });
+    }
+  });
 
   function refreshLogs() {
     const currentRecords = chunkManager.getLoadedRecords(scene.id);

@@ -91,6 +91,10 @@ export function encodeGenerastAstToTin(ast: GenerastAST | any): Uint8Array {
     return encodeStringAsGenerastTin(ast);
   }
 
+  if (ast instanceof Uint8Array) {
+    return ast;
+  }
+
   if (ast && typeof ast === 'object') {
     if (ast.type === 'string' && typeof ast.value === 'string') {
       return encodeStringAsGenerastTin(ast.value);

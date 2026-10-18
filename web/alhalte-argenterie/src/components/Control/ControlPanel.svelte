@@ -12,6 +12,7 @@
   import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
   import { ChunkLogManager } from '../../utils/log.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
+  import { ExtensionPipeline } from '../../wasm/runner.js';
   import CommonFooter, { type ActiveTab } from './CommonFooter.svelte';
   import CommonHeader from './CommonHeader.svelte';
   import CharacterManagementTab from './tabs/CharacterManagementTab.svelte';
@@ -25,6 +26,7 @@
     allScenes = [],
     characters = [],
     extensions = [],
+    extensionPipeline = new ExtensionPipeline(),
     movements = [],
     accessibleSceneIds = new Set<string>(),
     selectedCharacterId,
@@ -61,6 +63,7 @@
     allScenes?: Scene[];
     characters?: Character[];
     extensions?: ExtensionItem[];
+    extensionPipeline?: ExtensionPipeline;
     movements?: SceneMovementEvent[];
     accessibleSceneIds?: Set<string>;
     selectedCharacterId?: string;
@@ -148,6 +151,8 @@
         scene={currentScene}
         {allScenes}
         {characters}
+        {extensions}
+        {extensionPipeline}
         {roomId}
         {isAdmin}
         {chunkManager}
@@ -215,6 +220,7 @@
     {activeTab}
     {characters}
     {extensions}
+    {extensionPipeline}
     {selectedCharacterId}
     {isViewer}
     onTabChange={handleTabChange}
