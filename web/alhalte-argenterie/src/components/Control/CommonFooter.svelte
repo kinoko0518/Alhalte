@@ -70,28 +70,35 @@
     extensions = [],
     extensionPipeline = new ExtensionPipeline(),
     selectedCharacterId,
+    showDicePicker = $bindable(true),
     onTabChange,
     onSelectCharacter,
     onSendMessage,
     onSendGenerast,
+    onToggleDicePicker,
   }: {
     activeTab?: ActiveTab;
     characters?: Character[];
     extensions?: ExtensionItem[];
     extensionPipeline?: ExtensionPipeline;
     selectedCharacterId?: string;
+    showDicePicker?: boolean;
     onTabChange?: (tab: ActiveTab) => void;
     onSelectCharacter?: (charId: string) => void;
     onSendMessage?: (text: string, characterId?: string, generast?: GenerastAST) => void;
     onSendGenerast?: (generast: GenerastAST, characterId?: string, rawText?: string) => void;
+    onToggleDicePicker?: (show: boolean) => void;
   } = $props();
 
   let messageInput = $state('');
   let isCharPickerOpen = $state(false);
+  let isMoreMenuOpen = $state(false);
   let isSuggestDismissed = $state(false);
   let textareaElement = $state<HTMLTextAreaElement | null>(null);
   let charBtnElement = $state<HTMLElement | undefined>(undefined);
   let charPickerWrapper = $state<HTMLElement | null>(null);
+  let moreBtnElement = $state<HTMLElement | undefined>(undefined);
+  let moreMenuWrapper = $state<HTMLElement | null>(null);
 
   const tabItems: Array<{ id: ActiveTab; icon: string; label: string; fullLabel: string }> = [
     { id: 'log', icon: 'forum', label: 'ログ', fullLabel: 'ログタブ' },
@@ -188,6 +195,9 @@
     dismissSuggestions();
     if (isCharPickerOpen && charPickerWrapper && !charPickerWrapper.contains(e.target as Node)) {
       isCharPickerOpen = false;
+    }
+    if (isMoreMenuOpen && moreMenuWrapper && !moreMenuWrapper.contains(e.target as Node)) {
+      isMoreMenuOpen = false;
     }
   }
 </script>
@@ -359,7 +369,7 @@
       {/if}
     </div>
 
-    <!-- Right-aligned Send Button -->
+    <!-- Right-aligned Send Button and More options Button -->
     <div class="send-action-wrapper">
       <Button
         variant="filled"
@@ -375,26 +385,70 @@
         {/snippet}
         送信
       </Button>
+
+      <div class="more-menu-container" bind:this={moreMenuWrapper}>
+        <IconButton
+          variant="text"
+          size="s"
+          class="more-btn"
+          bind:element={moreBtnElement}
+          onclick={() => (isMoreMenuOpen = !isMoreMenuOpen)}
+          aria-label="その他"
+          title="その他"
+          aria-haspopup="menu"
+          aria-expanded={isMoreMenuOpen}
+          aria-describedby="tooltip-footer-more"
+          data-testid="footer-more-button"
+        >
+          <Icon>more_vert</Icon>
+        </IconButton>
+        <Tooltip id="tooltip-footer-more">その他</Tooltip>
+
+        {#if isMoreMenuOpen}
+          <Menu
+            bind:open={isMoreMenuOpen}
+            anchor={moreBtnElement}
+            class="footer-more-menu"
+            data-testid="footer-more-menu"
+          >
+            <MenuItem
+              onclick={() => {
+                showDicePicker = !showDicePicker;
+                onToggleDicePicker?.(showDicePicker);
+                isMoreMenuOpen = false;
+              }}
+              data-testid="toggle-dice-picker-menu-item"
+            >
+              {#snippet start()}
+                <Icon>{showDicePicker ? 'visibility_off' : 'visibility'}</Icon>
+              {/snippet}
+              {showDicePicker ? 'ダイスピッカーを非表示' : 'ダイスピッカーを表示'}
+            </MenuItem>
+          </Menu>
+        {/if}
+      </div>
     </div>
   </div>
 
-  <!-- Dice buttons row (Center-aligned) -->
-  <div class="dice-buttons-row" data-testid="dice-buttons-row">
-    {#each diceList as dice (dice)}
-      <IconButton
-        variant="text"
-        size="m"
-        onclick={() => handleInsertDice(dice)}
-        aria-label={dice}
-        aria-describedby={`tooltip-dice-${dice.toLowerCase()}`}
-        data-testid={`dice-btn-${dice.toLowerCase()}`}
-        class="dice-icon-btn"
-      >
-        {@render diceSvg(dice)}
-      </IconButton>
-      <Tooltip id={`tooltip-dice-${dice.toLowerCase()}`}>{dice}</Tooltip>
-    {/each}
-  </div>
+  <!-- Dice buttons row (Center-aligned, horizontally scrollable) -->
+  {#if showDicePicker}
+    <div class="dice-buttons-row" data-testid="dice-buttons-row">
+      {#each diceList as dice (dice)}
+        <IconButton
+          variant="text"
+          size="m"
+          onclick={() => handleInsertDice(dice)}
+          aria-label={dice}
+          aria-describedby={`tooltip-dice-${dice.toLowerCase()}`}
+          data-testid={`dice-btn-${dice.toLowerCase()}`}
+          class="dice-icon-btn"
+        >
+          {@render diceSvg(dice)}
+        </IconButton>
+        <Tooltip id={`tooltip-dice-${dice.toLowerCase()}`}>{dice}</Tooltip>
+      {/each}
+    </div>
+  {/if}
 
   <!-- Input field wrapper with chat palette suggestion overlay -->
   <div class="input-wrapper" data-testid="footer-input-wrapper">
@@ -533,19 +587,43 @@
   }
   .send-action-wrapper {
     margin-left: auto;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+  .more-menu-container {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
   }
 
-  /* 3. Dice buttons row */
+  /* 3. Dice buttons row (horizontal scroll on narrow width) */
   .dice-buttons-row {
     display: flex;
-    justify-content: center;
+    justify-content: safe center;
     align-items: center;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
     gap: 6px;
     width: 100%;
     padding: 2px 0;
+    box-sizing: border-box;
+    scrollbar-width: thin;
+    scrollbar-color: var(--np-color-outline-variant) transparent;
+  }
+  .dice-buttons-row::-webkit-scrollbar {
+    height: 4px;
+  }
+  .dice-buttons-row::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .dice-buttons-row::-webkit-scrollbar-thumb {
+    background: var(--np-color-outline-variant);
+    border-radius: 4px;
   }
   .dice-buttons-row :global(.dice-icon-btn) {
+    flex: 0 0 auto;
     color: var(--np-color-on-surface-variant);
     transition: color var(--np-motion-expressive-fast-effects, 200ms ease),
                 transform var(--np-motion-expressive-fast-spatial, 200ms ease);

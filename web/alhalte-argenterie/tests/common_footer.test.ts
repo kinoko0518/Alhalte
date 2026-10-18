@@ -391,4 +391,129 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     unmount(instance);
     target.remove();
   });
+
+  // spec: alhalte-argenterie/common-footer 送信ボタン右横の「その他」ボタンとTooltip、ダイスピッカー表示・非表示トグルメニュー (Issue #86)
+  it('renders more options button next to send button with tooltip, and toggles dice picker visibility via menu', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    let dicePickerVisible = true;
+    const onToggleDicePicker = vi.fn((show: boolean) => {
+      dicePickerVisible = show;
+    });
+
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        onToggleDicePicker,
+      },
+    });
+
+    // 1. Verify "その他" button exists next to Send button
+    const sendBtn = target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]');
+    expect(sendBtn).toBeTruthy();
+
+    const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="footer-more-button"]');
+    expect(moreBtn).toBeTruthy();
+    expect(moreBtn?.classList.contains('np-icon-button')).toBe(true);
+    expect(moreBtn?.classList.contains('s')).toBe(true);
+    expect(moreBtn?.classList.contains('text')).toBe(true);
+    expect(moreBtn?.getAttribute('aria-label')).toBe('その他');
+    expect(moreBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('more_vert');
+
+    // 2. Verify Tooltip exists for "その他"
+    const moreTooltip = target.querySelector('#tooltip-footer-more');
+    expect(moreTooltip).toBeTruthy();
+    expect(moreTooltip?.textContent?.trim()).toBe('その他');
+
+    // 3. Dice picker is initially visible by default
+    expect(target.querySelector('[data-testid="dice-buttons-row"]')).toBeTruthy();
+
+    // 4. Click "その他" button to open menu
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const menu = target.querySelector('[data-testid="footer-more-menu"]');
+    expect(menu).toBeTruthy();
+
+    const toggleItem = target.querySelector<HTMLElement>('[data-testid="toggle-dice-picker-menu-item"]');
+    expect(toggleItem).toBeTruthy();
+    expect(toggleItem?.textContent).toContain('ダイスピッカーを非表示');
+
+    // 5. Click "ダイスピッカーを非表示"
+    toggleItem?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Menu closes and dice picker is hidden
+    expect(target.querySelector('[data-testid="footer-more-menu"]')).toBeNull();
+    expect(target.querySelector('[data-testid="dice-buttons-row"]')).toBeNull();
+    expect(onToggleDicePicker).toHaveBeenCalledWith(false);
+    expect(dicePickerVisible).toBe(false);
+
+    // 6. Click "その他" button again to reopen menu
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const reopenMenu = target.querySelector('[data-testid="footer-more-menu"]');
+    expect(reopenMenu).toBeTruthy();
+
+    const toggleItem2 = target.querySelector<HTMLElement>('[data-testid="toggle-dice-picker-menu-item"]');
+    expect(toggleItem2).toBeTruthy();
+    expect(toggleItem2?.textContent).toContain('ダイスピッカーを表示');
+
+    // 7. Click "ダイスピッカーを表示"
+    toggleItem2?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Menu closes and dice picker is restored
+    expect(target.querySelector('[data-testid="footer-more-menu"]')).toBeNull();
+    expect(target.querySelector('[data-testid="dice-buttons-row"]')).toBeTruthy();
+    expect(onToggleDicePicker).toHaveBeenCalledWith(true);
+    expect(dicePickerVisible).toBe(true);
+
+    // 8. Test outside click dismissal for more menu
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="footer-more-menu"]')).toBeTruthy();
+
+    document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="footer-more-menu"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/common-footer showDicePicker初期プロパティ制御 (Issue #86)
+  it('respects initial showDicePicker=false prop', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: sampleCharacters,
+        selectedCharacterId: 'char-1',
+        showDicePicker: false,
+      },
+    });
+
+    // Dice row should not be in document initially
+    expect(target.querySelector('[data-testid="dice-buttons-row"]')).toBeNull();
+
+    // Opening more menu should show "ダイスピッカーを表示"
+    const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="footer-more-button"]');
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const toggleItem = target.querySelector<HTMLElement>('[data-testid="toggle-dice-picker-menu-item"]');
+    expect(toggleItem?.textContent).toContain('ダイスピッカーを表示');
+
+    unmount(instance);
+    target.remove();
+  });
 });
