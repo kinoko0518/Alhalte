@@ -65,4 +65,6 @@ pub use session::{
     cleanup_sessions_at, cleanup_sessions_with_cutoff, duration_until_next_4am, previous_4am_local,
     spawn_session_cleanup_task,
 };
-pub use spawner::{BanquetteSpawner, InProcessBanquetteSpawner, ProcessBanquetteSpawner};
+pub use spawner::{
+    BanquetteSpawner, InProcessBanquetteSpawner, ProcessBanquetteSpawner, resolve_banquette_bin,
+};

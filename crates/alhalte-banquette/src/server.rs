@@ -200,7 +200,7 @@ impl BanquetteServer {
                             client_id,
                             account_id,
                             session_id,
-                            current_scene: None,
+                            current_scene: Some("/".to_string()),
                         },
                     );
                     let mut r = room.write().await;

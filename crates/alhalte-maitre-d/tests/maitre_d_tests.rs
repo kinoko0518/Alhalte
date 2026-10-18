@@ -17,7 +17,8 @@ use alhalte_maitre_d::{
     RoomBridgeManager, RoomPermissionItem, RoomRole, SetRoomPermissionRequest, account_id_from_tin,
     account_id_to_tin, cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
     decrypt_sub, encrypt_sub, extract_session_id_from_cookie, parse_cli_args_from,
-    parse_session_id_from_cookie_str, previous_4am_local, session_id_from_tin, session_id_to_tin,
+    parse_session_id_from_cookie_str, previous_4am_local, resolve_banquette_bin,
+    session_id_from_tin, session_id_to_tin,
 };
 
 // spec: alhalte-maitre-d/labels
@@ -1556,4 +1557,205 @@ async fn test_websocket_viewer_mutate_blocking() {
 
     viewer_stream.close(None).await.unwrap();
     gm_stream.close(None).await.unwrap();
+}
+
+// spec: alhalte-maitre-d/gateway initial scene demux
+#[tokio::test]
+async fn test_initial_scene_demultiplexing_and_root_broadcasts() {
+    let temp_dir = tempdir().unwrap();
+    let socket_dir = temp_dir.path().to_path_buf();
+
+    let db = Database::new_in_memory().unwrap();
+    let acc = db
+        .get_or_create_account("sub-init-scene", "DemuxUser", None, 1000)
+        .unwrap();
+    let session = db.create_session(acc.account_id, 1000).unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        socket_dir, 8,
+    ));
+    let room_manager = RoomBridgeManager::new(spawner);
+    let oauth = Arc::new(MockOAuthProvider::new());
+    let state = AppState::new(db, "salt", oauth, room_manager);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let room_id: u64 = 999;
+    let ws_url = format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
+        acc.account_id, session.session_id
+    );
+
+    let (mut ws_stream, _) = connect_async(&ws_url).await.unwrap();
+
+    // The client is connected and registered into root scene "/" by default.
+    // Send an update to root scene state
+    let state_tin = tin::Tin::from_string("Initial Root Scene State");
+    let update_frame = serde_json::to_string(&ClientFrame::UpdateState {
+        scene_id: "/".to_string(),
+        key: "system::welcome".to_string(),
+        value: state_tin.clone(),
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(update_frame.into()))
+        .await
+        .unwrap();
+
+    // Verify client receives StateUpdated for "/" without needing explicit EnterScene
+    let mut received_root_state = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(text))) =
+            tokio::time::timeout(Duration::from_millis(500), ws_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::StateUpdated {
+                scene_id,
+                key,
+                value,
+            }) = serde_json::from_str::<ServerFrame>(&text)
+            && scene_id == "/"
+            && key == "system::welcome"
+            && value == state_tin
+        {
+            received_root_state = true;
+            break;
+        }
+    }
+    assert!(
+        received_root_state,
+        "Client should receive root scene StateUpdated broadcast upon initial connection"
+    );
+
+    // Send log entry to root scene "/"
+    let log_entry = tin::Tin::from_string("Welcome to the room!");
+    let log_frame = serde_json::to_string(&ClientFrame::AppendLog {
+        scene_id: "/".to_string(),
+        entry: Some(log_entry.clone()),
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(log_frame.into()))
+        .await
+        .unwrap();
+
+    // Verify client receives LogEventAppended for "/"
+    let mut received_root_log = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(text))) =
+            tokio::time::timeout(Duration::from_millis(500), ws_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::LogEventAppended {
+                scene_id, entry, ..
+            }) = serde_json::from_str::<ServerFrame>(&text)
+            && scene_id == "/"
+            && entry == Some(log_entry.clone())
+        {
+            received_root_log = true;
+            break;
+        }
+    }
+    assert!(
+        received_root_log,
+        "Client should receive root scene LogEventAppended broadcast upon initial connection"
+    );
+
+    // Create and move to another scene "side-room"
+    let create_scene = serde_json::to_string(&ClientFrame::CreateScene {
+        scene_id: "side-room".to_string(),
+        inherit_juices: false,
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(create_scene.into()))
+        .await
+        .unwrap();
+
+    let enter_side = serde_json::to_string(&ClientFrame::EnterScene {
+        scene_id: "side-room".to_string(),
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(enter_side.into()))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Update "side-room" state
+    let side_state = tin::Tin::from_string("Side Room Ambient");
+    let side_update = serde_json::to_string(&ClientFrame::UpdateState {
+        scene_id: "side-room".to_string(),
+        key: "side::ambient".to_string(),
+        value: side_state.clone(),
+    })
+    .unwrap();
+    ws_stream
+        .send(WsMessage::Text(side_update.into()))
+        .await
+        .unwrap();
+
+    // Verify client receives StateUpdated for "side-room"
+    let mut received_side_state = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(text))) =
+            tokio::time::timeout(Duration::from_millis(500), ws_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::StateUpdated {
+                scene_id,
+                key,
+                value,
+            }) = serde_json::from_str::<ServerFrame>(&text)
+            && scene_id == "side-room"
+            && key == "side::ambient"
+            && value == side_state
+        {
+            received_side_state = true;
+            break;
+        }
+    }
+    assert!(
+        received_side_state,
+        "Client should receive StateUpdated broadcast for new scene 'side-room'"
+    );
+
+    ws_stream.close(None).await.unwrap();
+}
+
+// spec: alhalte-maitre-d/spawner binary path resolution
+#[test]
+fn test_resolve_banquette_bin_paths() {
+    use std::path::Path;
+
+    // Existing file returns immediately
+    if let Ok(exe) = std::env::current_exe() {
+        let resolved = resolve_banquette_bin(&exe);
+        assert_eq!(resolved, exe);
+    }
+
+    // Resolving standard name "alhalte-banquette"
+    let bin_name = Path::new("alhalte-banquette");
+    let resolved = resolve_banquette_bin(bin_name);
+    // If built in target/debug, it should resolve to target/debug/alhalte-banquette
+    if Path::new("target/debug/alhalte-banquette").is_file() {
+        assert_eq!(
+            resolved,
+            std::path::PathBuf::from("target/debug/alhalte-banquette")
+        );
+    }
+
+    // Non-existent binary falls back to original path
+    let dummy = Path::new("nonexistent-banquette-bin-xyz-9876");
+    let fallback = resolve_banquette_bin(dummy);
+    assert_eq!(fallback, dummy);
 }

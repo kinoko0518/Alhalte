@@ -20,7 +20,13 @@ pub struct ModuleArgs {
 ///
 /// Deterministic and pure function.
 pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
-    vec![
+    let cellar_url = config
+        .maitre_d
+        .cellar_url
+        .clone()
+        .unwrap_or_else(|| config.cellar_url());
+
+    let mut args = vec![
         "--host".to_string(),
         config.restaurant.host.clone(),
         "--port".to_string(),
@@ -35,7 +41,16 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         config.maitre_d.salt.clone(),
         "--socket-dir".to_string(),
         config.maitre_d_socket_dir().display().to_string(),
-    ]
+        "--cellar-url".to_string(),
+        cellar_url,
+    ];
+
+    if let Some(ref bin) = config.maitre_d.banquette_bin {
+        args.push("--banquette-bin".to_string());
+        args.push(bin.display().to_string());
+    }
+
+    args
 }
 
 /// Generates CLI arguments for `alhalte-cellar`.

@@ -192,9 +192,11 @@ impl RoomBridge {
                 let cl = clients.read().await;
                 let scenes = client_scenes.read().await;
                 for (cid, tx) in cl.iter() {
-                    if let Some(curr_scene) = scenes.get(cid)
-                        && curr_scene == &scene_id
-                    {
+                    let matches = match scenes.get(cid) {
+                        Some(curr_scene) => curr_scene == &scene_id,
+                        None => scene_id == "/",
+                    };
+                    if matches {
                         let _ = tx.send(frame.clone()).await;
                     }
                 }
@@ -234,6 +236,10 @@ impl RoomBridge {
         {
             let mut cl = self.clients.write().await;
             cl.insert(client_id, tx);
+        }
+        {
+            let mut scenes = self.client_scenes.write().await;
+            scenes.insert(client_id, "/".to_string());
         }
 
         let _ = self

@@ -44,6 +44,57 @@ impl ProcessBanquetteSpawner {
     }
 }
 
+/// Resolves the filesystem path to the `alhalte-banquette` executable binary.
+///
+/// If `binary_path` exists directly on disk, it is returned as-is.
+/// Otherwise, checks:
+/// 1. `target/debug/<bin_name>` relative to the current working directory
+/// 2. `target/release/<bin_name>` relative to the current working directory
+/// 3. Alongside the current executable (`std::env::current_exe()`)
+/// 4. Directories listed in the `PATH` environment variable
+///
+/// If not found in any candidate locations, returns `binary_path.to_path_buf()` as fallback.
+pub fn resolve_banquette_bin(binary_path: &std::path::Path) -> PathBuf {
+    if binary_path.is_file() {
+        return binary_path.to_path_buf();
+    }
+
+    let bin_name = binary_path.file_name().unwrap_or(binary_path.as_os_str());
+
+    // 1. Current working directory target/debug and target/release
+    let candidates = [
+        PathBuf::from("target/debug").join(bin_name),
+        PathBuf::from("target/release").join(bin_name),
+    ];
+    for candidate in &candidates {
+        if candidate.is_file() {
+            return candidate.clone();
+        }
+    }
+
+    // 2. Alongside the currently running executable
+    if let Ok(current_exe) = std::env::current_exe()
+        && let Some(parent) = current_exe.parent()
+    {
+        let candidate = parent.join(bin_name);
+        if candidate.is_file() {
+            return candidate;
+        }
+    }
+
+    // 3. Search in PATH
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            let candidate = dir.join(bin_name);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+
+    binary_path.to_path_buf()
+}
+
 #[async_trait]
 impl BanquetteSpawner for ProcessBanquetteSpawner {
     async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf> {
@@ -57,7 +108,13 @@ impl BanquetteSpawner for ProcessBanquetteSpawner {
             let _ = tokio::fs::remove_file(&socket_path).await;
         }
 
-        let mut cmd = tokio::process::Command::new(&self.binary_path);
+        let resolved_bin = resolve_banquette_bin(&self.binary_path);
+        tracing::debug!(
+            "Spawning banquette for room {room_id} with binary: {:?}",
+            resolved_bin
+        );
+
+        let mut cmd = tokio::process::Command::new(&resolved_bin);
         cmd.arg("--room-id")
             .arg(room_id.to_string())
             .arg("--admin")
@@ -71,8 +128,8 @@ impl BanquetteSpawner for ProcessBanquetteSpawner {
 
         cmd.spawn().map_err(|e| {
             MaitreDError::Banquette(format!(
-                "Failed to spawn banquette binary at {:?}: {e}",
-                self.binary_path
+                "Failed to spawn banquette binary at {:?} (resolved: {:?}): {e}",
+                self.binary_path, resolved_bin
             ))
         })?;
 

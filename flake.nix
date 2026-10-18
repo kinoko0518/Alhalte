@@ -49,6 +49,7 @@
           ];
           text = ''
             export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.sqlite.dev}/lib/pkgconfig:''${PKG_CONFIG_PATH:-}"
+            export PATH="$PWD/target/debug:$PATH"
             export WASI_SYSROOT="${wasiSysroot}"
             export WASI_LIBDIR="${wasiSysroot}/lib/wasm32-wasip1"
             export CC_wasm32_unknown_unknown="${llvm.clang-unwrapped}/bin/clang"
