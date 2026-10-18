@@ -906,7 +906,13 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       timestamp: 1001,
     });
 
-    await new Promise((r) => setTimeout(r, 60));
+    // Rendering runs through the WASM extension, so wait for the rendered HTML
+    // instead of a fixed delay (the old 60 ms sleep flaked under parallel load,
+    // Issue #109).
+    await waitFor(() => {
+      const el = target.querySelector('[data-testid="msg-content-msg-fold-2"]');
+      return !!el?.innerHTML?.includes('saignant-bold');
+    });
 
     const content1 = target.querySelector('[data-testid="msg-content-msg-fold-1"]');
     expect(content1).toBeTruthy();
@@ -974,7 +980,6 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       timestamp: 1000,
     });
 
-    await new Promise((r) => setTimeout(r, 60));
     // Rendering runs through two WASM extensions, so wait for the rendered HTML
     // instead of relying on a fixed delay (this assertion used to flake under
     // parallel load without weakening either expectation).
@@ -1077,7 +1082,17 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     const logTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-log"]');
     expect(logTabBtn).toBeTruthy();
     logTabBtn?.click();
-    await new Promise((r) => setTimeout(r, 60));
+    // Wait for the re-render itself (raw Markdown text, no Saignant bold class)
+    // rather than a fixed delay; the assertions below stay equally strict
+    // (Issue #109).
+    await waitFor(() => {
+      const list = target.querySelector('[data-testid="messages-list"]');
+      return (
+        !!list &&
+        !!list.textContent?.includes('**こんにちは**') &&
+        !list.innerHTML.includes('saignant-bold')
+      );
+    });
 
     // Message should be re-rendered without extension transformation: raw '**こんにちは**'
     const updatedMessagesList = target.querySelector('[data-testid="messages-list"]');
@@ -1136,7 +1151,17 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       },
     });
 
-    await new Promise((r) => setTimeout(r, 60));
+    // Rendering runs through the WASM extension, so wait for both rendered
+    // records instead of a fixed delay (the old 60 ms sleep flaked under
+    // parallel load, Issue #109).
+    await waitFor(() => {
+      const first = target.querySelector('[data-testid="msg-content-msg-pre-1"]');
+      const second = target.querySelector('[data-testid="msg-content-msg-pre-2"]');
+      return (
+        !!first?.innerHTML?.includes('saignant-bold') &&
+        !!second?.innerHTML?.includes('saignant-italic')
+      );
+    });
 
     const content1 = target.querySelector('[data-testid="msg-content-msg-pre-1"]');
     const content2 = target.querySelector('[data-testid="msg-content-msg-pre-2"]');
