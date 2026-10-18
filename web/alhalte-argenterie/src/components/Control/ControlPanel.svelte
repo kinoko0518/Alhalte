@@ -50,6 +50,8 @@
     onCollapse,
     roomId,
     isViewer = false,
+    sending = false,
+    pendingMessageCount = 0,
     onSetDone,
     onManagePermissions,
     onRequestDeleteScene,
@@ -87,6 +89,10 @@
     onExportZip?: (type: 'full' | 'logs') => void;
     onCollapse?: () => void;
     roomId?: string;
+    /** Forwarded to `CommonFooter`: a message send is waiting for its echo (Issue #109). */
+    sending?: boolean;
+    /** Forwarded to `CommonFooter`: messages waiting in the durable offline outbox (Issue #109). */
+    pendingMessageCount?: number;
     onSetDone?: (done: boolean) => void;
     onManagePermissions?: () => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
@@ -223,6 +229,8 @@
     {extensionPipeline}
     {selectedCharacterId}
     {isViewer}
+    {sending}
+    {pendingMessageCount}
     onTabChange={handleTabChange}
     {onSelectCharacter}
     {onSendMessage}

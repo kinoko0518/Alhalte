@@ -16,6 +16,7 @@ import {
   type ConnectionState,
 } from '../src/utils/connection.js';
 import { RoomSocket } from '../src/utils/roomSocket.js';
+import { getOutbox, resetOutbox } from '../src/utils/outbox.js';
 import type { VisitedRoom } from '../src/types/index.js';
 
 class MockWebSocket {
@@ -345,7 +346,11 @@ describe('Server Connection Management & Offline Indicator (Issue #88 & #67)', (
     });
 
     // Requirement: オフライン動作中に送信したメッセージをqueueに蓄積、再接続できたあとにバルク送信
-    it('accumulates chat messages in queue while offline and bulk-sends upon reconnection', async () => {
+    // Issue #109: the queue is now the durable IndexedDB outbox (not RoomSocket's
+    // in-memory `messageQueue`), because RoomSocket would resend its own copy on
+    // reconnect and deliver every offline message twice.
+    it('accumulates chat messages in the durable outbox while offline and flushes them upon reconnection', async () => {
+      resetOutbox();
       const connectionManager = createConnectionManager({ initialState: 'connected' });
       const socket = new RoomSocket({
         roomId: 'room-offline-test',
@@ -400,10 +405,20 @@ describe('Server Connection Management & Offline Indicator (Issue #88 & #67)', (
         await new Promise((r) => setTimeout(r, 10));
       }
 
-      // Verify messages are accumulated in socket queue
-      expect(socket.getPendingMessageCount()).toBe(3);
-      const queuedMessages = socket.getMessageQueue();
-      expect(queuedMessages).toHaveLength(3);
+      // RoomSocket's in-memory queue stays untouched: the messages live in the
+      // durable outbox instead (queued directly, never duplicated).
+      expect(socket.getPendingMessageCount()).toBe(0);
+      expect(socket.getMessageQueue()).toHaveLength(0);
+      const queued = await getOutbox().list('room-offline-test', 'message');
+      expect(queued).toHaveLength(3);
+      expect(
+        queued.map((entry) => (entry.payload as { record: { content: string } }).record.content),
+      ).toEqual(['オフラインメッセージ1', 'オフラインメッセージ2', 'オフラインメッセージ3']);
+      // The wavy queue notice reports the pending count.
+      await new Promise((r) => setTimeout(r, 20));
+      expect(
+        target.querySelector('[data-testid="offline-queue-notice-count"]')?.textContent?.trim(),
+      ).toBe('3 件を蓄積中');
 
       // Now trigger reconnection
       const reconnectPromise = connectionManager.reconnect();
@@ -414,15 +429,47 @@ describe('Server Connection Management & Offline Indicator (Issue #88 & #67)', (
       await reconnectPromise;
       await new Promise((r) => setTimeout(r, 30));
 
+      // The outbox is flushed sequentially and each entry completes only once its
+      // `LogEventAppended` echo comes back, so answer the frames as they arrive.
+      let answered = 0;
+      const startedAt = Date.now();
+      while (answered < 3 && Date.now() - startedAt < 3000) {
+        const appendFrames = mockWs2.sentMessages
+          .map((m) => JSON.parse(m))
+          .filter((f) => typeof f === 'object' && f !== null && 'AppendLog' in f);
+        if (appendFrames.length > answered) {
+          const frame = appendFrames[answered];
+          mockWs2.receive({
+            LogEventAppended: {
+              scene_id: frame.AppendLog.scene_id,
+              chunk_index: 0,
+              position: answered,
+              entry: frame.AppendLog.entry,
+            },
+          });
+          answered += 1;
+        }
+        await new Promise((r) => setTimeout(r, 10));
+      }
+
       // Verify bulk transmission of all 3 queued messages to the newly connected WebSocket
       const sentFrames = mockWs2.sentMessages.map((m) => JSON.parse(m));
       const appendFrames = sentFrames.filter((f) => typeof f === 'object' && f !== null && 'AppendLog' in f);
       expect(appendFrames.length).toBeGreaterThanOrEqual(3);
 
-      // Queue is now empty
+      // Every entry was acknowledged and removed from the outbox.
+      expect(answered).toBe(3);
+      expect(await getOutbox().list('room-offline-test', 'message')).toHaveLength(0);
       expect(socket.getPendingMessageCount()).toBe(0);
+      await new Promise((r) => setTimeout(r, 20));
+      expect(target.querySelector('[data-testid="offline-queue-notice"]')).toBeNull();
+      // The echoed messages are now rendered in the log tab.
+      expect(target.querySelector('[data-testid="messages-list"]')?.textContent).toContain(
+        'オフラインメッセージ3',
+      );
 
       unmount(instance);
+      resetOutbox();
     });
 
     // Requirement: オフライン動作中のStateの変更は最終状態が変化したものを再接続後に送信

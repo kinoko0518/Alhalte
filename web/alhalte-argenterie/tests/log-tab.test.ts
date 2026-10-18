@@ -11,6 +11,7 @@ import {
 } from '../src/utils/log.js';
 import LogTab from '../src/components/Control/tabs/LogTab.svelte';
 import App from '../src/components/App.svelte';
+import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
 import { hexToBytes } from '@alhalte/pantry';
 import {
   DEFAULT_OFFICIAL_EXTENSIONS,
@@ -19,6 +20,18 @@ import {
 } from '../src/wasm/runner.js';
 import type { Character, ExtensionItem, Scene, VisitedRoom } from '../src/types/index.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
+
+/**
+ * Polls `predicate` until it holds. Used where WASM log rendering is involved so
+ * the assertions do not depend on a fixed sleep duration (Issue #109).
+ */
+async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
+  const startedAt = Date.now();
+  while (!predicate()) {
+    if (Date.now() - startedAt > timeoutMs) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 // Valid WebAssembly binary implementing:
 // - memory (1 page)
@@ -260,12 +273,17 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       },
     ];
 
+    const fakeSocket = new FakeRoomSocket();
+
     const instance = mount(App, {
       target,
       props: {
         initialRoom: testRoom,
         initialCharacters: testChars,
         isAdmin: true,
+        // The message is only rendered once the server's `LogEventAppended`
+        // echo arrives (Issue #109), so drive a connected socket explicitly.
+        roomSocket: asRoomSocket(fakeSocket),
       },
     });
 
@@ -282,11 +300,27 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     sendBtn!.click();
     await new Promise((r) => setTimeout(r, 30));
 
-    // Input should be cleared and message rendered in LogTab
+    // Input is cleared immediately, but nothing is rendered before the echo.
     expect(inputEl!.value).toBe('');
+    expect(fakeSocket.requestAppendLogCalls).toHaveLength(1);
+    expect(fakeSocket.requestAppendLogCalls[0].record.content).toBe('こんにちは、世界！');
+    const messagesBeforeEcho = target.querySelector('[data-testid="messages-list"]');
+    expect(messagesBeforeEcho?.textContent).not.toContain('こんにちは、世界！');
+
+    // The server echo confirms the append: only now does it appear in LogTab.
+    fakeSocket.deliverEcho();
+    await waitFor(
+      () =>
+        !!target
+          .querySelector('[data-testid="messages-list"]')
+          ?.textContent?.includes('こんにちは、世界！'),
+    );
+
     const messagesList = target.querySelector('[data-testid="messages-list"]');
     expect(messagesList?.textContent).toContain('こんにちは、世界！');
     expect(messagesList?.textContent).toContain('アルハルテ太郎');
+    // Exactly one record was appended (the echo), not a local copy plus echo.
+    expect(target.querySelectorAll('[data-testid^="log-record-"]')).toHaveLength(1);
 
     const newMsgEl = target.querySelector('.message-entry.message-entry-new');
     expect(newMsgEl).toBeTruthy();
@@ -753,11 +787,15 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       isAdmin: true,
     };
 
+    const fakeSocket = new FakeRoomSocket();
+
     const instance = mount(App, {
       target,
       props: {
         initialRoom: testRoom,
         isAdmin: true,
+        // Rendering waits for the server echo (Issue #109).
+        roomSocket: asRoomSocket(fakeSocket),
       },
     });
 
@@ -775,6 +813,8 @@ describe('Log Tab & Chunk Lazy Loading', () => {
 
     sendBtn!.click();
     await new Promise((r) => setTimeout(r, 30));
+    fakeSocket.deliverEcho();
+    await waitFor(() => target.querySelector('.message-entry.message-entry-new') !== null);
 
     const msgEl = target.querySelector('.message-entry.message-entry-new');
     expect(msgEl).toBeTruthy();
@@ -935,6 +975,15 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     });
 
     await new Promise((r) => setTimeout(r, 60));
+    // Rendering runs through two WASM extensions, so wait for the rendered HTML
+    // instead of relying on a fixed delay (this assertion used to flake under
+    // parallel load without weakening either expectation).
+    await waitFor(
+      () =>
+        !!target
+          .querySelector('[data-testid="msg-content-msg-prio-1"]')
+          ?.innerHTML?.includes('saignant-bold'),
+    );
 
     const contentEl = target.querySelector('[data-testid="msg-content-msg-prio-1"]');
     expect(contentEl).toBeTruthy();
@@ -974,12 +1023,16 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       },
     ];
 
+    const fakeSocket = new FakeRoomSocket();
+
     const instance = mount(App, {
       target,
       props: {
         initialRoom: testRoom,
         initialExtensions,
         isAdmin: true,
+        // Rendering waits for the server echo (Issue #109).
+        roomSocket: asRoomSocket(fakeSocket),
       },
     });
 
@@ -996,7 +1049,12 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     await new Promise((r) => setTimeout(r, 20));
 
     sendBtn!.click();
-    await new Promise((r) => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, 30));
+    fakeSocket.deliverEcho();
+    await waitFor(
+      () =>
+        !!target.querySelector('[data-testid="messages-list"]')?.textContent?.includes('こんにちは'),
+    );
 
     // Initially with extension enabled, message has bold styling
     const messagesList = target.querySelector('[data-testid="messages-list"]');

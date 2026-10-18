@@ -40,7 +40,13 @@
     ConnectionManager,
     type ConnectionState,
   } from '../utils/connection.js';
-  import { RoomSocket, parseCharacter } from '../utils/roomSocket.js';
+  import {
+    RoomSocket,
+    OperationTimeoutError,
+    ServerOperationError,
+    parseCharacter,
+  } from '../utils/roomSocket.js';
+  import { getOutbox } from '../utils/outbox.js';
   import {
     getRoomPermissions,
     getSavedAccountId,
@@ -406,24 +412,151 @@
   });
 
   let roomSocket = $state<RoomSocket | null>(customRoomSocket ?? null);
-  let pendingOfflineMessages = $state<Array<{ sceneId: string; record: LogRecord }>>([]);
-  let pendingOfflineStates = $state<Map<string, { sceneId: string; key: string; value: any }>>(new Map());
 
-  $effect(() => {
-    if (roomSocket) {
-      if (pendingOfflineStates.size > 0) {
-        for (const [, st] of pendingOfflineStates) {
-          roomSocket.updateState(st.sceneId, st.key, st.value);
-        }
-        pendingOfflineStates.clear();
-      }
-      if (pendingOfflineMessages.length > 0) {
-        for (const item of pendingOfflineMessages) {
-          roomSocket.appendLog(item.sceneId, item.record);
-        }
-        pendingOfflineMessages = [];
-      }
+  // ---------------------------------------------------------------------------
+  // Message sending & offline outbox (Issue #109 / sub-issue #139)
+  // ---------------------------------------------------------------------------
+  /** True while a sent message is waiting for the server's `LogEventAppended` echo. */
+  let isSending = $state(false);
+  /** Number of messages waiting in the durable outbox for the active room. */
+  let pendingMessageCount = $state(0);
+  /** Guards against overlapping outbox flushes (reconnect can fire repeatedly). */
+  let isFlushingOutbox = false;
+
+  /**
+   * Room id used to key the durable outbox, or `null` outside a room.
+   */
+  function getActiveRoomId(): string | null {
+    const roomId = currentRoom?.id || (currentRoom as any)?.roomId;
+    return typeof roomId === 'string' && roomId.length > 0 ? roomId : null;
+  }
+
+  /**
+   * Re-reads the outbox and republishes the queue notice count.
+   *
+   * Called after every outbox mutation (enqueue / flush / room switch) so the
+   * `OfflineQueueNotice` count always reflects IndexedDB rather than an
+   * optimistic in-memory counter.
+   */
+  async function refreshPendingMessageCount() {
+    const roomId = getActiveRoomId();
+    if (!roomId) {
+      pendingMessageCount = 0;
+      return;
     }
+    try {
+      const pending = await getOutbox().list(roomId, 'message');
+      pendingMessageCount = pending.length;
+    } catch (err) {
+      console.warn('Failed to read the offline outbox:', err);
+    }
+  }
+
+  /**
+   * Persists a message that could not be delivered into the durable outbox
+   * (30-day TTL, see `outbox.ts`) and refreshes the notice count.
+   *
+   * The payload keeps the `LogRecord` (including its `id`) so the flushed copy
+   * and a late echo of the same record dedupe on `LogRecord.id` inside
+   * `ChunkLogManager` instead of rendering twice.
+   */
+  async function enqueueOfflineMessage(roomId: string, sceneId: string, record: LogRecord) {
+    try {
+      await getOutbox().enqueue({
+        roomId,
+        kind: 'message',
+        payload: { sceneId, record },
+      });
+    } catch (err) {
+      // Last resort: keep the message visible locally rather than losing it.
+      console.error('Failed to queue the offline message:', err);
+      chunkManager.appendRecord(record);
+    }
+    await refreshPendingMessageCount();
+  }
+
+  /**
+   * Replays the room's queued messages after a reconnect.
+   *
+   * Each entry is handed to `requestAppendLog`, which resolves only once the
+   * matching echo arrives. `RoomSocket` already appends that echo into
+   * `chunkManager`, so nothing is appended here; a rejection leaves the entry
+   * queued for the next reconnect. Flushing is skipped entirely while the socket
+   * is not connected.
+   */
+  async function flushOutbox() {
+    if (isFlushingOutbox) return;
+    const roomId = getActiveRoomId();
+    if (!roomId) return;
+    if (!roomSocket || !roomSocket.isConnected) return;
+
+    isFlushingOutbox = true;
+    try {
+      await getOutbox().flush(roomId, async (entry) => {
+        if (entry.kind !== 'message') {
+          // Other kinds are owned by the features that queued them.
+          return false;
+        }
+        const payload = entry.payload as
+          | { sceneId?: unknown; record?: LogRecord }
+          | null
+          | undefined;
+        const record = payload?.record;
+        if (!record || typeof record !== 'object') {
+          console.warn('Dropping a malformed outbox message entry:', entry.id);
+          return true;
+        }
+        const sceneId =
+          typeof payload?.sceneId === 'string' ? payload.sceneId : currentScene.id;
+        if (!roomSocket || !roomSocket.isConnected) {
+          throw new Error('room socket is not connected');
+        }
+        await roomSocket.requestAppendLog(sceneId, record);
+        return true;
+      });
+    } catch (err) {
+      console.warn('Failed to flush the offline outbox:', err);
+    } finally {
+      isFlushingOutbox = false;
+      await refreshPendingMessageCount();
+    }
+  }
+
+  // Flush on mount (a previous session may have left messages queued) and on
+  // every transition into `connected`.
+  let lastConnectionState: ConnectionState | null = null;
+  $effect(() => {
+    const state = currentConnectionState;
+    const previous = lastConnectionState;
+    lastConnectionState = state;
+    if (state !== 'connected' || previous === 'connected') return;
+    void flushOutbox();
+  });
+
+  // Keep the queue notice count in sync with the active room.
+  $effect(() => {
+    const roomId = currentRoom?.id || (currentRoom as any)?.roomId;
+    if (!roomId) {
+      pendingMessageCount = 0;
+      return;
+    }
+    void refreshPendingMessageCount();
+  });
+
+  // Persist the room log cache from a `chunkManager` subscription: the
+  // `LogEventAppended` echo is appended to the manager before its subscribers
+  // run, so this never races the echo or double-adds a record.
+  $effect(() => {
+    let persistScheduled = false;
+    return chunkManager.subscribe(() => {
+      if (persistScheduled) return;
+      persistScheduled = true;
+      queueMicrotask(() => {
+        persistScheduled = false;
+        const roomId = getActiveRoomId();
+        if (roomId) persistRoomLogs(roomId);
+      });
+    });
   });
 
   $effect(() => {
@@ -529,6 +662,10 @@
       }
       if ('StateDeleted' in frame) {
         const { scene_id, key } = frame.StateDeleted;
+        // Resolve the target scene from the frame itself: the previous version
+        // referenced a `targetScene` that only existed inside the StateUpdated
+        // branch, which threw a ReferenceError on every StateDeleted frame.
+        const targetScene = scenes.find((s) => s.id === scene_id);
         if (targetScene) {
           if (key === 'std::bgm') {
             targetScene.juices.bgm1 = undefined;
@@ -637,15 +774,9 @@
     characters = characters.map((c) => {
       if (c.id === characterId) {
         const nextPlaced = !c.placedAsPiece;
-        if (roomSocket) {
-          roomSocket.updateState(currentScene.id, `piece::${characterId}::placed`, nextPlaced);
-        } else {
-          pendingOfflineStates.set(`${currentScene.id}:::piece::${characterId}::placed`, {
-            sceneId: currentScene.id,
-            key: `piece::${characterId}::placed`,
-            value: nextPlaced,
-          });
-        }
+        // RoomSocket de-duplicates state frames and replays the final value on
+        // reconnect; without a socket the change stays local only.
+        roomSocket?.updateState(currentScene.id, `piece::${characterId}::placed`, nextPlaced);
         return {
           ...c,
           placedAsPiece: nextPlaced,
@@ -667,15 +798,7 @@
       }
       return c;
     });
-    if (roomSocket) {
-      roomSocket.updateState(currentScene.id, `piece::${characterId}::pos`, position);
-    } else {
-      pendingOfflineStates.set(`${currentScene.id}:::piece::${characterId}::pos`, {
-        sceneId: currentScene.id,
-        key: `piece::${characterId}::pos`,
-        value: position,
-      });
-    }
+    roomSocket?.updateState(currentScene.id, `piece::${characterId}::pos`, position);
   }
 
   function handleCreateCharacter(char: Character) {
@@ -746,34 +869,79 @@
     }
   }
 
-  function handleSendMessage(text: string, characterId?: string) {
+  /**
+   * Sends a chat message (Issue #109 / sub-issue #139).
+   *
+   * The record is rendered only after the server's `LogEventAppended` echo:
+   * - connected: `requestAppendLog` resolves on the echo, and `RoomSocket`
+   *   appends that echo into `chunkManager` before notifying subscribers, so
+   *   this function never appends the record itself on success.
+   * - offline / no socket: the message goes straight to the durable outbox
+   *   instead of `RoomSocket.send()`, because `RoomSocket` also queues the frame
+   *   internally and would resend it on reconnect (double delivery).
+   * - timeout / connection failure on a connected socket: the frame already
+   *   left the socket, so queueing it in the outbox cannot duplicate a queued
+   *   frame; the entry is replayed on reconnect.
+   * - no room id at all (e.g. `App` mounted without a room in tests): there is
+   *   nowhere to key an outbox entry, so the record is appended locally and
+   *   treated as local-only.
+   */
+  async function handleSendMessage(text: string, characterId?: string) {
     if (isViewer) return;
+    if (isSending) return; // prevent double sends while an echo is pending
+
     const char = characters.find((c) => c.id === characterId);
     const speaker = char?.name || 'Anonymous';
+    const sceneId = currentScene.id;
     const record: LogRecord = {
       id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      sceneId: currentScene.id,
+      sceneId,
       content: text,
       speaker,
       speakerId: characterId,
       timestamp: Math.floor(Date.now() / 1000),
     };
+    const roomId = getActiveRoomId();
 
-    chunkManager.appendRecord(record);
-    if (currentRoom?.id) {
-      persistRoomLogs(currentRoom.id);
-    }
-    if (roomSocket) {
-      roomSocket.appendLog(currentScene.id, record);
-    } else {
-      pendingOfflineMessages.push({ sceneId: currentScene.id, record });
-    }
+    isSending = true;
+    try {
+      if (!roomSocket || !roomSocket.isConnected) {
+        // Offline: enqueue durably, never via RoomSocket's in-memory queue.
+        if (roomId) {
+          await enqueueOfflineMessage(roomId, sceneId, record);
+        } else {
+          chunkManager.appendRecord(record);
+        }
+        return;
+      }
 
-    if (extensions.some((ext) => ext.enabled && ext.wasmBytes)) {
-      const initialBytes = new TextEncoder().encode(text);
-      extensionPipeline.executePipeline(extensions, initialBytes).catch(() => {
-        // Keep raw message displayed if extension pipeline fails
-      });
+      try {
+        await roomSocket.requestAppendLog(sceneId, record);
+        // Success: the echo already appended and persisted the record.
+      } catch (err) {
+        const isPermissionDenied =
+          err instanceof ServerOperationError && err.code === 'PermissionDenied';
+        const isRetryable =
+          err instanceof OperationTimeoutError ||
+          (err instanceof ServerOperationError && !isPermissionDenied);
+        if (!isRetryable) throw err;
+        if (roomId) {
+          await enqueueOfflineMessage(roomId, sceneId, record);
+        } else {
+          // Connected but no room to key an outbox entry by.
+          chunkManager.appendRecord(record);
+        }
+      }
+    } catch (err) {
+      console.error('Failed to send the chat message:', err);
+    } finally {
+      isSending = false;
+      if (extensions.some((ext) => ext.enabled && ext.wasmBytes)) {
+        const initialBytes = new TextEncoder().encode(text);
+        extensionPipeline.executePipeline(extensions, initialBytes).catch(() => {
+          // Keep raw message displayed if extension pipeline fails
+        });
+      }
     }
   }
 </script>
@@ -868,6 +1036,8 @@
                   {selectedCharacterId}
                   isAdmin={isAdmin || currentRoom.isAdmin}
                   {isViewer}
+                  sending={isSending}
+                  {pendingMessageCount}
                   {chunkManager}
                   onCollapse={() => (isControlSheetOpen = false)}
                   onSelectScene={handleSelectScene}
@@ -951,6 +1121,8 @@
                 {selectedCharacterId}
                 isAdmin={isAdmin || currentRoom.isAdmin}
                 {isViewer}
+                sending={isSending}
+                {pendingMessageCount}
                 {chunkManager}
                 onCollapse={() => (isControlSheetOpen = false)}
                 onSelectScene={handleSelectScene}
