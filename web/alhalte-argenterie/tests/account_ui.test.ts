@@ -280,5 +280,3 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
     unmount(instance);
   });
 });
-
-

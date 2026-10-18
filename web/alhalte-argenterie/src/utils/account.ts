@@ -400,4 +400,3 @@ export function signOut(): void {
     safeSessionRemove(sessionStorage, OAUTH_REDIRECT_URI_STORAGE_KEY);
   }
 }
-
