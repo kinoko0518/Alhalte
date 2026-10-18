@@ -14,6 +14,7 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie`
    * - GitHub Issue #88: `オフライン動作に関する提言`
+   * - GitHub Issue #111: `オフライン動作であることを通知するバーが他のUIに覆い被さっている`
    */
   import { Button } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
@@ -66,83 +67,105 @@
   aria-live="polite"
   aria-hidden={!isOffline}
 >
-  <div class="indicator-main">
-    <div class="indicator-icon" data-testid="offline-indicator-icon">
-      {#if isReconnecting}
-        <Icon class="spin-icon">sync</Icon>
-      {:else}
-        <Icon>cloud_off</Icon>
-      {/if}
-    </div>
-
-    <div class="indicator-content">
-      <span class="indicator-message" data-testid="offline-message">
+  <div class="indicator-inner">
+    <div class="indicator-main">
+      <div class="indicator-icon" data-testid="offline-indicator-icon">
         {#if isReconnecting}
-          サーバーと再接続中です……
+          <Icon class="spin-icon">sync</Icon>
         {:else}
-          サーバーとの接続が切断されました
+          <Icon>cloud_off</Icon>
         {/if}
-      </span>
-    </div>
-  </div>
+      </div>
 
-  <div class="indicator-actions">
-    <Button
-      variant="tonal"
-      size="s"
-      disabled={isReconnecting || isRetrying}
-      start={refreshIcon}
-      onclick={handleReconnect}
-      data-testid="reconnect-button"
-      class="reconnect-button"
-    >
-      再接続
-    </Button>
+      <div class="indicator-content">
+        <span class="indicator-message" data-testid="offline-message">
+          {#if isReconnecting}
+            サーバーと再接続中です……
+          {:else}
+            サーバーとの接続が切断されました
+          {/if}
+        </span>
+      </div>
+    </div>
+
+    <div class="indicator-actions">
+      <Button
+        variant="tonal"
+        size="s"
+        disabled={isReconnecting || isRetrying}
+        start={refreshIcon}
+        onclick={handleReconnect}
+        data-testid="reconnect-button"
+        class="reconnect-button"
+      >
+        再接続
+      </Button>
+    </div>
   </div>
 </aside>
 
 <style>
   .offline-indicator-banner {
-    position: fixed;
-    top: 0;
-    left: 0;
-    right: 0;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 16px;
-    gap: 12px;
-    background-color: var(--np-color-error-container);
-    color: var(--np-color-on-error-container);
-    box-shadow: var(--np-elevation-2);
-    border-bottom: 1px solid var(--np-color-error);
-    transform: translateY(-100%);
+    position: relative;
+    width: 100%;
+    display: grid;
+    grid-template-rows: 0fr;
+    max-height: 0;
+    overflow: hidden;
     opacity: 0;
     visibility: hidden;
     pointer-events: none;
+    box-sizing: border-box;
+    background-color: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+    border-bottom: 0 solid transparent;
+    box-shadow: none;
+    flex-shrink: 0;
     transition:
-      transform var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
+      grid-template-rows var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
+      max-height var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
       opacity var(--np-motion-expressive-fast-effects, 200ms ease),
       visibility var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1)),
       background-color var(--np-motion-expressive-fast-effects, 200ms ease),
       color var(--np-motion-expressive-fast-effects, 200ms ease),
-      border-bottom-color var(--np-motion-expressive-fast-effects, 200ms ease);
-    z-index: 1200;
-    width: 100%;
-    box-sizing: border-box;
+      border-bottom-color var(--np-motion-expressive-fast-effects, 200ms ease),
+      box-shadow var(--np-motion-expressive-fast-effects, 200ms ease);
+    z-index: 100;
   }
 
   .offline-indicator-banner.is-visible {
-    transform: translateY(0);
+    grid-template-rows: 1fr;
+    max-height: 160px;
     opacity: 1;
     visibility: visible;
     pointer-events: auto;
+    border-bottom: 1px solid var(--np-color-error);
+    box-shadow: var(--np-elevation-2);
   }
 
   .offline-indicator-banner.is-reconnecting {
     background-color: var(--np-color-tertiary-container);
     color: var(--np-color-on-tertiary-container);
+  }
+
+  .offline-indicator-banner.is-reconnecting.is-visible {
     border-bottom: 1px solid var(--np-color-tertiary);
+  }
+
+  .indicator-inner {
+    overflow: hidden;
+    min-height: 0;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 16px;
+    gap: 12px;
+    box-sizing: border-box;
+    transition: padding var(--np-motion-expressive-default-spatial, 350ms cubic-bezier(0.2, 0, 0, 1));
+  }
+
+  .offline-indicator-banner.is-visible .indicator-inner {
+    padding: 8px 16px;
   }
 
   .indicator-main {
