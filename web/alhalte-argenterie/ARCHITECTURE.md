@@ -42,6 +42,7 @@
 | タブ | `LogTab`、`SceneGraphTab`、`SceneManagementTab`、`CharacterManagementTab`、`ExtensionManagementTab` |
 | モーダル | `AssetPickerModal`、`CharacterEditModal`、`RoomPermissionModal`、`GenericImagePicker`、`IconImagePicker` |
 | アカウント | `Control/AccountMenu.svelte`、`utils/account.ts` |
+| 門前払い | `Gate/GateScreen.svelte` |
 | 接続表示 | `OfflineIndicator.svelte`、`utils/connection.ts` |
 
 横長画面ではフィールド左・コントロール右、縦長画面ではフィールド全体＋ボトムシート。コントロールパネルはサイドシート / ボトムシートの 2 形態と開閉状態を持つ。
@@ -71,7 +72,17 @@
 2. `App.svelte` は `resolveRoomFromLocation` で URL から部屋を解決する。
 3. `RoomSocket` を作り、account / session をクエリに付けて接続する。
 4. `ServerFrame` の `SceneList`、`CharacterList`、`StateUpdated`、`StateDeleted`、`LogEventAppended` などを Svelte の state に反映する。
-5. 403 や「全体公開されていない部屋です」を受けたら `isForbidden` を立て、入室拒否画面を出す。
+5. 403 や「全体公開されていない部屋です」を受けたら `isForbidden` を立て、`GateScreen` を出す。
+
+### 門前払い画面
+
+`GateScreen` はフィールドやコントロールパネルの代わりに全画面で表示する。
+
+- 中央大文字: 「アカウントに入室権限がありません」
+- 説明: 「部屋の管理者に権限をリクエストしてください。正しいアカウントを使っていますか？」
+- 主操作: 「サインイン・アカウント切り替え」。サインイン済みならローカル session を破棄してから `prompt=select_account` 付きの Google 認可 URL を開く。
+- 右上: `AccountMenu`。サインイン・アカウント切り替え・サインアウトを行える。
+- 副操作: 「ホームに戻る」（`isForbidden` を解除して `/` へ戻る）。
 
 ### アカウントUI / Googleサインイン
 
@@ -103,7 +114,7 @@
 
 ### 権限 UI
 
-`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。viewer の場合はフッターの送信・ダイス・scene 変更などを無効化する。入室拒否時は門前払い画面を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。門前払い画面の文言とレイアウトは Issue #115 の仕様に従う。
+`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。viewer の場合はフッターの送信・ダイス・scene 変更などを無効化する。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
 
 ## 既知の差分・制約
 
@@ -116,3 +127,4 @@
 - ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
 - OAuth の `redirect_uri` は現在のパス（クエリ・フラグメントを除く）を使う。Google Cloud Console 側でこの URL を登録する必要がある。`state` は sessionStorage に保存した値と照合し、一致しない交換は行わない。
 - `AccountMenu` は account ごとに `GET /api/account/{id}` を呼ぶ。プロフィール取得に失敗してもサインイン状態は維持し、イニシャル表示にフォールバックする。
+- 現行 main では WebSocket の HTTP 403 status をブラウザから直接読めないため、`isForbidden` は権限一覧 API の結果と `Error` frame の文字列から立てている。Issue #114 の権限モデル移行後は、banquette / maitre-d の正式な拒否通知に接続する必要がある。このため、`room_permissions` に行があり `done` が true の部屋でも、権限一覧に自分がいないだけで門前払い画面になる可能性がある。

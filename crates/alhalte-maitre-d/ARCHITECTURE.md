@@ -81,7 +81,7 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 
 1. クエリ・ヘッダ・Cookie から account / session を解決する。
 2. 両方ある場合は `is_session_valid` で検証する。session だけの場合は 401。
-3. `room_permissions` に行がある部屋で、account に role がない場合は `done` を確認する。`done` でなければ 403 と「全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください」を返す。
+3. `room_permissions` に行がある部屋で、account に role がない場合は `done` を確認する。`done` でなければ 403 と「全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください」を返す。`argenterie` はこの拒否を門前払い画面（`GateScreen`）として表示し、アカウントのサインイン・切り替えを促す。
 4. `RoomBridgeManager::get_or_create_room` で部屋の bridge を取得する。bridge は banquette を起動し、UNIX ソケットへ接続する。接続完了までは `mpsc::unbounded_channel` にフレームをキューする。
 5. bridge に client を登録し、`ClientConnected` を banquette へ送る。初期 scene は `/`。
 6. クライアントからの `ClientFrame` は JSON または postcard で受け取り、viewer の mutate を遮断してから bridge へ渡す。
