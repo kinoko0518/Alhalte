@@ -47,6 +47,7 @@ pub mod cellar_sink;
 pub mod character;
 pub mod cli;
 pub mod error;
+pub mod export;
 pub mod labels;
 pub mod log;
 pub mod protocol;
@@ -63,6 +64,7 @@ pub use character::{
 };
 pub use cli::{CliArgs, parse_cli_args};
 pub use error::{BanquetteError, Result};
+pub use export::{CHUNK_ENTRY_DIR, ROOM_ENTRY, RoomArchive, export_room_to_zip};
 pub use labels::{
     IDENT_ALHALTE_BANQUETTE, IDENT_ALHALTE_BANQUETTE_LOG_BIBLIO,
     IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,

@@ -321,12 +321,19 @@ impl BanquetteServer {
                 MaitreDToBanquette::ExportRoom {
                     request_id,
                     caller_account,
+                    include_state,
                 } => {
                     let room_guard = room.read().await;
-                    let res = room_guard
+                    let res = match room_guard
                         .export_snapshot(cellar.as_ref(), caller_account)
                         .await
-                        .map_err(|e| e.to_string());
+                    {
+                        Ok((room_data, chunks)) => {
+                            crate::export::export_room_to_zip(&room_data, &chunks, include_state)
+                                .map_err(|e| e.to_string())
+                        }
+                        Err(e) => Err(e.to_string()),
+                    };
                     let _ = out_tx
                         .send(BanquetteToMaitreD::ExportRoomResponse {
                             request_id,

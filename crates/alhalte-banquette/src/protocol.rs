@@ -6,12 +6,12 @@ use bytes::{Buf, BufMut, BytesMut};
 use serde::{Deserialize, Serialize};
 use tokio_util::codec::{Decoder, Encoder};
 
-use tin::{Tin, TinId};
+use tin::Tin;
 
 use crate::character::Character;
 use crate::error::{BanquetteError, Result};
-use crate::log::{LogBiblio, LogChunk};
-use crate::room::{RoomData, RoomPermissionLevel, SceneSummary};
+use crate::log::LogBiblio;
+use crate::room::{RoomPermissionLevel, SceneSummary};
 
 /// WebRTC signaling payloads exchanged between clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -412,12 +412,19 @@ pub enum MaitreDToBanquette {
     },
     /// Keep-alive ping from `maitre-d`.
     Ping,
-    /// Request export snapshot of room data and log chunks.
+    /// Request an export archive of the room.
+    ///
+    /// `banquette` assembles the ZIP itself (Issue #193): it is the authority on
+    /// the caller's readable scenes, so the archive is built from the same
+    /// snapshot that enforces `Room::can_access_scene`.
     ExportRoom {
         /// Request correlation ID.
         request_id: u64,
         /// Calling account ID, if authenticated.
         caller_account: Option<u64>,
+        /// Whether scene state is included (`type=full`) or emptied
+        /// (`type=logs`).
+        include_state: bool,
     },
     /// Asks the running room for the effective permission of one account.
     ///
@@ -464,12 +471,13 @@ pub enum BanquetteToMaitreD {
         /// Reason for termination (e.g. idle timeout).
         reason: String,
     },
-    /// Response containing exported room data and log chunks.
+    /// Response carrying the export ZIP, or an error description.
     ExportRoomResponse {
         /// Request correlation ID.
         request_id: u64,
-        /// Exported room snapshot and log chunks, or an error description.
-        result: std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>,
+        /// ZIP archive bytes (see [`crate::export::export_room_to_zip`]), or an
+        /// error description when the room could not be exported.
+        result: std::result::Result<Vec<u8>, String>,
     },
     /// Answer to [`MaitreDToBanquette::QueryAccountPermission`].
     ///

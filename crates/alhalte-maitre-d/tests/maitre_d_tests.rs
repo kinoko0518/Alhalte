@@ -1316,18 +1316,19 @@ async fn test_room_zip_export_endpoints() {
     assert!(body.len() >= 4);
     assert_eq!(&body[0..4], b"PK\x03\x04");
 
-    // Load and verify with RoomArchive::load_from_slice
-    let archive = alhalte_kitchen::RoomArchive::load_from_slice(&body, None)
+    // Load and verify with the banquette archive reader (Issue #193: banquette
+    // owns both the archive format and its reader).
+    let archive = alhalte_banquette::export::RoomArchive::load_from_slice(&body)
         .expect("Failed to load archive from slice");
-    assert_eq!(archive.room_id, Some(room_id_u64));
+    assert_eq!(archive.room.room_id, room_id_u64);
     // The spawner's chunk size exponent is propagated to banquette.
-    assert_eq!(archive.chunk_exponent, 5);
-    assert!(archive.scenes.contains_key("dungeon"));
-    let dungeon_scene = archive.scenes.get("dungeon").unwrap();
+    assert_eq!(archive.room.chunk_exponent, 5);
+    assert!(archive.room.scenes.contains_key("dungeon"));
+    let dungeon_scene = archive.room.scenes.get("dungeon").unwrap();
     // In full export, scene states must NOT be empty
     assert!(!dungeon_scene.states.is_empty());
     assert!(dungeon_scene.states.contains_key("atmosphere::desc"));
-    assert!(!archive.characters.is_empty());
+    assert!(!archive.room.character_biblio.is_empty());
 
     // Test 2: Logs export via GET /room/{room_id}/export/zip (alternative path)
     let logs_url = format!(
@@ -1348,15 +1349,15 @@ async fn test_room_zip_export_endpoints() {
     let logs_body = logs_resp.bytes().await.unwrap();
     assert_eq!(&logs_body[0..4], b"PK\x03\x04");
 
-    let logs_archive = alhalte_kitchen::RoomArchive::load_from_slice(&logs_body, None)
+    let logs_archive = alhalte_banquette::export::RoomArchive::load_from_slice(&logs_body)
         .expect("Failed to load logs archive from slice");
-    assert_eq!(logs_archive.room_id, Some(room_id_u64));
-    assert!(logs_archive.scenes.contains_key("dungeon"));
-    let logs_dungeon = logs_archive.scenes.get("dungeon").unwrap();
+    assert_eq!(logs_archive.room.room_id, room_id_u64);
+    assert!(logs_archive.room.scenes.contains_key("dungeon"));
+    let logs_dungeon = logs_archive.room.scenes.get("dungeon").unwrap();
     // In logs export, scene states MUST be empty!
     assert!(logs_dungeon.states.is_empty());
     // Characters repository must be retained
-    assert!(!logs_archive.characters.is_empty());
+    assert!(!logs_archive.room.character_biblio.is_empty());
 
     // Test 3: Default type is "full" when type query param is omitted
     let default_url = format!(
@@ -2571,18 +2572,18 @@ async fn test_export_filters_scenes_by_permission() {
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body = response.bytes().await.unwrap();
     let archive =
-        alhalte_kitchen::RoomArchive::load_from_slice(&body, None).expect("a readable archive");
+        alhalte_banquette::export::RoomArchive::load_from_slice(&body).expect("a readable archive");
 
     assert!(
-        archive.scenes.contains_key("/"),
+        archive.room.scenes.contains_key("/"),
         "the root scene is always exported"
     );
     assert!(
-        !archive.scenes.contains_key("tavern"),
+        !archive.room.scenes.contains_key("tavern"),
         "a participant cannot read scenes it was not granted"
     );
     assert!(
-        !archive.scenes.contains_key("secret"),
+        !archive.room.scenes.contains_key("secret"),
         "a participant cannot read scenes it was not granted"
     );
 
@@ -2594,10 +2595,10 @@ async fn test_export_filters_scenes_by_permission() {
     .unwrap();
     assert_eq!(admin_export.status(), reqwest::StatusCode::OK);
     let admin_body = admin_export.bytes().await.unwrap();
-    let admin_archive = alhalte_kitchen::RoomArchive::load_from_slice(&admin_body, None)
+    let admin_archive = alhalte_banquette::export::RoomArchive::load_from_slice(&admin_body)
         .expect("a readable archive");
-    assert!(admin_archive.scenes.contains_key("tavern"));
-    assert!(admin_archive.scenes.contains_key("secret"));
+    assert!(admin_archive.room.scenes.contains_key("tavern"));
+    assert!(admin_archive.room.scenes.contains_key("secret"));
 
     let _ = admin_ws.close(None).await;
 }

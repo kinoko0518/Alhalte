@@ -1422,6 +1422,224 @@ async fn test_sigterm_runs_graceful_final_persist() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Issue #193: room export archives live in banquette
+// ---------------------------------------------------------------------------
+
+use alhalte_banquette::export::{CHUNK_ENTRY_DIR, ROOM_ENTRY, RoomArchive, export_room_to_zip};
+
+// spec: alhalte-banquette/export 0001 the archive carries room.tin and chunks
+#[tokio::test]
+async fn test_export_zip_carries_room_data_and_chunks() {
+    let cellar = InMemoryCellarSink::new();
+    let room = populated_room(&cellar).await;
+    let (room_data, chunks) = room.export_snapshot(&cellar, Some(42)).await.unwrap();
+    assert!(!chunks.is_empty(), "the fixture has log entries to export");
+
+    let bytes = export_room_to_zip(&room_data, &chunks, true).unwrap();
+    assert_eq!(&bytes[0..4], b"PK\x03\x04", "the export must be a ZIP");
+
+    // The file layout stays `room.tin` + one `chunks/<tin-id>.tin` per chunk.
+    let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).unwrap();
+    let names: Vec<String> = (0..zip.len())
+        .map(|index| zip.by_index(index).unwrap().name().to_string())
+        .collect();
+    assert!(names.iter().any(|name| name == ROOM_ENTRY));
+    assert_eq!(
+        names
+            .iter()
+            .filter(|name| name.starts_with(CHUNK_ENTRY_DIR))
+            .count(),
+        chunks.len(),
+        "every exported chunk gets exactly one entry"
+    );
+
+    // The reader half round-trips the exported snapshot unchanged.
+    let archive = RoomArchive::load_from_slice(&bytes).unwrap();
+    assert_eq!(archive.room, room_data);
+    assert_eq!(archive.chunks, chunks);
+
+    // A non-ZIP input is a typed archive error, not a panic.
+    assert!(matches!(
+        RoomArchive::load_from_slice(b"not a zip"),
+        Err(BanquetteError::Archive(_))
+    ));
+}
+
+// spec: alhalte-banquette/export 0002 type=logs empties scene state and keeps the rest
+#[tokio::test]
+async fn test_export_zip_logs_export_empties_scene_state() {
+    let cellar = InMemoryCellarSink::new();
+    let room = populated_room(&cellar).await;
+    let (room_data, chunks) = room.export_snapshot(&cellar, Some(42)).await.unwrap();
+
+    let full_bytes = export_room_to_zip(&room_data, &chunks, true).unwrap();
+    let logs_bytes = export_room_to_zip(&room_data, &chunks, false).unwrap();
+    let full = RoomArchive::load_from_slice(&full_bytes).unwrap();
+    let logs = RoomArchive::load_from_slice(&logs_bytes).unwrap();
+
+    assert_eq!(
+        full.room.scenes["tavern"].states["custom::weather"]
+            .as_string()
+            .unwrap(),
+        "rain"
+    );
+    assert!(
+        logs.room
+            .scenes
+            .values()
+            .all(|scene| scene.states.is_empty()),
+        "type=logs must not carry scene state"
+    );
+
+    // Everything except the state survives a logs export.
+    assert_eq!(logs.room.scenes.len(), full.room.scenes.len());
+    assert_eq!(
+        logs.room.scenes["tavern"].biblio,
+        full.room.scenes["tavern"].biblio
+    );
+    assert_eq!(
+        logs.room.scenes["tavern"].present_characters,
+        full.room.scenes["tavern"].present_characters
+    );
+    assert_eq!(
+        logs.room.character_biblio.len(),
+        full.room.character_biblio.len()
+    );
+    assert_eq!(logs.room.default_permission, full.room.default_permission);
+    assert_eq!(logs.chunks, full.chunks);
+}
+
+// spec: alhalte-banquette/export 0003 ExportRoom answers with ZIP bytes over the socket
+#[tokio::test]
+async fn test_export_room_frame_returns_zip_bytes() {
+    let dir = tempdir().unwrap();
+    let sock_path = dir.path().join("banquette-export.sock");
+
+    let cellar = Arc::new(InMemoryCellarSink::new());
+    let room = populated_room(&*cellar).await;
+    let room_id = room.room_id;
+
+    let config = ServerConfig {
+        socket_path: sock_path.clone(),
+        heartbeat_interval: Duration::from_secs(3600),
+    };
+    let server = BanquetteServer::new(config, room, cellar);
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client_stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (read_half, write_half) = client_stream.into_split();
+    let mut stream = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+    let mut client_sink = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+
+    for (request_id, include_state) in [(1u64, true), (2u64, false)] {
+        client_sink
+            .send(MaitreDToBanquette::ExportRoom {
+                request_id,
+                caller_account: Some(42),
+                include_state,
+            })
+            .await
+            .unwrap();
+        loop {
+            match stream.next().await {
+                Some(Ok(BanquetteToMaitreD::ExportRoomResponse {
+                    request_id: answered,
+                    result,
+                })) if answered == request_id => {
+                    let bytes = result.expect("the room must export");
+                    let archive =
+                        RoomArchive::load_from_slice(&bytes).expect("the answer must be a ZIP");
+                    assert_eq!(archive.room.room_id, room_id);
+                    assert!(archive.room.scenes.contains_key("tavern"));
+                    assert!(!archive.chunks.is_empty(), "log chunks are exported");
+                    if include_state {
+                        assert!(
+                            !archive.room.scenes["tavern"].states.is_empty(),
+                            "type=full keeps scene state"
+                        );
+                    } else {
+                        assert!(
+                            archive
+                                .room
+                                .scenes
+                                .values()
+                                .all(|scene| scene.states.is_empty()),
+                            "type=logs empties scene state"
+                        );
+                    }
+                    break;
+                }
+                Some(Ok(_)) => continue,
+                other => panic!("unexpected frame from banquette: {other:?}"),
+            }
+        }
+    }
+
+    server_task.abort();
+}
+
+// spec: alhalte-banquette/export 0004 a restored room exports the persisted chunks
+#[tokio::test]
+async fn test_export_zip_after_restore() {
+    let cellar = InMemoryCellarSink::new();
+    let room_id = 0x1930_0000_0000_0001u64;
+    // Exponent 1 seals a chunk after two entries, so the persisted room has a
+    // sealed chunk to export (unsealed active entries are not persisted).
+    let mut room = Room::new(room_id, 42, 1).unwrap();
+    room.create_scene(42, "tavern", Some("/")).unwrap();
+    room.update_scene_state(
+        42,
+        "tavern",
+        "custom::weather".to_string(),
+        Tin::from_string("rain"),
+    )
+    .unwrap();
+    for entry in ["a", "b"] {
+        room.append_log(42, 100, "tavern", Some(Tin::from_string(entry)), &cellar)
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        room.scene_biblio["tavern"].log.biblio.chunks.len(),
+        1,
+        "the second append must seal the first chunk"
+    );
+
+    let head = room.persist(&cellar).await.unwrap();
+    let restored = Room::load_from_cellar(&cellar, &head, room_id)
+        .await
+        .expect("the persisted room must restore");
+
+    let (room_data, chunks) = restored.export_snapshot(&cellar, Some(42)).await.unwrap();
+    let bytes = export_room_to_zip(&room_data, &chunks, true).unwrap();
+    let archive = RoomArchive::load_from_slice(&bytes).unwrap();
+
+    assert_eq!(archive.room.room_id, room_id);
+    assert_eq!(
+        archive.room.scenes["tavern"].states["custom::weather"]
+            .as_string()
+            .unwrap(),
+        "rain"
+    );
+    assert_eq!(archive.room.scenes["tavern"].biblio.head, (1, 0));
+    assert!(
+        !archive.chunks.is_empty(),
+        "the restored room must still export its sealed chunks"
+    );
+    // Every biblio chunk is present in the archive under its tin id.
+    for scene in archive.room.scenes.values() {
+        for tin_id in &scene.biblio.chunks {
+            assert!(
+                archive.chunks.iter().any(|(id, _)| id == tin_id),
+                "biblio chunk {tin_id:?} must be in the archive"
+            );
+        }
+    }
+}
 // spec: alhalte-maitre-d/debug-login 0002 --no-persist keeps the room out of cellar
 #[tokio::test]
 async fn test_no_persist_never_writes_cellar() {

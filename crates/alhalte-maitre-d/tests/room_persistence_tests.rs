@@ -241,12 +241,16 @@ async fn test_room_state_restored_after_banquette_restart() {
         .await
         .expect("the aliased head must restore the room");
 
-    // Export after a restore is a required #192 path: the snapshot comes from
-    // the restored room and must not be empty.
-    let (room_data, _chunks) = restored
-        .export_room(Some(account_id))
+    // Export after a restore is a required #192 path: the archive comes from
+    // the restored room and must not be empty. banquette builds the ZIP itself
+    // since Issue #193, so this also round-trips the archive format.
+    let export = restored
+        .export_room(Some(account_id), true)
         .await
         .expect("export of the restored room");
+    let room_data = alhalte_banquette::export::RoomArchive::load_from_slice(&export)
+        .expect("the exported ZIP must be readable")
+        .room;
 
     assert_eq!(room_data.room_id, ROOM_ID);
     assert_eq!(

@@ -42,6 +42,7 @@ CLI（`CliArgs`）:
 | `SceneLog` / `LogBiblio` / `LogChunk` | chunk 化された log と head。 |
 | `SceneState` | `BTreeMap<String, Tin>`。4KiB 制限と `::` 名前空間検証。 |
 | `Character` / `CharacterBiblio` | `HashMap<String, Tin>` と所有権。 |
+| `RoomArchive` / `export_room_to_zip` | export ZIP（`room.tin` + `chunks/<tin-id>.tin`）の組み立てと読み戻し。`include_state=false` で scene state だけを落とす（#193）。 |
 | `ClientFrame` / `ServerFrame` | クライアントと banquette の論理フレーム。 |
 | `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`QueryAccountPermission` / `AccountPermissionResponse` で account の実効権限を返す。head を報告する frame は持たない（Issue #192）。 |
 | `ProtocolCodec<T>` | 長さ前置 postcard コーデック。 |
@@ -51,9 +52,9 @@ CLI（`CliArgs`）:
 
 ### プロトコル
 
-`MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom`、`QueryAccountPermission { request_id, account_id }` を持つ。
+`MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom { request_id, caller_account, include_state }`、`QueryAccountPermission { request_id, account_id }` を持つ。
 
-`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`AccountPermissionResponse` を持つ。head を報告する `RoomPersisted` は Issue #192 で削除した（head は cellar の alias が持つ）。
+`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse { request_id, result: Result<Vec<u8>, String> }`、`AccountPermissionResponse` を持つ。head を報告する `RoomPersisted` は Issue #192 で削除した（head は cellar の alias が持つ）。`ExportRoomResponse` は ZIP bytes を運び、組み立ては banquette が行う（#193）。
 
 `QueryAccountPermission` は `maitre-d` が「この部屋でのこの account の実効権限」を尋ねる制御フレームで、`Room::get_account_permission` の結果を `AccountPermissionResponse { request_id, account_id, permission }` で返す。DB の role と部屋の権限表を突き合わせるのは `maitre-d` 側の責務（#200）で、banquette は自分の権限表だけを答える。旧 `SetAdmins` / `AdminsUpdated`（DB の GM 集合を実行中の部屋へ push する経路）は #199 で撤去した。
 
@@ -150,7 +151,9 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 
 ### export
 
-`ExportRoom` を受けると、呼び出し元がアクセスできる scene の `RoomData` と chunk を集める。scene の絞り込みは `Room::can_access_scene` に従う（`Viewer` / `Admin` は全 scene、`Participant` は `/` と付与された scene、`Denied` は無し）。`caller_account` が無い export は `default_permission` に従い、`RoomData` の構造を保つため `/` は常に含める。active chunk も export 用に封入し、`ExportRoomResponse` で返す。
+`ExportRoom { caller_account, include_state }` を受けると、呼び出し元がアクセスできる scene の `RoomData` と chunk を集め、`src/export.rs` の `export_room_to_zip` で ZIP を組み立てて `ExportRoomResponse { result: Result<Vec<u8>, String> }` として返す（#193）。scene の絞り込みは `Room::can_access_scene` に従う（`Viewer` / `Admin` は全 scene、`Participant` は `/` と付与された scene、`Denied` は無し）。`caller_account` が無い export は `default_permission` に従い、`RoomData` の構造を保つため `/` は常に含める。active chunk も export 用に封入する。
+
+ZIP の構成は `room.tin`（`RoomData` Tin）と `chunks/<tin-id>.tin`（`LogChunk` Tin）で、各 entry は plaintext（Zstd 圧縮）の Tin。banquette は room key を持たないため room-key 暗号化はしない。`include_state == false`（`type=logs`）は各 scene の `states` だけを空にし、scene の同一性・biblio・present characters・character 表・権限表は残す。`RoomArchive::load_from_slice` が同じ ZIP を `RoomData` と chunk に読み戻す。
 
 ## 権限モデル
 
@@ -190,7 +193,7 @@ load 後と権限変更後に呼び、次を検証する。違反は `InvalidRoo
 - `maitre-d` の DB role（`room_permissions`）と部屋の権限表はまだ接続していない。`SetAdmins` を撤去したため、実行中の部屋の権限は `SetMemberPermission` / `SetDefaultPermission` でしか変わらず、DB の role 変更は次回 spawn でも反映されない。接続は #200。
 - その帰結として、`maitre-d` の DB で `pl` / `viewer` の account も banquette からは `Denied`（`default_permission`）に見える。`Viewer` の mutate 遮断は当面 `maitre-d` の WS ゲートが担い、banquette 側の拒否と二重になる。#200 で DB role を部屋権限表へ移すと解消する。
 - `maitre-d` の pre-spawn gate（`rooms.done`）は #200 で部屋権限表に置き換えた。banquette は `QueryAccountPermission` で実効権限を答えるだけで、head や `default_permission` を報告しない（head 報告の `RoomPersisted` は #192 で削除）。
-- `alhalte-kitchen` の `RoomArchive.done` は `RoomData.default_permission != Denied` の射影で残している。アーカイブ形式は #184 で凍結するため、権限表そのものは運ばない。
+- `alhalte-kitchen` の `RoomArchive.done` は `RoomData.default_permission != Denied` の射影で残している。アーカイブ形式は #184 で凍結するため、権限表そのものは運ばない。banquette 側の export は `RoomData` をそのまま ZIP に格納し、`export.rs` の `RoomArchive` で権限表ごと読み戻すので `done` 射影を持たない（#193）。
 - `SetMemberPermission` / `SetDefaultPermission` の ack は要求元にだけ返し、部屋全体へは broadcast しない。降格された account は次回 `QueryPermissions` まで自分の権限変化を知らない（UI 追従は #201）。
 - `EnterScene` は権限が無い場合に無言で何もしない。`maitre-d` は自前の `client_scenes` で broadcast 先を決めるため、接続時の入場可否は当面 `maitre-d` のゲートが正で、banquette 側の判定は defense in depth。#200 で一本化する。
 - log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。
