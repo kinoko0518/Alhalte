@@ -13,7 +13,7 @@ use crate::db::Database;
 use crate::error::{CellarError, Result};
 use crate::gc::run_garbage_collection;
 use crate::handlers::create_router;
-use crate::model::{GcStats, StoreRequest, StoreResult, StoreStatus};
+use crate::model::{GcStats, SYSTEM_OWNER, StoreRequest, StoreResult, StoreStatus};
 use crate::storage::StorageManager;
 use crate::verifier::SessionVerifier;
 
@@ -60,6 +60,30 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+/// Credential that authorized a cellar write.
+///
+/// The credential, not the requested `owner`, decides the reference label:
+/// user sessions keep their account ID, while the internal service token always
+/// uses [`SYSTEM_OWNER`] so no request body can pick the label of an internal
+/// write. `owner` is never an authorization boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteAuthorization {
+    /// Write authorized by a user session.
+    Session,
+    /// Write authorized by the internal service token.
+    ServiceToken,
+}
+
+impl WriteAuthorization {
+    /// Returns the reference label to persist for a request that claimed `owner`.
+    fn reference_owner(self, owner: u64) -> u64 {
+        match self {
+            Self::Session => owner,
+            Self::ServiceToken => SYSTEM_OWNER,
+        }
+    }
 }
 
 /// Core service encapsulating cellar logic.
@@ -149,7 +173,7 @@ impl CellarService {
         self.service_token.is_some()
     }
 
-    /// Authorizes an internal write.
+    /// Authorizes a write and reports which credential authorized it.
     ///
     /// A request that carries a `service_token` is authorized only by that token:
     /// it never falls back to session verification, so a wrong token is rejected
@@ -159,18 +183,20 @@ impl CellarService {
         owner: u64,
         session_id: u64,
         service_token: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<WriteAuthorization> {
         let Some(presented) = service_token else {
             let is_valid = self.verifier.verify_session(owner, session_id).await?;
             return if is_valid {
-                Ok(())
+                Ok(WriteAuthorization::Session)
             } else {
                 Err(CellarError::Unauthorized { owner, session_id })
             };
         };
 
         match self.service_token.as_deref() {
-            Some(expected) if constant_time_eq(presented.as_bytes(), expected.as_bytes()) => Ok(()),
+            Some(expected) if constant_time_eq(presented.as_bytes(), expected.as_bytes()) => {
+                Ok(WriteAuthorization::ServiceToken)
+            }
             // No token configured, or a mismatch: fail closed with the same error
             // as an invalid session so callers cannot probe the token.
             _ => Err(CellarError::Unauthorized { owner, session_id }),
@@ -191,28 +217,34 @@ impl CellarService {
 
     /// Performs the store metadata handshake with an optional internal service token.
     ///
+    /// The reference label is the requested `owner` for a user session, and
+    /// [`SYSTEM_OWNER`] when the internal service token authorized the request.
+    /// `owner` never grants access by itself.
+    ///
     /// See [`Self::store_check`] and [`Self::with_service_token`].
     pub async fn store_check_with_token(
         &self,
         req: &StoreRequest,
         service_token: Option<&str>,
     ) -> Result<StoreStatus> {
-        self.authorize(req.owner, req.session_id, service_token)
+        let authorization = self
+            .authorize(req.owner, req.session_id, service_token)
             .await?;
+        let owner = authorization.reference_owner(req.owner);
 
         let conn = self.db.lock().await;
-        let already_owned = Database::has_owner_reference(&conn, &req.tin_id, req.owner)?;
+        let already_owned = Database::has_owner_reference(&conn, &req.tin_id, owner)?;
         let file_exists = self.storage.has_tin_file(&req.tin_id);
 
         if self.anti_oracle {
             // Anti-oracle mode: always report upload_required to avoid revealing existence.
             Ok(StoreStatus::UploadRequired)
         } else if already_owned {
-            // Already owned by this owner
+            // A reference with this label already exists
             Ok(StoreStatus::AlreadyOwned)
         } else if file_exists {
-            // Deduplicated: file exists in storage from another owner, add reference row
-            Database::insert_reference(&conn, &req.tin_id, req.owner, req.wrapped_key.as_deref())?;
+            // Deduplicated: file exists in storage under another label, add a reference row
+            Database::insert_reference(&conn, &req.tin_id, owner, req.wrapped_key.as_deref())?;
             Ok(StoreStatus::Deduplicated)
         } else {
             // File does not exist yet; client needs to upload it
@@ -238,6 +270,10 @@ impl CellarService {
 
     /// Stores an uploaded tin payload with an optional internal service token.
     ///
+    /// The stored reference label is `owner` for a user session and
+    /// [`SYSTEM_OWNER`] for a service-token write; [`StoreResult::owner`] reports
+    /// the label that was actually written.
+    ///
     /// See [`Self::store_payload`] and [`Self::with_service_token`].
     pub async fn store_payload_with_token(
         &self,
@@ -248,7 +284,8 @@ impl CellarService {
         wrapped_key: Option<Vec<u8>>,
         service_token: Option<&str>,
     ) -> Result<StoreResult> {
-        self.authorize(owner, session_id, service_token).await?;
+        let authorization = self.authorize(owner, session_id, service_token).await?;
+        let owner = authorization.reference_owner(owner);
 
         let file_exists = self.storage.has_tin_file(&tin_id);
         let written_to_disk = if self.anti_oracle && file_exists {
@@ -304,7 +341,10 @@ impl CellarService {
             .await
     }
 
-    /// Removes an ownership reference with an optional internal service token.
+    /// Removes a reference with an optional internal service token.
+    ///
+    /// A service-token unregister removes the [`SYSTEM_OWNER`] reference
+    /// regardless of the requested `owner`, mirroring service-token stores.
     ///
     /// See [`Self::unregister`] and [`Self::with_service_token`].
     pub async fn unregister_with_token(
@@ -314,7 +354,8 @@ impl CellarService {
         tin_id: &TinId,
         service_token: Option<&str>,
     ) -> Result<bool> {
-        self.authorize(owner, session_id, service_token).await?;
+        let authorization = self.authorize(owner, session_id, service_token).await?;
+        let owner = authorization.reference_owner(owner);
 
         let conn = self.db.lock().await;
         Database::delete_reference(&conn, tin_id, owner)

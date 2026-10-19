@@ -11,7 +11,7 @@ use tempfile::tempdir;
 use tokio::net::UnixStream;
 use tokio_util::codec::Framed;
 
-use alhalte_banquette::cellar_sink::InMemoryCellarSink;
+use alhalte_banquette::cellar_sink::{INTERNAL_WRITE_SESSION_ID, InMemoryCellarSink};
 use alhalte_banquette::character::{
     CharacterBiblio, get_character_name, get_character_owner, set_character_name,
     set_character_owner,
@@ -35,6 +35,7 @@ use alhalte_banquette::protocol::{
 use alhalte_banquette::room::{HeartbeatOutcome, Room, RoomPermissionLevel};
 use alhalte_banquette::server::{BanquetteServer, ServerConfig};
 use alhalte_banquette::state::SceneState;
+use alhalte_cellar::SYSTEM_OWNER;
 use tin::{Tin, label_hash};
 
 #[test]
@@ -523,30 +524,30 @@ async fn test_heartbeat_and_idle_exit() {
 
     // 1st tick with client activity: reset missed to 0
     room.record_client_activity();
-    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    let result = room.step_heartbeat(&cellar).await.unwrap();
     assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 0);
 
     // 1st idle tick
-    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    let result = room.step_heartbeat(&cellar).await.unwrap();
     assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 1);
 
     // 2nd idle tick
-    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    let result = room.step_heartbeat(&cellar).await.unwrap();
     assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 2);
 
     // Activity arrives! Resets counter
     room.record_client_activity();
-    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    let result = room.step_heartbeat(&cellar).await.unwrap();
     assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 0);
 
     // Now 3 consecutive idle ticks
-    let _ = room.step_heartbeat(&cellar, 42).await.unwrap(); // tick 1
-    let _ = room.step_heartbeat(&cellar, 42).await.unwrap(); // tick 2
-    let result = room.step_heartbeat(&cellar, 42).await.unwrap(); // tick 3
+    let _ = room.step_heartbeat(&cellar).await.unwrap(); // tick 1
+    let _ = room.step_heartbeat(&cellar).await.unwrap(); // tick 2
+    let result = room.step_heartbeat(&cellar).await.unwrap(); // tick 3
     assert_eq!(result.outcome, HeartbeatOutcome::ShouldExit);
     assert_eq!(room.missed_heartbeats, 3);
 }
@@ -595,7 +596,6 @@ async fn test_unix_socket_server_integration() {
     let config = ServerConfig {
         socket_path: sock_path.clone(),
         heartbeat_interval: Duration::from_secs(3600), // large interval
-        admin_account: 10,
     };
 
     let server = BanquetteServer::new(config, room, cellar);
@@ -796,6 +796,38 @@ async fn populated_room(cellar: &dyn CellarSink) -> Room {
     room
 }
 
+// spec: alhalte-banquette/persistence 0008 internal room writes use the system owner label
+#[tokio::test]
+async fn test_persist_uses_the_system_owner_label() {
+    let cellar = RecordingCellarSink::default();
+    let mut room = populated_room(&cellar).await;
+
+    let first = room.persist(&cellar).await.unwrap();
+    let stores = cellar.stores();
+    assert_eq!(stores.len(), 1);
+    assert_eq!(
+        stores[0].0,
+        alhalte_cellar::SYSTEM_OWNER,
+        "room state must not be labelled with the room administrator"
+    );
+    assert_eq!(stores[0].1, INTERNAL_WRITE_SESSION_ID);
+    assert_eq!(stores[0].2, first);
+
+    // The superseded head is unregistered under the same system owner label.
+    room.update_scene_state(
+        42,
+        "tavern",
+        "custom::weather".to_string(),
+        Tin::from_string("snow"),
+    )
+    .unwrap();
+    let second = room.persist(&cellar).await.unwrap();
+    assert_ne!(first, second);
+    assert_eq!(cellar.stores().len(), 2);
+    assert_eq!(cellar.stores()[1].0, alhalte_cellar::SYSTEM_OWNER);
+    assert_eq!(cellar.unregisters.lock().unwrap().as_slice(), &[first]);
+}
+
 // spec: alhalte-banquette/persistence 0001 persist and restore the whole room state
 #[tokio::test]
 async fn test_persist_and_restore_whole_room() {
@@ -803,7 +835,7 @@ async fn test_persist_and_restore_whole_room() {
     let mut room = populated_room(&cellar).await;
     let room_id = room.room_id;
 
-    let head = room.persist(&cellar, 42).await.unwrap();
+    let head = room.persist(&cellar).await.unwrap();
     assert_eq!(room.head_tin, Some(head));
     assert!(cellar.contains(&head).await);
 
@@ -891,7 +923,7 @@ async fn test_character_scene_membership_survives_persist_and_restore() {
     assert_eq!(summary.present_character_count, 1);
     assert_eq!(summary.present_characters, vec![character_id]);
 
-    let head = room.persist(&cellar, 42).await.unwrap();
+    let head = room.persist(&cellar).await.unwrap();
     let restored = Room::load_from_cellar(&cellar, &head, 4242).await.unwrap();
 
     let root = restored.scene_biblio.get("/").expect("root restored");
@@ -943,7 +975,7 @@ async fn test_superseded_head_is_unregistered() {
     let cellar = InMemoryCellarSink::new();
     let mut room = populated_room(&cellar).await;
 
-    let first_head = room.persist(&cellar, 42).await.unwrap();
+    let first_head = room.persist(&cellar).await.unwrap();
     room.update_scene_state(
         42,
         "tavern",
@@ -951,7 +983,7 @@ async fn test_superseded_head_is_unregistered() {
         Tin::from_string("snow"),
     )
     .unwrap();
-    let second_head = room.persist(&cellar, 42).await.unwrap();
+    let second_head = room.persist(&cellar).await.unwrap();
 
     assert_ne!(first_head, second_head);
     assert_eq!(room.head_tin, Some(second_head));
@@ -968,7 +1000,7 @@ async fn test_superseded_head_is_unregistered() {
     // contains `HashMap`s, so an unchanged room can serialize to a different
     // content-addressed tin id (postcard map ordering); in that case the
     // superseded head is the one that gets reclaimed.
-    let third_head = room.persist(&cellar, 42).await.unwrap();
+    let third_head = room.persist(&cellar).await.unwrap();
     assert_eq!(room.head_tin, Some(third_head));
     assert!(cellar.contains(&third_head).await);
     if third_head != second_head {
@@ -998,7 +1030,7 @@ async fn test_load_from_cellar_rejects_missing_or_corrupt_head() {
 
     // A valid room tin for a different room id.
     let mut other = Room::new(999, 42, 8).unwrap();
-    let other_head = other.persist(&cellar, 42).await.unwrap();
+    let other_head = other.persist(&cellar).await.unwrap();
     let err = Room::load_from_cellar(&cellar, &other_head, room_id).await;
     assert!(
         matches!(err, Err(PersistenceError::RoomIdMismatch { .. })),
@@ -1025,15 +1057,15 @@ async fn test_heartbeat_reports_persisted_tin_and_uses_internal_credential() {
     let mut room = Room::new(1001, 42, 8).unwrap();
     room.record_client_activity();
 
-    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    let result = room.step_heartbeat(&cellar).await.unwrap();
     assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     let tin_id = result.persisted_tin.expect("successful store reported");
     assert_eq!(room.head_tin, Some(tin_id));
 
-    // Internal writes carry the owner but never a synthetic user session.
+    // Internal writes use the system owner label and never a synthetic user session.
     let stores = cellar.stores();
     assert_eq!(stores.len(), 1);
-    assert_eq!(stores[0].0, 42);
+    assert_eq!(stores[0].0, SYSTEM_OWNER);
     assert_eq!(
         stores[0].1, 0,
         "internal room writes must not impersonate a user session"
@@ -1044,7 +1076,7 @@ async fn test_heartbeat_reports_persisted_tin_and_uses_internal_credential() {
     let mut failing_room = Room::new(1002, 42, 8).unwrap();
     failing_room.record_client_activity();
     let result = failing_room
-        .step_heartbeat(&failing, 42)
+        .step_heartbeat(&failing)
         .await
         .expect("store failure is non-fatal");
     assert_eq!(result.persisted_tin, None);
@@ -1062,7 +1094,6 @@ async fn test_heartbeat_reports_room_persisted_frame() {
         ServerConfig {
             socket_path: sock_path.clone(),
             heartbeat_interval: Duration::from_millis(50),
-            admin_account: 10,
         },
         Room::new(2002, 10, 8).unwrap(),
         Arc::clone(&cellar) as Arc<dyn CellarSink>,
@@ -1133,7 +1164,6 @@ async fn test_graceful_shutdown_persists_room_head() {
         ServerConfig {
             socket_path: sock_path.clone(),
             heartbeat_interval: Duration::from_secs(3600),
-            admin_account: 10,
         },
         room,
         Arc::clone(&cellar) as Arc<dyn CellarSink>,

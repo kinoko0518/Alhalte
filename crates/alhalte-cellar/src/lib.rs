@@ -68,7 +68,7 @@ pub use error::{CellarError, Result};
 pub use gc::run_garbage_collection;
 pub use handlers::create_router;
 pub use model::{
-    GcStats, StoreRequest, StoreResponse, StoreResult, StoreStatus, TinReference,
+    GcStats, SYSTEM_OWNER, StoreRequest, StoreResponse, StoreResult, StoreStatus, TinReference,
     UnregisterRequest, format_tin_id, parse_tin_id,
 };
 pub use service::{CellarConfig, CellarService};

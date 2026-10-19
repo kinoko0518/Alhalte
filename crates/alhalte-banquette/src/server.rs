@@ -40,8 +40,6 @@ pub struct ServerConfig {
     pub socket_path: PathBuf,
     /// Heartbeat interval (default 4 minutes / 240 seconds).
     pub heartbeat_interval: Duration,
-    /// Room admin account ID, also used as the cellar owner of internal room writes.
-    pub admin_account: u64,
 }
 
 impl Default for ServerConfig {
@@ -49,7 +47,6 @@ impl Default for ServerConfig {
         Self {
             socket_path: PathBuf::from("/tmp/alhalte-banquette.sock"),
             heartbeat_interval: Duration::from_secs(240),
-            admin_account: 1,
         }
     }
 }
@@ -171,7 +168,6 @@ impl BanquetteServer {
         let heartbeat_room = Arc::clone(&self.room);
         let heartbeat_cellar = Arc::clone(&self.cellar);
         let heartbeat_interval = self.config.heartbeat_interval;
-        let admin_account = self.config.admin_account;
         let heartbeat_persisted_tx = self.persisted_tx.clone();
         let heartbeat_shutdown = shutdown.clone();
 
@@ -185,7 +181,7 @@ impl BanquetteServer {
                     _ = wait_for_shutdown(heartbeat_shutdown.clone()) => break,
                     _ = interval.tick() => {
                         let mut room = heartbeat_room.write().await;
-                        match room.step_heartbeat(heartbeat_cellar.as_ref(), admin_account).await {
+                        match room.step_heartbeat(heartbeat_cellar.as_ref()).await {
                             Ok(result) => {
                                 if let Some(tin_id) = result.persisted_tin {
                                     // Only a successful store advances the head pointer.
@@ -261,8 +257,7 @@ impl BanquetteServer {
             let mut room = self.room.write().await;
             let default_permission = room.default_permission;
             (
-                room.persist(self.cellar.as_ref(), self.config.admin_account)
-                    .await,
+                room.persist(self.cellar.as_ref()).await,
                 default_permission,
             )
         };
