@@ -138,8 +138,16 @@ function inputValue(target: HTMLElement, testId: string): string {
 function hydratedStates() {
   return {
     'std::name': jsonToTin('サーバー命名シーン'),
+    // Slot 1 keeps the legacy bare 64-hex track (Issue #164 fallback).
     'std::bgm': jsonToTin(BGM_SLOT_1_TIN),
-    'std::bgm4': jsonToTin(BGM_SLOT_4_TIN),
+    // Slot 4 uses the current `{ tinId, mimeType, name }` shape.
+    'std::bgm4': jsonToTin({
+      tinId: BGM_SLOT_4_TIN,
+      mimeType: 'audio/ogg',
+      name: '森のテーマ',
+    }),
+    'bgm::1::playing': jsonToTin(true),
+    'bgm::4::playing': jsonToTin(true),
     'bgm::4::volume': jsonToTin(0.5),
     'std::b-img': jsonToTin({ tinId: BACKGROUND_TIN, mimeType: 'image/png' }),
     'std::b-img::width': jsonToTin(1280),
@@ -197,8 +205,14 @@ describe('Scene state hydration (Issue #159)', () => {
     );
     expect(background?.getAttribute('src')).toContain('data:image/png;base64');
     expect(cellar.downloadTin).toHaveBeenCalled();
-    expect(cellar.downloadTin.mock.calls[0][0]).toBe(BACKGROUND_TIN);
-    expect(cellar.downloadTin.mock.calls[0][1]).toBe(ROOM_KEY);
+    const backgroundCalls = cellar.downloadTin.mock.calls.filter(
+      (call) => call[0] === BACKGROUND_TIN,
+    );
+    expect(backgroundCalls).toHaveLength(1);
+    expect(backgroundCalls[0][1]).toBe(ROOM_KEY);
+    // Both playing BGM slots are downloaded and played (Issue #164).
+    expect(cellar.downloadTin.mock.calls.some((call) => call[0] === BGM_SLOT_1_TIN)).toBe(true);
+    expect(cellar.downloadTin.mock.calls.some((call) => call[0] === BGM_SLOT_4_TIN)).toBe(true);
 
     // Scene name / dimensions / BGM slots are visible in the settings tab.
     openSettings(target);
@@ -213,10 +227,15 @@ describe('Scene state hydration (Issue #159)', () => {
     expect(inputValue(target, 'bgm-slider-4')).toBe('50');
 
     // Re-applying the same snapshot (reconnect / scene switch) is idempotent:
-    // the background tin is not downloaded twice.
+    // neither the background tin nor the BGM tracks are downloaded twice.
+    const downloadsAfterFirstSnapshot = cellar.downloadTin.mock.calls.length;
+    expect(downloadsAfterFirstSnapshot).toBe(3);
     socket.emitFrame({ StateSnapshot: { scene_id: '/', states: hydratedStates() } });
     await settle(40);
-    expect(cellar.downloadTin).toHaveBeenCalledTimes(1);
+    expect(cellar.downloadTin).toHaveBeenCalledTimes(downloadsAfterFirstSnapshot);
+    expect(
+      cellar.downloadTin.mock.calls.filter((call) => call[0] === BACKGROUND_TIN),
+    ).toHaveLength(1);
     expect(sceneNameValue(target)).toBe('サーバー命名シーン');
 
     unmount(instance);
@@ -250,16 +269,20 @@ describe('Scene state hydration (Issue #159)', () => {
           ?.getAttribute('src'),
       ).toContain('data:image/png;base64');
     }
-    expect(cellar.downloadTin).toHaveBeenCalledTimes(2);
+    // Each client downloads the background plus the two playing BGM tracks.
+    expect(cellar.downloadTin).toHaveBeenCalledTimes(6);
+    expect(
+      cellar.downloadTin.mock.calls.filter((call) => call[0] === BACKGROUND_TIN),
+    ).toHaveLength(2);
 
     // Reconnect: the server re-sends the same snapshot; nothing is lost and the
-    // background tin is not refetched.
+    // background / BGM tins are not refetched.
     socketA.emitFrame({ StateSnapshot: { scene_id: '/', states: hydratedStates() } });
     await settle(40);
     expect(sceneNameValue(a.target)).toBe('サーバー命名シーン');
     expect(inputValue(a.target, 'bg-width-input')).toBe('1280');
     expect(inputValue(a.target, 'bg-height-input')).toBe('720');
-    expect(cellar.downloadTin).toHaveBeenCalledTimes(2);
+    expect(cellar.downloadTin).toHaveBeenCalledTimes(6);
 
     unmount(a.instance);
     a.target.remove();

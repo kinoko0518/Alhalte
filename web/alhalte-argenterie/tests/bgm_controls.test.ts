@@ -100,7 +100,9 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
         bgmSlots: [
           {
             slot: 1,
-            tinId: 'audio-tin-123',
+            tinId: TIN_ID_A,
+            mimeType: 'audio/ogg',
+            name: 'castle_theme.ogg',
             volume: 0.8,
             isPlaying: true,
           },
@@ -140,25 +142,26 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     expect(playBtn!.getAttribute('aria-label')).toBe('BGM停止');
     expect(playBtn!.textContent).toContain('stop');
 
-    // 1. Click to stop -> tinId becomes null (None), isPlaying becomes false
+    // 1. Click to stop -> the selected track stays, isPlaying becomes false
+    //    (Issue #164: stopping no longer deletes `std::bgm`).
     playBtn!.click();
     await new Promise((r) => setTimeout(r, 20));
 
     expect(lastUpdatedScene).toBeTruthy();
     const updatedSlot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
-    expect(updatedSlot1?.tinId).toBeNull();
+    expect(updatedSlot1?.tinId).toBe(TIN_ID_A);
     expect(updatedSlot1?.isPlaying).toBe(false);
 
     // Label and icon toggle to "BGM再生" and "play_arrow"
     expect(playBtn!.getAttribute('aria-label')).toBe('BGM再生');
     expect(playBtn!.textContent).toContain('play_arrow');
 
-    // 2. Click to resume play -> restores previous TinId ('audio-tin-123')
+    // 2. Click to resume play -> the same track starts again
     playBtn!.click();
     await new Promise((r) => setTimeout(r, 20));
 
     const resumedSlot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
-    expect(resumedSlot1?.tinId).toBe('audio-tin-123');
+    expect(resumedSlot1?.tinId).toBe(TIN_ID_A);
     expect(resumedSlot1?.isPlaying).toBe(true);
     expect(playBtn!.getAttribute('aria-label')).toBe('BGM停止');
     expect(playBtn!.textContent).toContain('stop');
@@ -398,10 +401,14 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     playBtn.click();
     await settle(0);
 
-    // Both requests are in flight, the select icon is the wavy spinner.
-    expect(socket.requestUpdateStateCalls).toHaveLength(1);
-    expect(socket.requestUpdateStateCalls[0].key).toBe('std::bgm');
-    expect(socket.requestUpdateStateCalls[0].value).toBe(TIN_ID_A);
+    // Both playback intent and the legacy track migration are in flight, and
+    // the select icon is the wavy spinner.
+    const playingWrite = socket.requestUpdateStateCalls.find(
+      (call) => call.key === 'bgm::1::playing',
+    );
+    const trackWrite = socket.requestUpdateStateCalls.find((call) => call.key === 'std::bgm');
+    expect(playingWrite?.value).toBe(true);
+    expect(trackWrite?.value).toMatchObject({ tinId: TIN_ID_A, mimeType: 'audio/mpeg' });
     expect(socket.requestChangeBgmCalls).toHaveLength(1);
     expect(socket.requestChangeBgmCalls[0]).toMatchObject({ slot: 1, tinId: TIN_ID_A });
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
@@ -417,7 +424,13 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
     expect(updateCount).toBe(0);
 
-    // The StateUpdated ack arrives too: now the local model is committed once.
+    // The first StateUpdated ack arrives: one write is still outstanding.
+    socket.resolveStateWrite();
+    await settle(0);
+    expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
+    expect(updateCount).toBe(0);
+
+    // The second StateUpdated ack arrives: now the local model is committed once.
     socket.resolveStateWrite();
     await settle();
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeNull();
@@ -431,8 +444,8 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     target.remove();
   });
 
-  // spec: argenterie/bgm-controls 停止はDeleteState(std::bgm) + ChangeBgm(null)
-  it('sends DeleteState + ChangeBgm(null) when stopping a playing slot', async () => {
+  // spec: argenterie/bgm-controls 停止は bgm::<slot>::playing=false + ChangeBgm(null) (Issue #164)
+  it('sends playing=false + ChangeBgm(null) when stopping a playing slot', async () => {
     const scene = makeScene({
       juices: {
         ...createDefaultJuices(),
@@ -457,9 +470,10 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     playBtn.click();
     await settle(0);
 
-    expect(socket.requestDeleteStateCalls).toHaveLength(1);
-    expect(socket.requestDeleteStateCalls[0].key).toBe('std::bgm');
-    expect(socket.requestUpdateStateCalls).toHaveLength(0);
+    expect(socket.requestDeleteStateCalls).toHaveLength(0);
+    expect(socket.requestUpdateStateCalls).toHaveLength(1);
+    expect(socket.requestUpdateStateCalls[0].key).toBe('bgm::1::playing');
+    expect(socket.requestUpdateStateCalls[0].value).toBe(false);
     expect(socket.requestChangeBgmCalls[0]).toMatchObject({ slot: 1, tinId: null });
     expect(lastUpdatedScene).toBeNull();
 
@@ -468,9 +482,10 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     await settle();
 
     const slot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
-    expect(slot1?.tinId).toBeNull();
+    // Issue #164: the track stays selected while stopped.
+    expect(slot1?.tinId).toBe(TIN_ID_A);
     expect(slot1?.isPlaying).toBe(false);
-    expect(lastUpdatedScene!.juices.bgm1).toBeUndefined();
+    expect(lastUpdatedScene!.juices.bgm1).toBe(TIN_ID_A);
     expect(playBtn.getAttribute('aria-label')).toBe('BGM再生');
 
     unmount(instance);
@@ -501,7 +516,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]')!.click();
     await settle(0);
 
-    socket.rejectDeleteState(new OperationTimeoutError('deleteState', 8000));
+    socket.rejectStateWrite(new OperationTimeoutError('updateState', 8000));
     socket.rejectChangeBgm(new OperationTimeoutError('changeBgm', 8000));
     await settle();
 
@@ -543,7 +558,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
 
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]')!.click();
     await settle(0);
-    socket.rejectDeleteState(new ServerOperationError('PermissionDenied', 'admin only'));
+    socket.rejectStateWrite(new ServerOperationError('PermissionDenied', 'admin only'));
     socket.rejectChangeBgm(new ServerOperationError('PermissionDenied', 'admin only'));
     await settle();
 
@@ -675,20 +690,30 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     requestedOptions.onSelect(audioAsset.dataUrl, audioAsset);
     await settle(0);
 
-    expect(socket.requestUpdateStateCalls).toHaveLength(1);
-    expect(socket.requestUpdateStateCalls[0].key).toBe('std::bgm2');
-    expect(socket.requestUpdateStateCalls[0].value).toBe(TIN_ID_B);
-    expect(socket.requestUpdateStateCalls[0].value).not.toBe(audioAsset.dataUrl);
+    const playingWrite = socket.requestUpdateStateCalls.find(
+      (call) => call.key === 'bgm::2::playing',
+    );
+    const trackWrite = socket.requestUpdateStateCalls.find((call) => call.key === 'std::bgm2');
+    expect(playingWrite?.value).toBe(true);
+    expect(trackWrite?.value).toMatchObject({
+      tinId: TIN_ID_B,
+      mimeType: 'audio/ogg',
+      name: 'tin_track.ogg',
+    });
+    expect(trackWrite?.value).not.toBe(audioAsset.dataUrl);
     expect(socket.requestChangeBgmCalls[0]).toMatchObject({ slot: 2, tinId: TIN_ID_B });
     expect(target.querySelector('[data-testid="bgm-pending-2"]')).toBeTruthy();
     expect(updateCount).toBe(0);
 
+    socket.resolveStateWrite();
     socket.resolveStateWrite();
     socket.resolveChangeBgm();
     await settle();
 
     const slot2 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 2);
     expect(slot2?.tinId).toBe(TIN_ID_B);
+    expect(slot2?.mimeType).toBe('audio/ogg');
+    expect(slot2?.name).toBe('tin_track.ogg');
     expect(slot2?.isPlaying).toBe(true);
     expect(updateCount).toBe(1);
 

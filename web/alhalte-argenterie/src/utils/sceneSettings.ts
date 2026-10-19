@@ -44,18 +44,21 @@ export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
     {
       slot: 1,
       tinId: juices.bgm1 ?? null,
+      mimeType: juices.bgm1 ? BGM_AUDIO_MIME_FALLBACK : undefined,
       volume: juices.bgm1Volume ?? 0.8,
       isPlaying: Boolean(juices.bgm1),
     },
     {
       slot: 2,
       tinId: juices.bgm2 ?? null,
+      mimeType: juices.bgm2 ? BGM_AUDIO_MIME_FALLBACK : undefined,
       volume: juices.bgm2Volume ?? 0.8,
       isPlaying: Boolean(juices.bgm2),
     },
     {
       slot: 3,
       tinId: juices.bgm3 ?? null,
+      mimeType: juices.bgm3 ? BGM_AUDIO_MIME_FALLBACK : undefined,
       volume: juices.bgm3Volume ?? 0.8,
       isPlaying: Boolean(juices.bgm3),
     },
@@ -191,6 +194,97 @@ export function parseSceneBackgroundState(value: unknown): SceneBackgroundState 
     return { tinId, mimeType };
   }
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// BGM state schema (Issue #164)
+// ---------------------------------------------------------------------------
+
+/**
+ * MIME type used when a BGM track reference does not carry one.
+ *
+ * The legacy `std::bgm<N>` format was a bare 64-hex tin id, so old rooms have
+ * no recorded MIME type. `audio/mpeg` is accepted by every browser and is only
+ * a hint for the `Blob` handed to the audio element.
+ */
+export const BGM_AUDIO_MIME_FALLBACK = 'audio/mpeg';
+
+/** `std::bgm` (slot 1) / `std::bgm<N>` (slot N >= 2) track reference key. */
+export function bgmTrackStateKey(slot: number): string {
+  return slot === 1 ? 'std::bgm' : `std::bgm${slot}`;
+}
+
+/** `bgm::<slot>::volume` state key. */
+export function bgmVolumeStateKey(slot: number): string {
+  return `bgm::${slot}::volume`;
+}
+
+/** `bgm::<slot>::playing` state key (Issue #164). */
+export function bgmPlayingStateKey(slot: number): string {
+  return `bgm::${slot}::playing`;
+}
+
+/** Decoded `std::bgm<N>` value. */
+export interface BgmTrackState {
+  /** 64-character lowercase hex cellar tin id. */
+  tinId: string;
+  /** `audio/*` MIME type, or {@link BGM_AUDIO_MIME_FALLBACK} for legacy values. */
+  mimeType: string;
+  /** Display name recorded at selection time (`''` when unknown). */
+  name: string;
+}
+
+/** Normalizes an audio MIME type, falling back to {@link BGM_AUDIO_MIME_FALLBACK}. */
+function normalizeAudioMimeType(value: unknown): string {
+  return typeof value === 'string' && value.trim().toLowerCase().startsWith('audio/')
+    ? value.trim().toLowerCase()
+    : BGM_AUDIO_MIME_FALLBACK;
+}
+
+/**
+ * Parses a `std::bgm<N>` state value.
+ *
+ * The current format is a small JSON Tin `{ tinId, mimeType, name }`; the
+ * legacy format was a bare 64-hex string and is accepted with the
+ * {@link BGM_AUDIO_MIME_FALLBACK} MIME type. Anything else is rejected so a
+ * malformed value never reaches the audio manager.
+ */
+export function parseBgmTrackState(value: unknown): BgmTrackState | null {
+  if (typeof value === 'string') {
+    const tinId = value.trim().toLowerCase();
+    if (!TIN_ID_HEX_PATTERN.test(tinId)) return null;
+    return { tinId, mimeType: BGM_AUDIO_MIME_FALLBACK, name: '' };
+  }
+  if (value && typeof value === 'object' && !Array.isArray(value)) {
+    const record = value as Record<string, unknown>;
+    const rawTinId = typeof record.tinId === 'string' ? record.tinId : '';
+    const tinId = rawTinId.trim().toLowerCase();
+    if (!TIN_ID_HEX_PATTERN.test(tinId)) return null;
+    return {
+      tinId,
+      mimeType: normalizeAudioMimeType(record.mimeType),
+      name: typeof record.name === 'string' ? record.name : '',
+    };
+  }
+  return null;
+}
+
+/**
+ * Serializes the selected track of a slot into the `std::bgm<N>` JSON shape.
+ *
+ * Returns `null` when the slot has no valid tin id (stopped / empty slot), so
+ * the caller deletes the state key instead of writing an empty reference.
+ */
+export function buildBgmTrackState(
+  slot: Pick<BgmSlot, 'tinId' | 'mimeType' | 'name'>,
+): BgmTrackState | null {
+  const raw = typeof slot.tinId === 'string' ? slot.tinId.trim().toLowerCase() : '';
+  if (!TIN_ID_HEX_PATTERN.test(raw)) return null;
+  return {
+    tinId: raw,
+    mimeType: normalizeAudioMimeType(slot.mimeType),
+    name: typeof slot.name === 'string' ? slot.name : '',
+  };
 }
 
 /** Minimal image asset shape needed to publish a background. */
