@@ -860,6 +860,14 @@
             isForbidden = true;
           }
         },
+        onClose: (event) => {
+          // 1008 / 4403 / 4404 mean the server rejected the join. The HTTP
+          // status is not readable from the browser, so this is best effort
+          // until the #156 preflight lands.
+          if (event.code === 1008 || event.code === 4403 || event.code === 4404) {
+            isForbidden = true;
+          }
+        },
       });
       roomSocket = socket;
 

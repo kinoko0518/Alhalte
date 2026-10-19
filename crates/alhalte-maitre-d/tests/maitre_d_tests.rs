@@ -682,7 +682,9 @@ async fn test_room_zip_export_endpoints() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let room_id: u64 = 888;
+    // A generated-style 16-hex room ID (contains hex letters).
+    let room_id = "9f3a7c1e5b2d8046";
+    let room_id_u64 = u64::from_str_radix(room_id, 16).unwrap();
     let client = reqwest::Client::new();
 
     // Populate data via WebSocket connection
@@ -766,7 +768,7 @@ async fn test_room_zip_export_endpoints() {
     // Load and verify with RoomArchive::load_from_slice
     let archive = alhalte_kitchen::RoomArchive::load_from_slice(&body, None)
         .expect("Failed to load archive from slice");
-    assert_eq!(archive.room_id, Some(room_id));
+    assert_eq!(archive.room_id, Some(room_id_u64));
     assert!(archive.scenes.contains_key("dungeon"));
     let dungeon_scene = archive.scenes.get("dungeon").unwrap();
     // In full export, scene states must NOT be empty
@@ -795,7 +797,7 @@ async fn test_room_zip_export_endpoints() {
 
     let logs_archive = alhalte_kitchen::RoomArchive::load_from_slice(&logs_body, None)
         .expect("Failed to load logs archive from slice");
-    assert_eq!(logs_archive.room_id, Some(room_id));
+    assert_eq!(logs_archive.room_id, Some(room_id_u64));
     assert!(logs_archive.scenes.contains_key("dungeon"));
     let logs_dungeon = logs_archive.scenes.get("dungeon").unwrap();
     // In logs export, scene states MUST be empty!
@@ -915,7 +917,7 @@ fn test_sqlite_room_permissions() {
         .get_or_create_account("sub-3", "Charlie", None, 1000)
         .unwrap();
 
-    let room_id = "test-room-1";
+    let room_id = "0123456789abcdef";
 
     // Initially no permissions
     assert!(!db.has_room_permissions(room_id).unwrap());
@@ -1098,7 +1100,7 @@ async fn test_room_permissions_rest_api() {
     });
 
     let client = reqwest::Client::new();
-    let room_id = "test-perm-room";
+    let room_id = "0123456789abcdef";
 
     // 1. Initial GET /api/room/{room_id}/permissions returns empty list
     let get_initial = client
@@ -1215,9 +1217,15 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
 
     let room_id: u64 = 901;
 
-    // Set permission for GM on room 901
-    db.set_room_permission(&room_id.to_string(), gm.account_id, RoomRole::Gm, 1000)
-        .unwrap();
+    // Set permission for GM on room 901. Permission rows use the canonical
+    // 16-hex form, which is what a 16-hex invitation URL resolves to.
+    db.set_room_permission(
+        &format!("{room_id:016x}"),
+        gm.account_id,
+        RoomRole::Gm,
+        1000,
+    )
+    .unwrap();
 
     // 1. Outsider attempts to connect to private room -> Rejected with 403 Forbidden!
     let outsider_ws_url = format!(
@@ -1372,7 +1380,7 @@ async fn test_websocket_viewer_mutate_blocking() {
     let viewer_sess = db.create_session(viewer.account_id, 1000).unwrap();
 
     let room_id: u64 = 903;
-    let room_id_str = room_id.to_string();
+    let room_id_str = format!("{room_id:016x}");
 
     // Register GM and Viewer permissions
     db.set_room_permission(&room_id_str, gm.account_id, RoomRole::Gm, 1000)

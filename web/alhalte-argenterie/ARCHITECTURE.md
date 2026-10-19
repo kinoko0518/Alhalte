@@ -14,7 +14,7 @@
 
 | 接続先 | 内容 |
 | --- | --- |
-| `maitre-d` `/api/rooms/{room_id}/permissions` | 部屋権限の取得・設定・削除（`utils/session.ts`）。 |
+| `maitre-d` `/api/room/{room_id}/permissions` | 部屋権限の取得・設定・削除（`utils/session.ts`）。`room_id` は 16 hex。 |
 | `maitre-d` `/api/accounts/search` | account 検索。 |
 | `maitre-d` `/api/account/{account_id}` | account 取得・更新。アカウントメニューの表示名・アイコン取得に使う（`utils/account.ts`）。 |
 | `maitre-d` `/auth/google/url` | Google 認可 URL の取得（`utils/account.ts`）。 |
@@ -26,6 +26,10 @@
 ### WebSocket
 
 `utils/roomSocket.ts` の `RoomSocket` が `/ws/room/{roomId}?account_id=...&session_id=...` へ接続する。`ClientFrame` を JSON で送り、`ServerFrame` を JSON で受ける。heartbeat ping には自動で `HeartbeatResponse` を返す。未接続時の送信はキューに積み、再接続後に flush する。
+
+- **URL 構築**: `buildRoomWebSocketUrl` は招待ページ URL（`https://host/rooms/<id>#<key>`）からは **origin だけ** を使い、`ws(s)://host/ws/room/<id>` を組み立てる。`/rooms/<id>` などのパスを WebSocket URL に引き継がない。明示的な `ws(s)://.../ws/room/...` だけをそのまま使い、それ以外の `ws(s)` URL も origin から作り直す。
+- **room ID 検証**: `utils/home.ts` の `parseRoomUrl` は 16 hex（または移行用 decimal）だけを受理し、`room-1` のような任意文字列は `null` で拒否する。`generateRoomUrl` は 16 hex を作る。
+- **close 通知と再接続**: `RoomSocket` は `onclose(event)` を `onClose` callback と `getLastCloseEvent()` で公開する。`1008` / `4403` / `4404` は再試行不能として自動再接続を止め、`App` はこれらを `isForbidden`（`GateScreen`）に反映する。HTTP 403 の完全な preflight は #156。
 
 - **Tin エンコード**: banquette が `Tin` を期待する frame（`AppendLog.entry`、character の `data`）は、`jsonToTin` / `logRecordToTin` / `characterToTinMap` で Tin JSON `{ label, payload }` に変換してから送る。label は pantry の `labelHash` で用途別定数（`LABEL_LOG_RECORD`、`LABEL_JSON`、`LABEL_BANQUETTE_LOG_CHANGE_BGM` など）を使う。受信側は `tinToJson` / `tinToLogRecord` / `tinMapToCharacter` で戻す。
 - **Promise API と ack**: mutate 用の `request*` と query 用の `query*` が Promise を返す。既存の void API（`appendLog`、`updateState`、`createCharacter` など）は残している。

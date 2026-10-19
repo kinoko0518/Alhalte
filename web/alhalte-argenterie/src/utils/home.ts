@@ -144,12 +144,40 @@ export function removeVisitedRoom(roomId: string, storage?: Storage): void {
 }
 
 /**
+ * Canonical room ID form: 16 lowercase/uppercase hexadecimal characters.
+ *
+ * Reference: `crates/alhalte-maitre-d/ARCHITECTURE.md` (room ID contract).
+ */
+export const ROOM_ID_HEX_PATTERN = /^[0-9a-f]{16}$/i;
+
+/**
+ * Returns true when `value` is either a canonical 16-hex room ID or a legacy
+ * decimal room ID that fits in a `u64`.
+ *
+ * A 16-character all-digit string is treated as canonical hex (the same rule
+ * the Rust `RoomId` parser uses).
+ */
+export function isValidRoomId(value: string): boolean {
+  const roomId = value.trim();
+  if (ROOM_ID_HEX_PATTERN.test(roomId)) return true;
+  if (!/^[0-9]{1,20}$/.test(roomId)) return false;
+  try {
+    return BigInt(roomId) <= 0xffffffffffffffffn;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Parses a room invitation URL or path and extracts `roomId`, `roomKeyHex`, and `roomUrl`.
  *
  * Supports:
  * - `/rooms/<roomId>#<roomKeyHex>`
  * - `/room/<roomId>#<roomKeyHex>`
  * - `/?room=<roomId>#<roomKeyHex>`
+ *
+ * `<roomId>` must be a canonical 16-hex room ID (or a legacy decimal ID);
+ * arbitrary strings are rejected by returning `null`.
  */
 export function parseRoomUrl(urlStr: string): {
   roomId: string;
@@ -160,19 +188,21 @@ export function parseRoomUrl(urlStr: string): {
 
   try {
     const url = new URL(urlStr, 'https://alhalte.local');
-    let roomId: string | null = null;
+    let rawRoomId: string | null = null;
 
     const pathMatch = url.pathname.match(/^\/rooms?\/([^/?#]+)\/?$/);
     if (pathMatch && pathMatch[1]) {
-      roomId = decodeURIComponent(pathMatch[1]);
+      rawRoomId = decodeURIComponent(pathMatch[1]);
     } else {
       const queryRoom = url.searchParams.get('room');
       if (queryRoom && queryRoom.trim().length > 0) {
-        roomId = queryRoom.trim();
+        rawRoomId = queryRoom.trim();
       }
     }
 
-    if (!roomId) return null;
+    if (!rawRoomId) return null;
+    const roomId = rawRoomId.trim();
+    if (!isValidRoomId(roomId)) return null;
 
     const roomKeyHex = url.hash.startsWith('#') ? url.hash.slice(1) : url.hash;
     const isAbsolute = /^https?:\/\//i.test(urlStr);

@@ -70,7 +70,7 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
 
   // spec: alhalte-argenterie/account 0020 OAuth開始時に戻り先URL・state・fragmentを保持
   it('starts Google OAuth, preserving the room fragment and adding select_account', async () => {
-    window.history.replaceState(null, '', '/rooms/room-1?invite=1#room-key');
+    window.history.replaceState(null, '', '/rooms/1122334455667788?invite=1#room-key');
     const fetchFn = vi.fn(async () =>
       jsonResponse({ url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=abc' }),
     );
@@ -85,16 +85,16 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
     const requested = new URL(String(fetchFn.mock.calls[0][0]), window.location.origin);
     expect(requested.pathname).toBe('/auth/google/url');
     expect(requested.searchParams.get('redirect_uri')).toBe(
-      `${window.location.origin}/rooms/room-1`,
+      `${window.location.origin}/rooms/1122334455667788`,
     );
     const state = requested.searchParams.get('state');
     expect(state).toBeTruthy();
     expect(sessionStorage.getItem(OAUTH_STATE_STORAGE_KEY)).toBe(state);
     expect(sessionStorage.getItem(OAUTH_RETURN_PATH_STORAGE_KEY)).toBe(
-      '/rooms/room-1?invite=1#room-key',
+      '/rooms/1122334455667788?invite=1#room-key',
     );
     expect(sessionStorage.getItem(OAUTH_REDIRECT_URI_STORAGE_KEY)).toBe(
-      `${window.location.origin}/rooms/room-1`,
+      `${window.location.origin}/rooms/1122334455667788`,
     );
 
     const navigated = new URL(navigate.mock.calls[0][0]);
@@ -104,15 +104,15 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
 
   // spec: alhalte-argenterie/account 0021 OAuthコールバックでaccount/session保存・部屋URL復元
   it('completes Google OAuth, stores account/session, and restores the room URL fragment', async () => {
-    window.history.replaceState(null, '', '/rooms/room-1?code=code-1&state=state-1');
+    window.history.replaceState(null, '', '/rooms/1122334455667788?code=code-1&state=state-1');
     sessionStorage.setItem(OAUTH_STATE_STORAGE_KEY, 'state-1');
-    sessionStorage.setItem(OAUTH_REDIRECT_URI_STORAGE_KEY, `${window.location.origin}/rooms/room-1`);
-    sessionStorage.setItem(OAUTH_RETURN_PATH_STORAGE_KEY, '/rooms/room-1#room-key');
+    sessionStorage.setItem(OAUTH_REDIRECT_URI_STORAGE_KEY, `${window.location.origin}/rooms/1122334455667788`);
+    sessionStorage.setItem(OAUTH_RETURN_PATH_STORAGE_KEY, '/rooms/1122334455667788#room-key');
 
     const fetchFn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
       expect(JSON.parse(String(init?.body))).toEqual({
         code: 'code-1',
-        redirect_uri: `${window.location.origin}/rooms/room-1`,
+        redirect_uri: `${window.location.origin}/rooms/1122334455667788`,
       });
       return jsonResponse({
         account: { account_id: 42, handle_name: 'Alice', icon_tin_id: null },
@@ -128,7 +128,7 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
     expect(localStorage.getItem('alhalte:session-id')).toBe('123456789');
     expect(document.cookie).toContain('session_id=123456789');
     expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(
-      '/rooms/room-1#room-key',
+      '/rooms/1122334455667788#room-key',
     );
     expect(sessionStorage.getItem(OAUTH_STATE_STORAGE_KEY)).toBeNull();
     expect(sessionStorage.getItem(OAUTH_REDIRECT_URI_STORAGE_KEY)).toBeNull();

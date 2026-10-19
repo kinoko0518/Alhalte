@@ -41,6 +41,7 @@ pub mod error;
 pub mod gateway;
 pub mod labels;
 pub mod oauth;
+pub mod room_id;
 pub mod server;
 pub mod session;
 pub mod spawner;
@@ -56,6 +57,7 @@ pub use labels::{
     account_id_to_tin, session_id_from_tin, session_id_to_tin,
 };
 pub use oauth::{GoogleOAuthProvider, GoogleUserInfo, MockOAuthProvider, OAuthProvider};
+pub use room_id::{RoomId, RoomIdParseError, parse_room_id};
 pub use server::{
     AccountSearchItem, AppState, AuthResponse, SearchAccountsQuery, SetRoomPermissionRequest,
     VerifySessionQuery, VerifySessionResponse, create_router, extract_session_id_from_cookie,

@@ -1,0 +1,15 @@
+{
+  "description": "Shared room ID contract fixture. Both the Rust room-ID parser and the TypeScript WebSocket URL builder must accept every value below. generated_hex entries are canonical 16-hex IDs in the form produced by generateRoomUrl; legacy_decimal entries are old decimal room IDs that must still parse (and are normalized to 16 hex).",
+  "generated_hex": [
+    "0123456789abcdef",
+    "fedcba9876543210",
+    "9f3a7c1e5b2d8046",
+    "a1b2c3d4e5f60718",
+    "deadbeefcafebabe",
+    "1a2b3c4d5e6f7081"
+  ],
+  "legacy_decimal": [
+    "777",
+    "18446744073709551615"
+  ]
+}

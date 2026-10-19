@@ -5,9 +5,9 @@ import type { VisitedRoom } from '../src/types/index.js';
 
 describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
   const dummyRoom: VisitedRoom = {
-    id: 'room-test-63',
+    id: '0000000000000063',
     name: 'サイズ連動テスト部屋',
-    url: 'https://alhalte.example/rooms/room-test-63#abcdef',
+    url: 'https://alhalte.example/rooms/0000000000000063#abcdef',
     lastVisited: Date.now(),
   };
 

@@ -31,12 +31,22 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 
 `/accounts/search`、`/room/{room_id}/permissions`、`/room/{room_id}/export/zip` など、`/api` なしの別名も登録されている。CORS は `CorsLayer::permissive()`。
 
+#### room ID 契約
+
+room-scoped route の `{room_id}` は `RoomId`（`crates/alhalte-maitre-d/src/room_id.rs`）で受ける。
+
+- 正は **16 hex**（`generateRoomUrl` が作る形）。`RoomId` の `Display` は常に 16 hex 小文字。
+- 移行用に decimal の `u64` 文字列も受理する。16 文字すべてが数字の場合は hex として解釈する。
+- 不正な ID は Axum の path / query 抽出で **400 Bad Request**。未知の ID は権限行があれば 403、なければ従来どおり（部屋 registry 導入前のため自動作成）となる。registry による 404 は R1-3（#155）で扱う。
+- `room_permissions.room_id` には `RoomId` の `Display`（16 hex）を保存する。WebSocket の権限判定も同じ正規形を使う。
+- `GET /ws?room=<id>` と `X-Alhalte-Room` ヘッダも `RoomId` として解釈する。
+
 ### WebSocket
 
 | パス | 内容 |
 | --- | --- |
-| `/ws` | クエリ `room` またはヘッダ `X-Alhalte-Room` で部屋を指定。 |
-| `/ws/room/{room_id}` | パスで部屋を指定。 |
+| `/ws` | クエリ `room` またはヘッダ `X-Alhalte-Room` で部屋を指定（16 hex / decimal）。 |
+| `/ws/room/{room_id}` | パスで部屋を指定（16 hex / decimal）。 |
 | `/room/{room_id}` | 招待 URL 互換。 |
 | `/room/{room_id}/ws` | 同上。 |
 
@@ -57,6 +67,7 @@ CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--clien
 
 ### 主な公開型
 
+- `RoomId`、`RoomIdParseError`、`parse_room_id`
 - `Database`、`Account`、`Session`、`RoomRole`、`RoomPermissionItem`
 - `OAuthProvider`、`GoogleOAuthProvider`、`MockOAuthProvider`、`GoogleUserInfo`
 - `RoomBridge`、`RoomBridgeManager`、`BanquetteSpawner`、`ProcessBanquetteSpawner`、`InProcessBanquetteSpawner`
@@ -105,7 +116,7 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 
 ### 権限管理
 
-`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保存する。`RoomRole` は serde で snake_case。WebSocket 接続時の入場可否と viewer の mutate 遮断に使う。`SetDone` は bridge の in-memory `done` と `RoomBridgeManager` の room 状態にも反映する。
+`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保存する。`room_id` は `RoomId` の正規形（16 hex 小文字）で、permissions API・export・WebSocket の権限判定で共通に使う。`RoomRole` は serde で snake_case。WebSocket 接続時の入場可否と viewer の mutate 遮断に使う。`SetDone` は bridge の in-memory `done` と `RoomBridgeManager` の room 状態にも反映する。
 
 ### ZIP export
 
@@ -128,7 +139,7 @@ room_permissions(room_id TEXT, account_id INTEGER, role TEXT, created_at INTEGER
                  PRIMARY KEY (room_id, account_id))
 ```
 
-`encrypted_sub` には索引がある。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列。
+`encrypted_sub` には索引がある。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列（`RoomId` の 16 hex 正規形）。
 
 ## 既知の差分・制約
 
