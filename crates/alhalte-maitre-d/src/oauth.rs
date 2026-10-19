@@ -1,6 +1,7 @@
 //! Google OAuth 2.0 integration and abstraction trait.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::RwLock;
 
 use async_trait::async_trait;
@@ -10,11 +11,22 @@ use crate::error::{MaitreDError, Result};
 
 /// User info obtained from Google OAuth, containing strictly only the `sub` identifier.
 ///
-/// In accordance with ARCHITECTURE.md, Google accounts only inherit `sub`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// In accordance with ARCHITECTURE.md, Google accounts only inherit `sub`. The
+/// value is transient: callers hash it with [`crate::crypto::hash_sub`], which
+/// zeroizes it, and the database only ever sees the hash (Issue #190).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GoogleUserInfo {
     /// Google unique subject identifier.
     pub sub: String,
+}
+
+impl fmt::Debug for GoogleUserInfo {
+    /// Redacts `sub`: the raw Google identifier must never reach a log line.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GoogleUserInfo")
+            .field("sub", &"<redacted>")
+            .finish()
+    }
 }
 
 /// Abstract contract for Google OAuth token exchange and ID token verification.

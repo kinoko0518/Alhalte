@@ -7,13 +7,14 @@
 //!
 //! `alhalte-maitre-d` acts as the primary communication gateway and authentication coordinator:
 //! - **Google OAuth 2.0 & SQLite Account Table**: Delegates authentication to Google OAuth, inheriting
-//!   only the `sub` identifier. Accounts are stored in SQLite with a 64-bit account ID (`alhalte/maitre-d/account-id`),
-//!   an instance-salt encrypted `sub`, handle name, and optional avatar Tin ID.
+//!   only the `sub` identifier. The raw `sub` is never stored: accounts keep a 128-bit, instance-salt
+//!   keyed BLAKE3 hash (`sub_hash`) plus a 64-bit account ID (`alhalte/maitre-d/account-id`), handle
+//!   name, and optional avatar Tin ID.
 //! - **Session Expiration at 4:00 AM**: Issues 64-bit session IDs (`alhalte/maitre-d/session-id`) with heartbeat
 //!   tracking. Every day at 4:00 AM local time, all sessions without a heartbeat since the previous 4:00 AM
 //!   are purged.
 //! - **Session Verification & Debug Accounts**: Exposes verification endpoints compatible with `alhalte-cellar`
-//!   and supports creating debug accounts with `sub = "0"` under debug builds.
+//!   and, in debug builds, creates throwaway accounts keyed by an unguessable synthetic subject.
 //! - **WebSocket Demultiplexer & Banquette Spawner**: Inspects incoming WebSocket headers (`X-Alhalte-Room`),
 //!   query parameters (`room`), and URL paths (`/room/{room_id}`) to demultiplex messages to `alhalte-banquette`
 //!   daemons via UNIX domain sockets. Spawning, room restore, and the socket connection are awaited before a
@@ -25,11 +26,16 @@
 //! ## Example
 //!
 //! ```
-//! use alhalte_maitre_d::{Database, account_id_to_tin, account_id_from_tin};
+//! use alhalte_maitre_d::{Database, account_id_to_tin, account_id_from_tin, hash_sub};
 //!
 //! let db = Database::new_in_memory().unwrap();
-//! let account = db.get_or_create_account("encrypted-sub-123", "Alice", None, 1000).unwrap();
+//! let mut sub = "google-sub-123".to_string();
+//! let account = db
+//!     .get_or_create_account(&hash_sub("instance-salt", &mut sub), "Alice", None, 1000)
+//!     .unwrap();
 //! assert_eq!(account.account_id, 1);
+//! // `hash_sub` zeroizes the raw identifier.
+//! assert!(sub.is_empty());
 //!
 //! let tin = account_id_to_tin(account.account_id);
 //! assert_eq!(account_id_from_tin(&tin).unwrap(), 1);
@@ -52,7 +58,7 @@ pub mod session;
 pub mod spawner;
 
 pub use cli::{CliArgs, parse_cli_args, parse_cli_args_from};
-pub use crypto::{DEBUG_SUB_CIPHERTEXT, decrypt_sub, encrypt_sub};
+pub use crypto::{SUB_HASH_BYTES, SUB_HASH_HEX_LEN, SubHash, hash_sub};
 pub use db::{Account, Database, OAUTH_STATE_TTL_SECS, Room, Session};
 pub use error::{MaitreDError, Result};
 pub use gateway::{RoomBridge, RoomBridgeManager};

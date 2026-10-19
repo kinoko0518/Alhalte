@@ -14,9 +14,15 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use alhalte_banquette::{ClientFrame, ServerFrame};
 use alhalte_maitre_d::{
-    AppState, Database, InProcessBanquetteSpawner, MockOAuthProvider, RoomBridgeManager,
-    create_router,
+    AppState, Database, InProcessBanquetteSpawner, MockOAuthProvider, RoomBridgeManager, SubHash,
+    create_router, hash_sub,
 };
+
+/// Hashes a test `sub` the way the OAuth path does (Issue #190).
+fn test_sub_hash(sub: &str) -> SubHash {
+    let mut sub = sub.to_string();
+    hash_sub("test-salt", &mut sub)
+}
 
 async fn spawn_router() -> (std::net::SocketAddr, tempfile::TempDir, Database) {
     let temp_dir = tempdir().unwrap();
@@ -94,7 +100,7 @@ async fn websocket_query_accepts_canonical_hex_room_id() {
     let (addr, _temp_dir, db) = spawn_router().await;
     let room_id = "fedcba9876543210";
     let account = db
-        .get_or_create_account("ws-query-sub", "QueryUser", None, 1000)
+        .get_or_create_account(&test_sub_hash("ws-query-sub"), "QueryUser", None, 1000)
         .unwrap();
     let session = db.create_session(account.account_id, 1000).unwrap();
     db.create_room(room_id, "Query room", account.account_id, 1000)
@@ -136,7 +142,7 @@ async fn permission_routes_accept_canonical_hex_room_id() {
     let (addr, _temp_dir, db) = spawn_router().await;
     let room_id = "deadbeefcafebabe";
     let account = db
-        .get_or_create_account("perm-room-sub", "PermUser", None, 1000)
+        .get_or_create_account(&test_sub_hash("perm-room-sub"), "PermUser", None, 1000)
         .unwrap();
     let session = db.create_session(account.account_id, 1000).unwrap();
     db.create_room(room_id, "Permission room", account.account_id, 1000)

@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-use crate::crypto::DEBUG_SUB_CIPHERTEXT;
+use crate::crypto::SubHash;
 use crate::error::{MaitreDError, Result};
 
 /// Lifetime of a pending Google OAuth state, in seconds.
@@ -16,12 +16,16 @@ use crate::error::{MaitreDError, Result};
 pub const OAUTH_STATE_TTL_SECS: i64 = 10 * 60;
 
 /// Account entity stored in SQLite.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Deliberately not `Serialize`: the stored [`SubHash`] is a pseudonymous
+/// account correlator that must never be handed to a client. The HTTP layer
+/// answers with [`crate::server::AccountResponse`] instead, which omits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
     /// 64-bit account ID (`alhalte/maitre-d/account-id`).
     pub account_id: u64,
-    /// Encrypted Google `sub` (or `"0"` for debug account).
-    pub encrypted_sub: String,
+    /// 128-bit salted hash of the Google `sub` (never the raw identifier).
+    pub sub_hash: SubHash,
     /// Handle name / nickname.
     pub handle_name: String,
     /// Optional 32-byte Tin ID pointing to the user's avatar icon.
@@ -63,6 +67,39 @@ pub struct Room {
     pub created_at: i64,
 }
 
+/// Column list of `accounts` in the order [`account_from_row`] expects.
+const ACCOUNT_COLUMNS: &str = "account_id, sub_hash, handle_name, icon_tin_id, created_at";
+
+/// Reads the `sub_hash` column at `index` and parses its stored hex form.
+///
+/// A row that does not hold a 32-hex hash is corrupt (or a pre-#190 row that
+/// slipped past [`Database::reject_legacy_account_schema`]).
+fn read_sub_hash(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<SubHash> {
+    let stored: String = row.get(index)?;
+    SubHash::from_hex(&stored).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
+    })
+}
+
+/// Maps an `accounts` row selected as [`ACCOUNT_COLUMNS`] to an [`Account`].
+fn account_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
+    let account_id: i64 = row.get(0)?;
+    let icon_blob: Option<Vec<u8>> = row.get(3)?;
+    let icon_tin_id = icon_blob.and_then(|bytes| <[u8; 32]>::try_from(bytes).ok());
+
+    Ok(Account {
+        account_id: account_id as u64,
+        sub_hash: read_sub_hash(row, 1)?,
+        handle_name: row.get(2)?,
+        icon_tin_id,
+        created_at: row.get(4)?,
+    })
+}
+
 /// Thread-safe SQLite database manager for accounts and sessions.
 #[derive(Clone)]
 pub struct Database {
@@ -98,16 +135,20 @@ impl Database {
             )))
         })?;
 
+        // `accounts` used to store a reversible ciphertext of the Google `sub`.
+        // Issue #190 replaced it with a one-way salted hash, and no account
+        // existed before it, so an old database is refused instead of migrated.
+        Self::reject_legacy_account_schema(&conn)?;
+
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS accounts (
                 account_id INTEGER PRIMARY KEY,
-                encrypted_sub TEXT NOT NULL,
+                sub_hash TEXT NOT NULL UNIQUE,
                 handle_name TEXT NOT NULL,
                 icon_tin_id BLOB,
                 created_at INTEGER NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_accounts_sub ON accounts(encrypted_sub);
 
             CREATE TABLE IF NOT EXISTS sessions (
                 session_id INTEGER PRIMARY KEY,
@@ -145,6 +186,45 @@ impl Database {
         // be refused (or, when the legacy artifacts are empty, cleaned up)
         // before any of the remaining queries run.
         Self::retire_legacy_permission_schema(&conn)?;
+
+        Ok(())
+    }
+
+    /// Refuses a pre-#190 `accounts` table.
+    ///
+    /// Issue #190 replaced `accounts.encrypted_sub` (reversible AES-GCM-SIV
+    /// ciphertext) with `accounts.sub_hash` (a one-way 128-bit salted hash).
+    /// Accounts were never created before that change, so there is no
+    /// migration: a database whose `accounts` table still has the legacy
+    /// column, or lacks `sub_hash`, is refused with an explicit error telling
+    /// the operator to reset the database.
+    ///
+    /// spec: alhalte-maitre-d/accounts 0001 no migration from the encrypted_sub schema
+    fn reject_legacy_account_schema(conn: &Connection) -> Result<()> {
+        let has_accounts_table: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                           WHERE type = 'table' AND name = 'accounts')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_accounts_table {
+            return Ok(());
+        }
+
+        let has_encrypted_sub: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'encrypted_sub')",
+            [],
+            |row| row.get(0),
+        )?;
+        let has_sub_hash: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'sub_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if has_encrypted_sub || !has_sub_hash {
+            return Err(MaitreDError::LegacySubSchema);
+        }
 
         Ok(())
     }
@@ -200,10 +280,15 @@ impl Database {
         Ok(())
     }
 
-    /// Looks up an account by `encrypted_sub`. If it does not exist, inserts a new account.
+    /// Looks up an account by its salted `sub` hash. If it does not exist, inserts a new account.
+    ///
+    /// The caller hashes the Google `sub` first ([`crate::crypto::hash_sub`]);
+    /// the raw identifier never reaches the database.
+    ///
+    /// spec: alhalte-maitre-d/accounts 0002 accounts are keyed by sub_hash
     pub fn get_or_create_account(
         &self,
-        encrypted_sub: &str,
+        sub_hash: &SubHash,
         default_handle_name: &str,
         icon_tin_id: Option<[u8; 32]>,
         now: i64,
@@ -214,36 +299,12 @@ impl Database {
             )))
         })?;
 
-        let mut stmt = conn.prepare(
-            "SELECT account_id, encrypted_sub, handle_name, icon_tin_id, created_at FROM accounts WHERE encrypted_sub = ?1 LIMIT 1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE sub_hash = ?1 LIMIT 1"
+        ))?;
 
         let existing = stmt
-            .query_row(params![encrypted_sub], |row| {
-                let account_id: i64 = row.get(0)?;
-                let encrypted_sub: String = row.get(1)?;
-                let handle_name: String = row.get(2)?;
-                let icon_blob: Option<Vec<u8>> = row.get(3)?;
-                let created_at: i64 = row.get(4)?;
-
-                let icon_tin_id = icon_blob.and_then(|b| {
-                    if b.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&b);
-                        Some(arr)
-                    } else {
-                        None
-                    }
-                });
-
-                Ok(Account {
-                    account_id: account_id as u64,
-                    encrypted_sub,
-                    handle_name,
-                    icon_tin_id,
-                    created_at,
-                })
-            })
+            .query_row(params![sub_hash.as_hex()], account_from_row)
             .optional()?;
 
         if let Some(account) = existing {
@@ -260,10 +321,10 @@ impl Database {
         let icon_bytes = icon_tin_id.map(|id| id.to_vec());
 
         conn.execute(
-            "INSERT INTO accounts (account_id, encrypted_sub, handle_name, icon_tin_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO accounts (account_id, sub_hash, handle_name, icon_tin_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 next_id,
-                encrypted_sub,
+                sub_hash.as_hex(),
                 default_handle_name,
                 icon_bytes,
                 now
@@ -272,7 +333,7 @@ impl Database {
 
         Ok(Account {
             account_id: next_id as u64,
-            encrypted_sub: encrypted_sub.to_string(),
+            sub_hash: *sub_hash,
             handle_name: default_handle_name.to_string(),
             icon_tin_id,
             created_at: now,
@@ -287,79 +348,34 @@ impl Database {
             )))
         })?;
 
-        let mut stmt = conn.prepare(
-            "SELECT account_id, encrypted_sub, handle_name, icon_tin_id, created_at FROM accounts WHERE account_id = ?1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE account_id = ?1"
+        ))?;
 
         let account = stmt
-            .query_row(params![account_id as i64], |row| {
-                let account_id: i64 = row.get(0)?;
-                let encrypted_sub: String = row.get(1)?;
-                let handle_name: String = row.get(2)?;
-                let icon_blob: Option<Vec<u8>> = row.get(3)?;
-                let created_at: i64 = row.get(4)?;
-
-                let icon_tin_id = icon_blob.and_then(|b| {
-                    if b.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&b);
-                        Some(arr)
-                    } else {
-                        None
-                    }
-                });
-
-                Ok(Account {
-                    account_id: account_id as u64,
-                    encrypted_sub,
-                    handle_name,
-                    icon_tin_id,
-                    created_at,
-                })
-            })
+            .query_row(params![account_id as i64], account_from_row)
             .optional()?;
 
         Ok(account)
     }
 
-    /// Retrieves an account by `encrypted_sub`.
-    pub fn get_account_by_sub(&self, encrypted_sub: &str) -> Result<Option<Account>> {
+    /// Retrieves an account by the salted hash of its Google `sub`.
+    ///
+    /// The argument is the hash, not the raw identifier: `maitre-d` cannot
+    /// reverse it.
+    pub fn get_account_by_sub(&self, sub_hash: &SubHash) -> Result<Option<Account>> {
         let conn = self.conn.lock().map_err(|e| {
             MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
                 std::io::Error::other(e.to_string()),
             )))
         })?;
 
-        let mut stmt = conn.prepare(
-            "SELECT account_id, encrypted_sub, handle_name, icon_tin_id, created_at FROM accounts WHERE encrypted_sub = ?1 LIMIT 1",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ACCOUNT_COLUMNS} FROM accounts WHERE sub_hash = ?1 LIMIT 1"
+        ))?;
 
         let account = stmt
-            .query_row(params![encrypted_sub], |row| {
-                let account_id: i64 = row.get(0)?;
-                let encrypted_sub: String = row.get(1)?;
-                let handle_name: String = row.get(2)?;
-                let icon_blob: Option<Vec<u8>> = row.get(3)?;
-                let created_at: i64 = row.get(4)?;
-
-                let icon_tin_id = icon_blob.and_then(|b| {
-                    if b.len() == 32 {
-                        let mut arr = [0u8; 32];
-                        arr.copy_from_slice(&b);
-                        Some(arr)
-                    } else {
-                        None
-                    }
-                });
-
-                Ok(Account {
-                    account_id: account_id as u64,
-                    encrypted_sub,
-                    handle_name,
-                    icon_tin_id,
-                    created_at,
-                })
-            })
+            .query_row(params![sub_hash.as_hex()], account_from_row)
             .optional()?;
 
         Ok(account)
@@ -400,50 +416,6 @@ impl Database {
         }
 
         Ok(())
-    }
-
-    /// Creates a new debug account with `encrypted_sub = "0"`.
-    ///
-    /// Available in debug builds (`#[cfg(debug_assertions)]`).
-    #[cfg(debug_assertions)]
-    pub fn create_debug_account(
-        &self,
-        handle_name: &str,
-        icon_tin_id: Option<[u8; 32]>,
-        now: i64,
-    ) -> Result<Account> {
-        let conn = self.conn.lock().map_err(|e| {
-            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
-                std::io::Error::other(e.to_string()),
-            )))
-        })?;
-
-        let next_id: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(account_id), 0) + 1 FROM accounts",
-            [],
-            |r| r.get(0),
-        )?;
-
-        let icon_bytes = icon_tin_id.map(|id| id.to_vec());
-
-        conn.execute(
-            "INSERT INTO accounts (account_id, encrypted_sub, handle_name, icon_tin_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![
-                next_id,
-                DEBUG_SUB_CIPHERTEXT,
-                handle_name,
-                icon_bytes,
-                now
-            ],
-        )?;
-
-        Ok(Account {
-            account_id: next_id as u64,
-            encrypted_sub: DEBUG_SUB_CIPHERTEXT.to_string(),
-            handle_name: handle_name.to_string(),
-            icon_tin_id,
-            created_at: now,
-        })
     }
 
     /// Issues a new 64-bit session ID for the given account.
@@ -811,52 +783,30 @@ impl Database {
         let mut stmt;
         let mut rows = match parsed_id {
             Some(id) => {
-                stmt = conn.prepare(
-                    "SELECT account_id, encrypted_sub, handle_name, icon_tin_id, created_at
+                stmt = conn.prepare(&format!(
+                    "SELECT {ACCOUNT_COLUMNS}
                      FROM accounts
                      WHERE account_id = ?1 OR handle_name LIKE ?2
                      ORDER BY (account_id = ?1) DESC, account_id ASC
-                     LIMIT 50",
-                )?;
+                     LIMIT 50"
+                ))?;
                 stmt.query(params![id, like_pattern])?
             }
             None => {
-                stmt = conn.prepare(
-                    "SELECT account_id, encrypted_sub, handle_name, icon_tin_id, created_at
+                stmt = conn.prepare(&format!(
+                    "SELECT {ACCOUNT_COLUMNS}
                      FROM accounts
                      WHERE handle_name LIKE ?1
                      ORDER BY account_id ASC
-                     LIMIT 50",
-                )?;
+                     LIMIT 50"
+                ))?;
                 stmt.query(params![like_pattern])?
             }
         };
 
         let mut accounts = Vec::new();
         while let Some(row) = rows.next()? {
-            let account_id: i64 = row.get(0)?;
-            let encrypted_sub: String = row.get(1)?;
-            let handle_name: String = row.get(2)?;
-            let icon_blob: Option<Vec<u8>> = row.get(3)?;
-            let created_at: i64 = row.get(4)?;
-
-            let icon_tin_id = icon_blob.and_then(|b| {
-                if b.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&b);
-                    Some(arr)
-                } else {
-                    None
-                }
-            });
-
-            accounts.push(Account {
-                account_id: account_id as u64,
-                encrypted_sub,
-                handle_name,
-                icon_tin_id,
-                created_at,
-            });
+            accounts.push(account_from_row(row)?);
         }
 
         Ok(accounts)

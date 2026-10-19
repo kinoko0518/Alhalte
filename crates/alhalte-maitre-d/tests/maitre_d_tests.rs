@@ -11,15 +11,24 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use alhalte_banquette::{ClientFrame, RoomPermissionLevel, ServerFrame};
 use alhalte_maitre_d::{
-    AccountSearchItem, AppState, BanquetteSpawner, DEBUG_SUB_CIPHERTEXT, Database,
-    IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID,
-    InProcessBanquetteSpawner, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
-    LABEL_ALHALTE_MAITRE_D_SESSION_ID, MockOAuthProvider, RoomBridgeManager, RoomInfoResponse,
-    RoomPermissionItem, RoomRole, SetRoomPermissionRequest, account_id_from_tin, account_id_to_tin,
-    cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router, decrypt_sub, encrypt_sub,
-    extract_session_id_from_cookie, parse_cli_args_from, parse_session_id_from_cookie_str,
-    previous_4am_local, resolve_banquette_bin, session_id_from_tin, session_id_to_tin,
+    AccountSearchItem, AppState, BanquetteSpawner, Database, IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID,
+    IDENT_ALHALTE_MAITRE_D_SESSION_ID, InProcessBanquetteSpawner,
+    LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID, MaitreDError,
+    MockOAuthProvider, RoomBridgeManager, RoomInfoResponse, RoomPermissionItem, RoomRole,
+    SUB_HASH_BYTES, SUB_HASH_HEX_LEN, SetRoomPermissionRequest, SubHash, account_id_from_tin,
+    account_id_to_tin, cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
+    extract_session_id_from_cookie, hash_sub, parse_cli_args_from,
+    parse_session_id_from_cookie_str, previous_4am_local, resolve_banquette_bin,
+    session_id_from_tin, session_id_to_tin,
 };
+
+/// Hashes a test `sub` the way the OAuth path does (Issue #190).
+///
+/// spec: alhalte-maitre-d/accounts 0002 accounts are keyed by sub_hash
+fn test_sub_hash(sub: &str) -> SubHash {
+    let mut sub = sub.to_string();
+    hash_sub("test-salt", &mut sub)
+}
 
 // spec: alhalte-maitre-d/rooms registry
 /// Registers `room_id` in the room registry with `creator` as its creator.
@@ -125,7 +134,9 @@ async fn spawn_recording_router() -> (
 
 /// Creates an account and an active session for room API tests.
 fn account_with_session(db: &Database, sub: &str, name: &str) -> (u64, u64) {
-    let account = db.get_or_create_account(sub, name, None, 1000).unwrap();
+    let account = db
+        .get_or_create_account(&test_sub_hash(sub), name, None, 1000)
+        .unwrap();
     let session = db.create_session(account.account_id, 1000).unwrap();
     (account.account_id, session.session_id)
 }
@@ -192,30 +203,187 @@ fn test_labels_and_tin_conversions() {
     assert!(account_id_from_tin(&short_tin).is_err());
 }
 
-// spec: alhalte-maitre-d/crypto
+// spec: alhalte-maitre-d/crypto 0001 sub is stored as a salted 128-bit hash
 #[test]
-fn test_sub_deterministic_encryption() {
+fn test_hash_sub_is_deterministic_salted_and_zeroizes() {
     let salt = "unique-instance-salt-12345";
-    let sub = "109876543210987654321";
+    let raw = "109876543210987654321";
 
-    // Deterministic: multiple encryptions with identical salt yield identical ciphertext
-    let enc1 = encrypt_sub(salt, sub).unwrap();
-    let enc2 = encrypt_sub(salt, sub).unwrap();
-    assert_eq!(enc1, enc2);
+    let mut sub_a = raw.to_string();
+    let mut sub_a_again = raw.to_string();
+    let mut sub_b = "109876543210987654322".to_string();
+    let mut sub_other_salt = raw.to_string();
 
-    // Different salt yields different ciphertext
-    let enc_diff_salt = encrypt_sub("another-salt", sub).unwrap();
-    assert_ne!(enc1, enc_diff_salt);
+    let hash_a = hash_sub(salt, &mut sub_a);
+    let hash_a_again = hash_sub(salt, &mut sub_a_again);
+    let hash_b = hash_sub(salt, &mut sub_b);
+    let hash_other_salt = hash_sub("another-salt", &mut sub_other_salt);
 
-    // Reversible: decrypts back to original sub
-    let dec = decrypt_sub(salt, &enc1).unwrap();
-    assert_eq!(dec, sub);
+    // Same sub + same salt -> same hash (account lookup keeps working).
+    assert_eq!(hash_a, hash_a_again);
+    // Different sub -> different hash.
+    assert_ne!(hash_a, hash_b);
+    // Different salt -> different hash (the salt is the keyed-hash key).
+    assert_ne!(hash_a, hash_other_salt);
 
-    // Wrong salt fails decryption
-    assert!(decrypt_sub("wrong-salt", &enc1).is_err());
+    // The raw sub is zeroized before `hash_sub` returns.
+    assert!(sub_a.is_empty());
+    assert!(sub_a_again.is_empty());
 
-    // Debug sub ciphertext "0" decrypts directly as "0"
-    assert_eq!(decrypt_sub(salt, DEBUG_SUB_CIPHERTEXT).unwrap(), "0");
+    // 128 bits, lowercase hex, fixed width, and not the raw identifier.
+    let stored = hash_a.as_hex();
+    assert_eq!(hash_a.as_bytes().len(), SUB_HASH_BYTES);
+    assert_eq!(stored.len(), SUB_HASH_HEX_LEN);
+    assert!(
+        stored
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    );
+    assert_ne!(stored, raw);
+    assert!(!stored.contains(raw));
+}
+
+// spec: alhalte-maitre-d/crypto 0002 a stored hash round-trips through its hex form
+#[test]
+fn test_sub_hash_hex_round_trip_and_parse_errors() {
+    let hash = test_sub_hash("google-sub-round-trip");
+    let stored = hash.as_hex();
+    let parsed = SubHash::from_hex(&stored).unwrap();
+    assert_eq!(parsed, hash);
+    assert_eq!(parsed.as_bytes(), hash.as_bytes());
+
+    // Nothing shorter/longer than 32 hex characters is a valid stored hash.
+    let short = "a".repeat(SUB_HASH_HEX_LEN - 1);
+    let long = "a".repeat(SUB_HASH_HEX_LEN + 1);
+    for invalid in ["", "0", "00", short.as_str(), long.as_str()] {
+        assert!(
+            matches!(
+                SubHash::from_hex(invalid),
+                Err(MaitreDError::InvalidSubHash)
+            ),
+            "{invalid:?} must not parse"
+        );
+    }
+    assert!(matches!(
+        SubHash::from_hex(&"z".repeat(SUB_HASH_HEX_LEN)),
+        Err(MaitreDError::InvalidSubHash)
+    ));
+}
+
+// spec: alhalte-maitre-d/crypto 0003 the hash is redacted from Debug output
+#[test]
+fn test_sub_hash_and_account_debug_are_redacted() {
+    let hash = test_sub_hash("google-sub-debug");
+    let rendered = format!("{hash:?}");
+    assert_eq!(rendered, "SubHash(<redacted>)");
+    let rendered_hash = hash.as_hex();
+    assert!(!rendered.contains(rendered_hash.as_str()));
+
+    let db = Database::new_in_memory().unwrap();
+    let account = db
+        .get_or_create_account(&hash, "Redacted", None, 1000)
+        .unwrap();
+    let rendered = format!("{account:?}");
+    let rendered_hash = hash.as_hex();
+    assert!(!rendered.contains(rendered_hash.as_str()));
+}
+
+// spec: alhalte-maitre-d/accounts 0003 the database never holds a raw sub
+#[test]
+fn test_database_never_stores_the_raw_sub() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("maitre-d.db");
+    let db = Database::open(&path).unwrap();
+
+    let raw_sub = "google-sub-plaintext-canary-9f3c";
+    let hash = test_sub_hash(raw_sub);
+    let account = db
+        .get_or_create_account(&hash, "Canary", None, 1000)
+        .unwrap();
+    assert_eq!(account.sub_hash, hash);
+    drop(db);
+
+    // The raw identifier is nowhere in the SQLite file, and nothing on disk can
+    // be inverted back to it: only the 32-hex hash is stored.
+    let bytes = std::fs::read(&path).unwrap();
+    let needle = raw_sub.as_bytes();
+    assert!(
+        !bytes.windows(needle.len()).any(|window| window == needle),
+        "the raw Google sub must never be written to SQLite"
+    );
+    let stored_hex = hash.as_hex();
+    assert!(
+        bytes
+            .windows(stored_hex.len())
+            .any(|window| window == stored_hex.as_bytes()),
+        "the sub hash must be stored in its hex form"
+    );
+}
+
+// spec: alhalte-maitre-d/accounts 0001 no migration from the encrypted_sub schema
+#[test]
+fn test_legacy_encrypted_sub_schema_is_refused_at_startup() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("legacy.db");
+
+    // Reproduce the pre-#190 schema by hand: a reversible ciphertext column and
+    // a debug account whose ciphertext is literally "0".
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts (
+                 account_id INTEGER PRIMARY KEY,
+                 encrypted_sub TEXT NOT NULL,
+                 handle_name TEXT NOT NULL,
+                 icon_tin_id BLOB,
+                 created_at INTEGER NOT NULL
+             );
+             CREATE INDEX idx_accounts_sub ON accounts(encrypted_sub);
+             INSERT INTO accounts VALUES (1, '0', 'Legacy', NULL, 1000);",
+        )
+        .unwrap();
+    }
+
+    match Database::open(&path) {
+        Err(MaitreDError::LegacySubSchema) => {}
+        Err(other) => panic!("expected LegacySubSchema, got {other}"),
+        Ok(_) => panic!("a pre-#190 database must not open"),
+    }
+
+    // Refusal is not destructive: no silent migration, no dropped rows.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM accounts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(rows, 1);
+    let has_encrypted_sub: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'encrypted_sub')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        has_encrypted_sub,
+        "the legacy schema must be left untouched"
+    );
+}
+
+// spec: alhalte-maitre-d/accounts 0001 an accounts table without sub_hash is refused
+#[test]
+fn test_accounts_table_without_sub_hash_is_refused_at_startup() {
+    let temp = tempdir().unwrap();
+    let path = temp.path().join("unknown.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE accounts (account_id INTEGER PRIMARY KEY);")
+            .unwrap();
+    }
+
+    assert!(matches!(
+        Database::open(&path),
+        Err(MaitreDError::LegacySubSchema)
+    ));
 }
 
 // spec: alhalte-maitre-d/accounts
@@ -224,23 +392,25 @@ fn test_sqlite_accounts_management() {
     let db = Database::new_in_memory().unwrap();
 
     let salt = "instance-salt";
-    let sub = "google-sub-alice";
-    let enc_sub = encrypt_sub(salt, sub).unwrap();
+    let mut sub = "google-sub-alice".to_string();
+    let sub_hash = hash_sub(salt, &mut sub);
     let icon_id = [0xAAu8; 32];
 
     // Create new account
     let acc1 = db
-        .get_or_create_account(&enc_sub, "Alice", Some(icon_id), 1000)
+        .get_or_create_account(&sub_hash, "Alice", Some(icon_id), 1000)
         .unwrap();
     assert_eq!(acc1.account_id, 1);
     assert_eq!(acc1.handle_name, "Alice");
     assert_eq!(acc1.icon_tin_id, Some(icon_id));
+    assert_eq!(acc1.sub_hash, sub_hash);
 
     // Calling again returns existing account
     let acc1_repeat = db
-        .get_or_create_account(&enc_sub, "Alice", None, 1005)
+        .get_or_create_account(&sub_hash, "Alice", None, 1005)
         .unwrap();
     assert_eq!(acc1_repeat.account_id, 1);
+    assert_eq!(acc1_repeat.sub_hash, sub_hash);
 
     // Query by ID
     let fetched = db.get_account(1).unwrap().unwrap();
@@ -263,7 +433,7 @@ fn test_sqlite_accounts_management() {
 fn test_sqlite_sessions_and_heartbeats() {
     let db = Database::new_in_memory().unwrap();
     let acc = db
-        .get_or_create_account("sub-enc", "Bob", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-enc"), "Bob", None, 1000)
         .unwrap();
 
     // Create session
@@ -361,7 +531,7 @@ fn test_previous_4am_local_calculation() {
 fn test_deterministic_session_cleanup_at_4am() {
     let db = Database::new_in_memory().unwrap();
     let acc = db
-        .get_or_create_account("sub-clean", "Charlie", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-clean"), "Charlie", None, 1000)
         .unwrap();
 
     let day1_04am = Local
@@ -415,25 +585,11 @@ fn test_deterministic_session_cleanup_at_4am() {
     assert!(!db.is_session_valid(acc.account_id, s2.session_id).unwrap());
 }
 
-// spec: alhalte-maitre-d/debug-account
+// spec: alhalte-maitre-d/debug-account 0001 debug accounts are keyed by a synthetic sub hash
 #[tokio::test]
 async fn test_debug_account_creation() {
     let db = Database::new_in_memory().unwrap();
-    let now = chrono::Utc::now().timestamp();
 
-    // Direct database method
-    let debug_acc = db.create_debug_account("DebugUser", None, now).unwrap();
-    assert_eq!(debug_acc.encrypted_sub, DEBUG_SUB_CIPHERTEXT);
-    assert_eq!(debug_acc.encrypted_sub, "0");
-    assert_eq!(debug_acc.handle_name, "DebugUser");
-
-    let session = db.create_session(debug_acc.account_id, now).unwrap();
-    assert!(
-        db.is_session_valid(debug_acc.account_id, session.session_id)
-            .unwrap()
-    );
-
-    // HTTP endpoint test
     let spawner =
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
     let room_manager = RoomBridgeManager::new(spawner, db.clone());
@@ -448,25 +604,45 @@ async fn test_debug_account_creation() {
     });
 
     let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://{addr}/api/debug/account"))
-        .json(&serde_json::json!({
-            "handle_name": "HttpDebugUser"
-        }))
-        .send()
-        .await
+    let mut created = Vec::new();
+    for handle_name in ["HttpDebugUser", "HttpDebugUser"] {
+        let resp = client
+            .post(format!("http://{addr}/api/debug/account"))
+            .json(&serde_json::json!({ "handle_name": handle_name }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // No raw `sub`, no hash: the auth DTO is an AccountResponse.
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["account"].get("sub_hash").is_none());
+        assert!(body["account"].get("encrypted_sub").is_none());
+        assert_eq!(body["account"]["handle_name"], handle_name);
+
+        let auth: alhalte_maitre_d::AuthResponse = serde_json::from_value(body).unwrap();
+        // The route issues a usable session for the new account.
+        assert!(
+            db.is_session_valid(auth.account.account_id, auth.session_id)
+                .unwrap()
+        );
+        created.push(auth);
+    }
+
+    // Debug accounts are ordinary accounts with distinct synthetic subjects, so
+    // the unique `sub_hash` constraint holds and there is no shared "0" row.
+    assert_ne!(created[0].account.account_id, created[1].account.account_id);
+    let first = db
+        .get_account(created[0].account.account_id)
+        .unwrap()
         .unwrap();
-
-    assert_eq!(resp.status(), reqwest::StatusCode::OK);
-    let auth_res: alhalte_maitre_d::AuthResponse = resp.json().await.unwrap();
-    assert_eq!(auth_res.account.encrypted_sub, "0");
-    assert_eq!(auth_res.account.handle_name, "HttpDebugUser");
-
-    // Session is valid
-    assert!(
-        db.is_session_valid(auth_res.account.account_id, auth_res.session_id)
-            .unwrap()
-    );
+    let second = db
+        .get_account(created[1].account.account_id)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.sub_hash, second.sub_hash);
+    assert_eq!(first.sub_hash.as_hex().len(), SUB_HASH_HEX_LEN);
+    assert_ne!(first.sub_hash.as_hex(), "0");
 }
 
 // spec: alhalte-maitre-d/session-verification-endpoint
@@ -474,7 +650,7 @@ async fn test_debug_account_creation() {
 async fn test_session_verification_http_endpoint() {
     let db = Database::new_in_memory().unwrap();
     let acc = db
-        .get_or_create_account("sub-verify", "Dave", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-verify"), "Dave", None, 1000)
         .unwrap();
     let session = db.create_session(acc.account_id, 1000).unwrap();
 
@@ -523,7 +699,7 @@ async fn test_interoperability_with_cellar_maitre_d_verifier() {
 
     let db = Database::new_in_memory().unwrap();
     let acc = db
-        .get_or_create_account("sub-cellar", "Eve", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-cellar"), "Eve", None, 1000)
         .unwrap();
     let session = db.create_session(acc.account_id, 1000).unwrap();
 
@@ -694,19 +870,19 @@ async fn test_oauth_login_and_callback_flow() {
     assert_eq!(session_data.session_id, session_id);
     assert_eq!(session_data.account.handle_name, "Anonymous");
 
-    // The sub is encrypted with the instance salt and never exposed by /api/session.
+    // `/api/session` never exposes the stored hash; the row keeps only the
+    // salted hash, which is what maps the next login back to this account.
+    let session_body: serde_json::Value = serde_json::to_value(&session_data).unwrap();
+    assert!(session_body["account"].get("sub_hash").is_none());
+    assert!(session_body["account"].get("encrypted_sub").is_none());
+
+    let mut frank_sub = "google-sub-frank".to_string();
+    let expected_hash = hash_sub(salt, &mut frank_sub);
     let stored = db
         .get_account(session_data.account.account_id)
         .unwrap()
         .unwrap();
-    assert_eq!(
-        stored.encrypted_sub,
-        encrypt_sub(salt, "google-sub-frank").unwrap()
-    );
-    assert_eq!(
-        decrypt_sub(salt, &stored.encrypted_sub).unwrap(),
-        "google-sub-frank"
-    );
+    assert_eq!(stored.sub_hash, expected_hash);
 
     // spec: alhalte-maitre-d/oauth-state 0001 states are single-use
     let replay = client
@@ -889,7 +1065,7 @@ async fn test_websocket_demux_and_banquette_spawner() {
 
     let db = Database::new_in_memory().unwrap();
     let acc = db
-        .get_or_create_account("sub-ws", "Grace", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-ws"), "Grace", None, 1000)
         .unwrap();
     let session = db.create_session(acc.account_id, 1000).unwrap();
 
@@ -1002,7 +1178,7 @@ async fn test_room_zip_export_endpoints() {
 
     let db = Database::new_in_memory().unwrap();
     let acc = db
-        .get_or_create_account("sub-export", "Henry", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-export"), "Henry", None, 1000)
         .unwrap();
     let session = db.create_session(acc.account_id, 1000).unwrap();
 
@@ -1420,13 +1596,13 @@ fn test_empty_legacy_permission_artifacts_are_dropped() {
 fn test_sqlite_account_search() {
     let db = Database::new_in_memory().unwrap();
     let acc1 = db
-        .get_or_create_account("sub-1", "Alice Wonder", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-1"), "Alice Wonder", None, 1000)
         .unwrap();
     let acc2 = db
-        .get_or_create_account("sub-2", "Bob Builder", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-2"), "Bob Builder", None, 1000)
         .unwrap();
     let acc3 = db
-        .get_or_create_account("sub-3", "Alice Cooper", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-3"), "Alice Cooper", None, 1000)
         .unwrap();
 
     // Substring search for "Alice"
@@ -1451,10 +1627,15 @@ async fn test_accounts_search_endpoint() {
     let db = Database::new_in_memory().unwrap();
     let icon_bytes = [0x22u8; 32];
     let acc1 = db
-        .get_or_create_account("sub-search-1", "Shinji", Some(icon_bytes), 1000)
+        .get_or_create_account(
+            &test_sub_hash("sub-search-1"),
+            "Shinji",
+            Some(icon_bytes),
+            1000,
+        )
         .unwrap();
     let acc2 = db
-        .get_or_create_account("sub-search-2", "Asuka", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-search-2"), "Asuka", None, 1000)
         .unwrap();
     let session = db.create_session(acc1.account_id, 1000).unwrap();
     let auth = format!(
@@ -1697,13 +1878,18 @@ async fn test_room_permissions_rest_api_proxies_banquette() {
     assert_eq!(get_unknown.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
-// spec: alhalte-maitre-d/account-api 0001 GET /api/account/{id} requires a session and hides encrypted_sub
+// spec: alhalte-maitre-d/account-api 0001 GET /api/account/{id} requires a session and hides sub_hash
 #[tokio::test]
-async fn test_get_account_response_hides_encrypted_sub_and_requires_session() {
+async fn test_get_account_response_hides_sub_hash_and_requires_session() {
     let (addr, _temp_dir, db, _spawner, _manager) = spawn_recording_router().await;
     let icon_bytes = [0x33u8; 32];
     let account = db
-        .get_or_create_account("sub-account-dto", "DtoUser", Some(icon_bytes), 1000)
+        .get_or_create_account(
+            &test_sub_hash("sub-account-dto"),
+            "DtoUser",
+            Some(icon_bytes),
+            1000,
+        )
         .unwrap();
     let session = db.create_session(account.account_id, 1000).unwrap();
     let auth = format!(
@@ -1731,8 +1917,12 @@ async fn test_get_account_response_hides_encrypted_sub_and_requires_session() {
 
     let value: serde_json::Value = response.json().await.unwrap();
     assert!(
+        value.get("sub_hash").is_none(),
+        "the stored sub hash must never be serialized to clients"
+    );
+    assert!(
         value.get("encrypted_sub").is_none(),
-        "encrypted_sub must never be serialized to clients"
+        "the retired ciphertext column must not resurface either"
     );
     assert_eq!(value["account_id"], account.account_id);
     assert_eq!(value["handle_name"], "DtoUser");
@@ -1875,7 +2065,7 @@ async fn test_websocket_identity_rules() {
 fn test_room_registry_create_and_lookup() {
     let db = Database::new_in_memory().unwrap();
     let account = db
-        .get_or_create_account("sub-registry", "Registry", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-registry"), "Registry", None, 1000)
         .unwrap();
     let room_id = "0123456789abcdef";
 
@@ -2443,12 +2633,12 @@ async fn test_websocket_denied_caller_rejected_and_default_viewer_permitted() {
 
     let db = Database::new_in_memory().unwrap();
     let gm = db
-        .get_or_create_account("sub-gm", "GM", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-gm"), "GM", None, 1000)
         .unwrap();
     let gm_sess = db.create_session(gm.account_id, 1000).unwrap();
 
     let outsider = db
-        .get_or_create_account("sub-out", "Outsider", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-out"), "Outsider", None, 1000)
         .unwrap();
     let outsider_sess = db.create_session(outsider.account_id, 1000).unwrap();
 
@@ -2567,7 +2757,7 @@ async fn test_websocket_cookie_session_authentication() {
 
     let db = Database::new_in_memory().unwrap();
     let user = db
-        .get_or_create_account("sub-cookie", "CookieUser", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-cookie"), "CookieUser", None, 1000)
         .unwrap();
     let session = db.create_session(user.account_id, 1000).unwrap();
 
@@ -2635,12 +2825,12 @@ async fn test_websocket_viewer_mutate_blocking() {
 
     let db = Database::new_in_memory().unwrap();
     let gm = db
-        .get_or_create_account("sub-gm-v", "GM", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-gm-v"), "GM", None, 1000)
         .unwrap();
     let gm_sess = db.create_session(gm.account_id, 1000).unwrap();
 
     let viewer = db
-        .get_or_create_account("sub-viewer", "Audience", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-viewer"), "Audience", None, 1000)
         .unwrap();
     let viewer_sess = db.create_session(viewer.account_id, 1000).unwrap();
 
@@ -2852,7 +3042,7 @@ async fn test_initial_scene_demultiplexing_and_root_broadcasts() {
 
     let db = Database::new_in_memory().unwrap();
     let acc = db
-        .get_or_create_account("sub-init-scene", "DemuxUser", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-init-scene"), "DemuxUser", None, 1000)
         .unwrap();
     let session = db.create_session(acc.account_id, 1000).unwrap();
 
