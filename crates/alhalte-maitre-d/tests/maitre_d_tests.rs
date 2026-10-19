@@ -11,15 +11,93 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use alhalte_banquette::{ClientFrame, ServerFrame};
 use alhalte_maitre_d::{
-    AccountSearchItem, AppState, DEBUG_SUB_CIPHERTEXT, Database, IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID,
-    IDENT_ALHALTE_MAITRE_D_SESSION_ID, InProcessBanquetteSpawner,
-    LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID, MockOAuthProvider,
-    RoomBridgeManager, RoomPermissionItem, RoomRole, SetRoomPermissionRequest, account_id_from_tin,
-    account_id_to_tin, cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
-    decrypt_sub, encrypt_sub, extract_session_id_from_cookie, is_mutate_frame, parse_cli_args_from,
+    AccountSearchItem, AppState, BanquetteSpawner, DEBUG_SUB_CIPHERTEXT, Database,
+    IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID,
+    InProcessBanquetteSpawner, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
+    LABEL_ALHALTE_MAITRE_D_SESSION_ID, MockOAuthProvider, RoomBridgeManager, RoomInfoResponse,
+    RoomPermissionItem, RoomRole, SetRoomPermissionRequest, account_id_from_tin, account_id_to_tin,
+    cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router, decrypt_sub, encrypt_sub,
+    extract_session_id_from_cookie, is_mutate_frame, parse_cli_args_from,
     parse_session_id_from_cookie_str, previous_4am_local, resolve_banquette_bin,
     session_id_from_tin, session_id_to_tin,
 };
+
+// spec: alhalte-maitre-d/rooms registry
+/// Registers `room_id` in the room registry with `creator` as its initial GM.
+fn register_room(db: &Database, room_id: u64, creator: u64, name: &str) {
+    db.create_room(&format!("{room_id:016x}"), name, creator, 1000)
+        .unwrap();
+}
+
+type SpawnCalls = Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+
+/// Wraps an in-process spawner and records every `(room_id, admin_account)`.
+#[derive(Clone)]
+struct RecordingSpawner {
+    inner: Arc<InProcessBanquetteSpawner>,
+    calls: SpawnCalls,
+}
+
+impl RecordingSpawner {
+    fn new(socket_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            inner: Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+                socket_dir, 8,
+            )),
+            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    fn calls(&self) -> Vec<(u64, u64)> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl BanquetteSpawner for RecordingSpawner {
+    async fn spawn_banquette(
+        &self,
+        room_id: u64,
+        admin_account: u64,
+    ) -> alhalte_maitre_d::Result<std::path::PathBuf> {
+        self.calls.lock().unwrap().push((room_id, admin_account));
+        self.inner.spawn_banquette(room_id, admin_account).await
+    }
+}
+
+/// Spawns a router backed by an in-memory DB and a [`RecordingSpawner`].
+async fn spawn_recording_router() -> (
+    std::net::SocketAddr,
+    tempfile::TempDir,
+    Database,
+    RecordingSpawner,
+    RoomBridgeManager,
+) {
+    let temp_dir = tempdir().unwrap();
+    let spawner = RecordingSpawner::new(temp_dir.path().to_path_buf());
+    let manager = RoomBridgeManager::new(Arc::new(spawner.clone()));
+    let db = Database::new_in_memory().unwrap();
+    let state = AppState::new(
+        db.clone(),
+        "salt",
+        Arc::new(MockOAuthProvider::new()),
+        manager.clone(),
+    );
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, temp_dir, db, spawner, manager)
+}
+
+/// Creates an account and an active session for room API tests.
+fn account_with_session(db: &Database, sub: &str, name: &str) -> (u64, u64) {
+    let account = db.get_or_create_account(sub, name, None, 1000).unwrap();
+    let session = db.create_session(account.account_id, 1000).unwrap();
+    (account.account_id, session.session_id)
+}
 
 // spec: alhalte-maitre-d/labels
 #[test]
@@ -563,7 +641,7 @@ async fn test_websocket_demux_and_banquette_spawner() {
     ));
     let room_manager = RoomBridgeManager::new(spawner);
     let oauth = Arc::new(MockOAuthProvider::new());
-    let state = AppState::new(db, "salt", oauth, room_manager);
+    let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -573,6 +651,7 @@ async fn test_websocket_demux_and_banquette_spawner() {
     });
 
     let room_id: u64 = 777;
+    register_room(&db, room_id, acc.account_id, "Demux room");
 
     // Connect via WebSocket to /ws/room/{room_id} with credentials
     let ws_url = format!(
@@ -669,11 +748,11 @@ async fn test_room_zip_export_endpoints() {
     let session = db.create_session(acc.account_id, 1000).unwrap();
 
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
-        socket_dir, 8,
+        socket_dir, 5,
     ));
     let room_manager = RoomBridgeManager::new(spawner);
     let oauth = Arc::new(MockOAuthProvider::new());
-    let state = AppState::new(db, "salt", oauth, room_manager);
+    let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -685,6 +764,8 @@ async fn test_room_zip_export_endpoints() {
     // A generated-style 16-hex room ID (contains hex letters).
     let room_id = "9f3a7c1e5b2d8046";
     let room_id_u64 = u64::from_str_radix(room_id, 16).unwrap();
+    db.create_room(room_id, "Export room", acc.account_id, 1000)
+        .unwrap();
     let client = reqwest::Client::new();
 
     // Populate data via WebSocket connection
@@ -769,6 +850,8 @@ async fn test_room_zip_export_endpoints() {
     let archive = alhalte_kitchen::RoomArchive::load_from_slice(&body, None)
         .expect("Failed to load archive from slice");
     assert_eq!(archive.room_id, Some(room_id_u64));
+    // The spawner's chunk size exponent is propagated to banquette.
+    assert_eq!(archive.chunk_exponent, 5);
     assert!(archive.scenes.contains_key("dungeon"));
     let dungeon_scene = archive.scenes.get("dungeon").unwrap();
     // In full export, scene states must NOT be empty
@@ -1184,6 +1267,403 @@ async fn test_room_permissions_rest_api() {
     assert_eq!(perms_after_del[0].account_id, acc1.account_id);
 }
 
+// spec: alhalte-maitre-d/rooms registry sqlite
+#[test]
+fn test_room_registry_create_and_lookup() {
+    let db = Database::new_in_memory().unwrap();
+    let account = db
+        .get_or_create_account("sub-registry", "Registry", None, 1000)
+        .unwrap();
+    let room_id = "0123456789abcdef";
+
+    assert!(db.get_room(room_id).unwrap().is_none());
+
+    let room = db
+        .create_room(room_id, "Crypt", account.account_id, 1000)
+        .unwrap();
+    assert_eq!(room.room_id, room_id);
+    assert_eq!(room.name, "Crypt");
+    assert_eq!(room.creator_account, account.account_id);
+    assert_eq!(room.created_at, 1000);
+    assert_eq!(db.get_room(room_id).unwrap(), Some(room));
+
+    // The creator is inserted as the initial gm.
+    assert_eq!(
+        db.get_room_role(room_id, account.account_id).unwrap(),
+        Some(RoomRole::Gm)
+    );
+    assert_eq!(db.get_room_gm(room_id).unwrap(), Some(account.account_id));
+
+    // Duplicate registration is an error and leaves the original intact.
+    let duplicate = db.create_room(room_id, "Other", account.account_id, 2000);
+    assert!(matches!(
+        duplicate,
+        Err(alhalte_maitre_d::MaitreDError::RoomAlreadyExists(_))
+    ));
+    assert_eq!(db.get_room(room_id).unwrap().unwrap().name, "Crypt");
+}
+
+// spec: alhalte-maitre-d/rooms registry legacy migration
+#[test]
+fn test_room_registry_migrates_legacy_permissions() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.sqlite3");
+
+    let account_id = {
+        let db = Database::open(&path).unwrap();
+        let account = db
+            .get_or_create_account("sub-legacy", "Legacy", None, 900)
+            .unwrap();
+        // Pre-#154 rows stored the decimal form.
+        db.set_room_permission("777", account.account_id, RoomRole::Gm, 900)
+            .unwrap();
+        // A permission-only room also needs a registry row.
+        db.set_room_permission("deadbeefcafebabe", account.account_id, RoomRole::Pl, 950)
+            .unwrap();
+        account.account_id
+    };
+
+    // Reopening runs the startup migration.
+    let db = Database::open(&path).unwrap();
+    let canonical = format!("{:016x}", 777);
+    assert!(db.get_room("777").unwrap().is_none());
+    let migrated = db.get_room(&canonical).unwrap().unwrap();
+    assert_eq!(migrated.creator_account, account_id);
+    assert_eq!(migrated.name, "Unnamed room");
+    assert_eq!(
+        db.get_room_role(&canonical, account_id).unwrap(),
+        Some(RoomRole::Gm)
+    );
+
+    let recovered = db.get_room("deadbeefcafebabe").unwrap().unwrap();
+    assert_eq!(recovered.creator_account, account_id);
+    assert_eq!(recovered.name, "Unnamed room");
+}
+
+// spec: alhalte-maitre-d/rooms create api
+#[tokio::test]
+async fn test_create_room_api_registers_creator_as_gm() {
+    let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
+    let (account_id, session_id) = account_with_session(&db, "sub-create-room", "Creator");
+    let client = reqwest::Client::new();
+    let auth = format!("account_id={account_id}&session_id={session_id}");
+
+    // A session is required.
+    let unauthenticated = client
+        .post(format!("http://{addr}/api/rooms"))
+        .json(&serde_json::json!({
+            "room_id": "abcdef0123456789",
+            "name": "Lair"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = client
+        .post(format!("http://{addr}/api/rooms?{auth}"))
+        .json(&serde_json::json!({
+            "room_id": "abcdef0123456789",
+            "name": "  Lair  "
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let info: RoomInfoResponse = response.json().await.unwrap();
+    assert_eq!(info.room_id, "abcdef0123456789");
+    assert_eq!(info.name, "Lair");
+    assert_eq!(info.role, RoomRole::Gm);
+    assert!(!info.done);
+
+    let room = db.get_room("abcdef0123456789").unwrap().unwrap();
+    assert_eq!(room.creator_account, account_id);
+    assert_eq!(
+        db.get_room_role("abcdef0123456789", account_id).unwrap(),
+        Some(RoomRole::Gm)
+    );
+    // Creation does not spawn banquette.
+    assert!(spawner.calls().is_empty());
+
+    // Duplicate -> 409.
+    let duplicate = client
+        .post(format!("http://{addr}/api/rooms?{auth}"))
+        .json(&serde_json::json!({
+            "room_id": "abcdef0123456789",
+            "name": "Duplicate"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+
+    // A generated ID is canonical 16-hex and also creates no process.
+    let generated = client
+        .post(format!("http://{addr}/api/rooms?{auth}"))
+        .json(&serde_json::json!({ "name": "Generated" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(generated.status(), reqwest::StatusCode::OK);
+    let generated_info: RoomInfoResponse = generated.json().await.unwrap();
+    assert_eq!(generated_info.room_id.len(), 16);
+    assert!(
+        generated_info
+            .room_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    );
+    assert_eq!(
+        db.get_room(&generated_info.room_id)
+            .unwrap()
+            .unwrap()
+            .creator_account,
+        account_id
+    );
+    assert!(spawner.calls().is_empty());
+}
+
+// spec: alhalte-maitre-d/rooms create api validation
+#[tokio::test]
+async fn test_create_room_api_validates_input() {
+    let (addr, _temp_dir, db, _spawner, _manager) = spawn_recording_router().await;
+    let (account_id, session_id) = account_with_session(&db, "sub-validate-room", "Creator");
+    let client = reqwest::Client::new();
+    let auth = format!("account_id={account_id}&session_id={session_id}");
+
+    for invalid_room_id in [
+        "room-1",
+        "0x1234",
+        "zzzzzzzzzzzzzzzz",
+        "18446744073709551616",
+    ] {
+        let response = client
+            .post(format!("http://{addr}/api/rooms?{auth}"))
+            .json(&serde_json::json!({
+                "room_id": invalid_room_id,
+                "name": "Valid name"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{invalid_room_id} must be rejected"
+        );
+    }
+
+    for invalid_name in ["", "   ", "\n\t"] {
+        let response = client
+            .post(format!("http://{addr}/api/rooms?{auth}"))
+            .json(&serde_json::json!({ "name": invalid_name }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "name {invalid_name:?} must be rejected"
+        );
+    }
+
+    let long_name = "x".repeat(alhalte_maitre_d::MAX_ROOM_NAME_LEN + 1);
+    let response = client
+        .post(format!("http://{addr}/api/rooms?{auth}"))
+        .json(&serde_json::json!({ "name": long_name }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Legacy decimal IDs are still accepted and stored/returned canonical.
+    let response = client
+        .post(format!("http://{addr}/api/rooms?{auth}"))
+        .json(&serde_json::json!({ "room_id": "777", "name": "Legacy" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let info: RoomInfoResponse = response.json().await.unwrap();
+    assert_eq!(info.room_id, format!("{:016x}", 777));
+    assert!(db.get_room("0000000000000309").unwrap().is_some());
+}
+
+// spec: alhalte-maitre-d/rooms get api
+#[tokio::test]
+async fn test_get_room_info_access_rules() {
+    let (addr, _temp_dir, db, spawner, manager) = spawn_recording_router().await;
+    let (creator, creator_session) = account_with_session(&db, "sub-info-creator", "Creator");
+    let (outsider, outsider_session) = account_with_session(&db, "sub-info-outsider", "Outsider");
+    let room_id = "0123456789abcdef";
+    let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
+    db.create_room(room_id, "Info room", creator, 1000).unwrap();
+    let client = reqwest::Client::new();
+
+    // Unknown room -> 404.
+    let unknown = client
+        .get(format!(
+            "http://{addr}/api/rooms/ffffffffffffffff?account_id={outsider}&session_id={outsider_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // Authentication is required.
+    let anonymous = client
+        .get(format!("http://{addr}/api/rooms/{room_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // A non-member of a private room -> 403.
+    let private = client
+        .get(format!(
+            "http://{addr}/api/rooms/{room_id}?account_id={outsider}&session_id={outsider_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(private.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // The creator sees their GM role.
+    let member = client
+        .get(format!(
+            "http://{addr}/api/rooms/{room_id}?account_id={creator}&session_id={creator_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member.status(), reqwest::StatusCode::OK);
+    let member_info: RoomInfoResponse = member.json().await.unwrap();
+    assert_eq!(member_info.role, RoomRole::Gm);
+    assert!(!member_info.done);
+
+    // Once done, a non-member may read the room as a viewer.
+    manager.set_room_done(room_u64, true).await;
+    let public = client
+        .get(format!(
+            "http://{addr}/api/rooms/{room_id}?account_id={outsider}&session_id={outsider_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(public.status(), reqwest::StatusCode::OK);
+    let public_info: RoomInfoResponse = public.json().await.unwrap();
+    assert_eq!(public_info.role, RoomRole::Viewer);
+    assert!(public_info.done);
+    assert_eq!(public_info.name, "Info room");
+
+    // Reading room info never spawns banquette.
+    assert!(spawner.calls().is_empty());
+}
+
+// spec: alhalte-maitre-d/rooms no implicit creation
+#[tokio::test]
+async fn test_unregistered_room_ws_and_export_do_not_create_rooms() {
+    let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
+    let (account_id, session_id) = account_with_session(&db, "sub-unknown-room", "Caller");
+    let unknown_room = "0000000000000abc";
+
+    match connect_async(format!(
+        "ws://{addr}/ws/room/{unknown_room}?account_id={account_id}&session_id={session_id}"
+    ))
+    .await
+    {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        }
+        other => panic!("expected HTTP 404 for an unregistered room, got {other:?}"),
+    }
+
+    let export = reqwest::get(format!(
+        "http://{addr}/api/room/{unknown_room}/export/zip?account_id={account_id}&session_id={session_id}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(export.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // The failed requests neither registered the room nor spawned banquette.
+    assert!(db.get_room(unknown_room).unwrap().is_none());
+    assert!(spawner.calls().is_empty());
+}
+
+// spec: alhalte-maitre-d/rooms export requires membership
+#[tokio::test]
+async fn test_export_private_room_requires_membership_without_spawn() {
+    let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
+    let (creator, _creator_session) = account_with_session(&db, "sub-export-creator", "Creator");
+    let (outsider, outsider_session) = account_with_session(&db, "sub-export-outsider", "Outsider");
+    let room_id = "fedcba9876543210";
+    db.create_room(room_id, "Private export", creator, 1000)
+        .unwrap();
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/room/{room_id}/export/zip?account_id={outsider}&session_id={outsider_session}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(spawner.calls().is_empty());
+}
+
+// spec: alhalte-maitre-d/rooms bridge admin is the creator, not the first connector
+#[tokio::test]
+async fn test_bridge_admin_is_creator_not_first_connector() {
+    let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
+    let (creator, _creator_session) = account_with_session(&db, "sub-admin-creator", "Creator");
+    let (player, player_session) = account_with_session(&db, "sub-admin-player", "Player");
+    let room_id = "abcdefabcdef0001";
+    let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
+    db.create_room(room_id, "Admin room", creator, 1000)
+        .unwrap();
+    db.set_room_permission(room_id, player, RoomRole::Pl, 1010)
+        .unwrap();
+
+    // The player connects first; the bridge must still use the creator as admin.
+    let (mut ws_stream, _) = connect_async(format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={player}&session_id={player_session}"
+    ))
+    .await
+    .unwrap();
+    let list_req = serde_json::to_string(&ClientFrame::ListScenes).unwrap();
+    ws_stream
+        .send(WsMessage::Text(list_req.into()))
+        .await
+        .unwrap();
+
+    let mut received_scene_list = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(text))) =
+            tokio::time::timeout(Duration::from_millis(500), ws_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::SceneList { scenes }) =
+                serde_json::from_str::<ServerFrame>(&text)
+        {
+            assert!(scenes.contains(&"/".to_string()));
+            received_scene_list = true;
+            break;
+        }
+    }
+    assert!(received_scene_list);
+    assert_eq!(spawner.calls(), vec![(room_u64, creator)]);
+    ws_stream.close(None).await.unwrap();
+}
+
+// spec: alhalte-maitre-d/cli-args chunk-size-exponent
+#[test]
+fn test_chunk_size_exponent_cli_flag() {
+    let default = parse_cli_args_from(["alhalte-maitre-d"]).unwrap();
+    assert_eq!(default.chunk_size_exponent, 8);
+
+    let custom = parse_cli_args_from(["alhalte-maitre-d", "--chunk-size-exponent", "12"]).unwrap();
+    assert_eq!(custom.chunk_size_exponent, 12);
+}
+
 // spec: alhalte-maitre-d/websocket-auth-and-done-rejection
 #[tokio::test]
 async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted() {
@@ -1217,15 +1697,9 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
 
     let room_id: u64 = 901;
 
-    // Set permission for GM on room 901. Permission rows use the canonical
-    // 16-hex form, which is what a 16-hex invitation URL resolves to.
-    db.set_room_permission(
-        &format!("{room_id:016x}"),
-        gm.account_id,
-        RoomRole::Gm,
-        1000,
-    )
-    .unwrap();
+    // Register the room; the creator becomes the initial GM. The canonical
+    // 16-hex ID is what a 16-hex invitation URL resolves to.
+    register_room(&db, room_id, gm.account_id, "Private room");
 
     // 1. Outsider attempts to connect to private room -> Rejected with 403 Forbidden!
     let outsider_ws_url = format!(
@@ -1312,7 +1786,7 @@ async fn test_websocket_cookie_session_authentication() {
     ));
     let room_manager = RoomBridgeManager::new(spawner);
     let oauth = Arc::new(MockOAuthProvider::new());
-    let state = AppState::new(db, "salt", oauth, room_manager);
+    let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1322,6 +1796,7 @@ async fn test_websocket_cookie_session_authentication() {
     });
 
     let room_id: u64 = 902;
+    register_room(&db, room_id, user.account_id, "Cookie room");
 
     // Construct WebSocket handshake request with Cookie header
     let ws_url = format!("ws://{addr}/ws/room/{room_id}");
@@ -1382,9 +1857,8 @@ async fn test_websocket_viewer_mutate_blocking() {
     let room_id: u64 = 903;
     let room_id_str = format!("{room_id:016x}");
 
-    // Register GM and Viewer permissions
-    db.set_room_permission(&room_id_str, gm.account_id, RoomRole::Gm, 1000)
-        .unwrap();
+    // Register the room (GM) and add a Viewer permission.
+    register_room(&db, room_id, gm.account_id, "Viewer room");
     db.set_room_permission(&room_id_str, viewer.account_id, RoomRole::Viewer, 1010)
         .unwrap();
 
@@ -1584,7 +2058,7 @@ async fn test_initial_scene_demultiplexing_and_root_broadcasts() {
     ));
     let room_manager = RoomBridgeManager::new(spawner);
     let oauth = Arc::new(MockOAuthProvider::new());
-    let state = AppState::new(db, "salt", oauth, room_manager);
+    let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1594,6 +2068,7 @@ async fn test_initial_scene_demultiplexing_and_root_broadcasts() {
     });
 
     let room_id: u64 = 999;
+    register_room(&db, room_id, acc.account_id, "Initial scene room");
     let ws_url = format!(
         "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
         acc.account_id, session.session_id

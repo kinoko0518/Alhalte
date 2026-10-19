@@ -18,7 +18,7 @@ use alhalte_maitre_d::{
     create_router,
 };
 
-async fn spawn_router() -> (std::net::SocketAddr, tempfile::TempDir) {
+async fn spawn_router() -> (std::net::SocketAddr, tempfile::TempDir, Database) {
     let temp_dir = tempdir().unwrap();
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         temp_dir.path().to_path_buf(),
@@ -26,7 +26,7 @@ async fn spawn_router() -> (std::net::SocketAddr, tempfile::TempDir) {
     ));
     let db = Database::new_in_memory().unwrap();
     let state = AppState::new(
-        db,
+        db.clone(),
         "salt",
         Arc::new(MockOAuthProvider::new()),
         RoomBridgeManager::new(spawner),
@@ -38,13 +38,13 @@ async fn spawn_router() -> (std::net::SocketAddr, tempfile::TempDir) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, temp_dir)
+    (addr, temp_dir, db)
 }
 
 // spec: alhalte-maitre-d/room-id invalid IDs return 400 on room-scoped routes
 #[tokio::test]
 async fn invalid_room_ids_return_400_on_room_scoped_routes() {
-    let (addr, _temp_dir) = spawn_router().await;
+    let (addr, _temp_dir, _db) = spawn_router().await;
     let client = reqwest::Client::new();
 
     for path in [
@@ -91,12 +91,21 @@ async fn invalid_room_ids_return_400_on_room_scoped_routes() {
 // spec: alhalte-maitre-d/room-id /ws?room=<hex> accepts canonical IDs
 #[tokio::test]
 async fn websocket_query_accepts_canonical_hex_room_id() {
-    let (addr, _temp_dir) = spawn_router().await;
+    let (addr, _temp_dir, db) = spawn_router().await;
     let room_id = "fedcba9876543210";
-
-    let (mut ws_stream, _) = connect_async(format!("ws://{addr}/ws?room={room_id}"))
-        .await
+    let account = db
+        .get_or_create_account("ws-query-sub", "QueryUser", None, 1000)
         .unwrap();
+    let session = db.create_session(account.account_id, 1000).unwrap();
+    db.create_room(room_id, "Query room", account.account_id, 1000)
+        .unwrap();
+
+    let (mut ws_stream, _) = connect_async(format!(
+        "ws://{addr}/ws?room={room_id}&account_id={}&session_id={}",
+        account.account_id, session.session_id
+    ))
+    .await
+    .unwrap();
     let list_req = serde_json::to_string(&ClientFrame::ListScenes).unwrap();
     ws_stream
         .send(WsMessage::Text(list_req.into()))
@@ -124,7 +133,7 @@ async fn websocket_query_accepts_canonical_hex_room_id() {
 // spec: alhalte-maitre-d/room-id permission routes use the canonical hex form
 #[tokio::test]
 async fn permission_routes_accept_canonical_hex_room_id() {
-    let (addr, _temp_dir) = spawn_router().await;
+    let (addr, _temp_dir, _db) = spawn_router().await;
     let room_id = "deadbeefcafebabe";
 
     let resp = reqwest::get(format!("http://{addr}/api/room/{room_id}/permissions"))

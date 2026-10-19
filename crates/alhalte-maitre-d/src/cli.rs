@@ -57,6 +57,10 @@ pub struct CliArgs {
     )]
     pub cellar_url: String,
 
+    /// Log chunk size exponent passed to spawned banquette instances (`1..=30`).
+    #[arg(long, default_value_t = 8, env = "ALHALTE_CHUNK_SIZE_EXPONENT")]
+    pub chunk_size_exponent: u8,
+
     /// Optional UNIX domain socket path to bind for HTTP/API requests.
     #[arg(long, env = "ALHALTE_UNIX_SOCKET")]
     pub unix_socket: Option<PathBuf>,

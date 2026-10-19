@@ -20,7 +20,7 @@ alhalte-bistrot [--config Bistrot.toml] [--age-key KEY] <command>
 
 | コマンド | 内容 |
 | --- | --- |
-| `args [module]` | `all` / `maitre-d` / `cellar` / `banquette` の引数を出力。 |
+| `args [module]` | `all` / `maitre-d` / `cellar` の引数を出力。 |
 | `systemd` | unit を stdout または `--output-dir` に出力。 |
 | `url` | argenterie の URL を出力。 |
 | `validate` | 設定を検証し、要約を出力。 |
@@ -30,7 +30,7 @@ alhalte-bistrot [--config Bistrot.toml] [--age-key KEY] <command>
 ### 主な公開型
 
 - `BistrotConfig`、`RestaurantConfig`、`MaitreDConfig`、`CellarConfig`、`BanquetteConfig`、`ArgenterieConfig`、`ExtensionConfig`
-- `ModuleArgs`、`generate_all_args`、`generate_maitre_d_args`、`generate_cellar_args`、`generate_banquette_args`、`generate_module_args`
+- `ModuleArgs`、`generate_all_args`、`generate_maitre_d_args`、`generate_cellar_args`、`generate_module_args`
 - `SystemdOptions`、`SystemdUnits`、`generate_systemd_units`、`generate_*_service`
 - `parse_bistrot_toml`、`load_from_path`、`decrypt_rops_toml`、`encrypt_bistrot_toml`
 
@@ -100,9 +100,10 @@ enabled = true
 
 ### 引数生成
 
-- `generate_maitre_d_args`: host、port、db-path、client-id、client-secret、salt、socket-dir、cellar-url。`banquette-bin` があれば追加。
+- `generate_maitre_d_args`: host、port、db-path、client-id、client-secret、salt、socket-dir、cellar-url、chunk-size-exponent。`banquette-bin` があれば追加。
 - `generate_cellar_args`: host、port、storage-path、db-path、session verifier（`cellar.maitre-d-socket` があれば `--maitre-d-socket <path>`、なければ `--maitre-d-url <url>`）、`allow-all-sessions` が true のとき `--allow-all-sessions`、`anti-oracle` が true のとき `--anti-oracle`。既定の URL は `http://{restaurant.host}:{maitre-d.port}`。
-- `generate_banquette_args`: chunk-size-exponent と socket-dir。
+
+`alhalte-banquette` は `alhalte-maitre-d` が部屋ごとに起動し、`--room-id` / `--admin` / `--socket` / `--chunk-size-exponent` を spawner が組み立てるため、bistrot は静的な banquette 引数を生成しない。`[banquette] chunk-size-exponent` は `generate_maitre_d_args` 経由で maitre-d に渡り、spawner が各 banquette に伝播する。
 
 すべて副作用なし。`generate_module_args` はモジュール名を正規化して振り分ける。
 
@@ -127,7 +128,7 @@ enabled = true
 
 ## 既知の差分・制約
 
-- `generate_banquette_args` は `--socket-dir <dir>` を出すが、`alhalte-banquette` の CLI は `--socket <path>` を取る。現状この引数は直接起動に使われておらず、maitre-d の spawner が `--socket` を組み立てる。
+- `generate_banquette_args` は削除した。banquette は maitre-d が部屋ごとに起動し、`--room-id` / `--admin` / `--socket` は設定ファイルから静的に決められないため。`args banquette` は未知のモジュールとしてエラーになる。
 - `nix run .#bistrot` は systemd が使えない環境ではバックグラウンドプロセスへフォールバックする。この処理は `flake.nix` の `bistrot-runner` 側にある。
 - argenterie は開発サーバー（Vite）として起動する。本番配信の unit は未定義。
 - `Bistrot.toml` の `maitre-d` と `cellar` は必須。`restaurant`、`banquette`、`argenterie`、`extensions` は既定値を持つ。

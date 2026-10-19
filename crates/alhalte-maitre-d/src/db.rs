@@ -79,6 +79,23 @@ impl std::fmt::Display for RoomRole {
     }
 }
 
+/// Room registered in the persistent room registry (`rooms` table).
+///
+/// The room ID is stored in its canonical 16-hex form. Rooms are created
+/// explicitly through [`Database::create_room`]; a permission row alone does not
+/// make a room joinable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Room {
+    /// Canonical 16-hex room ID.
+    pub room_id: String,
+    /// Human-readable room name.
+    pub name: String,
+    /// Account that created the room (also inserted as the initial `gm`).
+    pub creator_account: u64,
+    /// Creation timestamp (seconds since Unix epoch).
+    pub created_at: i64,
+}
+
 /// Room permission entry returned by query and listing endpoints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomPermissionItem {
@@ -147,6 +164,13 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id);
             CREATE INDEX IF NOT EXISTS idx_sessions_heartbeat ON sessions(last_heartbeat);
 
+            CREATE TABLE IF NOT EXISTS rooms (
+                room_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                creator_account INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS room_permissions (
                 room_id TEXT NOT NULL,
                 account_id INTEGER NOT NULL,
@@ -158,6 +182,101 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_room_permissions_account ON room_permissions(account_id);
             ",
         )?;
+
+        // Bring pre-registry data forward: permission rows written before the
+        // canonical room ID contract used decimal IDs, and rooms created before
+        // this table existed have permission rows but no registry row.
+        Self::normalize_legacy_room_permissions(&conn)?;
+        Self::backfill_room_registry(&conn)?;
+
+        Ok(())
+    }
+
+    /// Placeholder name used when a room is recovered from its permission rows.
+    const RECOVERED_ROOM_NAME: &'static str = "Unnamed room";
+
+    /// Rewrites legacy decimal `room_permissions.room_id` values to canonical
+    /// 16-hex form (spec: `room_permissions` stores canonical room IDs).
+    ///
+    /// A 16-character all-digit value is left untouched because the room ID
+    /// contract interprets it as hex; only shorter/longer decimal strings are
+    /// rewritten. When a canonical row already exists for the same account, the
+    /// canonical row wins and the legacy duplicate is dropped.
+    fn normalize_legacy_room_permissions(conn: &Connection) -> Result<()> {
+        let legacy: Vec<(String, i64, String, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT room_id, account_id, role, created_at
+                 FROM room_permissions
+                 WHERE length(room_id) <> 16
+                   AND room_id <> ''
+                   AND room_id NOT GLOB '*[^0-9]*'",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        for (legacy_id, account_id, role, created_at) in legacy {
+            let Ok(value) = legacy_id.parse::<u64>() else {
+                continue;
+            };
+            let canonical = format!("{value:016x}");
+            conn.execute(
+                "INSERT OR IGNORE INTO room_permissions (room_id, account_id, role, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![canonical, account_id, role, created_at],
+            )?;
+            conn.execute(
+                "DELETE FROM room_permissions WHERE room_id = ?1 AND account_id = ?2",
+                params![legacy_id, account_id],
+            )?;
+        }
+
+        Ok(())
+    }
+
+    /// Backfills `rooms` for permission rows that predate the room registry.
+    ///
+    /// The creator is the earliest `gm` (or, failing that, the earliest account
+    /// with any role) so that the recovered room has a stable bridge admin. The
+    /// original room name was client-side only, so a placeholder is used.
+    fn backfill_room_registry(conn: &Connection) -> Result<()> {
+        let missing: Vec<(String, i64, i64)> = {
+            let mut stmt = conn.prepare(
+                "SELECT p.room_id,
+                        COALESCE(
+                            (SELECT g.account_id FROM room_permissions g
+                             WHERE g.room_id = p.room_id AND g.role = 'gm'
+                             ORDER BY g.created_at ASC, g.account_id ASC LIMIT 1),
+                            (SELECT a.account_id FROM room_permissions a
+                             WHERE a.room_id = p.room_id
+                             ORDER BY a.created_at ASC, a.account_id ASC LIMIT 1)
+                        ),
+                        COALESCE(
+                            (SELECT MIN(c.created_at) FROM room_permissions c
+                             WHERE c.room_id = p.room_id),
+                            0
+                        )
+                 FROM (SELECT DISTINCT room_id FROM room_permissions) p
+                 WHERE NOT EXISTS (SELECT 1 FROM rooms r WHERE r.room_id = p.room_id)",
+            )?;
+            let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        for (room_id, creator_account, created_at) in missing {
+            conn.execute(
+                "INSERT OR IGNORE INTO rooms (room_id, name, creator_account, created_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    room_id,
+                    Self::RECOVERED_ROOM_NAME,
+                    creator_account,
+                    created_at
+                ],
+            )?;
+        }
 
         Ok(())
     }
@@ -533,6 +652,89 @@ impl Database {
         )?;
 
         Ok(affected)
+    }
+
+    /// Registers a room and inserts `creator_account` as its initial `gm`.
+    ///
+    /// The caller is responsible for supplying a canonical 16-hex `room_id` and
+    /// a validated `name`; the HTTP layer performs both checks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaitreDError::RoomAlreadyExists`] when the room ID is already
+    /// registered. The room and its initial permission are inserted in one
+    /// transaction, so a failure leaves neither behind.
+    pub fn create_room(
+        &self,
+        room_id: &str,
+        name: &str,
+        creator_account: u64,
+        now: i64,
+    ) -> Result<Room> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let exists: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM rooms WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if exists.is_some() {
+            return Err(MaitreDError::RoomAlreadyExists(room_id.to_string()));
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO rooms (room_id, name, creator_account, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![room_id, name, creator_account as i64, now],
+        )?;
+        tx.execute(
+            "INSERT INTO room_permissions (room_id, account_id, role, created_at)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (room_id, account_id) DO UPDATE SET role = excluded.role",
+            params![room_id, creator_account as i64, RoomRole::Gm.as_str(), now],
+        )?;
+        tx.commit()?;
+
+        Ok(Room {
+            room_id: room_id.to_string(),
+            name: name.to_string(),
+            creator_account,
+            created_at: now,
+        })
+    }
+
+    /// Looks up a registered room by its canonical 16-hex ID.
+    pub fn get_room(&self, room_id: &str) -> Result<Option<Room>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT room_id, name, creator_account, created_at FROM rooms WHERE room_id = ?1",
+        )?;
+
+        let room = stmt
+            .query_row(params![room_id], |row| {
+                let creator_account: i64 = row.get(2)?;
+                Ok(Room {
+                    room_id: row.get(0)?,
+                    name: row.get(1)?,
+                    creator_account: creator_account as u64,
+                    created_at: row.get(3)?,
+                })
+            })
+            .optional()?;
+
+        Ok(room)
     }
 
     /// Sets or updates the permission role for an account in a room.

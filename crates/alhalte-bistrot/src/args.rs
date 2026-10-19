@@ -5,18 +5,23 @@
 use crate::config::BistrotConfig;
 use crate::error::{BistrotError, Result};
 
-/// Bundled arguments for all Alhalte modules.
+/// Bundled arguments for the long-lived Alhalte services.
+///
+/// `alhalte-banquette` is not included: it is spawned per room by
+/// `alhalte-maitre-d`, which supplies `--room-id`, `--admin`, `--socket`, and
+/// the chunk size exponent itself.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModuleArgs {
     /// Command-line arguments for `alhalte-maitre-d`.
     pub maitre_d: Vec<String>,
     /// Command-line arguments for `alhalte-cellar`.
     pub cellar: Vec<String>,
-    /// Command-line arguments for `alhalte-banquette`.
-    pub banquette: Vec<String>,
 }
 
 /// Generates CLI arguments for `alhalte-maitre-d`.
+///
+/// `[banquette] chunk-size-exponent` is passed as `--chunk-size-exponent` so
+/// maitre-d can forward it to every banquette process it spawns.
 ///
 /// Deterministic and pure function.
 pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
@@ -43,6 +48,9 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         config.maitre_d_socket_dir().display().to_string(),
         "--cellar-url".to_string(),
         cellar_url,
+        // Passed through to every banquette process maitre-d spawns.
+        "--chunk-size-exponent".to_string(),
+        config.banquette.chunk_size_exponent.to_string(),
     ];
 
     if let Some(ref bin) = config.maitre_d.banquette_bin {
@@ -94,30 +102,19 @@ pub fn generate_cellar_args(config: &BistrotConfig) -> Vec<String> {
     args
 }
 
-/// Generates CLI arguments for `alhalte-banquette`.
-///
-/// Deterministic and pure function.
-pub fn generate_banquette_args(config: &BistrotConfig) -> Vec<String> {
-    vec![
-        "--chunk-size-exponent".to_string(),
-        config.banquette.chunk_size_exponent.to_string(),
-        "--socket-dir".to_string(),
-        config.banquette_socket_dir().display().to_string(),
-    ]
-}
-
-/// Generates CLI arguments for all Alhalte modules.
+/// Generates CLI arguments for all long-lived Alhalte services.
 pub fn generate_all_args(config: &BistrotConfig) -> ModuleArgs {
     ModuleArgs {
         maitre_d: generate_maitre_d_args(config),
         cellar: generate_cellar_args(config),
-        banquette: generate_banquette_args(config),
     }
 }
 
 /// Generates CLI arguments for a named module.
 ///
-/// Supported module names: `"maitre-d"` (or `"maitre_d"`), `"cellar"`, `"banquette"`.
+/// Supported module names: `"maitre-d"` (or `"maitre_d"`) and `"cellar"`.
+/// `alhalte-banquette` is spawned per room by `alhalte-maitre-d`, so it has no
+/// static argument list here.
 ///
 /// # Errors
 ///
@@ -126,7 +123,6 @@ pub fn generate_module_args(config: &BistrotConfig, module_name: &str) -> Result
     match module_name.to_lowercase().replace('_', "-").as_str() {
         "maitre-d" => Ok(generate_maitre_d_args(config)),
         "cellar" => Ok(generate_cellar_args(config)),
-        "banquette" => Ok(generate_banquette_args(config)),
         other => Err(BistrotError::UnknownModule(other.to_string())),
     }
 }

@@ -34,7 +34,7 @@ struct Cli {
 enum Commands {
     /// Generate command-line arguments for Alhalte modules.
     Args {
-        /// Target module name ("maitre-d", "cellar", "banquette", or "all").
+        /// Target module name ("maitre-d", "cellar", or "all").
         #[arg(default_value = "all")]
         module: String,
     },
@@ -122,8 +122,6 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
                 println!("{}", all_args.maitre_d.join(" "));
                 println!("\n[alhalte-cellar]");
                 println!("{}", all_args.cellar.join(" "));
-                println!("\n[alhalte-banquette]");
-                println!("{}", all_args.banquette.join(" "));
             } else {
                 let args = generate_module_args(&config, &module)?;
                 println!("{}", args.join(" "));
