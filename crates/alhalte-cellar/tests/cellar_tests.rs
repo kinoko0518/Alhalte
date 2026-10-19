@@ -7,7 +7,9 @@ use alhalte_cellar::CellarError;
 use alhalte_cellar::CellarService;
 use alhalte_cellar::SYSTEM_OWNER;
 use alhalte_cellar::db::Database;
-use alhalte_cellar::model::{StoreRequest, StoreStatus, UnregisterRequest, format_tin_id};
+use alhalte_cellar::model::{
+    StoreRequest, StoreStatus, UnregisterRequest, WriteCredentials, format_tin_id,
+};
 use alhalte_cellar::run_garbage_collection;
 use alhalte_cellar::storage::StorageManager;
 use alhalte_cellar::verifier::{
@@ -397,32 +399,29 @@ async fn test_store_with_maitre_d_verifier_mock() {
 
     // A session accepted by maitre-d can check and upload.
     let store_req = StoreRequest {
-        owner: 42,
-        session_id: 100,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
     };
     assert_eq!(
-        service.store_check(&store_req).await.unwrap(),
+        service
+            .store_check(&store_req, WriteCredentials::session(42, 100))
+            .await
+            .unwrap(),
         StoreStatus::UploadRequired
     );
     let result = service
-        .store_payload(42, 100, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(42, 100))
         .await
         .unwrap();
     assert!(result.written_to_disk);
     assert!(service.storage().has_tin_file(&tin_id));
 
     // A session rejected by maitre-d is unauthorized for both store phases.
-    let rejected_req = StoreRequest {
-        owner: 42,
-        session_id: 999,
-        tin_id,
-        size: tin_bytes.len() as u64,
-        wrapped_key: None,
-    };
-    let check_err = service.store_check(&rejected_req).await.unwrap_err();
+    let check_err = service
+        .store_check(&store_req, WriteCredentials::session(42, 999))
+        .await
+        .unwrap_err();
     assert!(matches!(
         check_err,
         CellarError::Unauthorized {
@@ -431,7 +430,12 @@ async fn test_store_with_maitre_d_verifier_mock() {
         }
     ));
     let payload_err = service
-        .store_payload(42, 999, [0xAB; 32], b"rejected", None)
+        .store_payload(
+            [0xAB; 32],
+            b"rejected",
+            None,
+            WriteCredentials::session(42, 999),
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -448,7 +452,9 @@ async fn test_store_with_maitre_d_verifier_mock() {
         .method("POST")
         .uri("/store")
         .header("Content-Type", "application/json")
-        .body(Body::from(serde_json::to_vec(&rejected_req).unwrap()))
+        .header("X-Alhalte-Owner", "42")
+        .header("X-Alhalte-Session-Id", "999")
+        .body(Body::from(serde_json::to_vec(&store_req).unwrap()))
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
@@ -465,20 +471,21 @@ async fn test_store_result_upload_required() {
     let (tin_bytes, tin_id) = create_test_tin("content for upload_required");
 
     let req = StoreRequest {
-        owner: 10,
-        session_id: 100,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
     };
 
     // Store check reports upload_required through the service API.
-    let status = service.store_check(&req).await.unwrap();
+    let status = service
+        .store_check(&req, WriteCredentials::session(10, 100))
+        .await
+        .unwrap();
     assert_eq!(status, StoreStatus::UploadRequired);
 
     // Client uploads payload
     let res = service
-        .store_payload(10, 100, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(10, 100))
         .await
         .unwrap();
     assert!(res.written_to_disk);
@@ -501,21 +508,22 @@ async fn test_store_result_deduplicated() {
 
     // Owner 10 uploads first
     let res = service
-        .store_payload(10, 100, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(10, 100))
         .await
         .unwrap();
     assert!(res.written_to_disk);
 
     // Owner 20 sends store_check for the exact same tin
     let req2 = StoreRequest {
-        owner: 20,
-        session_id: 200,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: Some(vec![0xAA, 0xBB]),
     };
 
-    let status = service.store_check(&req2).await.unwrap();
+    let status = service
+        .store_check(&req2, WriteCredentials::session(20, 200))
+        .await
+        .unwrap();
     // Must report deduplicated.
     assert_eq!(status, StoreStatus::Deduplicated);
 
@@ -545,20 +553,21 @@ async fn test_store_result_already_owned() {
 
     // Owner 10 stores the tin
     service
-        .store_payload(10, 100, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(10, 100))
         .await
         .unwrap();
 
     // Owner 10 checks store again for the same tin
     let req = StoreRequest {
-        owner: 10,
-        session_id: 100,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
     };
 
-    let status = service.store_check(&req).await.unwrap();
+    let status = service
+        .store_check(&req, WriteCredentials::session(10, 100))
+        .await
+        .unwrap();
     // Must report already_owned.
     assert_eq!(status, StoreStatus::AlreadyOwned);
 }
@@ -577,27 +586,33 @@ async fn test_anti_oracle_mode() {
 
     // Owner 10 uploads
     let res10 = service
-        .store_payload(10, 100, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(10, 100))
         .await
         .unwrap();
     assert!(res10.written_to_disk);
 
     // Owner 20 checks store: Even though file exists, anti_oracle reports upload_required!
     let req20 = StoreRequest {
-        owner: 20,
-        session_id: 200,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: Some(vec![9, 9, 9]),
     };
 
-    let status = service.store_check(&req20).await.unwrap();
+    let status = service
+        .store_check(&req20, WriteCredentials::session(20, 200))
+        .await
+        .unwrap();
     assert_eq!(status, StoreStatus::UploadRequired);
 
     // Owner 20 sends payload: It should be discarded (written_to_disk: false),
     // but reference_added should still be true!
     let res20 = service
-        .store_payload(20, 200, tin_id, &tin_bytes, Some(vec![9, 9, 9]))
+        .store_payload(
+            tin_id,
+            &tin_bytes,
+            Some(vec![9, 9, 9]),
+            WriteCredentials::session(20, 200),
+        )
         .await
         .unwrap();
     assert!(!res20.written_to_disk);
@@ -621,7 +636,12 @@ async fn test_download_tin_and_wrapped_key() {
     let wrapped_key = vec![11, 22, 33, 44];
 
     service
-        .store_payload(1, 10, tin_id, &tin_bytes, Some(wrapped_key.clone()))
+        .store_payload(
+            tin_id,
+            &tin_bytes,
+            Some(wrapped_key.clone()),
+            WriteCredentials::session(1, 10),
+        )
         .await
         .unwrap();
 
@@ -646,16 +666,19 @@ async fn test_unregister_removes_ownership_reference() {
     let (tin_bytes, tin_id) = create_test_tin("content to unregister");
 
     service
-        .store_payload(1, 10, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(1, 10))
         .await
         .unwrap();
     service
-        .store_payload(2, 20, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(2, 20))
         .await
         .unwrap();
 
     // Owner 1 unregisters
-    let unregistered = service.unregister(1, 10, &tin_id).await.unwrap();
+    let unregistered = service
+        .unregister(&tin_id, WriteCredentials::session(1, 10))
+        .await
+        .unwrap();
     assert!(unregistered);
 
     // Owner 1 can no longer download with owner=1 filter
@@ -681,16 +704,19 @@ async fn test_garbage_collection() {
     let (tin_bytes2, tin_id2) = create_test_tin("orphaned content");
 
     service
-        .store_payload(1, 10, tin_id1, &tin_bytes1, None)
+        .store_payload(tin_id1, &tin_bytes1, None, WriteCredentials::session(1, 10))
         .await
         .unwrap();
     service
-        .store_payload(1, 10, tin_id2, &tin_bytes2, None)
+        .store_payload(tin_id2, &tin_bytes2, None, WriteCredentials::session(1, 10))
         .await
         .unwrap();
 
     // Unregister tin_id2 so it becomes orphaned
-    service.unregister(1, 10, &tin_id2).await.unwrap();
+    service
+        .unregister(&tin_id2, WriteCredentials::session(1, 10))
+        .await
+        .unwrap();
 
     // Pre-GC: both files exist on disk
     assert!(service.storage().has_tin_file(&tin_id1));
@@ -722,10 +748,9 @@ async fn test_http_api_flow() {
     let (tin_bytes, tin_id) = create_test_tin("HTTP API test payload");
     let hex_id = format_tin_id(&tin_id);
 
-    // 1. POST /store -> 200 with result "upload_required"
+    // 1. POST /store -> 200 with result "upload_required". The body carries no
+    //    ownership claim: the caller is identified by the headers (Issue #191).
     let store_req = StoreRequest {
-        owner: 100,
-        session_id: 1000,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: Some(vec![1, 2, 3]),
@@ -735,6 +760,8 @@ async fn test_http_api_flow() {
         .method("POST")
         .uri("/store")
         .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "100")
+        .header("X-Alhalte-Session-Id", "1000")
         .body(Body::from(serde_json::to_vec(&store_req).unwrap()))
         .unwrap();
 
@@ -773,8 +800,6 @@ async fn test_http_api_flow() {
 
     // 4. POST /store by second owner -> 200 with result "deduplicated"
     let store_req2 = StoreRequest {
-        owner: 200,
-        session_id: 2000,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
@@ -784,6 +809,8 @@ async fn test_http_api_flow() {
         .method("POST")
         .uri("/store")
         .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "200")
+        .header("X-Alhalte-Session-Id", "2000")
         .body(Body::from(serde_json::to_vec(&store_req2).unwrap()))
         .unwrap();
 
@@ -795,6 +822,8 @@ async fn test_http_api_flow() {
         .method("POST")
         .uri("/store")
         .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "100")
+        .header("X-Alhalte-Session-Id", "1000")
         .body(Body::from(serde_json::to_vec(&store_req).unwrap()))
         .unwrap();
 
@@ -802,15 +831,13 @@ async fn test_http_api_flow() {
     assert_store_check_result(resp, "already_owned").await;
 
     // 6. POST /unregister by owner 100
-    let unreg = UnregisterRequest {
-        owner: 100,
-        session_id: 1000,
-        tin_id,
-    };
+    let unreg = UnregisterRequest { tin_id };
     let req = Request::builder()
         .method("POST")
         .uri("/unregister")
         .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "100")
+        .header("X-Alhalte-Session-Id", "1000")
         .body(Body::from(serde_json::to_vec(&unreg).unwrap()))
         .unwrap();
 
@@ -968,8 +995,6 @@ async fn test_service_token_authorizes_internal_writes_without_a_session() {
 
     let (tin_bytes, tin_id) = create_test_tin("internal room state");
     let req = StoreRequest {
-        owner: 42,
-        session_id: 0,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
@@ -978,27 +1003,33 @@ async fn test_service_token_authorizes_internal_writes_without_a_session() {
     // Valid token: upload required, then payload accepted.
     assert_eq!(
         service
-            .store_check_with_token(&req, Some("service-secret"))
+            .store_check_with_token(&req, WriteCredentials::service(), Some("service-secret"))
             .await
             .unwrap(),
         StoreStatus::UploadRequired
     );
     let result = service
-        .store_payload_with_token(42, 0, tin_id, &tin_bytes, None, Some("service-secret"))
+        .store_payload_with_token(
+            tin_id,
+            &tin_bytes,
+            None,
+            WriteCredentials::service(),
+            Some("service-secret"),
+        )
         .await
         .unwrap();
     assert!(result.written_to_disk);
 
     // Wrong token fails closed (401), never falling back to session verification.
     let err = service
-        .store_check_with_token(&req, Some("wrong-secret"))
+        .store_check_with_token(&req, WriteCredentials::service(), Some("wrong-secret"))
         .await
         .unwrap_err();
     assert!(matches!(err, CellarError::Unauthorized { .. }));
 
     // No token and no session fails as before.
     let err = service
-        .store_check_with_token(&req, None)
+        .store_check_with_token(&req, WriteCredentials::service(), None)
         .await
         .unwrap_err();
     assert!(matches!(err, CellarError::Unauthorized { .. }));
@@ -1013,7 +1044,7 @@ async fn test_service_token_authorizes_internal_writes_without_a_session() {
     .unwrap();
     assert!(!tokenless.has_service_token());
     let err = tokenless
-        .store_check_with_token(&req, Some("service-secret"))
+        .store_check_with_token(&req, WriteCredentials::service(), Some("service-secret"))
         .await
         .unwrap_err();
     assert!(matches!(err, CellarError::Unauthorized { .. }));
@@ -1021,14 +1052,14 @@ async fn test_service_token_authorizes_internal_writes_without_a_session() {
     // Invalid token without any session.
     assert!(
         service
-            .unregister_with_token(42, 0, &tin_id, Some("wrong"))
+            .unregister_with_token(&tin_id, WriteCredentials::service(), Some("wrong"))
             .await
             .is_err(),
         "a wrong service token must not unregister"
     );
     assert!(
         service
-            .unregister_with_token(42, 0, &tin_id, Some("service-secret"))
+            .unregister_with_token(&tin_id, WriteCredentials::service(), Some("service-secret"))
             .await
             .unwrap(),
         "the valid service token must unregister the reference"
@@ -1047,29 +1078,28 @@ async fn test_service_token_keeps_user_session_verification() {
 
     let (tin_bytes, tin_id) = create_test_tin("user session content");
     let user_req = StoreRequest {
-        owner: 7,
-        session_id: 70,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
     };
     // A normal user request without the service token is verified against the session.
     assert_eq!(
-        service.store_check(&user_req).await.unwrap(),
+        service
+            .store_check(&user_req, WriteCredentials::session(7, 70))
+            .await
+            .unwrap(),
         StoreStatus::UploadRequired
     );
     service
-        .store_payload(7, 70, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(7, 70))
         .await
         .unwrap();
 
     // Revoked sessions are still rejected even though a service token exists.
-    let unknown_req = StoreRequest {
-        owner: 7,
-        session_id: 71,
-        ..user_req
-    };
-    let err = service.store_check(&unknown_req).await.unwrap_err();
+    let err = service
+        .store_check(&user_req, WriteCredentials::session(7, 71))
+        .await
+        .unwrap_err();
     assert!(matches!(
         err,
         CellarError::Unauthorized {
@@ -1096,8 +1126,6 @@ async fn test_service_token_header_is_accepted_by_the_router() {
     let app = Arc::clone(&service).into_router();
 
     let req_body = StoreRequest {
-        owner: 42,
-        session_id: 0,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
@@ -1135,10 +1163,9 @@ async fn test_service_token_header_is_accepted_by_the_router() {
     let resp = app.clone().oneshot(request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
-    // Unregister with the token removes the reference.
+    // Unregister with the token removes the reference. The body carries only the
+    // tin id; the ownership label comes from the token.
     let unregister_body = serde_json::json!({
-        "owner": 42,
-        "session_id": 0,
         "tin_id": format_tin_id(&tin_id),
     });
     let request = Request::builder()
@@ -1161,36 +1188,52 @@ async fn test_service_token_header_is_accepted_by_the_router() {
 async fn test_service_token_store_and_unregister_use_the_system_owner_label() {
     let dir = tempdir().unwrap();
     // The verifier denies every session, so success can only come from the token.
-    let service = CellarService::new_with_in_memory_db(
-        dir.path(),
-        Arc::new(InMemorySessionVerifier::new()),
-        false,
-    )
-    .unwrap()
-    .with_service_token("service-secret");
+    let service = Arc::new(
+        CellarService::new_with_in_memory_db(
+            dir.path(),
+            Arc::new(InMemorySessionVerifier::new()),
+            false,
+        )
+        .unwrap()
+        .with_service_token("service-secret"),
+    );
+    let app = Arc::clone(&service).into_router();
 
     let (tin_bytes, tin_id) = create_test_tin("system-owned room state");
-    // The claimed owner is ignored: the credential decides the reference label.
+    let hex_id = format_tin_id(&tin_id);
     let req = StoreRequest {
-        owner: 42,
-        session_id: 0,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
     };
-    assert_eq!(
-        service
-            .store_check_with_token(&req, Some("service-secret"))
-            .await
-            .unwrap(),
-        StoreStatus::UploadRequired
-    );
-    let result = service
-        .store_payload_with_token(42, 0, tin_id, &tin_bytes, None, Some("service-secret"))
-        .await
+
+    // The claimed owner header is ignored: the token decides the reference label.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/store")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "42")
+        .header("X-Alhalte-Session-Id", "0")
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(serde_json::to_vec(&req).unwrap()))
         .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_store_check_result(resp, "upload_required").await;
+
+    let upload = Request::builder()
+        .method("POST")
+        .uri(format!("/store/{hex_id}"))
+        .header("X-Alhalte-Owner", "42")
+        .header("X-Alhalte-Session-Id", "0")
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(tin_bytes.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(upload).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(
-        result.owner, SYSTEM_OWNER,
+        payload["owner"], SYSTEM_OWNER,
         "service-token writes must be labelled with the system owner"
     );
 
@@ -1201,23 +1244,32 @@ async fn test_service_token_store_and_unregister_use_the_system_owner_label() {
         CellarError::NotFound(_)
     ));
 
-    // A second store is already_owned for the system owner, independent of the claim.
-    let other_claim = StoreRequest { owner: 999, ..req };
-    assert_eq!(
-        service
-            .store_check_with_token(&other_claim, Some("service-secret"))
-            .await
-            .unwrap(),
-        StoreStatus::AlreadyOwned
-    );
+    // A second store is already_owned for the system owner, independent of the
+    // (changed) owner header.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/store")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "999")
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(serde_json::to_vec(&req).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_store_check_result(resp, "already_owned").await;
 
     // Unregister is normalized the same way, so GC reclaims the entity.
-    assert!(
-        service
-            .unregister_with_token(42, 0, &tin_id, Some("service-secret"))
-            .await
-            .unwrap()
-    );
+    let request = Request::builder()
+        .method("POST")
+        .uri("/unregister")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "42")
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(
+            serde_json::to_vec(&UnregisterRequest { tin_id }).unwrap(),
+        ))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
     let stats = service.run_gc().await.unwrap();
     assert_eq!(
         stats.deleted_files, 1,
@@ -1292,18 +1344,19 @@ async fn test_user_session_owner_label_is_bound_to_the_session() {
 
     let (tin_bytes, tin_id) = create_test_tin("user-owned content");
     let req = StoreRequest {
-        owner: 7,
-        session_id: 70,
         tin_id,
         size: tin_bytes.len() as u64,
         wrapped_key: None,
     };
     assert_eq!(
-        service.store_check(&req).await.unwrap(),
+        service
+            .store_check(&req, WriteCredentials::session(7, 70))
+            .await
+            .unwrap(),
         StoreStatus::UploadRequired
     );
     let result = service
-        .store_payload(7, 70, tin_id, &tin_bytes, None)
+        .store_payload(tin_id, &tin_bytes, None, WriteCredentials::session(7, 70))
         .await
         .unwrap();
     assert_eq!(
@@ -1316,18 +1369,165 @@ async fn test_user_session_owner_label_is_bound_to_the_session() {
         "a user write must not be labelled with the system owner"
     );
 
-    // Claiming another owner with this session is rejected; the body cannot
-    // change the label because the session verifier checks the pair.
-    let spoofed = StoreRequest {
-        owner: 8,
-        session_id: 70,
-        ..req
-    };
+    // Claiming another owner with this session is rejected: the header pair must
+    // satisfy the session verifier, and the body has no say at all.
     assert!(matches!(
-        service.store_check(&spoofed).await.unwrap_err(),
+        service
+            .store_check(&req, WriteCredentials::session(8, 70))
+            .await
+            .unwrap_err(),
         CellarError::Unauthorized {
             owner: 8,
             session_id: 70
         }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #191: ownership is derived from auth headers, never from the body
+// ---------------------------------------------------------------------------
+
+// spec: alhalte-cellar/owner-label 0004 a body carrying owner / session_id is rejected (Issue #191)
+#[tokio::test]
+async fn test_body_owner_and_session_fields_are_rejected_with_400() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    verifier.allow(100, 1000);
+    let service = Arc::new(
+        CellarService::new_with_in_memory_db(dir.path(), verifier, false)
+            .unwrap()
+            .with_service_token("service-secret"),
+    );
+    let app = Arc::clone(&service).into_router();
+
+    let (tin_bytes, tin_id) = create_test_tin("legacy body claim");
+    let hex_id = format_tin_id(&tin_id);
+
+    // A valid session header does not excuse the legacy body fields: the request
+    // is malformed, so the answer is 400 rather than a silently rewired write.
+    for body in [
+        serde_json::json!({
+            "owner": 100,
+            "session_id": 1000,
+            "tin_id": hex_id,
+            "size": tin_bytes.len(),
+        }),
+        serde_json::json!({
+            "owner": 100,
+            "tin_id": hex_id,
+            "size": tin_bytes.len(),
+        }),
+        serde_json::json!({
+            "tin_id": hex_id,
+            "size": tin_bytes.len(),
+            "unknown_field": 1,
+        }),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/store")
+            .header("Content-Type", "application/json")
+            .header("X-Alhalte-Owner", "100")
+            .header("X-Alhalte-Session-Id", "1000")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "store body {body} must be rejected"
+        );
+    }
+
+    // The unregister contract is the same.
+    for body in [
+        serde_json::json!({ "owner": 100, "session_id": 1000, "tin_id": hex_id }),
+        serde_json::json!({ "session_id": 1000, "tin_id": hex_id }),
+    ] {
+        let request = Request::builder()
+            .method("POST")
+            .uri("/unregister")
+            .header("Content-Type", "application/json")
+            .header("X-Alhalte-Service-Token", "service-secret")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "unregister body {body} must be rejected"
+        );
+    }
+
+    // Nothing reached the database: the reference was never created.
+    assert!(service.download(&tin_id, None).await.is_err());
+}
+
+// spec: alhalte-cellar/owner-label 0005 header-only handshake stores and downloads (Issue #191)
+#[tokio::test]
+async fn test_header_credentials_store_and_download_without_body_owner() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    verifier.allow(100, 1000);
+    let service =
+        Arc::new(CellarService::new_with_in_memory_db(dir.path(), verifier, false).unwrap());
+    let app = Arc::clone(&service).into_router();
+
+    let (tin_bytes, tin_id) = create_test_tin("header-only transfer");
+    let hex_id = format_tin_id(&tin_id);
+    let store_req = StoreRequest {
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+
+    // 1. Handshake: the body has no ownership claim, the headers carry it.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/store")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "100")
+        .header("X-Alhalte-Session-Id", "1000")
+        .body(Body::from(serde_json::to_vec(&store_req).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_store_check_result(resp, "upload_required").await;
+
+    // 2. Upload.
+    let request = Request::builder()
+        .method("PUT")
+        .uri(format!("/store/{hex_id}"))
+        .header("X-Alhalte-Owner", "100")
+        .header("X-Alhalte-Session-Id", "1000")
+        .body(Body::from(tin_bytes.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["owner"], 100);
+
+    // 3. Download returns the same bytes.
+    let request = Request::builder()
+        .method("GET")
+        .uri(format!("/tin/{hex_id}"))
+        .header("X-Alhalte-Owner", "100")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), tin_bytes.as_slice());
+
+    // 4. A spoofed owner header without a matching session is rejected.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/store")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Owner", "100")
+        .header("X-Alhalte-Session-Id", "9999")
+        .body(Body::from(serde_json::to_vec(&store_req).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }

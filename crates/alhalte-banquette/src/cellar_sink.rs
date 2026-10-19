@@ -8,8 +8,10 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use tokio::sync::RwLock;
 
+use alhalte_cellar::handlers::{OWNER_HEADER, SERVICE_TOKEN_HEADER, SESSION_ID_HEADER};
 use alhalte_cellar::{
-    StoreRequest, StoreResponse, StoreResult, StoreStatus, UnregisterRequest, format_tin_id,
+    SYSTEM_OWNER, StoreRequest, StoreResponse, StoreResult, StoreStatus, UnregisterRequest,
+    format_tin_id,
 };
 use tin::TinId;
 
@@ -138,9 +140,12 @@ impl CellarSink for InMemoryCellarSink {
 
 /// HTTP client implementation of [`CellarSink`] communicating with a remote `alhalte-cellar` server.
 ///
-/// When a cellar service token is configured, internal writes (room state
-/// persistence and superseded-head retention) carry it in the
-/// `X-Alhalte-Service-Token` header instead of a synthetic user session. The
+/// The writer's identity travels in the `X-Alhalte-Owner` / `X-Alhalte-Session-Id`
+/// headers, never in the body (Issue #191). When a cellar service token is
+/// configured, internal writes (room state persistence and superseded-head
+/// retention) carry it in the `X-Alhalte-Service-Token` header instead of a
+/// synthetic user session, and the reference label is
+/// [`alhalte_cellar::SYSTEM_OWNER`] exactly as cellar applies it (#198). The
 /// token is redacted from the [`std::fmt::Debug`] representation.
 #[derive(Clone)]
 pub struct HttpCellarSink {
@@ -194,9 +199,33 @@ impl HttpCellarSink {
     /// Adds the service token header to an internal write request, if configured.
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match self.service_token.as_deref() {
-            Some(token) => request.header(alhalte_cellar::handlers::SERVICE_TOKEN_HEADER, token),
+            Some(token) => request.header(SERVICE_TOKEN_HEADER, token),
             None => request,
         }
+    }
+
+    /// Returns the reference label cellar will actually store for a write.
+    ///
+    /// With a service token cellar always labels the write
+    /// [`SYSTEM_OWNER`] (#198), so the result synthesized for the
+    /// `deduplicated` / `already_owned` handshakes must report the same label.
+    fn reference_owner(&self, owner: u64) -> u64 {
+        if self.service_token.is_some() {
+            SYSTEM_OWNER
+        } else {
+            owner
+        }
+    }
+
+    /// Adds the write credentials as request headers.
+    ///
+    /// Ownership is never part of the body (Issue #191): cellar derives both the
+    /// authorization and the reference label from these headers.
+    fn write_headers(&self, owner: u64, session_id: u64) -> [(&'static str, String); 2] {
+        [
+            (OWNER_HEADER, self.reference_owner(owner).to_string()),
+            (SESSION_ID_HEADER, session_id.to_string()),
+        ]
     }
 }
 
@@ -211,16 +240,21 @@ impl CellarSink for HttpCellarSink {
         wrapped_key: Option<Vec<u8>>,
     ) -> Result<StoreResult> {
         let check_url = format!("{}/store", self.base_url);
+        // The handshake body is metadata only: the writer's identity is in the
+        // headers, so cellar never accepts an ownership claim from the body.
         let store_req = StoreRequest {
-            owner,
-            session_id,
             tin_id: *tin_id,
             size: tin_bytes.len() as u64,
             wrapped_key: wrapped_key.clone(),
         };
 
+        let mut check_request = self.client.post(&check_url).json(&store_req);
+        for (name, value) in self.write_headers(owner, session_id) {
+            check_request = check_request.header(name, value);
+        }
+
         let resp = self
-            .authorize(self.client.post(&check_url).json(&store_req))
+            .authorize(check_request)
             .send()
             .await
             .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
@@ -247,9 +281,11 @@ impl CellarSink for HttpCellarSink {
                 let mut req = self
                     .client
                     .post(&upload_url)
-                    .header("X-Alhalte-Owner", owner.to_string())
-                    .header("X-Alhalte-Session-Id", session_id.to_string())
                     .body(Bytes::copy_from_slice(tin_bytes));
+
+                for (name, value) in self.write_headers(owner, session_id) {
+                    req = req.header(name, value);
+                }
 
                 if let Some(ref key) = wrapped_key {
                     req = req.header("X-Alhalte-Wrapped-Key", hex::encode(key));
@@ -277,13 +313,13 @@ impl CellarSink for HttpCellarSink {
             }
             StoreStatus::Deduplicated => Ok(StoreResult {
                 tin_id: *tin_id,
-                owner,
+                owner: self.reference_owner(owner),
                 written_to_disk: false,
                 reference_added: true,
             }),
             StoreStatus::AlreadyOwned => Ok(StoreResult {
                 tin_id: *tin_id,
-                owner,
+                owner: self.reference_owner(owner),
                 written_to_disk: false,
                 reference_added: false,
             }),
@@ -326,14 +362,16 @@ impl CellarSink for HttpCellarSink {
 
     async fn unregister_tin(&self, owner: u64, session_id: u64, tin_id: &TinId) -> Result<bool> {
         let unregister_url = format!("{}/unregister", self.base_url);
-        let request = UnregisterRequest {
-            owner,
-            session_id,
-            tin_id: *tin_id,
-        };
+        // The body carries only the tin id; ownership comes from the headers.
+        let request = UnregisterRequest { tin_id: *tin_id };
+
+        let mut req = self.client.post(&unregister_url).json(&request);
+        for (name, value) in self.write_headers(owner, session_id) {
+            req = req.header(name, value);
+        }
 
         let resp = self
-            .authorize(self.client.post(&unregister_url).json(&request))
+            .authorize(req)
             .send()
             .await
             .map_err(|e| BanquetteError::Cellar(e.to_string()))?;

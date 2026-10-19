@@ -275,7 +275,12 @@ describe('uploadTin', () => {
     expect(xhrs[0].method).toBe('POST');
     expect(xhrs[0].url).toBe(`${CELLAR_PROXY_BASE_PATH}/store`);
     const handshake = JSON.parse(xhrs[0].body as string);
-    expect(handshake).toMatchObject({ owner: 0, session_id: 0, size: 4 });
+    // Issue #191: the body carries metadata only. `owner` / `session_id` are
+    // derived by maitre-d from the session and must never be sent.
+    expect(Object.keys(handshake).sort()).toEqual(['size', 'tin_id', 'wrapped_key']);
+    expect(handshake).toMatchObject({ size: 4 });
+    expect(handshake).not.toHaveProperty('owner');
+    expect(handshake).not.toHaveProperty('session_id');
     expect(handshake.tin_id).toBe(result.tinId);
     expect(handshake.wrapped_key).toBeNull();
     // Step 2: body upload.
@@ -359,6 +364,29 @@ describe('uploadTin', () => {
     expect(handshake.tin_id).toBe(tinId);
     expect(handshake.wrapped_key).toBe('deadbeef');
     expect(xhrs[1].headers['X-Alhalte-Wrapped-Key']).toBe('deadbeef');
+  });
+
+  it('never sends owner / session_id in the handshake body', async () => {
+    // spec: alhalte-argenterie/cellar-transfer 0013 handshake body has no ownership claim (Issue #191)
+    const { factory, xhrs } = scriptedFactory([
+      storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED),
+      { status: 201 },
+    ]);
+
+    await uploadTin(new Uint8Array([7, 7]), {
+      xhrFactory: factory,
+      wrappedKey: new Uint8Array([1, 2]),
+    });
+
+    const handshake = JSON.parse(xhrs[0].body as string);
+    expect(handshake).not.toHaveProperty('owner');
+    expect(handshake).not.toHaveProperty('session_id');
+    expect(handshake.wrapped_key).toBe('0102');
+
+    // The upload step authenticates with the session cookie only; ownership
+    // headers are maitre-d's to add.
+    expect(xhrs[1].headers).not.toHaveProperty('X-Alhalte-Owner');
+    expect(xhrs[1].headers).not.toHaveProperty('X-Alhalte-Session-Id');
   });
 
   it('rejects a malformed pre-computed tin id', async () => {

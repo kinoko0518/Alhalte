@@ -27,7 +27,7 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | `GET` / `POST` | `/api/room/{room_id}/permissions` | GET は認証 + メンバー、POST は認証 + GM。 |
 | `DELETE` | `/api/room/{room_id}/permissions/{account_id}` | 認証 + GM。 |
 | `GET` | `/api/room/{room_id}/export/zip?type=full|logs` | 部屋またはログの ZIP。persisted head から復元できなければ 5xx。 |
-| `POST` | `/api/cellar/store` | 認証付き cellar proxy。cellar の `POST /store`（store check）へ転送し、`200 OK` + `{"result": ...}` の status / body をそのまま返す。 |
+| `POST` | `/api/cellar/store` | 認証付き cellar proxy。body は `{ tin_id, size, wrapped_key }` のみ（`owner` / `session_id` は 400）。cellar の `POST /store`（store check）へ転送し、`200 OK` + `{"result": ...}` の status / body をそのまま返す。 |
 | `POST` / `PUT` | `/api/cellar/store/{tin_id}` | 認証付き cellar proxy。Tin 本体を cellar の `POST` / `PUT /store/{tin_id}` へ転送する。 |
 | `GET` | `/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。本体と `X-Alhalte-Wrapped-Key` を返す。 |
 | `POST` | `/api/debug/account` | debug ビルドのみ。推測不能な合成 `sub` を hash した account を作る（実 account と同じ形。専用 DB へ移すのは #150）。 |
@@ -126,8 +126,8 @@ Google から継承するのは `sub` のみ。`sub` はその場で hash 化・
 
 ### cellar proxy
 
-1. `resolve_caller` が Cookie `session_id` / クエリ / ヘッダから session を解決し、DB から account を引く。リクエストの `owner` / `session_id` は使わない。
-2. `/api/cellar/store` の JSON body は `owner` / `session_id` を session 由来の値で上書きしてから cellar へ送る。クライアントは owner を詐称できない。
+1. `resolve_caller` が Cookie `session_id` / クエリ / ヘッダから session を解決し、DB から account を引く。リクエストの `owner` / `session_id` は認可に使わない。
+2. `/api/cellar/store` の JSON body は `{ tin_id, size, wrapped_key }` のみを受理し、`X-Alhalte-Owner` / `X-Alhalte-Session-Id` を session 由来の値で付与してから body をそのまま cellar へ送る。body に `owner` / `session_id` が入っていれば 400。クライアントは owner を詐称できない（クエリ / ヘッダの `owner` が session と食い違えば 403）。
 3. `/api/cellar/store/{tin_id}` は `X-Alhalte-Owner` / `X-Alhalte-Session-Id` を付与し、`X-Alhalte-Wrapped-Key` と `Content-Type` を透過する。`tin_id` は 64 hex を検証してから転送する。
 4. `GET /api/cellar/tin/{tin_id}` は `X-Alhalte-Wrapped-Key` をレスポンスへ透過する。
 5. 上流の status / body はそのまま返し、接続失敗は 502、timeout は 504 に変換して内部 URL を漏らさない。cellar 未設定時は 503。

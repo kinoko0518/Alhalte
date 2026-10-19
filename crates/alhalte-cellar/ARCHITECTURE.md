@@ -26,7 +26,7 @@ tin の実体をファイルとして保存し、`(tin_id, owner, wrapped_key)` 
 | `DELETE` | `/store/{tin_id}` / `/tin/{tin_id}` | 参照を削除する。 |
 | `POST` | `/gc` | GC を実行し、`GcStats` を返す。 |
 
-アップロード時の認証情報はヘッダ `X-Alhalte-Owner` / `X-Alhalte-Session-Id`、またはクエリ `owner` / `session_id`。wrapped key は `X-Alhalte-Wrapped-Key`（hex）またはクエリ `wrapped_key`。
+書き込みの認証情報はヘッダ `X-Alhalte-Owner` / `X-Alhalte-Session-Id` のみで受け取る。クエリ `owner` / `session_id` は受理しない（ダウンロードの `owner` は参照行の絞り込み専用）。wrapped key は `X-Alhalte-Wrapped-Key`（hex）またはクエリ `wrapped_key`。`StoreRequest` / `UnregisterRequest` の body は `tin_id`（と `POST /store` では `size` / `wrapped_key`）だけで、`owner` / `session_id` を body で送ると 400 になる（Issue #191）。
 
 `/store`、`/store/{tin_id}`、`/tin/{tin_id}`（upload）、`/unregister` はヘッダ `X-Alhalte-Service-Token` でも認可できる。これは `--service-token` で設定した内部トークンとの一致だけを検証し、ユーザー session とは独立している。ヘッダを付けたリクエストは session 検証へフォールバックしない（不一致は 401）。ヘッダのないリクエストは従来どおり `SessionVerifier` で検証する。
 
@@ -49,10 +49,12 @@ anti-oracle が有効な場合、`/store` は常に `upload_required` を返し�
 ### 主な公開型
 
 - `CellarConfig`、`CellarService`
-- `StoreRequest`、`StoreResponse`、`StoreResult`、`StoreStatus`、`UnregisterRequest`、`TinReference`、`GcStats`
+- `StoreRequest`、`StoreResponse`、`StoreResult`、`StoreStatus`、`UnregisterRequest`、`WriteCredentials`、`TinReference`、`GcStats`
 - `Database`、`StorageManager`、`SessionVerifier`、`InMemorySessionVerifier`、`MaitreDVerifier`
 - `create_router`、`run_garbage_collection`、`parse_tin_id` / `format_tin_id`
-- `CellarService::with_service_token` / `has_service_token` と `store_check_with_token` / `store_payload_with_token` / `unregister_with_token`、`handlers::SERVICE_TOKEN_HEADER`
+- `CellarService::with_service_token` / `has_service_token` と `store_check_with_token` / `store_payload_with_token` / `unregister_with_token`、`handlers::SERVICE_TOKEN_HEADER` / `OWNER_HEADER` / `SESSION_ID_HEADER`
+
+`StoreRequest` / `UnregisterRequest` は `#[serde(deny_unknown_fields)]` で、body の未知フィールド（旧 `owner` / `session_id` を含む）は 400 になる。認可と参照ラベルは `CellarService` が `WriteCredentials`（ヘッダ由来）と service token から決める。`WriteCredentials::session(owner, session_id)` と `WriteCredentials::service()` がその構築口。
 
 CLI（`CliArgs`）: `--host`、`--port`、`--storage-path`、`--db-path`、`--anti-oracle`、`--maitre-d-url`、`--maitre-d-socket`、`--allow-all-sessions`、`--service-token`（`ALHALTE_SERVICE_TOKEN`、後方互換）、`--service-token-file`（`ALHALTE_SERVICE_TOKEN_FILE`、0600 file から読む。file が優先）、`--gc-interval-secs`。秘密 file は `alhalte_cellar::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
 
@@ -85,13 +87,13 @@ tin_references(
 
 ### store check
 
-1. `verify_session(owner, session_id)`。`X-Alhalte-Service-Token` がある場合は代わりにトークンを検証する。
+1. ヘッダの `X-Alhalte-Owner` / `X-Alhalte-Session-Id` を `WriteCredentials` として読む。`X-Alhalte-Service-Token` がある場合はトークンだけを検証し、`owner` ヘッダは無視して参照ラベルを `SYSTEM_OWNER` にする。トークンがない場合は `verify_session(owner, session_id)`。
 2. anti-oracle なら常に `upload_required`。
-3. 同じ owner の参照があれば `already_owned`。
+3. 同じ参照ラベルの参照があれば `already_owned`。
 4. 実体ファイルがあれば、参照行を追加して `deduplicated`。
 5. どちらもなければ `upload_required`。
 
-いずれの結果も `200 OK` + `{"result": ...}` で返す。
+いずれの結果も `200 OK` + `{"result": ...}` で返す。body に `owner` / `session_id` が入っている場合はこの段階に到達せず 400 を返す。
 
 ### store payload
 
@@ -103,7 +105,7 @@ tin_references(
 
 ### 内部サービス認可
 
-`authorize` は service token が提示された場合、設定済みトークンと定数時間比較し、一致しなければ 401 を返す。トークン未設定の cellar にトークンが提示された場合も 401（設定情報を漏らさない）。トークンが提示されない場合は従来の session 検証だけを行う。トークンはログに出さず、`CellarService` の `Debug` にも含めない（`CellarService` は `Debug` を実装しない）。
+`authorize` は service token が提示された場合、設定済みトークンと定数時間比較し、一致しなければ 401 を返す。トークン未設定の cellar にトークンが提示された場合も 401（設定情報を漏らさない）。トークンが提示されず、かつ `X-Alhalte-Owner` / `X-Alhalte-Session-Id` が揃っている場合は session 検証だけを行う。所有者ヘッダが片方でも欠ける場合は 401。トークンはログに出さず、`CellarService` の `Debug` にも含めない（`CellarService` は `Debug` を実装しない）。
 
 ### download
 
@@ -123,4 +125,4 @@ tin_references(
 - upload は `Bytes` extractor でリクエスト全量をメモリにバッファする（上限 64 MiB）。maitre-d proxy も同じ上限・同じバッファリングを行う。
 - service token は平文で設定・比較する。ローテーション機構はなく、変更するには `cellar` / `maitre-d` / 全 banquette の再起動と設定更新が必要。
 - service token は `--service-token` 引数でも渡せるため `ps` から読める。本番では環境変数か systemd の `EnvironmentFile` を使うのが望ましい。
-- service token による書き込みでも `owner` は必要で、参照行の所有権はその owner に紐づく。banquette は部屋の管理者 account を owner として使う。
+- `owner` は参照ラベルであり認可境界ではない。ユーザー session の書き込みは session の account を、service token の書き込みは常に `SYSTEM_OWNER` をラベルにする。body やクエリで owner を指定する経路はない（ヘッダのみ）。
