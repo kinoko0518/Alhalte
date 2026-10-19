@@ -174,6 +174,11 @@ describe('Home Screen & Room URL', () => {
 
     let posted: { name: string; room_id?: string } | null = null;
     const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      // The home screen also reads `GET /api/server-info` on mount for the
+      // debug-login warning (Issue #150); it is off here.
+      if (String(url).endsWith('/api/server-info')) {
+        return jsonResponse({ debug_login: false });
+      }
       expect(String(url)).toBe('https://alhalte.example/api/rooms');
       expect(init?.method).toBe('POST');
       posted = JSON.parse(String(init?.body)) as { name: string; room_id?: string };
@@ -263,7 +268,11 @@ describe('Home Screen & Room URL', () => {
     joinBtn?.click();
 
     await vi.waitFor(() => expect(enteredRoom).toBeTruthy());
-    expect(fetchFn).toHaveBeenCalledTimes(1);
+    // Only the room creation is a POST; `/api/server-info` is a GET on mount.
+    const roomCalls = fetchFn.mock.calls.filter(([url]) =>
+      String(url).endsWith('/api/rooms'),
+    );
+    expect(roomCalls).toHaveLength(1);
     expect(posted?.name).toBe('新セッション部屋');
     expect(posted?.room_id).toMatch(/^[0-9a-f]{16}$/);
     expect(enteredRoom?.name).toBe('新セッション部屋');
@@ -309,7 +318,12 @@ describe('Home Screen & Room URL', () => {
     joinBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    expect(fetchFn).not.toHaveBeenCalled();
+    // Nothing is registered on the server while signed out. (The mount still
+    // reads `GET /api/server-info` for the debug-login warning, Issue #150.)
+    const roomCalls = fetchFn.mock.calls.filter(([url]) =>
+      String(url).endsWith('/api/rooms'),
+    );
+    expect(roomCalls).toHaveLength(0);
     expect(enteredRoom).toBeNull();
     expect(getRecentRooms()).toHaveLength(0);
 
