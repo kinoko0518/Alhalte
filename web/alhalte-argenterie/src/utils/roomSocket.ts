@@ -571,6 +571,59 @@ function decodeChangeBgmEntry(
   return { tinIdHex, slot };
 }
 
+/** Summary of one scene as sent by banquette (`SceneList` / `SceneInfo`). */
+export interface SceneSummary {
+  /** Scene identifier. */
+  id: string;
+  /** Human-readable `std::name` value, falling back to the scene id. */
+  name?: string;
+  /** Number of present characters. */
+  present_character_count?: number;
+  /** Number of active connected clients. */
+  active_client_count?: number;
+  /** Whether the scene is currently loaded in memory. */
+  is_loaded?: boolean;
+}
+
+/**
+ * One `SceneList` entry.
+ *
+ * Older servers sent bare scene ids; the current protocol sends summaries. The
+ * client accepts both so a stale server cannot break the scene switcher.
+ */
+export type SceneListEntry = string | SceneSummary;
+
+/** Normalizes a `SceneList` entry to its scene id. */
+export function sceneListEntryId(entry: unknown): string {
+  if (typeof entry === 'string') return entry;
+  if (entry && typeof entry === 'object') {
+    const id = (entry as Record<string, unknown>).id;
+    if (typeof id === 'string') return id;
+  }
+  return String(entry ?? '');
+}
+
+/** Normalizes a `SceneList` entry to a summary object. */
+export function sceneListEntrySummary(entry: unknown): SceneSummary | null {
+  if (typeof entry === 'string') return { id: entry };
+  if (entry && typeof entry === 'object') {
+    const record = entry as Record<string, unknown>;
+    if (typeof record.id !== 'string') return null;
+    return {
+      id: record.id,
+      ...(typeof record.name === 'string' ? { name: record.name } : {}),
+      ...(typeof record.present_character_count === 'number'
+        ? { present_character_count: record.present_character_count }
+        : {}),
+      ...(typeof record.active_client_count === 'number'
+        ? { active_client_count: record.active_client_count }
+        : {}),
+      ...(typeof record.is_loaded === 'boolean' ? { is_loaded: record.is_loaded } : {}),
+    };
+  }
+  return null;
+}
+
 /**
  * Commands and requests initiated by a client WebSocket connection.
  * Conforms to `crates/alhalte-banquette/src/protocol.rs`.
@@ -579,7 +632,7 @@ export type ClientFrame =
   | 'ListScenes'
   | { ListScenes?: Record<string, never> }
   | { QueryScene: { scene_id: string } }
-  | { CreateScene: { scene_id: string; inherit_juices: boolean } }
+  | { CreateScene: { scene_id: string; inherit_juices: boolean; name?: string | null } }
   | { DeleteScene: { scene_id: string } }
   | { EnterScene: { scene_id: string } }
   | { LeaveScene: { scene_id: string } }
@@ -609,8 +662,8 @@ export type ClientFrame =
  * Conforms to `crates/alhalte-banquette/src/protocol.rs`.
  */
 export type ServerFrame =
-  | { SceneList: { scenes: string[] } }
-  | { SceneInfo: any }
+  | { SceneList: { scenes: SceneListEntry[] } }
+  | { SceneInfo: SceneSummary }
   | { StateSnapshot: { scene_id: string; states: Record<string, any> } }
   | { StateUpdated: { scene_id: string; key: string; value: any } }
   | { StateDeleted: { scene_id: string; key: string } }
@@ -988,6 +1041,8 @@ export class RoomSocket {
 
   // Local state cache
   private scenes: string[] = [];
+  /** Server-authoritative scene summaries keyed by scene id. */
+  private sceneSummaries: Map<string, SceneSummary> = new Map();
   private characters: Character[] = [];
   private stateMap: Map<string, Map<string, any>> = new Map();
 
@@ -1723,10 +1778,14 @@ export class RoomSocket {
 
   /**
    * Creates a scene and resolves when the server acknowledges with `SceneCreated`.
+   *
+   * `name` is written to the scene state `std::name` atomically at creation, so
+   * `SceneSummary` / `SceneList` already carry the display name on the ack.
    */
   public requestCreateScene(
     sceneId: string,
     inheritJuices = false,
+    name?: string,
     timeoutMs?: number,
   ): Promise<SceneAck> {
     const promise = this.registerOperation<SceneAck>(
@@ -1743,7 +1802,13 @@ export class RoomSocket {
       timeoutMs,
     );
 
-    this.send({ CreateScene: { scene_id: sceneId, inherit_juices: inheritJuices } });
+    this.send({
+      CreateScene: {
+        scene_id: sceneId,
+        inherit_juices: inheritJuices,
+        ...(name !== undefined && name.length > 0 ? { name } : {}),
+      },
+    });
     return promise;
   }
 
@@ -1942,7 +2007,10 @@ export class RoomSocket {
   }
 
   /**
-   * Requests the room scene list and resolves with the `SceneList` payload.
+   * Requests the room scene list and resolves with the scene ids.
+   *
+   * Use {@link RoomSocket.getSceneSummaries} (or the `SceneInfo` callback) for
+   * the server-authoritative names.
    */
   public querySceneList(timeoutMs?: number): Promise<string[]> {
     const promise = this.registerOperation<string[]>(
@@ -1952,7 +2020,10 @@ export class RoomSocket {
         if (typeof frame !== 'object' || frame === null || !('SceneList' in frame)) {
           return { matched: false };
         }
-        return { matched: true, value: frame.SceneList.scenes };
+        return {
+          matched: true,
+          value: (frame.SceneList.scenes ?? []).map((entry) => sceneListEntryId(entry)),
+        };
       },
       timeoutMs,
     );
@@ -2114,14 +2185,25 @@ export class RoomSocket {
     // the cache/callback handling so callers observe the acknowledgement promptly.
     this.dispatchPendingOperations(frame);
 
-    // 2. SceneList
+    // 2. SceneList (summaries; older servers may still send bare ids)
     if ('SceneList' in frame) {
-      this.scenes = frame.SceneList.scenes;
-      this.options.onSceneList?.(frame.SceneList.scenes);
+      const entries = Array.isArray(frame.SceneList.scenes) ? frame.SceneList.scenes : [];
+      this.sceneSummaries.clear();
+      const ids: string[] = [];
+      for (const entry of entries) {
+        const summary = sceneListEntrySummary(entry);
+        if (!summary) continue;
+        this.sceneSummaries.set(summary.id, summary);
+        ids.push(summary.id);
+      }
+      this.scenes = ids;
+      this.options.onSceneList?.(ids);
     }
 
     // 2b. SceneInfo
     if ('SceneInfo' in frame) {
+      const summary = sceneListEntrySummary(frame.SceneInfo);
+      if (summary) this.sceneSummaries.set(summary.id, summary);
       this.options.onSceneInfo?.(frame.SceneInfo);
     }
 
@@ -2137,6 +2219,7 @@ export class RoomSocket {
     if ('SceneDeleted' in frame) {
       const { scene_id } = frame.SceneDeleted;
       this.scenes = this.scenes.filter((id) => id !== scene_id);
+      this.sceneSummaries.delete(scene_id);
       this.stateMap.delete(scene_id);
       this.options.onSceneDeleted?.(scene_id);
     }
@@ -2318,6 +2401,13 @@ export class RoomSocket {
    */
   public getScenes(): string[] {
     return [...this.scenes];
+  }
+
+  /**
+   * Current cached scene summaries (IDs and server-authoritative names).
+   */
+  public getSceneSummaries(): SceneSummary[] {
+    return [...this.sceneSummaries.values()];
   }
 
   /**

@@ -25,7 +25,14 @@
   import { Icon } from 'noph-ui/icons';
   import GenericImagePicker from '../GenericImagePicker.svelte';
   import type { BgmSlot, Character, Scene } from '../../../types/index.js';
-  import { getNormalizedBgmSlots } from '../../../utils/sceneSettings.js';
+  import {
+    clearSceneBackground,
+    getNormalizedBgmSlots,
+    SCENE_BACKGROUND_HEIGHT_STATE_KEY,
+    SCENE_BACKGROUND_WIDTH_STATE_KEY,
+    SCENE_NAME_STATE_KEY,
+    uploadSceneBackground,
+  } from '../../../utils/sceneSettings.js';
   import { ServerOperationError, type RoomSocket } from '../../../utils/roomSocket.js';
   import {
     applyMenuPosition,
@@ -54,6 +61,7 @@
     onDeleteSceneLogs,
     onRequestAssetPicker,
     roomSocket = null,
+    roomKey,
     sceneActionPending = null,
     sceneActionError = null,
   }: {
@@ -83,10 +91,17 @@
       onSelect: (dataUrl?: string, asset?: AssetItem) => void;
     }) => void;
     /**
-     * Room socket used to acknowledge BGM state changes (Issue #109 / #142).
-     * When absent or disconnected the component keeps its local-only behaviour.
+     * Room socket used to acknowledge BGM state changes (Issue #109 / #142),
+     * scene rename / background / dimensions state (Issue #159).
+     * When absent or disconnected the component keeps its local-only behaviour
+     * only for standalone usage (no room key either).
      */
     roomSocket?: RoomSocket | null;
+    /**
+     * 32-byte room key used to encrypt the background image in the cellar
+     * (Issue #159). `undefined` means "not resolved"; `null` means "no key".
+     */
+    roomKey?: Uint8Array | null;
     /**
      * Scene action whose control is replaced by a wavy `CircularProgress`
      * (`create` / `delete-logs` / `delete-scene` / `move:<characterId>`),
@@ -175,19 +190,99 @@
   let inputWidth = $state<number | undefined>(undefined);
   let inputHeight = $state<number | undefined>(undefined);
 
+  /** Background upload / dimension / clear error shown under the picker. */
+  let bgImageError = $state<string | null>(null);
+  /** True while the background image is being uploaded / published. */
+  let bgImagePending = $state(false);
+  /** Scene rename error shown under the scene name field. */
+  let sceneNameError = $state<string | null>(null);
+  /** Draft of the scene name; committed only after the server ack. */
+  let sceneNameDraft = $state(currentScene.name);
+  let sceneNameTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const SCENE_STATE_COMMUNICATION_ERROR = 'サーバーと通信できませんでした';
+  const SCENE_BACKGROUND_MISSING_KEY_ERROR = '部屋鍵がないため、背景画像を保存できません';
+
+  /**
+   * True when the component runs standalone (tests / previews) rather than in a
+   * room: no socket was supplied and no room key was even resolved.
+   */
+  function isStandalone(): boolean {
+    return roomSocket === null && roomKey === undefined;
+  }
+
   // Keep dimension inputs in sync with currentScene
   $effect(() => {
     inputWidth = currentScene.juices.bgWidth;
     inputHeight = currentScene.juices.bgHeight;
   });
 
+  // Mirror external (snapshot / SceneInfo) scene name changes into the draft.
+  // Only a real external change replaces the draft, so an unrelated re-render
+  // does not discard in-progress typing.
+  let lastSyncedSceneName = currentScene.name;
+  $effect(() => {
+    const externalName = currentScene.name;
+    if (externalName !== lastSyncedSceneName) {
+      lastSyncedSceneName = externalName;
+      sceneNameDraft = externalName;
+    }
+  });
+
+  // Drop a pending rename debounce when the component is destroyed.
+  $effect(() => {
+    return () => {
+      if (sceneNameTimer) {
+        clearTimeout(sceneNameTimer);
+        sceneNameTimer = null;
+      }
+    };
+  });
+
+  /** Persists one background dimension, committing locally only after the ack. */
+  async function commitDimension(axis: 'width' | 'height', value: number | undefined) {
+    const key =
+      axis === 'width' ? SCENE_BACKGROUND_WIDTH_STATE_KEY : SCENE_BACKGROUND_HEIGHT_STATE_KEY;
+    const sceneId = currentScene.id;
+    const socket = roomSocket;
+    bgImageError = null;
+
+    if (!socket || !socket.isConnected) {
+      if (isStandalone()) {
+        if (axis === 'width') currentScene.juices.bgWidth = value;
+        else currentScene.juices.bgHeight = value;
+        onUpdateScene?.(currentScene);
+        return;
+      }
+      bgImageError = SCENE_STATE_COMMUNICATION_ERROR;
+      return;
+    }
+
+    try {
+      if (value === undefined) {
+        await socket.requestDeleteState(sceneId, key);
+      } else {
+        await socket.requestUpdateState(sceneId, key, value);
+      }
+      if (currentScene.id !== sceneId) return;
+      if (axis === 'width') currentScene.juices.bgWidth = value;
+      else currentScene.juices.bgHeight = value;
+      onUpdateScene?.(currentScene);
+    } catch (error) {
+      console.warn(`[SceneSettingsTab] Failed to persist the background ${axis}:`, error);
+      bgImageError = SCENE_STATE_COMMUNICATION_ERROR;
+      // Show the last committed value again; the state was not updated.
+      inputWidth = currentScene.juices.bgWidth;
+      inputHeight = currentScene.juices.bgHeight;
+    }
+  }
+
   function handleWidthChange(e: Event) {
     const raw = (e.target as HTMLInputElement).value.trim();
     const num = raw === '' ? NaN : Number(raw);
     const parsed = Number.isNaN(num) || num <= 0 ? undefined : num;
     inputWidth = parsed;
-    currentScene.juices.bgWidth = parsed;
-    onUpdateScene?.(currentScene);
+    void commitDimension('width', parsed);
   }
 
   function handleHeightChange(e: Event) {
@@ -195,8 +290,7 @@
     const num = raw === '' ? NaN : Number(raw);
     const parsed = Number.isNaN(num) || num <= 0 ? undefined : num;
     inputHeight = parsed;
-    currentScene.juices.bgHeight = parsed;
-    onUpdateScene?.(currentScene);
+    void commitDimension('height', parsed);
   }
 
 
@@ -549,10 +643,82 @@
     onUpdateScene?.(currentScene);
   }
 
+  /**
+   * Publishes a picked background image to the cellar and the scene state
+   * (Issue #159).
+   *
+   * The local preview changes only after the upload and the state
+   * acknowledgements succeed; any failure keeps the previous background and
+   * shows the communication error. Standalone usage (no room socket and no
+   * resolved room key) keeps the legacy local-only behaviour for tests.
+   */
+  async function commitBackgroundImage(dataUrl?: string, asset?: AssetItem) {
+    const sceneId = currentScene.id;
+    const socket = roomSocket;
+    bgImageError = null;
+
+    if (!dataUrl) {
+      if (!socket || !socket.isConnected) {
+        if (isStandalone()) {
+          currentScene.juices.bgImage = undefined;
+          onUpdateScene?.(currentScene);
+        } else {
+          bgImageError = SCENE_STATE_COMMUNICATION_ERROR;
+        }
+        return;
+      }
+      try {
+        await clearSceneBackground({ sceneId, roomSocket: socket });
+        if (currentScene.id !== sceneId) return;
+        currentScene.juices.bgImage = undefined;
+        onUpdateScene?.(currentScene);
+      } catch (error) {
+        console.warn('[SceneSettingsTab] Failed to clear the background image:', error);
+        bgImageError = SCENE_STATE_COMMUNICATION_ERROR;
+      }
+      return;
+    }
+
+    if (!socket || !socket.isConnected) {
+      if (isStandalone()) {
+        currentScene.juices.bgImage = dataUrl;
+        onUpdateScene?.(currentScene);
+      } else {
+        bgImageError = SCENE_STATE_COMMUNICATION_ERROR;
+      }
+      return;
+    }
+    if (!(roomKey instanceof Uint8Array) || roomKey.length !== 32) {
+      bgImageError = SCENE_BACKGROUND_MISSING_KEY_ERROR;
+      return;
+    }
+
+    bgImagePending = true;
+    try {
+      const result = await uploadSceneBackground({
+        sceneId,
+        dataUrl,
+        asset,
+        roomKey,
+        roomSocket: socket,
+        width: currentScene.juices.bgWidth,
+        height: currentScene.juices.bgHeight,
+      });
+      if (currentScene.id !== sceneId) return;
+      // The state stores the tin id; the local preview is the picked data URL.
+      currentScene.juices.bgImage = result.dataUrl;
+      onUpdateScene?.(currentScene);
+    } catch (error) {
+      console.warn('[SceneSettingsTab] Failed to upload the background image:', error);
+      bgImageError = SCENE_STATE_COMMUNICATION_ERROR;
+    } finally {
+      bgImagePending = false;
+    }
+  }
+
   function handleAssetPicked(dataUrl?: string, asset?: AssetItem) {
     if (assetPickerTarget === 'bgImage') {
-      currentScene.juices.bgImage = dataUrl;
-      onUpdateScene?.(currentScene);
+      void commitBackgroundImage(dataUrl, asset);
     } else if (activeBgmSlotPicking !== null) {
       const slotNum = activeBgmSlotPicking;
       activeBgmSlotPicking = null;
@@ -565,13 +731,68 @@
   }
 
   function handleQuickSelectBgImage(dataUrl: string | undefined) {
-    currentScene.juices.bgImage = dataUrl;
-    onUpdateScene?.(currentScene);
+    void commitBackgroundImage(dataUrl);
+  }
+
+  /**
+   * Commits a scene rename after the server acknowledged `std::name`.
+   *
+   * Standalone usage updates the local model directly; in a room the local
+   * name changes only after the `StateUpdated` ack, so a failed rename never
+   * looks applied.
+   */
+  async function commitSceneName(rawName: string) {
+    const name = rawName.trim();
+    const sceneId = currentScene.id;
+    if (!name || name === currentScene.name) return;
+    sceneNameError = null;
+
+    const socket = roomSocket;
+    if (!socket || !socket.isConnected) {
+      if (isStandalone()) {
+        currentScene.name = name;
+        onUpdateScene?.(currentScene);
+      } else {
+        sceneNameError = SCENE_STATE_COMMUNICATION_ERROR;
+      }
+      return;
+    }
+
+    try {
+      await socket.requestUpdateState(sceneId, SCENE_NAME_STATE_KEY, name);
+      if (currentScene.id !== sceneId) return;
+      currentScene.name = name;
+      sceneNameDraft = name;
+      onUpdateScene?.(currentScene);
+    } catch (error) {
+      console.warn('[SceneSettingsTab] Failed to rename the scene:', error);
+      sceneNameError = SCENE_STATE_COMMUNICATION_ERROR;
+      // The server rejected / never answered: show the committed name again.
+      sceneNameDraft = currentScene.name;
+    }
   }
 
   function handleSceneNameInput(e: Event) {
-    currentScene.name = (e.target as HTMLInputElement).value;
-    onUpdateScene?.(currentScene);
+    const value = (e.target as HTMLInputElement).value;
+    sceneNameDraft = value;
+    sceneNameError = null;
+
+    if (sceneNameTimer) {
+      clearTimeout(sceneNameTimer);
+      sceneNameTimer = null;
+    }
+
+    if (isStandalone()) {
+      currentScene.name = value;
+      onUpdateScene?.(currentScene);
+      return;
+    }
+
+    // Debounce so keystrokes do not each become a state round trip.
+    sceneNameTimer = setTimeout(() => {
+      sceneNameTimer = null;
+      void commitSceneName(value);
+    }, 400);
   }
 
   // ---------------------------------------------------------------------------
@@ -765,6 +986,16 @@
           />
         </div>
       </div>
+      {#if bgImagePending}
+        <p class="bg-image-pending" role="status" data-testid="bg-image-pending">
+          背景画像を保存しています…
+        </p>
+      {/if}
+      {#if bgImageError}
+        <p class="scene-state-error" role="status" data-testid="bg-image-error">
+          {bgImageError}
+        </p>
+      {/if}
     </div>
 
     <!-- BGM Controls (Issue #53: Reconstructed with slot u32, toggle play/stop, narrow button, 1:1 select button, volume slider) -->
@@ -877,13 +1108,18 @@
         <TextField
           variant="outlined"
           label="シーン名"
-          value={currentScene.name}
+          value={sceneNameDraft}
           oninput={handleSceneNameInput}
           disabled={!canManageScenes}
           data-testid="scene-name-input"
           placeholder="シーン名"
           class="scene-name-field"
         />
+        {#if sceneNameError}
+          <p class="scene-state-error" role="status" data-testid="scene-name-error">
+            {sceneNameError}
+          </p>
+        {/if}
       </div>
 
       <!-- 3つのアクション「シーンを新規作成」「シーンのログを削除」「シーンを削除」:
@@ -1383,6 +1619,18 @@
     font-size: 0.8rem;
     line-height: 1.3;
     color: var(--np-color-error);
+  }
+  .scene-state-error {
+    margin: 0.25rem 0 0;
+    font-size: 0.8rem;
+    line-height: 1.3;
+    color: var(--np-color-error);
+  }
+  .bg-image-pending {
+    margin: 0.25rem 0 0;
+    font-size: 0.8rem;
+    line-height: 1.3;
+    color: var(--np-color-on-surface-variant);
   }
   /* 停止/再生ボタン: 選択ボタン（1:1）に対してより細い幅 (narrow) */
   :global(.bgm-play-btn.narrow-btn) {

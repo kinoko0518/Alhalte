@@ -559,6 +559,59 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       expect(sceneListCallback).toHaveBeenCalledWith(['/', 'tavern', 'dungeon']);
     });
 
+    // spec: roomSocket SceneListはSceneSummaryの列でシーン名を持つ (Issue #159)
+    it('accepts SceneSummary entries in SceneList and caches the server names', () => {
+      const sceneListCallback = vi.fn();
+      socket = new RoomSocket({
+        roomId: '00000000000000ae',
+        onSceneList: sceneListCallback,
+        webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+      });
+      socket.connect();
+      const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+      ws.open();
+
+      ws.receive({
+        SceneList: {
+          scenes: [
+            { id: '/', name: 'メインシーン', present_character_count: 2 },
+            { id: 'tavern', name: '酒場', active_client_count: 1 },
+          ],
+        },
+      });
+
+      expect(socket.getScenes()).toEqual(['/', 'tavern']);
+      expect(sceneListCallback).toHaveBeenCalledWith(['/', 'tavern']);
+      expect(socket.getSceneSummaries()).toEqual([
+        { id: '/', name: 'メインシーン', present_character_count: 2 },
+        { id: 'tavern', name: '酒場', active_client_count: 1 },
+      ]);
+    });
+
+    // spec: roomSocket SceneInfoは他クライアントのrenameを通知する (Issue #159)
+    it('forwards a SceneInfo rename to onSceneInfo', () => {
+      const sceneInfoCallback = vi.fn();
+      socket = new RoomSocket({
+        roomId: '00000000000000ae',
+        onSceneInfo: sceneInfoCallback,
+        webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+      });
+      socket.connect();
+      const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+      ws.open();
+
+      ws.receive({ SceneInfo: { id: 'tavern', name: '酒場', present_character_count: 1 } });
+
+      expect(sceneInfoCallback).toHaveBeenCalledWith({
+        id: 'tavern',
+        name: '酒場',
+        present_character_count: 1,
+      });
+      expect(socket.getSceneSummaries()).toEqual([
+        { id: 'tavern', name: '酒場', present_character_count: 1 },
+      ]);
+    });
+
     it('appends LogEventAppended frame into ChunkLogManager and notifies listener', () => {
       const logAppendedCallback = vi.fn();
       socket = new RoomSocket({

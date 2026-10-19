@@ -12,6 +12,7 @@ use tokio_util::codec::Framed;
 
 use crate::cellar_sink::CellarSink;
 use crate::error::{BanquetteError, Result};
+use crate::labels::KEY_STD_NAME;
 use crate::log::{ChangeBgmEvent, CharacterCameEvent, CharacterGoneEvent, LogOperationEvent};
 use crate::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
@@ -432,7 +433,7 @@ impl BanquetteServer {
         match frame {
             ClientFrame::ListScenes => {
                 let r = room.read().await;
-                let scenes = r.list_scene_ids();
+                let scenes = r.list_scene_summaries();
                 let _ = out_tx
                     .send(BanquetteToMaitreD::SendToClient {
                         client_id,
@@ -455,12 +456,14 @@ impl BanquetteServer {
             ClientFrame::CreateScene {
                 scene_id,
                 inherit_juices,
+                name,
             } => {
                 let mut r = room.write().await;
                 let source = if inherit_juices { Some("/") } else { None };
-                match r.create_scene(account_id, &scene_id, source) {
+                match r.create_scene_named(account_id, &scene_id, source, name.as_deref()) {
                     Ok(()) => {
-                        let scenes = r.list_scene_ids();
+                        let scenes = r.list_scene_summaries();
+                        let created_summary = r.scene_summary(&scene_id);
                         send_to_client(
                             out_tx,
                             client_id,
@@ -470,6 +473,12 @@ impl BanquetteServer {
                         )
                         .await;
                         broadcast_to_room(out_tx, ServerFrame::SceneList { scenes }).await;
+                        // Announce the new scene summary (including its
+                        // server-authoritative name) to every client so nobody
+                        // needs a reload to see it.
+                        if let Some(summary) = created_summary {
+                            broadcast_to_room(out_tx, ServerFrame::SceneInfo(summary)).await;
+                        }
                     }
                     Err(e) => {
                         send_to_client(
@@ -488,7 +497,7 @@ impl BanquetteServer {
                 let mut r = room.write().await;
                 match r.delete_scene(account_id, &scene_id) {
                     Ok(()) => {
-                        let scenes = r.list_scene_ids();
+                        let scenes = r.list_scene_summaries();
                         send_to_client(
                             out_tx,
                             client_id,
@@ -514,13 +523,26 @@ impl BanquetteServer {
             }
             ClientFrame::EnterScene { scene_id } => {
                 let mut r = room.write().await;
-                if let Ok(()) = r
-                    .client_enter_scene(client_id, account_id, &scene_id, cellar.as_ref())
+                if r.client_enter_scene(client_id, account_id, &scene_id, cellar.as_ref())
                     .await
+                    .is_ok()
                 {
                     let mut cl = clients.write().await;
                     if let Some(c) = cl.get_mut(&client_id) {
-                        c.current_scene = Some(scene_id);
+                        c.current_scene = Some(scene_id.clone());
+                    }
+                    drop(cl);
+                    // Hydrate the entered scene immediately: an accessible scene
+                    // is answered with a StateSnapshot so the client does not
+                    // need a separate QueryState after every entry / reconnect.
+                    if let Some(states) = r.query_state(account_id, &scene_id) {
+                        let states = states.clone();
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::StateSnapshot { scene_id, states },
+                        )
+                        .await;
                     }
                 }
             }
@@ -588,7 +610,7 @@ impl BanquetteServer {
                     Ok(_) => {
                         let frame = ServerFrame::StateUpdated {
                             scene_id: scene_id.clone(),
-                            key,
+                            key: key.clone(),
                             value,
                         };
                         // The requester may not be in the target scene (root-scene state is
@@ -598,6 +620,14 @@ impl BanquetteServer {
                         // are idempotent, so applying them twice is harmless.
                         send_to_client(out_tx, client_id, frame.clone()).await;
                         broadcast_to_scene(out_tx, &scene_id, frame).await;
+                        // A rename is a summary change as well: broadcast the new
+                        // `SceneInfo` so other clients update their scene list
+                        // without a reload or a re-entry.
+                        if key == KEY_STD_NAME
+                            && let Some(summary) = r.scene_summary(&scene_id)
+                        {
+                            broadcast_to_room(out_tx, ServerFrame::SceneInfo(summary)).await;
+                        }
                     }
                     Err(e) => {
                         send_to_client(
@@ -984,7 +1014,7 @@ impl BanquetteServer {
                         .await;
 
                         if destination_created {
-                            let scenes = r.list_scene_ids();
+                            let scenes = r.list_scene_summaries();
                             broadcast_to_room(out_tx, ServerFrame::SceneList { scenes }).await;
                         }
                     }

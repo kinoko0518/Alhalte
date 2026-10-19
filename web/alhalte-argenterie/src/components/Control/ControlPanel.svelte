@@ -240,6 +240,7 @@
         {onDeleteSceneLogs}
         {onRequestAssetPicker}
         {roomSocket}
+        {roomKey}
         {sceneActionPending}
         {sceneActionError}
       />

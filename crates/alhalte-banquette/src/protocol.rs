@@ -40,6 +40,12 @@ pub enum ClientFrame {
         scene_id: String,
         /// Whether to inherit juices (BGM/background image) from root.
         inherit_juices: bool,
+        /// Optional human-readable scene name written to `std::name` at creation.
+        ///
+        /// `None` keeps the scene name empty so `SceneSummary` falls back to the
+        /// scene ID. Declared after the pre-existing fields so the postcard
+        /// struct layout of the earlier fields stays stable.
+        name: Option<String>,
     },
     /// Delete a scene (admin only).
     DeleteScene {
@@ -191,10 +197,14 @@ pub enum ClientFrame {
 /// Messages emitted from `banquette` to a client WebSocket.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ServerFrame {
-    /// List of scene IDs.
+    /// List of scene summaries.
+    ///
+    /// Carries the human-readable `std::name` alongside the public identifiers
+    /// so a client can render the room without a separate `QueryScene` per
+    /// scene.
     SceneList {
-        /// Public scene identifiers.
-        scenes: Vec<String>,
+        /// Public scene summaries, sorted by scene ID.
+        scenes: Vec<SceneSummary>,
     },
     /// Scene summary information.
     SceneInfo(SceneSummary),

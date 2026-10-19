@@ -360,6 +360,17 @@ describe('Promise-based server operations (Issue #136)', () => {
     expect(socket.getScenes()).not.toContain('tavern');
   });
 
+  it('sends the optional scene name with CreateScene', async () => {
+    const { socket, ws } = connectSocket();
+
+    const createPromise = socket.requestCreateScene('tavern', true, '酒場');
+    expect(lastSentFrame(ws)).toEqual({
+      CreateScene: { scene_id: 'tavern', inherit_juices: true, name: '酒場' },
+    });
+    ws.receive({ SceneCreated: { scene_id: 'tavern' } });
+    await expect(createPromise).resolves.toEqual({ scene_id: 'tavern' });
+  });
+
   it('resolves requestMoveCharacter on CharacterMoved', async () => {
     const { socket, ws } = connectSocket();
 
