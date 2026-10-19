@@ -22,7 +22,7 @@
 | `maitre-d` `GET /auth/google/callback` | Google からの固定 callback。ブラウザが直接踏む。maitre-d が `session_id` Cookie を設定して `return_to` へ 302 する。アプリは関与しない。 |
 | `maitre-d` `GET /api/session` | OAuth 後に Cookie から `account`（`AccountResponse`）と `session_id` を取得する（`utils/account.ts`）。 |
 | `maitre-d` `/api/room/{room_id}/export/zip?type=full|logs` | ZIP ダウンロード（`CommonHeader.svelte`）。 |
-| `maitre-d` `/api/cellar/store`、`/api/cellar/store/{tin_id}`、`/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。アセット・拡張 wasm の Tin を XHR で送受信する（`utils/cellarTransfer.ts`）。store check は `200 OK` + body の `result`（`upload_required` / `deduplicated` / `already_owned`）で判定し、`upload_required` のときだけ本体を PUT する。進捗は `upload.onprogress`、失敗は型付き `CellarTransferError`。 |
+| `maitre-d` `/api/cellar/store`、`/api/cellar/store/{tin_id}`、`/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。アセット・拡張 wasm の Tin を XHR で送受信する（`utils/cellarTransfer.ts`）。store check は `200 OK` + body の `result`（`upload_required` / `deduplicated` / `already_owned`）で判定し、`upload_required` のときだけ本体を PUT する。handshake body は `{ tin_id, size, wrapped_key }` のみで、`owner` / `session_id` は送らない（maitre-d が session から付与する。送ると 400）。進捗は `upload.onprogress`、失敗は型付き `CellarTransferError`。 |
 | Vite dev proxy | `/api`、`/auth`、`/room` を `http://127.0.0.1:8080`、`/ws` を `ws://127.0.0.1:8080` へ転送。`/auth` はサインイン開始（`/auth/login`）と Google callback の両方に必要で、maitre-d の `--public-url` がこの dev origin を指すことで Cookie が UI と同一 origin に付く。 |
 
 ### WebSocket

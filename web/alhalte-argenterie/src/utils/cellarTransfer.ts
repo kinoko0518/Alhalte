@@ -10,7 +10,9 @@
  * `session_id` cookie and injects `X-Alhalte-Owner` / `X-Alhalte-Session-Id`
  * itself. This module therefore authenticates with the cookie only (no
  * `X-Alhalte-Account` claim), so a stale `localStorage` account can never make
- * the proxy reject a request.
+ * the proxy reject a request. Ownership is never sent in a body either: the
+ * store handshake carries `{ tin_id, size, wrapped_key }` only and the proxy
+ * answers `400` if `owner` / `session_id` appear (Issue #191).
  *
  * Transfer flow (2-step):
  * 1. `POST /api/cellar/store` with a metadata handshake. It always answers
@@ -593,7 +595,8 @@ function parseStoreResult(responseText: string): CellarStoreResult {
  *
  * Performs the 2-step handshake:
  * 1. `POST /api/cellar/store` with `{ tin_id, size, wrapped_key }`. The answer is
- *    always `200 OK` with `{ "result": ... }`.
+ *    always `200 OK` with `{ "result": ... }`. No ownership field is sent: the
+ *    proxy derives it from the session (Issue #191).
  * 2. `upload_required` → `PUT /api/cellar/store/{tinId}` with the wire bytes.
  *    `deduplicated` / `already_owned` → resolves without uploading.
  *
@@ -626,15 +629,14 @@ export async function uploadTin(
     : bytesToHex(computeBlake3Hash(wireBytes)).toLowerCase();
   const wrappedKeyHex = wrappedKeyToHex(options?.wrappedKey);
 
-  // Step 1: metadata handshake. `owner` / `session_id` are placeholders — the
-  // maitre-d proxy overwrites both from the authenticated session.
+  // Step 1: metadata handshake. The body is `{ tin_id, size, wrapped_key }` only:
+  // maitre-d derives `owner` / `session_id` from the session and rejects a body
+  // that claims either of them (Issue #191).
   const handshake = await performXhr(xhrFactory, {
     method: 'POST',
     url: `${baseUrl}/store`,
     headers: { ...baseHeaders(), 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      owner: 0,
-      session_id: 0,
       tin_id: tinId,
       size: wireBytes.byteLength,
       wrapped_key: wrappedKeyHex,
