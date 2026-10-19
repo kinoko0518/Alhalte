@@ -48,6 +48,7 @@ pub mod log;
 pub mod protocol;
 pub mod room;
 pub mod scene;
+pub mod secret_file;
 pub mod server;
 pub mod state;
 

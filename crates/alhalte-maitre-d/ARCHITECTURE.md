@@ -67,7 +67,9 @@ room-scoped route の `{room_id}` は `RoomId`（`crates/alhalte-maitre-d/src/ro
 
 `/api/cellar/store`、`/api/cellar/store/{tin_id}` は Axum 既定の 2 MiB を超える Tin（アセット・拡張 wasm）を通すため、`DefaultBodyLimit::max(64 MiB)` を route 単位で設定する。他の route は既定のまま。
 
-CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--public-url`（`ALHALTE_PUBLIC_URL`、既定 `http://127.0.0.1:8080`）、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`、`--service-token`（`ALHALTE_CELLAR_SERVICE_TOKEN`）、`--cors-origin`（繰り返し / カンマ区切り、`ALHALTE_CORS_ORIGINS`）。`--public-url` は OAuth の `redirect_uri`（`{public_url}/auth/google/callback`）と Cookie の `Secure` 判定に使う。Bistrot は `maitre-d.public-url` があればそれを、なければ `restaurant.domain` が非ループバックなら `https://{domain}`、ループバック開発なら argenterie URL を渡す。
+CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--public-url`（`ALHALTE_PUBLIC_URL`、既定 `http://127.0.0.1:8080`）、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`、`--client-secret-file`（`ALHALTE_CLIENT_SECRET_FILE`、0600 file から読む。`--client-secret` より優先）、`--service-token-file`（`ALHALTE_SERVICE_TOKEN_FILE`、0600 file から読む。各 banquette へ path を転送する）、`--service-token`（`ALHALTE_SERVICE_TOKEN`、後方互換）、`--cors-origin`（繰り返し / カンマ区切り、`ALHALTE_CORS_ORIGINS`）。`--public-url` は OAuth の `redirect_uri`（`{public_url}/auth/google/callback`）と Cookie の `Secure` 判定に使う。Bistrot は `maitre-d.public-url` があればそれを、なければ `restaurant.domain` が非ループバックなら `https://{domain}`、ループバック開発なら argenterie URL を渡す。
+
+秘密値（`--client-secret-file` / `--service-token-file`）は `alhalte_maitre_d::secret_file::read_secret_file` が 0600 file から読み、group/other に読める file は拒否する（Issue #194）。Bistrot は復号した秘密を `<data-dir>/secrets/` に 0600 で書き、引数には path だけを渡す。`--service-token-file` の path は spawner が各 banquette に `--service-token-file` として転送する。
 
 ### 主な公開型
 

@@ -54,7 +54,7 @@ anti-oracle が有効な場合、`/store` は常に `upload_required` を返し�
 - `create_router`、`run_garbage_collection`、`parse_tin_id` / `format_tin_id`
 - `CellarService::with_service_token` / `has_service_token` と `store_check_with_token` / `store_payload_with_token` / `unregister_with_token`、`handlers::SERVICE_TOKEN_HEADER`
 
-CLI（`CliArgs`）: `--host`、`--port`、`--storage-path`、`--db-path`、`--anti-oracle`、`--maitre-d-url`、`--maitre-d-socket`、`--allow-all-sessions`、`--service-token`（`ALHALTE_CELLAR_SERVICE_TOKEN`）、`--gc-interval-secs`。
+CLI（`CliArgs`）: `--host`、`--port`、`--storage-path`、`--db-path`、`--anti-oracle`、`--maitre-d-url`、`--maitre-d-socket`、`--allow-all-sessions`、`--service-token`（`ALHALTE_SERVICE_TOKEN`、後方互換）、`--service-token-file`（`ALHALTE_SERVICE_TOKEN_FILE`、0600 file から読む。file が優先）、`--gc-interval-secs`。秘密 file は `alhalte_cellar::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
 
 ### 外部接続
 

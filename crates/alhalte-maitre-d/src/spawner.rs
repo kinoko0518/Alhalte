@@ -33,7 +33,10 @@ pub trait BanquetteSpawner: Send + Sync {
 
 /// Spawns external `alhalte-banquette` executable binaries as OS child processes.
 ///
-/// The service token is redacted from the [`std::fmt::Debug`] representation.
+/// The service token is redacted from the [`std::fmt::Debug`] representation and
+/// never appears in the child's argument list: maitre-d forwards the
+/// `--service-token-file` path it received, or passes the value through the
+/// `ALHALTE_SERVICE_TOKEN` environment variable (Issue #194).
 #[derive(Clone)]
 pub struct ProcessBanquetteSpawner {
     binary_path: PathBuf,
@@ -41,6 +44,7 @@ pub struct ProcessBanquetteSpawner {
     cellar_url: String,
     chunk_size_exponent: u8,
     service_token: Option<String>,
+    service_token_file: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for ProcessBanquetteSpawner {
@@ -54,6 +58,7 @@ impl std::fmt::Debug for ProcessBanquetteSpawner {
                 "service_token",
                 &self.service_token.as_ref().map(|_| "<redacted>"),
             )
+            .field("service_token_file", &self.service_token_file)
             .finish()
     }
 }
@@ -72,12 +77,15 @@ impl ProcessBanquetteSpawner {
             cellar_url: cellar_url.into(),
             chunk_size_exponent,
             service_token: None,
+            service_token_file: None,
         }
     }
 
     /// Configures the internal cellar service token passed to spawned banquette processes.
     ///
-    /// An empty token is treated as unset. The value is never logged.
+    /// An empty token is treated as unset. The value is never logged and never
+    /// placed on the child's command line: it is passed through the
+    /// `ALHALTE_SERVICE_TOKEN` environment variable.
     #[must_use]
     pub fn with_service_token(mut self, token: impl Into<String>) -> Self {
         let token = token.into();
@@ -89,10 +97,20 @@ impl ProcessBanquetteSpawner {
         self
     }
 
+    /// Configures the `0600` file holding the internal service token.
+    ///
+    /// The path is forwarded to the spawned banquette as `--service-token-file`,
+    /// so neither the parent nor the child exposes the value in `ps`.
+    #[must_use]
+    pub fn with_service_token_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.service_token_file = Some(path.into());
+        self
+    }
+
     /// Builds the argument list passed to the spawned `alhalte-banquette` binary.
     ///
-    /// Exposed so tests can assert the `--room-tin` restore contract without
-    /// launching a child process.
+    /// Exposed so tests can assert the `--room-tin` restore contract and the
+    /// "no secret in argv" property without launching a child process.
     pub fn command_args(
         &self,
         room_id: u64,
@@ -118,9 +136,9 @@ impl ProcessBanquetteSpawner {
             args.push(hex::encode(tin_id));
         }
 
-        if let Some(token) = self.service_token.as_deref() {
-            args.push("--service-token".to_string());
-            args.push(token.to_string());
+        if let Some(path) = self.service_token_file.as_deref() {
+            args.push("--service-token-file".to_string());
+            args.push(path.display().to_string());
         }
 
         args
@@ -204,6 +222,13 @@ impl BanquetteSpawner for ProcessBanquetteSpawner {
 
         let mut cmd = tokio::process::Command::new(&resolved_bin);
         cmd.args(self.command_args(room_id, admin_account, &socket_path, room_head.as_ref()));
+        // The token never goes on the command line. When only the value is known
+        // (no forwarded file path) hand it to the child through the environment.
+        if self.service_token_file.is_none()
+            && let Some(token) = self.service_token.as_deref()
+        {
+            cmd.env("ALHALTE_SERVICE_TOKEN", token);
+        }
 
         cmd.spawn().map_err(|e| {
             MaitreDError::Banquette(format!(

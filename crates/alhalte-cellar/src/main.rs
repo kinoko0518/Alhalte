@@ -16,6 +16,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = CliArgs::parse();
 
+    // The token is read from a 0600 file (or the environment) so it never shows
+    // up in `ps` (Issue #194). Resolved before any field is moved out of `args`.
+    let service_token = args.resolve_service_token()?;
+
     let allow_all_sessions = args.allow_all_sessions;
     let endpoint_configured = args.maitre_d_url.is_some() || args.maitre_d_socket.is_some();
     let verifier_mode =
@@ -47,13 +51,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let mut service = CellarService::new(&config, verifier)?;
-    match args.service_token.as_deref() {
+    match service_token {
         Some(token) => {
             tracing::info!("Internal service token configured for trusted room-state persistence");
             service = service.with_service_token(token);
         }
         None => tracing::warn!(
-            "No --service-token configured: internal room-state persistence from banquette \
+            "No --service-token-file configured: internal room-state persistence from banquette \
              will be rejected unless a user session is supplied"
         ),
     }

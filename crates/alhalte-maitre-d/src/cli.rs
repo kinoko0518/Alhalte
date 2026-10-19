@@ -5,6 +5,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::secret_file::{SecretFileError, resolve_secret};
+
 /// Command-line arguments for the `alhalte-maitre-d` service.
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -30,8 +32,23 @@ pub struct CliArgs {
     pub client_id: String,
 
     /// Google OAuth Client Secret.
-    #[arg(long, default_value = "", env = "ALHALTE_CLIENT_SECRET")]
+    ///
+    /// Prefer `--client-secret-file`: an inline value is visible in `ps`.
+    #[arg(
+        long,
+        default_value = "",
+        env = "ALHALTE_CLIENT_SECRET",
+        hide_env_values = true
+    )]
     pub client_secret: String,
+
+    /// File containing the Google OAuth client secret (mode 0600).
+    ///
+    /// Bistrot writes the decrypted secret to `<data-dir>/secrets/` and passes
+    /// this path, so the secret never appears in `ps` or in a systemd unit
+    /// (Issue #194). Takes precedence over `--client-secret`.
+    #[arg(long, env = "ALHALTE_CLIENT_SECRET_FILE")]
+    pub client_secret_file: Option<PathBuf>,
 
     /// Instance-specific salt for deterministic Google `sub` encryption.
     #[arg(long, default_value = "alhalte-salt", env = "ALHALTE_SALT")]
@@ -85,8 +102,18 @@ pub struct CliArgs {
     /// Banquette sends it as `X-Alhalte-Service-Token` so room state persistence
     /// is authorized without impersonating a user session. `alhalte-cellar`
     /// must be configured with the same token. The value is never logged.
-    #[arg(long, env = "ALHALTE_CELLAR_SERVICE_TOKEN", hide_env_values = true)]
+    ///
+    /// Prefer `--service-token-file`: an inline value is visible in `ps`.
+    #[arg(long, env = "ALHALTE_SERVICE_TOKEN", hide_env_values = true)]
     pub service_token: Option<String>,
+
+    /// File containing the internal cellar service token (mode 0600).
+    ///
+    /// The path is forwarded to every spawned banquette as
+    /// `--service-token-file`, so the token never appears in `ps` or in a
+    /// systemd unit (Issue #194). Takes precedence over `--service-token`.
+    #[arg(long, env = "ALHALTE_SERVICE_TOKEN_FILE")]
+    pub service_token_file: Option<PathBuf>,
 
     /// Browser origin allowed by CORS. Repeat the flag or use a comma-separated
     /// value / `ALHALTE_CORS_ORIGINS`.
@@ -113,7 +140,101 @@ where
     CliArgs::try_parse_from(itr)
 }
 
+impl CliArgs {
+    /// Resolves the Google OAuth client secret from the file or the inline value.
+    ///
+    /// The file (`--client-secret-file` / `ALHALTE_CLIENT_SECRET_FILE`) wins. An
+    /// unset secret stays empty, matching the previous default.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretFileError`] when the file is not owner-only, empty, or
+    /// unreadable.
+    pub fn resolve_client_secret(&self) -> Result<String, SecretFileError> {
+        Ok(resolve_secret(
+            self.client_secret_file.as_deref(),
+            Some(&self.client_secret),
+        )?
+        .unwrap_or_default())
+    }
+
+    /// Resolves the internal service token from the file or the inline value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretFileError`] when the file is not owner-only, empty, or
+    /// unreadable.
+    pub fn resolve_service_token(&self) -> Result<Option<String>, SecretFileError> {
+        resolve_secret(
+            self.service_token_file.as_deref(),
+            self.service_token.as_deref(),
+        )
+    }
+}
+
 /// Parses CLI arguments from `std::env::args_os()`.
 pub fn parse_cli_args() -> CliArgs {
     CliArgs::parse()
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    fn write_secret(path: &std::path::Path, value: &str) {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(value.as_bytes()).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+
+    // spec: alhalte-maitre-d/cli 0007 the OAuth secret and service token are read
+    // from 0600 files, never from argv
+    #[test]
+    fn resolves_secrets_from_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let client_secret = dir.path().join("client-secret");
+        let service_token = dir.path().join("service-token");
+        write_secret(&client_secret, "file-oauth-secret");
+        write_secret(&service_token, "file-token");
+
+        let args = CliArgs::try_parse_from([
+            "alhalte-maitre-d",
+            "--client-secret",
+            "inline-oauth-secret",
+            "--client-secret-file",
+            client_secret.to_str().unwrap(),
+            "--service-token",
+            "inline-token",
+            "--service-token-file",
+            service_token.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(args.resolve_client_secret().unwrap(), "file-oauth-secret");
+        assert_eq!(
+            args.resolve_service_token().unwrap().as_deref(),
+            Some("file-token")
+        );
+
+        // An unset OAuth secret stays empty, matching the previous default.
+        let args = CliArgs::try_parse_from(["alhalte-maitre-d"]).unwrap();
+        assert_eq!(args.resolve_client_secret().unwrap(), "");
+
+        // A group/other-readable secret file is rejected.
+        std::fs::set_permissions(&client_secret, std::fs::Permissions::from_mode(0o604)).unwrap();
+        let args = CliArgs::try_parse_from([
+            "alhalte-maitre-d",
+            "--client-secret-file",
+            client_secret.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(args.resolve_client_secret().is_err());
+    }
 }

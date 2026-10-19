@@ -20,11 +20,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.socket
     );
 
+    // The token comes from a 0600 file when maitre-d forwards one; argv and the
+    // environment stay backward compatible (Issue #194).
+    let service_token = args.resolve_service_token()?;
     let mut cellar = HttpCellarSink::new(args.cellar_url);
-    match args.service_token.as_deref() {
+    match service_token {
         Some(token) => cellar = cellar.with_service_token(token),
         None => tracing::warn!(
-            "No --service-token configured: room state persistence will fail unless cellar \
+            "No --service-token-file configured: room state persistence will fail unless cellar \
              accepts the write through a user session"
         ),
     }

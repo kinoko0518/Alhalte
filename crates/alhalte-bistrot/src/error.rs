@@ -36,6 +36,39 @@ pub enum BistrotError {
     #[error("Configuration validation error: {0}")]
     ConfigValidation(String),
 
+    /// An age-armored value needs an identity, but none was configured.
+    ///
+    /// Pass `--age-key`, `ROPS_AGE`, or `ALHALTE_AGE_KEY`.
+    #[error(
+        "age identity is required to decrypt armored values in Bistrot.toml; \
+         pass --age-key, ROPS_AGE, or ALHALTE_AGE_KEY"
+    )]
+    AgeKeyMissing,
+
+    /// The configured age identity string is not a valid x25519 identity.
+    #[error("invalid age identity: {0}")]
+    AgeIdentity(String),
+
+    /// Decryption of an age-armored value failed.
+    #[error("age decryption error: {0}")]
+    AgeDecrypt(String),
+
+    /// Encryption with an age recipient failed.
+    #[error("age encryption error: {0}")]
+    AgeEncrypt(String),
+
+    /// A secret value is still plaintext.
+    ///
+    /// Plaintext secrets are fail-closed: encrypt them with
+    /// `alhalte-bistrot encrypt-value --recipient age1...` (Issue #194).
+    /// `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` allows them for local development.
+    #[error(
+        "plaintext secret(s) in Bistrot.toml: {0}; encrypt them with \
+         `alhalte-bistrot encrypt-value --recipient age1...` or set \
+         ALHALTE_ALLOW_PLAINTEXT_SECRETS=1 for local development only"
+    )]
+    PlaintextSecret(String),
+
     /// A configured extension `.wasm` file does not exist.
     ///
     /// This is a `Bistrot.toml` configuration error (the path is wrong or the

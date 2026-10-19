@@ -144,12 +144,22 @@ async fn serve_app(state: AppState) -> (std::net::SocketAddr, tokio::task::JoinH
 }
 
 /// Reads the repository's default `Bistrot.toml` and returns the parsed config.
+///
+/// The bundled local development configuration keeps plaintext secrets, so it is
+/// parsed with the documented development escape hatch (Issue #194).
 fn default_bistrot_config() -> alhalte_bistrot::BistrotConfig {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
         .join("Bistrot.toml");
-    alhalte_bistrot::load_from_path(&path).expect("the default Bistrot.toml must parse")
+    alhalte_bistrot::load_from_path_with_options(
+        &path,
+        &alhalte_bistrot::ParseOptions {
+            age_key: None,
+            allow_plaintext_secrets: true,
+        },
+    )
+    .expect("the default Bistrot.toml must parse")
 }
 
 // spec: alhalte-maitre-d/room-head 0002 whole room survives a banquette restart
@@ -547,15 +557,17 @@ async fn test_internal_service_token_store_and_old_head_retention() {
 }
 
 // spec: alhalte-maitre-d/room-head 0006 process spawner forwards --room-tin
+// spec: alhalte-bistrot/secrets 0003 secrets are forwarded as file paths, never argv
 #[test]
 fn test_process_spawner_passes_room_tin_and_service_token() {
+    let token_path = std::path::Path::new("/run/alhalte/secrets/cellar-service-token");
     let spawner = ProcessBanquetteSpawner::new(
         "/usr/local/bin/alhalte-banquette",
         "/run/alhalte",
         "http://127.0.0.1:8081",
         8,
     )
-    .with_service_token("secret-token");
+    .with_service_token_file(token_path);
     let head = [0x11u8; 32];
     let socket = std::path::Path::new("/run/alhalte/banquette-1.sock");
 
@@ -566,15 +578,33 @@ fn test_process_spawner_passes_room_tin_and_service_token() {
     );
     assert!(
         args.windows(2)
-            .any(|w| w[0] == "--service-token" && w[1] == "secret-token")
+            .any(|w| w[0] == "--service-token-file" && w[1] == token_path.display().to_string())
+    );
+    assert!(
+        !args.iter().any(|arg| arg == "--service-token"),
+        "the token value must never be passed as an argument"
     );
 
     // Without a persisted head no restore flag is passed.
     let args = spawner.command_args(1, 42, socket, None);
     assert!(!args.iter().any(|arg| arg == "--room-tin"));
 
+    // A value-only token is forwarded through the environment, not argv.
+    let value_only = ProcessBanquetteSpawner::new(
+        "/usr/local/bin/alhalte-banquette",
+        "/run/alhalte",
+        "http://127.0.0.1:8081",
+        8,
+    )
+    .with_service_token("secret-token");
+    let args = value_only.command_args(1, 42, socket, None);
+    assert!(
+        !args.iter().any(|arg| arg == "secret-token"),
+        "the token value must never be passed as an argument"
+    );
+
     // Debug must not leak the token.
-    let debug = format!("{spawner:?}");
+    let debug = format!("{value_only:?}");
     assert!(
         !debug.contains("secret-token"),
         "token leaked in Debug: {debug}"
@@ -583,6 +613,7 @@ fn test_process_spawner_passes_room_tin_and_service_token() {
 }
 
 // spec: alhalte-bistrot/service-token 0002 the default Bistrot.toml persists room state
+// spec: alhalte-bistrot/secrets 0006 the default config injects the token as a file
 #[tokio::test]
 async fn test_default_bistrot_config_authorizes_room_persistence() {
     let config = default_bistrot_config();
@@ -590,23 +621,41 @@ async fn test_default_bistrot_config_authorizes_room_persistence() {
         .cellar
         .service_token
         .as_deref()
-        .expect("the default Bistrot.toml must configure an internal service token");
+        .expect("the default Bistrot.toml must configure an internal service token")
+        .to_string();
 
-    // `nix run .#bistrot` passes the same token to both long-lived services.
+    // `nix run .#bistrot` passes the same secret file to both long-lived
+    // services, and neither argument list carries the value.
+    let token_path = config
+        .secrets_dir()
+        .join("cellar-service-token")
+        .display()
+        .to_string();
     let maitre_args = alhalte_bistrot::generate_maitre_d_args(&config);
     let cellar_args = alhalte_bistrot::generate_cellar_args(&config);
-    assert_eq!(arg_after(&maitre_args, "--service-token"), Some(token));
-    assert_eq!(arg_after(&cellar_args, "--service-token"), Some(token));
+    assert_eq!(
+        arg_after(&maitre_args, "--service-token-file"),
+        Some(token_path.as_str())
+    );
+    assert_eq!(
+        arg_after(&cellar_args, "--service-token-file"),
+        Some(token_path.as_str())
+    );
+    for args in [&maitre_args, &cellar_args] {
+        assert!(!args.contains(&token));
+        assert!(!args.iter().any(|arg| arg == "--service-token"));
+    }
 
-    // maitre-d forwards its argv token to every spawned banquette.
+    // maitre-d forwards the injected file path to every spawned banquette.
     let spawner = ProcessBanquetteSpawner::new(
         "/usr/local/bin/alhalte-banquette",
         "/run/alhalte",
         "http://127.0.0.1:8081",
         config.banquette.chunk_size_exponent,
     )
-    .with_service_token(
-        arg_after(&maitre_args, "--service-token").expect("maitre-d token forwarded to banquette"),
+    .with_service_token_file(
+        arg_after(&maitre_args, "--service-token-file")
+            .expect("maitre-d token file forwarded to banquette"),
     );
     let banquette_args = spawner.command_args(
         ROOM_ID,
@@ -614,14 +663,16 @@ async fn test_default_bistrot_config_authorizes_room_persistence() {
         std::path::Path::new("/run/alhalte/banquette.sock"),
         None,
     );
-    assert_eq!(arg_after(&banquette_args, "--service-token"), Some(token));
+    assert_eq!(
+        arg_after(&banquette_args, "--service-token-file"),
+        Some(token_path.as_str())
+    );
+    assert!(!banquette_args.contains(&token));
 
     // With the real session verifier and the default token, the internal
     // RoomData store is accepted (no 401) and restores.
-    let (addr, service, _dir) = spawn_cellar(Some(token)).await;
-    let sink = HttpCellarSink::new(format!("http://{addr}")).with_service_token(
-        arg_after(&banquette_args, "--service-token").expect("banquette receives the token"),
-    );
+    let (addr, service, _dir) = spawn_cellar(Some(token.as_str())).await;
+    let sink = HttpCellarSink::new(format!("http://{addr}")).with_service_token(token.as_str());
     let mut room = Room::new(ROOM_ID, ADMIN, config.banquette.chunk_size_exponent).unwrap();
     room.create_scene(ADMIN, "tavern", None).unwrap();
     let head = room

@@ -4,6 +4,8 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+use crate::secret_file::{SecretFileError, resolve_secret};
+
 /// Command-line arguments for the `alhalte-banquette` room daemon.
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -61,8 +63,33 @@ pub struct CliArgs {
     ///
     /// Sent as `X-Alhalte-Service-Token` so internal writes do not impersonate a
     /// user session. The value is never logged.
-    #[arg(long, env = "ALHALTE_CELLAR_SERVICE_TOKEN", hide_env_values = true)]
+    ///
+    /// Prefer `--service-token-file`: an inline value is visible in `ps`.
+    #[arg(long, env = "ALHALTE_SERVICE_TOKEN", hide_env_values = true)]
     pub service_token: Option<String>,
+
+    /// File containing the internal cellar service token (mode 0600).
+    ///
+    /// `alhalte-maitre-d` forwards the file path it received, so the token never
+    /// appears in `ps` or in a systemd unit (Issue #194). Takes precedence over
+    /// `--service-token`.
+    #[arg(long, env = "ALHALTE_SERVICE_TOKEN_FILE")]
+    pub service_token_file: Option<PathBuf>,
+}
+
+impl CliArgs {
+    /// Resolves the internal service token from the file or the inline value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SecretFileError`] when the file is not owner-only, empty, or
+    /// unreadable.
+    pub fn resolve_service_token(&self) -> Result<Option<String>, SecretFileError> {
+        resolve_secret(
+            self.service_token_file.as_deref(),
+            self.service_token.as_deref(),
+        )
+    }
 }
 
 /// Parses a 64-hex-character tin ID argument into a [`tin::TinId`].
@@ -191,5 +218,60 @@ mod tests {
             ])
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod secret_file_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    // spec: alhalte-banquette/cli 0007 the token is read from a 0600 file and the
+    // file wins over an inline value
+    #[test]
+    fn resolves_service_token_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("service-token");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        file.write_all(b"file-token\n").unwrap();
+        drop(file);
+
+        let args = CliArgs::try_parse_from([
+            "alhalte-banquette",
+            "--room-id",
+            "777",
+            "--admin",
+            "1",
+            "--service-token",
+            "inline-token",
+            "--service-token-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            args.resolve_service_token().unwrap().as_deref(),
+            Some("file-token")
+        );
+
+        // A group/other-readable file is rejected instead of being trusted.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let args = CliArgs::try_parse_from([
+            "alhalte-banquette",
+            "--room-id",
+            "777",
+            "--admin",
+            "1",
+            "--service-token-file",
+            path.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(args.resolve_service_token().is_err());
     }
 }

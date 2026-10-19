@@ -26,7 +26,9 @@ CLI（`CliArgs`）:
 - `--chunk-size-exponent` / `ALHALTE_CHUNK_SIZE_EXPONENT`（既定 8）
 - `--heartbeat-interval-secs` / `ALHALTE_HEARTBEAT_INTERVAL_SECS`（既定 240）
 - `--room-tin` / `ALHALTE_ROOM_TIN`: 復元する `RoomData` の 64 hex tin id。指定時は必ず cellar から復元し、失敗したら起動しない。
-- `--service-token` / `ALHALTE_CELLAR_SERVICE_TOKEN`: 内部書き込み用トークン。値はログに出さない。
+- `--service-token` / `ALHALTE_SERVICE_TOKEN`: 内部書き込み用トークン（後方互換。argv に出るので非推奨）。値はログに出さない。
+- `--service-token-file` / `ALHALTE_SERVICE_TOKEN_FILE`: 内部書き込み用トークンを 0600 file から読む。maitre-d が Bistrot から受け取った path をそのまま転送する。
+- 秘密 file は `alhalte_banquette::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
 
 ### 主な公開型
 
