@@ -3236,3 +3236,18 @@ fn test_resolve_banquette_bin_paths() {
     let fallback = resolve_banquette_bin(dummy);
     assert_eq!(fallback, dummy);
 }
+
+// spec: alhalte-maitre-d/permissions 0040 roles are four-level only
+#[test]
+fn test_legacy_three_level_roles_are_rejected() {
+    assert!(serde_json::from_str::<RoomRole>("\"gm\"").is_err());
+    assert!(serde_json::from_str::<RoomRole>("\"pl\"").is_err());
+    assert_eq!(
+        serde_json::from_str::<RoomRole>("\"admin\"").unwrap(),
+        RoomRole::Admin
+    );
+    assert_eq!(
+        serde_json::from_str::<RoomRole>("\"participant\"").unwrap(),
+        RoomRole::Participant
+    );
+}
