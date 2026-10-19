@@ -8,6 +8,7 @@
 - NixOS。すべてのコマンドは `nix develop -c <cmd>` で実行する（flake.nix の devShell に必要なツールが揃っている）。
 - ツールが足りなければ `flake.nix` に追加してよい（その旨を PR に書く）。
 - 作業は現在の worktree の中だけで行う。他の worktree、リポジトリ外のファイル、`~` 配下の設定は変更しない。
+- Issue campaign 中に限り、リポジトリ内の `.worktrees/issue-<N>` に per-issue worktree を作成してよい。各エージェントは自分に割り当てられた worktree だけを変更し、main worktree と他の worktree には触れない。`.worktrees/` は `.gitignore` に追加済み。
 
 ## レイアウト
 - Rust ライブラリ / バイナリ: `crates/<crate名>`（crate 名は ARCHITECTURE.md の見出しどおり。例: `crates/tin-rs` の package 名は `tin`、`crates/alhalte-banquette`）
