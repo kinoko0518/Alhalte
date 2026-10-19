@@ -1078,26 +1078,23 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     toggleCheckbox?.click();
     await new Promise((r) => setTimeout(r, 30));
 
-    // Switch back to Log Tab
+    // Switch back to Log Tab. Issue #161 persists the extension result in
+    // `contentTin` at send time, so toggling the local extension off must not
+    // change the display of the already-sent record.
     const logTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-log"]');
     expect(logTabBtn).toBeTruthy();
     logTabBtn?.click();
-    // Wait for the re-render itself (raw Markdown text, no Saignant bold class)
-    // rather than a fixed delay; the assertions below stay equally strict
-    // (Issue #109).
     await waitFor(() => {
       const list = target.querySelector('[data-testid="messages-list"]');
-      return (
-        !!list &&
-        !!list.textContent?.includes('**こんにちは**') &&
-        !list.innerHTML.includes('saignant-bold')
-      );
+      return !!list && list.innerHTML.includes('saignant-bold');
     });
 
-    // Message should be re-rendered without extension transformation: raw '**こんにちは**'
+    // The persisted contentTin still renders the same bold message; the raw
+    // Markdown source is only the fallback field.
     const updatedMessagesList = target.querySelector('[data-testid="messages-list"]');
-    expect(updatedMessagesList?.innerHTML).not.toContain('saignant-bold');
-    expect(updatedMessagesList?.textContent).toContain('**こんにちは**');
+    expect(updatedMessagesList?.innerHTML).toContain('saignant-bold');
+    expect(updatedMessagesList?.textContent).toContain('こんにちは');
+    expect(updatedMessagesList?.textContent).not.toContain('**こんにちは**');
 
     unmount(instance);
     target.remove();

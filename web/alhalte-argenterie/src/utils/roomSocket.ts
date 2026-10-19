@@ -23,12 +23,12 @@ import {
   bytesToHex,
   labelHash,
 } from '@alhalte/pantry';
-import type { Character, LogRecord } from '../types/index.js';
+import type { Character, LogRecord, LogSystemEvent } from '../types/index.js';
 import {
   connectionManager as defaultConnectionManager,
   ConnectionManager,
 } from './connection.js';
-import { ChunkLogManager, parseLogRecord } from './log.js';
+import { ChunkLogManager, contentTinToBytes, parseLogRecord } from './log.js';
 
 /**
  * Self-typed Tin container JSON representation.
@@ -113,6 +113,21 @@ export const LABEL_PRIMITIVE_F64 = Number(labelHash('primitive/f64'));
 /** Label of a BGM change log event (`alhalte/banquette/log/change-bgm`). */
 export const LABEL_BANQUETTE_LOG_CHANGE_BGM = Number(
   labelHash('alhalte/banquette/log/change-bgm'),
+);
+
+/** Label of a background image change log event (`alhalte/banquette/log/change-bg-img`). */
+export const LABEL_BANQUETTE_LOG_CHANGE_BG_IMG = Number(
+  labelHash('alhalte/banquette/log/change-bg-img'),
+);
+
+/** Label of a character entrance log event (`alhalte/banquette/log/character-came`). */
+export const LABEL_BANQUETTE_LOG_CHARACTER_CAME = Number(
+  labelHash('alhalte/banquette/log/character-came'),
+);
+
+/** Label of a character departure log event (`alhalte/banquette/log/character-gone`). */
+export const LABEL_BANQUETTE_LOG_CHARACTER_GONE = Number(
+  labelHash('alhalte/banquette/log/character-gone'),
 );
 
 /** Acknowledgement payload of an appended log entry (`LogEventAppended`). */
@@ -336,6 +351,195 @@ export function tinToJson(tin: unknown): any {
   }
 }
 
+/** Cursor over postcard payload bytes used by the system-event decoders. */
+interface PostcardCursor {
+  bytes: number[];
+  offset: number;
+}
+
+/**
+ * Reads an unsigned Postcard varint (u64) as a `bigint`.
+ *
+ * Returns `null` on truncation or an overlong (more than 64-bit) encoding so the
+ * caller can fall back to a text row instead of throwing.
+ */
+function readPostcardVarint(cursor: PostcardCursor): bigint | null {
+  let value = 0n;
+  let shift = 0n;
+  while (cursor.offset < cursor.bytes.length) {
+    const byte = cursor.bytes[cursor.offset++];
+    value |= BigInt(byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) {
+      return BigInt.asUintN(64, value);
+    }
+    shift += 7n;
+    if (shift > 63n) return null;
+  }
+  return null;
+}
+
+/** Reads a Postcard `Option` discriminant (0 = none, 1 = some). */
+function readPostcardOptionTag(cursor: PostcardCursor): boolean | null {
+  if (cursor.offset >= cursor.bytes.length) return null;
+  const tag = cursor.bytes[cursor.offset++];
+  if (tag === 0) return false;
+  if (tag === 1) return true;
+  return null;
+}
+
+/** Reads a fixed-size byte string (e.g. a 32-byte `TinId`) as lowercase hex. */
+function readPostcardFixedHex(cursor: PostcardCursor, length: number): string | null {
+  if (cursor.bytes.length < cursor.offset + length) return null;
+  const slice = Uint8Array.from(cursor.bytes.slice(cursor.offset, cursor.offset + length));
+  cursor.offset += length;
+  return bytesToHex(slice);
+}
+
+/** Reads a little-endian IEEE 754 `f32`. */
+function readPostcardF32(cursor: PostcardCursor): number | null {
+  if (cursor.bytes.length < cursor.offset + 4) return null;
+  const bytes = Uint8Array.from(cursor.bytes.slice(cursor.offset, cursor.offset + 4));
+  cursor.offset += 4;
+  return new DataView(bytes.buffer, bytes.byteOffset, 4).getFloat32(0, true);
+}
+
+/**
+ * Decodes a banquette system-event Tin into a {@link LogSystemEvent}.
+ *
+ * Field order follows the serde definitions in `alhalte-banquette/src/log.rs`:
+ * - `change-bgm`: `Option<TinId>`, `Option<f32>`, `u32`, `Option<u8>`
+ * - `change-bg-img`: `Option<TinId>`, `Option<u32>`, `Option<u32>`
+ * - `character-came` / `character-gone`: `u64`
+ *
+ * Returns `null` for unknown labels or malformed payloads; callers then fall
+ * back to the text path without ever decoding the bytes as UTF-8 chat content.
+ */
+export function decodeLogSystemEvent(entry: unknown): LogSystemEvent | null {
+  if (!isTinJson(entry)) return null;
+  const label = Number(entry.label);
+  const cursor: PostcardCursor = { bytes: toByteArray(entry.payload), offset: 0 };
+
+  if (label === LABEL_BANQUETTE_LOG_CHARACTER_CAME) {
+    const characterId = readPostcardVarint(cursor);
+    if (characterId === null) return null;
+    return { type: 'character-came', characterId: characterId.toString() };
+  }
+  if (label === LABEL_BANQUETTE_LOG_CHARACTER_GONE) {
+    const characterId = readPostcardVarint(cursor);
+    if (characterId === null) return null;
+    return { type: 'character-gone', characterId: characterId.toString() };
+  }
+  if (label === LABEL_BANQUETTE_LOG_CHANGE_BGM) {
+    const hasTinId = readPostcardOptionTag(cursor);
+    if (hasTinId === null) return null;
+    let bgmTinId: string | undefined;
+    if (hasTinId) {
+      const hex = readPostcardFixedHex(cursor, 32);
+      if (hex === null) return null;
+      bgmTinId = hex;
+    }
+    const hasVolume = readPostcardOptionTag(cursor);
+    if (hasVolume === null) return null;
+    let volume: number | undefined;
+    if (hasVolume) {
+      const value = readPostcardF32(cursor);
+      if (value === null) return null;
+      volume = value;
+    }
+    const slotValue = readPostcardVarint(cursor);
+    if (slotValue === null) return null;
+    const hasTrack = readPostcardOptionTag(cursor);
+    if (hasTrack === null) return null;
+    let trackIndex: number | undefined;
+    if (hasTrack) {
+      if (cursor.offset >= cursor.bytes.length) return null;
+      trackIndex = cursor.bytes[cursor.offset++];
+    }
+    return {
+      type: 'change-bgm',
+      slot: Number(slotValue),
+      ...(bgmTinId !== undefined ? { bgmTinId } : {}),
+      ...(volume !== undefined ? { volume } : {}),
+      ...(trackIndex !== undefined ? { trackIndex } : {}),
+    };
+  }
+  if (label === LABEL_BANQUETTE_LOG_CHANGE_BG_IMG) {
+    const hasTinId = readPostcardOptionTag(cursor);
+    if (hasTinId === null) return null;
+    let imageTinId: string | undefined;
+    if (hasTinId) {
+      const hex = readPostcardFixedHex(cursor, 32);
+      if (hex === null) return null;
+      imageTinId = hex;
+    }
+    const hasWidth = readPostcardOptionTag(cursor);
+    if (hasWidth === null) return null;
+    let width: number | undefined;
+    if (hasWidth) {
+      const value = readPostcardVarint(cursor);
+      if (value === null) return null;
+      width = Number(value);
+    }
+    const hasHeight = readPostcardOptionTag(cursor);
+    if (hasHeight === null) return null;
+    let height: number | undefined;
+    if (hasHeight) {
+      const value = readPostcardVarint(cursor);
+      if (value === null) return null;
+      height = Number(value);
+    }
+    return {
+      type: 'change-bg-img',
+      ...(imageTinId !== undefined ? { imageTinId } : {}),
+      ...(width !== undefined ? { width } : {}),
+      ...(height !== undefined ? { height } : {}),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Builds a `system` log record from a decoded banquette event Tin.
+ *
+ * The postcard payload is never decoded as UTF-8, so no byte garbage can leak
+ * into the chat text. A known event label with a malformed payload still yields
+ * a `system` record (without an `event`), which renders as a generic status row
+ * instead of binary text. Returns `null` for unknown labels.
+ */
+function systemEventToLogRecord(
+  entry: unknown,
+  sceneId: string,
+  chunkIndex: number,
+  position: number,
+): LogRecord | null {
+  if (!isTinJson(entry)) return null;
+  const label = Number(entry.label);
+  const event = decodeLogSystemEvent(entry);
+  if (!event && !isBanquetteSystemEventLabel(label)) return null;
+  return parseLogRecord(
+    {
+      sceneId,
+      content: '',
+      speaker: 'System',
+      timestamp: 0,
+      kind: 'system',
+      ...(event ? { event } : {}),
+    },
+    `log-${chunkIndex}-${position}`,
+  );
+}
+
+/** Returns true for the four banquette system-event labels. */
+function isBanquetteSystemEventLabel(label: number): boolean {
+  return (
+    label === LABEL_BANQUETTE_LOG_CHANGE_BGM ||
+    label === LABEL_BANQUETTE_LOG_CHANGE_BG_IMG ||
+    label === LABEL_BANQUETTE_LOG_CHARACTER_CAME ||
+    label === LABEL_BANQUETTE_LOG_CHARACTER_GONE
+  );
+}
+
 /**
  * Encodes a `LogRecord` (or any plain record object) as a Tin whose payload is
  * UTF-8 JSON, embedding `clientOpId` so that the sender can correlate the
@@ -347,11 +551,28 @@ export function logRecordToTin(
 ): TinJson {
   const payload: Record<string, any> = {};
   if (record && typeof record === 'object') {
-    for (const key of ['id', 'sceneId', 'content', 'speaker', 'speakerId', 'timestamp', 'chunkId']) {
+    for (const key of [
+      'id',
+      'sceneId',
+      'content',
+      'speaker',
+      'speakerId',
+      'timestamp',
+      'chunkId',
+      'kind',
+      'event',
+    ]) {
       const value = (record as Record<string, any>)[key];
       if (value !== undefined) {
         payload[key] = value;
       }
+    }
+    // `contentTin` is the extension-pipeline result (Issue #161). Normalize the
+    // accepted representations to the canonical byte array so banquette stores a
+    // stable JSON payload and kitchen can decode it.
+    const contentTinBytes = contentTinToBytes((record as Record<string, any>).contentTin);
+    if (contentTinBytes) {
+      payload.contentTin = Array.from(contentTinBytes);
     }
   }
   payload.clientOpId = clientOpId;
@@ -374,6 +595,11 @@ export function tinToLogRecord(
   position = 0,
 ): LogRecord | null {
   if (entry === null || entry === undefined) return null;
+
+  // Banquette system events are postcard payloads: decode them by label before
+  // any UTF-8 fallback so they are never shown as binary chat text.
+  const systemRecord = systemEventToLogRecord(entry, sceneId, chunkIndex, position);
+  if (systemRecord) return systemRecord;
 
   let raw: Record<string, any>;
   if (isTinJson(entry)) {
@@ -887,6 +1113,11 @@ export function entryToLogRecord(
   position = 0,
 ): LogRecord | null {
   if (entry === null || entry === undefined) return null;
+
+  // Banquette system events are postcard payloads; decode by label first so
+  // their bytes are never interpreted as UTF-8 chat content (Issue #161).
+  const systemRecord = systemEventToLogRecord(entry, sceneId, chunkIndex, position);
+  if (systemRecord) return systemRecord;
 
   // Direct LogRecord object
   if (

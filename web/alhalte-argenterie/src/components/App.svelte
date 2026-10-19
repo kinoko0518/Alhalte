@@ -17,6 +17,7 @@
   import { saveRecentRoom, type RecentRoom } from '../utils/recentRooms.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
   import { fetchRoomInfo, resolveRoomFromLocation, RoomApiError } from '../utils/home.js';
+  import { buildContentTinFromText } from '../utils/generast.js';
   import { ChunkLogManager } from '../utils/log.js';
   import type { SceneMovementEvent } from '../utils/sceneGraph.js';
   import {
@@ -641,6 +642,11 @@
   // ---------------------------------------------------------------------------
   /** True while a sent message is waiting for the server's `LogEventAppended` echo. */
   let isSending = $state(false);
+  /**
+   * Warning shown when the send-time extension pipeline could not run and the
+   * message was stored with its raw `content` only (Issue #161).
+   */
+  let pipelineWarning = $state<string | null>(null);
   /** Number of messages waiting in the durable outbox for the active room. */
   let pendingMessageCount = $state(0);
   /** Guards against overlapping outbox flushes (reconnect can fire repeatedly). */
@@ -2384,18 +2390,45 @@
     const char = characters.find((c) => c.id === characterId);
     const speaker = char?.name || 'Anonymous';
     const sceneId = currentScene.id;
-    const record: LogRecord = {
-      id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      sceneId,
-      content: text,
-      speaker,
-      speakerId: characterId,
-      timestamp: Math.floor(Date.now() / 1000),
-    };
-    const roomId = getActiveRoomId();
-
+    pipelineWarning = null;
     isSending = true;
+
     try {
+      // Issue #161: run the extension pipeline *before* sending so its result is
+      // persisted as `contentTin`. Rendering then never re-applies extensions,
+      // so clients with different extension versions / priorities agree.
+      let contentTin: number[] | undefined;
+      try {
+        const bytes = await buildContentTinFromText(
+          text,
+          extensions,
+          extensionPipeline,
+          characterId,
+        );
+        if (bytes) {
+          contentTin = Array.from(bytes);
+        } else {
+          pipelineWarning =
+            '拡張機能の処理結果を保存できませんでした。原文を送信します。';
+        }
+      } catch (err) {
+        console.error('Failed to run the extension pipeline before sending:', err);
+        pipelineWarning =
+          '拡張機能を適用できませんでした。原文を送信します。';
+      }
+
+      const record: LogRecord = {
+        id: `msg-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        sceneId,
+        content: text,
+        speaker,
+        speakerId: characterId,
+        timestamp: Math.floor(Date.now() / 1000),
+        kind: 'chat',
+        ...(contentTin ? { contentTin } : {}),
+      };
+      const roomId = getActiveRoomId();
+
       if (!roomSocket || !roomSocket.isConnected) {
         // Offline: enqueue durably, never via RoomSocket's in-memory queue.
         if (roomId) {
@@ -2427,12 +2460,6 @@
       console.error('Failed to send the chat message:', err);
     } finally {
       isSending = false;
-      if (extensions.some((ext) => ext.enabled && ext.wasmBytes)) {
-        const initialBytes = new TextEncoder().encode(text);
-        extensionPipeline.executePipeline(extensions, initialBytes).catch(() => {
-          // Keep raw message displayed if extension pipeline fails
-        });
-      }
     }
   }
 </script>
@@ -2453,6 +2480,16 @@
       data-testid="piece-action-error"
     >
       {pieceActionError}
+    </div>
+  {/if}
+
+  {#if pipelineWarning}
+    <div
+      class="pipeline-warning"
+      role="status"
+      data-testid="pipeline-warning"
+    >
+      {pipelineWarning}
     </div>
   {/if}
 
@@ -2942,6 +2979,22 @@
     color: var(--np-color-on-error-container, #410e0b);
     box-shadow: var(--np-elevation-2, 0 1px 3px rgba(0, 0, 0, 0.2));
     font-size: 0.9rem;
+    font-weight: 600;
+    text-align: center;
+  }
+  .pipeline-warning {
+    position: absolute;
+    top: 64px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 80;
+    max-width: min(90vw, 480px);
+    padding: 8px 16px;
+    border-radius: var(--np-shape-corner-medium, 12px);
+    background: var(--np-color-tertiary-container, #ffd8e4);
+    color: var(--np-color-on-tertiary-container, #31111d);
+    box-shadow: var(--np-elevation-1, 0 1px 2px rgba(0, 0, 0, 0.15));
+    font-size: 0.85rem;
     font-weight: 600;
     text-align: center;
   }

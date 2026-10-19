@@ -102,7 +102,64 @@ export interface Scene {
 }
 
 /**
+ * Kind of a log record.
+ *
+ * - `chat`: A user-authored message rendered by Saignant.
+ * - `system`: A banquette event (`change-bgm`, `change-bg-img`,
+ *   `character-came`, `character-gone`) rendered as a status row.
+ */
+export type LogRecordKind = 'chat' | 'system';
+
+/** A BGM change system event (`alhalte/banquette/log/change-bgm`). */
+export interface LogChangeBgmEvent {
+  type: 'change-bgm';
+  /** Tin ID of the new track, or `undefined` when playback stopped. */
+  bgmTinId?: string;
+  /** Playback volume in the `0.0..=1.0` range. */
+  volume?: number;
+  /** 1-based BGM slot. */
+  slot: number;
+  /** Legacy track index, when present. */
+  trackIndex?: number;
+}
+
+/** A background image change system event (`alhalte/banquette/log/change-bg-img`). */
+export interface LogChangeBgImgEvent {
+  type: 'change-bg-img';
+  /** Tin ID of the new image, or `undefined` when the background was cleared. */
+  imageTinId?: string;
+  /** Optional target width. */
+  width?: number;
+  /** Optional target height. */
+  height?: number;
+}
+
+/** A character entrance system event (`alhalte/banquette/log/character-came`). */
+export interface LogCharacterCameEvent {
+  type: 'character-came';
+  characterId: string;
+}
+
+/** A character departure system event (`alhalte/banquette/log/character-gone`). */
+export interface LogCharacterGoneEvent {
+  type: 'character-gone';
+  characterId: string;
+}
+
+/** Decoded banquette system event carried by a {@link LogRecord}. */
+export type LogSystemEvent =
+  | LogChangeBgmEvent
+  | LogChangeBgImgEvent
+  | LogCharacterCameEvent
+  | LogCharacterGoneEvent;
+
+/**
  * Log entry parsed from pantry / cellar / banquette.
+ *
+ * The canonical wire form is the `alhalte/argenterie/log-record` JSON Tin. Old
+ * records omit {@link LogRecord.contentTin} and are re-processed through the
+ * extension pipeline at render time; records carrying it are rendered as-is so
+ * extension version / priority differences cannot change their display.
  */
 export interface LogRecord {
   id: string;
@@ -112,6 +169,16 @@ export interface LogRecord {
   speakerId?: string;
   timestamp: number; // Unix timestamp in seconds (fallback: 0)
   chunkId?: string;
+  /**
+   * Extension-pipeline output: the `alhalte/generast` Tin plaintext bytes
+   * (a `(Generast, speaker_id)` ext-io Tin when produced by the send path).
+   * Stored as a byte array in JSON; base64 is also accepted when decoding.
+   */
+  contentTin?: number[];
+  /** Record kind. Missing values on old records are treated as `chat`. */
+  kind?: LogRecordKind;
+  /** Decoded system event payload; set only when `kind === 'system'`. */
+  event?: LogSystemEvent;
 }
 
 /**
