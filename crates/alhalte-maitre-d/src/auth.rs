@@ -344,9 +344,11 @@ mod tests {
             other.into_sub_hash("salt").0
         );
 
-        // The subject is redacted from Debug and zeroized by the hash.
-        assert!(!format!("{identity:?}").contains("Alice"));
-        assert!(format!("{identity:?}").contains("<redacted>"));
+        // The subject is redacted from Debug and zeroized by the hash. The
+        // handle name is not a secret, so only the subject itself must not leak.
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains(&format!("{DEBUG_SUBJECT_PREFIX}Alice")));
+        assert!(debug.contains("<redacted>"));
 
         // The debug provider has no Google flow.
         assert_eq!(provider.authorization_url("http://x/cb", "state"), None);

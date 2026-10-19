@@ -1175,6 +1175,7 @@ async fn oauth_token_handler(
 ///
 /// The same rules as `GET /auth/login` apply: an absolute URL on a CORS-allowed
 /// origin, never a protocol-relative or foreign URL.
+#[allow(clippy::result_large_err)]
 fn debug_return_to<'a>(
     state: &AppState,
     raw: Option<&'a str>,

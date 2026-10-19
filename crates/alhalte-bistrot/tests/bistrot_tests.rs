@@ -1940,6 +1940,8 @@ fn test_generate_maitre_d_args_passes_debug_login() {
 client-id = "id"
 client-secret = "secret"
 salt = "salt"
+
+[cellar]
 "#,
     )
     .unwrap();
@@ -1959,6 +1961,8 @@ client-id = "id"
 client-secret = "secret"
 salt = "salt"
 debug-login = true
+
+[cellar]
 "#,
     )
     .unwrap();
@@ -1976,6 +1980,8 @@ client-id = "id"
 client-secret = "secret"
 salt = "salt"
 debug_login = true
+
+[cellar]
 "#,
     )
     .unwrap();

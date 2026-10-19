@@ -5,10 +5,9 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
 use alhalte_maitre_d::{
-    AppState, BanquetteSpawner, CliArgs, DEBUG_SUBJECT_PREFIX, Database, InProcessBanquetteSpawner,
+    AppState, CliArgs, DEBUG_SUBJECT_PREFIX, Database, InProcessBanquetteSpawner,
     MAX_DEBUG_ACCOUNT_NAME_LEN, MockOAuthProvider, OAuthProvider, ProcessBanquetteSpawner,
     RoomBridgeManager, ServerInfoResponse, SessionResponse, SubHash, create_router, hash_sub,
     parse_cli_args_from,
@@ -22,10 +21,6 @@ const APP_ORIGIN: &str = "http://app.test";
 /// Instance salt used by the test router (must match `debug_state`).
 const TEST_SALT: &str = "debug-salt";
 
-/// Room used by the no-persist test (canonical 16-hex form).
-const ROOM_ID_HEX: &str = "00000000000000d1";
-const ROOM_ID: u64 = 0x00000000000000d1;
-
 /// Hashes a test `sub` the way the provider path does (Issue #190).
 fn test_sub_hash(sub: &str) -> SubHash {
     let mut sub = sub.to_string();
@@ -38,7 +33,7 @@ fn debug_state(db: Database) -> AppState {
         "/tmp/alhalte-debug-login-tests",
         8,
     ));
-    let manager = RoomBridgeManager::new(spawner, db.clone());
+    let manager = RoomBridgeManager::new(spawner);
     AppState::new(db, TEST_SALT, Arc::new(MockOAuthProvider::new()), manager)
         .with_public_url("http://maitre-d.test")
         .with_allowed_origins([APP_ORIGIN])
@@ -51,7 +46,7 @@ fn google_state(db: Database, oauth: Arc<dyn OAuthProvider>) -> AppState {
         "/tmp/alhalte-debug-login-tests",
         8,
     ));
-    let manager = RoomBridgeManager::new(spawner, db.clone());
+    let manager = RoomBridgeManager::new(spawner);
     AppState::new(db, TEST_SALT, oauth, manager)
         .with_public_url("http://maitre-d.test")
         .with_allowed_origins([APP_ORIGIN])
@@ -524,7 +519,7 @@ fn process_spawner_disables_persistence_for_debug_rooms() {
     assert!(!normal.is_no_persist());
     assert!(
         !normal
-            .command_args(1, 42, socket, None)
+            .command_args(1, 42, socket)
             .iter()
             .any(|arg| arg == "--no-persist")
     );
@@ -537,102 +532,9 @@ fn process_spawner_disables_persistence_for_debug_rooms() {
     )
     .with_no_persist();
     assert!(debug.is_no_persist());
-    let args = debug.command_args(1, 42, socket, None);
+    let args = debug.command_args(1, 42, socket);
     assert!(
         args.iter().any(|arg| arg == "--no-persist"),
         "the child must keep room state in memory: {args:?}"
     );
-    assert!(
-        !args.iter().any(|arg| arg == "--room-tin"),
-        "nothing persisted means nothing to restore: {args:?}"
-    );
-}
-
-/// Wraps an in-process spawner and records every `(room_id, admin, room_head)`.
-#[derive(Clone)]
-struct RecordingSpawner {
-    inner: Arc<InProcessBanquetteSpawner>,
-    calls: Arc<std::sync::Mutex<Vec<(u64, u64, Option<[u8; 32]>)>>>,
-}
-
-impl RecordingSpawner {
-    fn new(socket_dir: impl Into<std::path::PathBuf>) -> Self {
-        Self {
-            inner: Arc::new(
-                InProcessBanquetteSpawner::new_with_in_memory_cellar(socket_dir, 8)
-                    .with_heartbeat_interval(Duration::from_millis(50)),
-            ),
-            calls: Arc::new(std::sync::Mutex::new(Vec::new())),
-        }
-    }
-
-    fn calls(&self) -> Vec<(u64, u64, Option<[u8; 32]>)> {
-        self.calls.lock().unwrap().clone()
-    }
-}
-
-#[async_trait::async_trait]
-impl BanquetteSpawner for RecordingSpawner {
-    async fn spawn_banquette(
-        &self,
-        room_id: u64,
-        admin_account: u64,
-        room_head: Option<[u8; 32]>,
-    ) -> alhalte_maitre_d::Result<std::path::PathBuf> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push((room_id, admin_account, room_head));
-        self.inner
-            .spawn_banquette(room_id, admin_account, room_head)
-            .await
-    }
-}
-
-// spec: alhalte-maitre-d/debug-login 0003 debug rooms record no room_heads
-#[tokio::test]
-async fn debug_room_manager_neither_restores_nor_records_room_heads() {
-    let dir = tempdir().unwrap();
-    let db = Database::new_in_memory().unwrap();
-    let admin = db
-        .get_or_create_account(&test_sub_hash("sub-debug-admin"), "Admin", None, 1000)
-        .unwrap();
-    db.create_room(ROOM_ID_HEX, "Debug room", admin.account_id, 1000)
-        .unwrap();
-
-    let spawner = RecordingSpawner::new(dir.path().to_path_buf());
-    let manager =
-        RoomBridgeManager::new(Arc::new(spawner.clone()), db.clone()).without_persistence();
-    assert!(!manager.persists_room_heads());
-
-    let bridge = manager
-        .get_or_create_room(ROOM_ID, admin.account_id)
-        .await
-        .unwrap();
-    assert_eq!(bridge.room_id, ROOM_ID);
-
-    // The in-process banquette persists into its in-memory cellar on every
-    // heartbeat and reports `RoomPersisted`; a debug manager drops it.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(
-        db.get_room_head(ROOM_ID_HEX).unwrap(),
-        None,
-        "a no-persist room must not leave a head pointer"
-    );
-
-    // A fresh bridge (the room restarted) is spawned without a restore pointer.
-    manager.remove_room(ROOM_ID).await;
-    let _ = manager
-        .get_or_create_room(ROOM_ID, admin.account_id)
-        .await
-        .unwrap();
-    let calls = spawner.calls();
-    assert_eq!(calls.len(), 2);
-    assert_eq!(calls[0].2, None);
-    assert_eq!(
-        calls[1].2, None,
-        "nothing was persisted, so nothing may be restored"
-    );
-
-    manager.remove_room(ROOM_ID).await;
 }
