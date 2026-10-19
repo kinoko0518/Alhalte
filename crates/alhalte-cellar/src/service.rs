@@ -47,6 +47,21 @@ impl Default for CellarConfig {
     }
 }
 
+/// Compares two byte strings without an early exit on the first mismatch.
+///
+/// Used for the internal service token so that response timing does not leak
+/// how many prefix bytes were correct.
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.iter().zip(right.iter()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 /// Core service encapsulating cellar logic.
 pub struct CellarService {
     storage: StorageManager,
@@ -54,6 +69,7 @@ pub struct CellarService {
     verifier: Arc<dyn SessionVerifier>,
     anti_oracle: bool,
     gc_interval: Option<Duration>,
+    service_token: Option<String>,
 }
 
 impl CellarService {
@@ -68,6 +84,7 @@ impl CellarService {
             verifier,
             anti_oracle: config.anti_oracle,
             gc_interval: config.gc_interval,
+            service_token: None,
         })
     }
 
@@ -86,6 +103,7 @@ impl CellarService {
             verifier,
             anti_oracle,
             gc_interval: None,
+            service_token: None,
         })
     }
 
@@ -107,6 +125,58 @@ impl CellarService {
         &self.verifier
     }
 
+    /// Configures the internal service token used for trusted service-to-service writes.
+    ///
+    /// When set, a store check / upload / unregister request may present the
+    /// token in the `X-Alhalte-Service-Token` header instead of a user session.
+    /// This is how `alhalte-banquette` persists room state without impersonating
+    /// a synthetic user session. User session verification is unchanged: requests
+    /// without the header still go through [`SessionVerifier`].
+    #[must_use]
+    pub fn with_service_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.service_token = if token.trim().is_empty() {
+            None
+        } else {
+            Some(token)
+        };
+        self
+    }
+
+    /// Returns whether an internal service token is configured.
+    #[must_use]
+    pub fn has_service_token(&self) -> bool {
+        self.service_token.is_some()
+    }
+
+    /// Authorizes an internal write.
+    ///
+    /// A request that carries a `service_token` is authorized only by that token:
+    /// it never falls back to session verification, so a wrong token is rejected
+    /// rather than silently accepted through a user session.
+    async fn authorize(
+        &self,
+        owner: u64,
+        session_id: u64,
+        service_token: Option<&str>,
+    ) -> Result<()> {
+        let Some(presented) = service_token else {
+            let is_valid = self.verifier.verify_session(owner, session_id).await?;
+            return if is_valid {
+                Ok(())
+            } else {
+                Err(CellarError::Unauthorized { owner, session_id })
+            };
+        };
+
+        match self.service_token.as_deref() {
+            Some(expected) if constant_time_eq(presented.as_bytes(), expected.as_bytes()) => Ok(()),
+            // No token configured, or a mismatch: fail closed with the same error
+            // as an invalid session so callers cannot probe the token.
+            _ => Err(CellarError::Unauthorized { owner, session_id }),
+        }
+    }
+
     /// Performs the initial store metadata handshake.
     ///
     /// Evaluates storage rights and checks whether upload is needed:
@@ -114,16 +184,19 @@ impl CellarService {
     /// - Returns `211` (Deduplicated) if already stored by another owner (adding a DB reference row).
     /// - Returns `212` (AlreadyOwned) if already owned by this owner.
     pub async fn store_check(&self, req: &StoreRequest) -> Result<StoreStatus> {
-        let is_valid = self
-            .verifier
-            .verify_session(req.owner, req.session_id)
+        self.store_check_with_token(req, None).await
+    }
+
+    /// Performs the store metadata handshake with an optional internal service token.
+    ///
+    /// See [`Self::store_check`] and [`Self::with_service_token`].
+    pub async fn store_check_with_token(
+        &self,
+        req: &StoreRequest,
+        service_token: Option<&str>,
+    ) -> Result<StoreStatus> {
+        self.authorize(req.owner, req.session_id, service_token)
             .await?;
-        if !is_valid {
-            return Err(CellarError::Unauthorized {
-                owner: req.owner,
-                session_id: req.session_id,
-            });
-        }
 
         let conn = self.db.lock().await;
         let already_owned = Database::has_owner_reference(&conn, &req.tin_id, req.owner)?;
@@ -164,10 +237,23 @@ impl CellarService {
         data: &[u8],
         wrapped_key: Option<Vec<u8>>,
     ) -> Result<StoreResult> {
-        let is_valid = self.verifier.verify_session(owner, session_id).await?;
-        if !is_valid {
-            return Err(CellarError::Unauthorized { owner, session_id });
-        }
+        self.store_payload_with_token(owner, session_id, tin_id, data, wrapped_key, None)
+            .await
+    }
+
+    /// Stores an uploaded tin payload with an optional internal service token.
+    ///
+    /// See [`Self::store_payload`] and [`Self::with_service_token`].
+    pub async fn store_payload_with_token(
+        &self,
+        owner: u64,
+        session_id: u64,
+        tin_id: TinId,
+        data: &[u8],
+        wrapped_key: Option<Vec<u8>>,
+        service_token: Option<&str>,
+    ) -> Result<StoreResult> {
+        self.authorize(owner, session_id, service_token).await?;
 
         let file_exists = self.storage.has_tin_file(&tin_id);
         let written_to_disk = if self.anti_oracle && file_exists {
@@ -226,10 +312,21 @@ impl CellarService {
     ///
     /// Returns `true` if a row was deleted, `false` if not found.
     pub async fn unregister(&self, owner: u64, session_id: u64, tin_id: &TinId) -> Result<bool> {
-        let is_valid = self.verifier.verify_session(owner, session_id).await?;
-        if !is_valid {
-            return Err(CellarError::Unauthorized { owner, session_id });
-        }
+        self.unregister_with_token(owner, session_id, tin_id, None)
+            .await
+    }
+
+    /// Removes an ownership reference with an optional internal service token.
+    ///
+    /// See [`Self::unregister`] and [`Self::with_service_token`].
+    pub async fn unregister_with_token(
+        &self,
+        owner: u64,
+        session_id: u64,
+        tin_id: &TinId,
+        service_token: Option<&str>,
+    ) -> Result<bool> {
+        self.authorize(owner, session_id, service_token).await?;
 
         let conn = self.db.lock().await;
         Database::delete_reference(&conn, tin_id, owner)

@@ -64,6 +64,14 @@ pub struct CliArgs {
     /// Optional UNIX domain socket path to bind for HTTP/API requests.
     #[arg(long, env = "ALHALTE_UNIX_SOCKET")]
     pub unix_socket: Option<PathBuf>,
+
+    /// Internal cellar service token forwarded to every spawned banquette.
+    ///
+    /// Banquette sends it as `X-Alhalte-Service-Token` so room state persistence
+    /// is authorized without impersonating a user session. `alhalte-cellar`
+    /// must be configured with the same token. The value is never logged.
+    #[arg(long, env = "ALHALTE_CELLAR_SERVICE_TOKEN", hide_env_values = true)]
+    pub service_token: Option<String>,
 }
 
 /// Parses CLI arguments from an arbitrary iterator of strings (useful for unit tests).

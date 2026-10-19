@@ -29,7 +29,7 @@ async fn spawn_router() -> (std::net::SocketAddr, tempfile::TempDir, Database) {
         db.clone(),
         "salt",
         Arc::new(MockOAuthProvider::new()),
-        RoomBridgeManager::new(spawner),
+        RoomBridgeManager::new(spawner, db.clone()),
     );
     let app = create_router(state);
 

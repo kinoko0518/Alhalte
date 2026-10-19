@@ -23,6 +23,21 @@ use crate::service::CellarService;
 /// Bodies are still buffered fully in memory by the `Bytes` extractor.
 pub const MAX_STORE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Header name carrying the internal service token.
+///
+/// `alhalte-banquette` uses it for room state persistence so that internal
+/// writes do not need a synthetic user session. The value is never logged.
+pub const SERVICE_TOKEN_HEADER: &str = "X-Alhalte-Service-Token";
+
+/// Reads the internal service token from request headers, if present.
+///
+/// An empty header value is treated as absent so a misconfigured client cannot
+/// accidentally authorize with an empty configured token.
+fn service_token_from_headers(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(SERVICE_TOKEN_HEADER)?.to_str().ok()?;
+    if value.is_empty() { None } else { Some(value) }
+}
+
 /// Query parameters for download requests.
 #[derive(Debug, Deserialize)]
 pub struct DownloadQuery {
@@ -108,12 +123,18 @@ async fn health_check() -> impl IntoResponse {
 /// Store metadata check handler.
 ///
 /// Returns 210 (UploadRequired), 211 (Deduplicated), or 212 (AlreadyOwned).
+/// Authorization is either the internal service token (see
+/// [`SERVICE_TOKEN_HEADER`]) or the owner's user session.
 async fn handle_store_check(
     State(service): State<Arc<CellarService>>,
+    headers: HeaderMap,
     Json(payload): Json<StoreRequest>,
 ) -> std::result::Result<Response, CellarError> {
     let tin_id = payload.tin_id;
-    let status = service.store_check(&payload).await?;
+    let service_token = service_token_from_headers(&headers);
+    let status = service
+        .store_check_with_token(&payload, service_token)
+        .await?;
 
     let response_body = StoreResponse {
         code: status.as_u16(),
@@ -171,7 +192,14 @@ async fn handle_store_upload(
     };
 
     let result = service
-        .store_payload(owner, session_id, tin_id, &body, wrapped_key)
+        .store_payload_with_token(
+            owner,
+            session_id,
+            tin_id,
+            &body,
+            wrapped_key,
+            service_token_from_headers(&headers),
+        )
         .await?;
 
     Ok((StatusCode::CREATED, Json(result)).into_response())
@@ -237,12 +265,20 @@ async fn handle_tin_metadata(
 }
 
 /// Unregister handler via JSON POST.
+///
+/// Authorization is either the internal service token or the owner's session.
 async fn handle_unregister(
     State(service): State<Arc<CellarService>>,
+    headers: HeaderMap,
     Json(payload): Json<UnregisterRequest>,
 ) -> std::result::Result<Response, CellarError> {
     let deleted = service
-        .unregister(payload.owner, payload.session_id, &payload.tin_id)
+        .unregister_with_token(
+            payload.owner,
+            payload.session_id,
+            &payload.tin_id,
+            service_token_from_headers(&headers),
+        )
         .await?;
 
     if deleted {
@@ -286,7 +322,14 @@ async fn handle_unregister_delete(
             CellarError::Internal("Missing required session_id (header X-Alhalte-Session-Id or query parameter session_id)".to_string())
         })?;
 
-    let deleted = service.unregister(owner, session_id, &tin_id).await?;
+    let deleted = service
+        .unregister_with_token(
+            owner,
+            session_id,
+            &tin_id,
+            service_token_from_headers(&headers),
+        )
+        .await?;
 
     if deleted {
         Ok((

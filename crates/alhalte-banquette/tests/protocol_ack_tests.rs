@@ -144,7 +144,6 @@ async fn start_test_server() -> (tempfile::TempDir, ClientSink, ServerStream, Jo
         socket_path: sock_path.clone(),
         heartbeat_interval: Duration::from_secs(3600),
         admin_account: 10,
-        system_session_id: 1,
     };
 
     let server = BanquetteServer::new(config, room, cellar);

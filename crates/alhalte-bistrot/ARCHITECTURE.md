@@ -59,6 +59,7 @@ anti-oracle = false
 # maitre-d-url = "http://127.0.0.1:8080"  # 既定は http://{restaurant.host}:{maitre-d.port}
 # maitre-d-socket = ".alhalte/sockets/maitre-d.sock"  # 指定時は url より優先
 # allow-all-sessions = false              # ローカル開発専用。true で全 session を許可
+# service-token = "..."                    # 内部書き込み用。rops で暗号化する秘密値
 
 [banquette]
 chunk-size-exponent = 8
@@ -74,7 +75,7 @@ path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
 enabled = true
 ```
 
-`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。
+`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。`cellar.service-token` は設定する場合のみ非空でなければならない。
 
 パス省略時の既定:
 
@@ -100,10 +101,10 @@ enabled = true
 
 ### 引数生成
 
-- `generate_maitre_d_args`: host、port、db-path、client-id、client-secret、salt、socket-dir、cellar-url、chunk-size-exponent。`banquette-bin` があれば追加。
-- `generate_cellar_args`: host、port、storage-path、db-path、session verifier（`cellar.maitre-d-socket` があれば `--maitre-d-socket <path>`、なければ `--maitre-d-url <url>`）、`allow-all-sessions` が true のとき `--allow-all-sessions`、`anti-oracle` が true のとき `--anti-oracle`。既定の URL は `http://{restaurant.host}:{maitre-d.port}`。
+- `generate_maitre_d_args`: host、port、db-path、client-id、client-secret、salt、socket-dir、cellar-url、chunk-size-exponent。`banquette-bin` があれば追加。`cellar.service-token` があれば `--service-token <token>` を追加する（maitre-d が各 banquette へ伝播する）。
+- `generate_cellar_args`: host、port、storage-path、db-path、session verifier（`cellar.maitre-d-socket` があれば `--maitre-d-socket <path>`、なければ `--maitre-d-url <url>`）、`allow-all-sessions` が true のとき `--allow-all-sessions`、`anti-oracle` が true のとき `--anti-oracle`、`cellar.service-token` があれば `--service-token <token>`。既定の URL は `http://{restaurant.host}:{maitre-d.port}`。
 
-`alhalte-banquette` は `alhalte-maitre-d` が部屋ごとに起動し、`--room-id` / `--admin` / `--socket` / `--chunk-size-exponent` を spawner が組み立てるため、bistrot は静的な banquette 引数を生成しない。`[banquette] chunk-size-exponent` は `generate_maitre_d_args` 経由で maitre-d に渡り、spawner が各 banquette に伝播する。
+`alhalte-banquette` は `alhalte-maitre-d` が部屋ごとに起動し、`--room-id` / `--admin` / `--socket` / `--chunk-size-exponent` / `--room-tin` / `--service-token` を spawner が組み立てるため、bistrot は静的な banquette 引数を生成しない。`[banquette] chunk-size-exponent` と `[cellar] service-token` は `generate_maitre_d_args` 経由で maitre-d に渡り、spawner が各 banquette に伝播する。
 
 すべて副作用なし。`generate_module_args` はモジュール名を正規化して振り分ける。
 
@@ -133,4 +134,6 @@ enabled = true
 - argenterie は開発サーバー（Vite）として起動する。本番配信の unit は未定義。
 - `Bistrot.toml` の `maitre-d` と `cellar` は必須。`restaurant`、`banquette`、`argenterie`、`extensions` は既定値を持つ。
 - `cellar.allow-all-sessions` はローカル開発専用。有効時は `alhalte-cellar` が警告を出し、session 検証をすべて許可する。verifier が未設定でこのフラグも false の場合、`alhalte-cellar` は全拒否の verifier に落ちず起動エラーになる。
+- `cellar.service-token` は rops で暗号化して保持する前提。未設定でも起動できるが、`alhalte-banquette` の部屋状態 persistence は cellar に拒否される（ローカル開発では `allow-all-sessions` で代用できるが、本番では設定する）。
+- `--service-token` は生成される systemd unit の `ExecStart` に含まれる。`--client-secret` と同じ扱いで、unit ファイルと `ps` から読める点は既知の制約。
 - rops の鍵はファイルに保存せず、`ROPS_AGE` か CLI 引数で渡す前提。

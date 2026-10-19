@@ -19,6 +19,9 @@
 //!   receive **no response** to queries for scene log, state, or name.
 //! - **Lifecycle**: Unloading idle scenes when active client counts drop to zero, and periodic 4-minute heartbeats
 //!   with room state persistence, shutting down when idle for 3 consecutive intervals.
+//! - **Persistence**: [`Room::persist`] stores the whole room in cellar and reports the tin ID so
+//!   [`Room::load_from_cellar`] can restore it on the next process start. Internal writes are authorized
+//!   by the cellar service token carried by the [`CellarSink`], never by a synthetic user session.
 //!
 //! ## Example
 //!
@@ -48,7 +51,7 @@ pub mod scene;
 pub mod server;
 pub mod state;
 
-pub use cellar_sink::{CellarSink, HttpCellarSink, InMemoryCellarSink};
+pub use cellar_sink::{CellarSink, HttpCellarSink, INTERNAL_WRITE_SESSION_ID, InMemoryCellarSink};
 pub use character::{
     Character, CharacterBiblio, get_character_name, get_character_owner, set_character_name,
     set_character_owner,
@@ -76,7 +79,7 @@ pub use protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
     WebRtcSignalPayload,
 };
-pub use room::{HeartbeatOutcome, Room, RoomData, SceneSummary};
+pub use room::{HeartbeatOutcome, HeartbeatResult, Room, RoomData, SceneSummary};
 pub use scene::{Scene, SceneData};
 pub use server::{BanquetteServer, ConnectedClient, ServerConfig};
 pub use state::{

@@ -308,6 +308,7 @@ fn test_generate_maitre_d_args() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -383,6 +384,7 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -552,6 +554,7 @@ fn test_generate_all_args_and_module_args() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -604,6 +607,7 @@ fn test_systemd_generator() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -1070,4 +1074,72 @@ fn test_root_bistrot_toml_extensions_configuration() {
         assert_eq!(config.extensions[i].path, PathBuf::from(*expected_path));
         assert_eq!(config.extensions[i].enabled, *expected_enabled);
     }
+}
+
+// spec: alhalte-bistrot/service-token 0001 internal cellar service token is passed to maitre-d and cellar
+#[test]
+fn test_generate_args_includes_service_token() {
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+service-token = "internal-service-token"
+"#;
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(
+        config.cellar.service_token.as_deref(),
+        Some("internal-service-token")
+    );
+
+    let maitre_d_args = generate_maitre_d_args(&config);
+    let token_index = maitre_d_args
+        .iter()
+        .position(|arg| arg == "--service-token")
+        .expect("maitre-d must receive --service-token");
+    assert_eq!(maitre_d_args[token_index + 1], "internal-service-token");
+
+    let cellar_args = generate_cellar_args(&config);
+    let token_index = cellar_args
+        .iter()
+        .position(|arg| arg == "--service-token")
+        .expect("cellar must receive --service-token");
+    assert_eq!(cellar_args[token_index + 1], "internal-service-token");
+
+    // Without a token no flag is emitted.
+    let plain = parse_bistrot_toml(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+"#,
+    )
+    .unwrap();
+    assert!(
+        !generate_maitre_d_args(&plain)
+            .iter()
+            .any(|arg| arg == "--service-token")
+    );
+    assert!(
+        !generate_cellar_args(&plain)
+            .iter()
+            .any(|arg| arg == "--service-token")
+    );
+
+    // An explicitly empty token is rejected.
+    let empty = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+service-token = ""
+"#;
+    assert!(parse_bistrot_toml(empty).is_err());
 }

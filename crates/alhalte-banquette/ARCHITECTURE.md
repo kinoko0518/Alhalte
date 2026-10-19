@@ -6,7 +6,7 @@
 
 ## 責務
 
-部屋ごとに 1 プロセスで動くルームデーモン。何を交換するかではなく、どう交換するかを担う。scene のログ・state、character の所有権、クライアントの入退室、WebRTC signaling の中継、cellar への永続化を持つ。HTTP サーバーは持たず、`alhalte-maitre-d` と UNIX ソケットで話す。
+部屋ごとに 1 プロセスで動くルームデーモン。何を交換するかではなく、どう交換するかを担う。scene のログ・state、character の所有権、クライアントの入退室、WebRTC signaling の中継、cellar への永続化と**部屋全体の復元**を持つ。HTTP サーバーは持たず、`alhalte-maitre-d` と UNIX ソケットで話す。
 
 ## 公開 API / 外部接続点
 
@@ -14,8 +14,8 @@
 
 | 接続先 | 方向 | 内容 |
 | --- | --- | --- |
-| `alhalte-maitre-d` | 双方向 | UNIX ドメインソケット。4 バイト big-endian 長 + postcard のフレーム。 |
-| `alhalte-cellar` | 送信・取得 | `POST /store`、`POST /store/{tin_id}`、`GET /tin/{tin_id}`。封入した chunk、scene、room の永続化。 |
+| `alhalte-maitre-d` | 双方向 | UNIX ドメインソケット。4 バイト big-endian 長 + postcard のフレーム。部屋 head の報告もここで行う。 |
+| `alhalte-cellar` | 送信・取得 | `POST /store`、`POST /store/{tin_id}`、`GET /tin/{tin_id}`、`POST /unregister`。封入した chunk、scene、room の永続化と旧 head の解放。内部書き込みは `X-Alhalte-Service-Token` で認可する。 |
 
 CLI（`CliArgs`）:
 
@@ -25,27 +25,32 @@ CLI（`CliArgs`）:
 - `--cellar-url` / `ALHALTE_CELLAR_URL`（既定 `http://127.0.0.1:8080`）
 - `--chunk-size-exponent` / `ALHALTE_CHUNK_SIZE_EXPONENT`（既定 8）
 - `--heartbeat-interval-secs` / `ALHALTE_HEARTBEAT_INTERVAL_SECS`（既定 240）
+- `--room-tin` / `ALHALTE_ROOM_TIN`: 復元する `RoomData` の 64 hex tin id。指定時は必ず cellar から復元し、失敗したら起動しない。
+- `--service-token` / `ALHALTE_CELLAR_SERVICE_TOKEN`: 内部書き込み用トークン。値はログに出さない。
 
 ### 主な公開型
 
 | API | 内容 |
 | --- | --- |
 | `Room` / `RoomData` / `RoomPermissionLevel` | 部屋全体。scene biblio、character biblio、権限、chunk exponent。`room_id` は `u64`。 |
+| `Room::persist` / `Room::load_from_cellar` / `Room::from_tin_with_head` | 部屋全体の保存・復元。復元は room_id と root scene を検証する。 |
+| `HeartbeatOutcome` / `HeartbeatResult` | heartbeat の継続判定と、保存に成功した `RoomData` tin id。 |
 | `Scene` / `SceneData` | 独立した log と state を持つ scene。 |
 | `SceneLog` / `LogBiblio` / `LogChunk` | chunk 化された log と head。 |
 | `SceneState` | `BTreeMap<String, Tin>`。4KiB 制限と `::` 名前空間検証。 |
 | `Character` / `CharacterBiblio` | `HashMap<String, Tin>` と所有権。 |
 | `ClientFrame` / `ServerFrame` | クライアントと banquette の論理フレーム。 |
-| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。 |
+| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`BanquetteToMaitreD::RoomPersisted` で head を報告する。 |
 | `ProtocolCodec<T>` | 長さ前置 postcard コーデック。 |
-| `BanquetteServer` / `ServerConfig` | UNIX ソケットサーバー。 |
-| `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。 |
+| `BanquetteServer` / `ServerConfig` | UNIX ソケットサーバー。`run_until_shutdown` で明示的に停止できる。 |
+| `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。`unregister_tin` を含む。 |
+| `INTERNAL_WRITE_SESSION_ID` | 内部書き込みが送る session id（`0`）。合成 session は使わない。 |
 
 ### プロトコル
 
-`MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom`、`QueryAccountPermission`、`SetAccountPermission`、`SetDefaultPermission` を持つ。
+`MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom` を持つ。
 
-`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`AccountPermissionResponse` を持つ。
+`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`RoomPersisted` を持つ。`RoomPersisted { tin_id }` は `RoomData` の store が成功したときだけ送られ、`maitre-d` が `room_heads` を更新する。
 
 `ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答、BGM 変更を持つ。`ServerFrame` はその結果と broadcast を返す。
 
@@ -79,10 +84,23 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 
 ### 起動
 
-1. `Room::new(room_id, creator_account, chunk_exponent)` が `/` を作り、作成者を管理者として `std::admins` に書き込む。
-2. `BanquetteServer::run` が既存ソケットを削除し、UNIX ソケットを bind する。
-3. 4 分間隔の heartbeat タスクを起動する。初回 tick は捨てる。
-4. maitre-d からの接続ごとに `handle_connection` を spawn する。
+1. `--room-tin` が指定された場合、`Room::load_from_cellar` が cellar から tin を取得する。
+   - `Tin::decode` で復号し、tin id（内容ハッシュ）が head と一致することを確認する。
+   - `Room::from_tin` が `RoomData` を復元し、root scene `/` の存在を検証する。
+   - `RoomData.room_id` が `--room-id` と一致することを検証する。
+   - 取得・復号・検証のいずれかが失敗したら**空部屋で起動せず**、明確なエラーで終了する。
+2. `--room-tin` がない場合は `Room::new(room_id, creator_account, chunk_exponent)` が `/` を作り、作成者を管理者として `std::admins` に書き込む。
+3. `BanquetteServer::run` が既存ソケットを削除し、UNIX ソケットを bind する。
+4. heartbeat タスクを起動する。初回 tick は捨てる。
+5. maitre-d からの接続ごとに `handle_connection` を spawn する。
+
+### 部屋状態の永続化と復元
+
+- heartbeat ごとに `Room::persist` が部屋全体を `alhalte/banquette` Tin（Zstd）として cellar に保存する。内部書き込みは `INTERNAL_WRITE_SESSION_ID = 0` と `X-Alhalte-Service-Token` を使い、合成 session は使わない。
+- 保存に成功した tin id を `HeartbeatResult::persisted_tin` で返し、`RoomPersisted` として接続中の maitre-d へ通知する。保存失敗時は通知せず、ログに残して次周期に再試行する。
+- 保存に成功すると、直前の head tin を `CellarSink::unregister_tin` で best-effort に解放する。現在の head は解放しない。解放失敗は警告ログのみで、保存自体は成功扱い。
+- graceful shutdown（idle による `ShouldExit`、または `run_until_shutdown`）では終了直前に `persist` をもう一度行い、`RoomPersisted` を送ってからソケットを閉じる。
+- `room_id → head tin` のポインタは `alhalte-maitre-d` の `room_heads` が持つ。banquette 自身は head を永続化しない。
 
 ### クライアント接続
 
@@ -150,4 +168,10 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 - `ChangeBgmEvent` は `slot: u32` を主とし、旧 `track_index: Option<u8>` をフォールバックとして受け付ける。
 - log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。
 - WebRTC の DataChannel は signaling の中継までを実装し、state の DataChannel 経路そのものは未実装。
+- `RoomData` は `HashMap` を含むため、内容が同じでも postcard の map 順序が変わり tin id が変わることがある。heartbeat ごとに head が作り直されるが、旧 head の unregister と GC で回収される。wire schema は変更していない。
+- `persist` の失敗はログのみで、次周期までの再試行はない。メトリクスや専用の再試行キューは持たない。
+- 合成 session（旧 `system_session_id = 1`）は廃止した。`--service-token` が未設定の場合、内部書き込みは cellar の session 検証に失敗する。
+- graceful shutdown は idle 終了と `run_until_shutdown` のみ。SIGTERM / SIGINT は `run` に配線していないため、シグナル終了では最終 persist が走らない。
+- `Room::load_from_cellar` の download は cellar 側で認証されない（現行 cellar の download は session 検証を行わない）。service token は書き込みだけを守る。
+- `maitre-d` が記録した head が別インスタンスの persist で置き換わった場合、`maitre-d` はその旧 head を unregister しない（banquette が自分の直前 head だけを解放する）。
 

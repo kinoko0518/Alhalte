@@ -1365,10 +1365,23 @@ async fn handle_ws_upgrade(
         }
     };
 
-    let bridge = state
+    let bridge = match state
         .room_manager
         .get_or_create_room(room_id_u64, admin_account)
-        .await;
+        .await
+    {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            tracing::error!("Failed to start banquette for room {room_id_str}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to restore the room process: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let state_clone = state.clone();
     ws.on_upgrade(move |socket| {
@@ -1677,10 +1690,26 @@ async fn export_room_zip_handler(
         }
     };
 
-    let bridge = state
+    // A bridge is only created for a registered room, and it restores the room
+    // from the persisted head. If that head cannot be loaded, return an error
+    // instead of exporting a freshly fabricated empty room.
+    let bridge = match state
         .room_manager
         .get_or_create_room(room_id.as_u64(), admin_account)
-        .await;
+        .await
+    {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            tracing::error!("Failed to start banquette for export of room {room_id_str}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to restore the room state for export: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let (mut room_data, chunks) = match bridge.export_room(caller_account).await {
         Ok(data) => data,

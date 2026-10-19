@@ -413,6 +413,18 @@ pub enum BanquetteToMaitreD {
         /// Exported room snapshot and log chunks, or an error description.
         result: std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>,
     },
+    /// The whole `RoomData` was successfully stored to cellar under `tin_id`.
+    ///
+    /// `maitre-d` records this tin ID as the room's persisted head pointer so a
+    /// later spawn can restore the room. Sent only after a successful store and
+    /// also after the final persist on graceful shutdown.
+    ///
+    /// Declared last so that the postcard variant indices of pre-existing frames
+    /// stay stable (backward compatibility).
+    RoomPersisted {
+        /// Tin ID of the stored `RoomData`.
+        tin_id: TinId,
+    },
 }
 
 /// Length-delimited Postcard codec for protocol stream communication.

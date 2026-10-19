@@ -20,7 +20,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = parse_cli_args();
-    tracing::info!("Starting alhalte-maitre-d with args: {:?}", args);
+    tracing::info!(
+        "Starting alhalte-maitre-d on {}:{} (db: {:?})",
+        args.host,
+        args.port,
+        args.db_path
+    );
 
     let db = Database::open(&args.db_path)?;
     tracing::info!("SQLite database opened at {:?}", args.db_path);
@@ -33,14 +38,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.client_secret,
     ));
 
-    let spawner = Arc::new(ProcessBanquetteSpawner::new(
+    let mut spawner = ProcessBanquetteSpawner::new(
         &args.banquette_bin,
         &args.socket_dir,
         &args.cellar_url,
         args.chunk_size_exponent,
-    ));
+    );
+    match args.service_token.as_deref() {
+        Some(token) => spawner = spawner.with_service_token(token),
+        None => tracing::warn!(
+            "No --service-token configured: spawned banquette processes cannot persist room \
+             state unless cellar accepts the write through a user session"
+        ),
+    }
+    let spawner = Arc::new(spawner);
 
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
 
     let state = AppState::new(db, args.salt, oauth, room_manager)
         .with_cellar_proxy(CellarProxy::new(&args.cellar_url)?);

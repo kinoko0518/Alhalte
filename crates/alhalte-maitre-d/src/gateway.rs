@@ -16,11 +16,20 @@ use tokio::net::UnixStream;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::codec::Framed;
 
+use crate::db::Database;
 use crate::error::{MaitreDError, Result};
 use crate::spawner::BanquetteSpawner;
 
 type ExportResponseSender =
     oneshot::Sender<std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>>;
+
+/// Current UNIX timestamp in seconds, used for `room_heads.updated_at`.
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// Active bidirectional bridge connecting WebSocket clients in a room with a `banquette` process.
 pub struct RoomBridge {
@@ -41,15 +50,25 @@ pub struct RoomBridge {
 }
 
 impl RoomBridge {
-    /// Creates and spawns a new [`RoomBridge`].
+    /// Spawns a banquette for `room_id`, connects to its UNIX socket, and returns the bridge.
     ///
-    /// Messages queued before the UNIX socket is connected are preserved and flushed once connected.
-    pub fn new(
+    /// `room_head` is the persisted `RoomData` tin pointer. The spawner restores
+    /// the room from it, so a bridge is never silently created around an empty
+    /// room when a head exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the spawner fails (including a persisted head that
+    /// cannot be downloaded, decoded, or validated) or the UNIX socket does not
+    /// become connectable in time.
+    pub async fn new(
         room_id: u64,
         admin_account: u64,
+        room_head: Option<TinId>,
         spawner: Arc<dyn BanquetteSpawner>,
+        db: Database,
         on_terminated: impl Fn(u64) + Send + Sync + 'static,
-    ) -> Self {
+    ) -> Result<Self> {
         let clients = Arc::new(RwLock::new(HashMap::new()));
         let client_scenes = Arc::new(RwLock::new(HashMap::new()));
         let pending_exports = Arc::new(RwLock::new(HashMap::new()));
@@ -62,57 +81,42 @@ impl RoomBridge {
         let bridge_scenes = Arc::clone(&client_scenes);
         let bridge_exports = Arc::clone(&pending_exports);
 
+        tracing::info!("Launching banquette for room {room_id}...");
+        let socket_path = spawner
+            .spawn_banquette(room_id, admin_account, room_head)
+            .await?;
+
+        // Connect to UNIX domain socket with retry loop
+        let stream = Self::connect_with_retry(&socket_path, 60, Duration::from_millis(50)).await?;
+
+        tracing::info!(
+            "Connected to banquette for room {room_id} at {:?}",
+            socket_path
+        );
+
+        let (read_half, write_half) = stream.into_split();
+        let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+        let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+
+        // Task to flush and stream outgoing frames to banquette
+        let write_task = tokio::spawn(async move {
+            while let Some(msg) = to_banquette_rx.recv().await {
+                if let Err(e) = writer.send(msg).await {
+                    tracing::error!("Error writing frame to banquette: {e:?}");
+                    break;
+                }
+            }
+        });
+
         tokio::spawn(async move {
-            tracing::info!("Launching banquette for room {room_id}...");
-            let socket_path = match spawner.spawn_banquette(room_id, admin_account).await {
-                Ok(path) => path,
-                Err(e) => {
-                    tracing::error!("Failed to spawn banquette for room {room_id}: {e:?}");
-                    on_terminated(room_id);
-                    return;
-                }
-            };
-
-            // Connect to UNIX domain socket with retry loop
-            let stream = match Self::connect_with_retry(&socket_path, 60, Duration::from_millis(50))
-                .await
-            {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to connect to banquette socket at {:?} for room {room_id}: {e:?}",
-                        socket_path
-                    );
-                    on_terminated(room_id);
-                    return;
-                }
-            };
-
-            tracing::info!(
-                "Connected to banquette for room {room_id} at {:?}",
-                socket_path
-            );
-
-            let (read_half, write_half) = stream.into_split();
-            let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
-            let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
-
-            // Task to flush and stream outgoing frames to banquette
-            let write_task = tokio::spawn(async move {
-                while let Some(msg) = to_banquette_rx.recv().await {
-                    if let Err(e) = writer.send(msg).await {
-                        tracing::error!("Error writing frame to banquette: {e:?}");
-                        break;
-                    }
-                }
-            });
-
             // Read incoming responses and broadcasts from banquette
             while let Some(item) = reader.next().await {
                 match item {
                     Ok(frame) => {
                         Self::dispatch_banquette_frame(
                             frame,
+                            room_id,
+                            &db,
                             &bridge_clients,
                             &bridge_scenes,
                             &bridge_exports,
@@ -137,7 +141,7 @@ impl RoomBridge {
             on_terminated(room_id);
         });
 
-        Self {
+        Ok(Self {
             room_id,
             clients,
             client_scenes,
@@ -145,7 +149,7 @@ impl RoomBridge {
             pending_exports,
             export_counter,
             is_done,
-        }
+        })
     }
 
     /// Retries connecting to the UNIX domain socket until ready or timeout.
@@ -171,6 +175,8 @@ impl RoomBridge {
     /// Dispatches frames received from `banquette` to connected WebSocket clients and pending queries.
     async fn dispatch_banquette_frame(
         frame: BanquetteToMaitreD,
+        room_id: u64,
+        db: &Database,
         clients: &Arc<RwLock<HashMap<u64, mpsc::Sender<ServerFrame>>>>,
         client_scenes: &Arc<RwLock<HashMap<u64, String>>>,
         pending_exports: &Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
@@ -220,6 +226,30 @@ impl RoomBridge {
                 let mut pending = pending_exports.write().await;
                 if let Some(tx) = pending.remove(&request_id) {
                     let _ = tx.send(result);
+                }
+            }
+            // spec: alhalte-maitre-d/room-head 0001 persist RoomData head pointer
+            BanquetteToMaitreD::RoomPersisted { tin_id } => {
+                let room_id_hex = format!("{room_id:016x}");
+                match db.set_room_head(&room_id_hex, &tin_id, unix_timestamp()) {
+                    Ok(previous) => {
+                        if let Some(previous) = previous
+                            && previous != tin_id
+                        {
+                            // banquette unregisters its own superseded head; this
+                            // only happens when another instance persisted in the
+                            // meantime, so retention is left to the owner of that
+                            // head and only recorded here.
+                            tracing::debug!(
+                                "room {room_id_hex} head replaced {} -> {}",
+                                hex::encode(previous),
+                                hex::encode(tin_id)
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to record room head for {room_id_hex}: {e}");
+                    }
                 }
             }
         }
@@ -360,25 +390,45 @@ impl RoomBridge {
 pub struct RoomBridgeManager {
     rooms: Arc<RwLock<HashMap<u64, Arc<RoomBridge>>>>,
     spawner: Arc<dyn BanquetteSpawner>,
+    db: Database,
     room_done_status: Arc<RwLock<HashMap<u64, bool>>>,
 }
 
 impl RoomBridgeManager {
     /// Creates a new [`RoomBridgeManager`].
-    pub fn new(spawner: Arc<dyn BanquetteSpawner>) -> Self {
+    ///
+    /// The database is used to read the persisted room head before spawning
+    /// banquette and to record the head reported by `RoomPersisted`.
+    pub fn new(spawner: Arc<dyn BanquetteSpawner>, db: Database) -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
             spawner,
+            db,
             room_done_status: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
-    /// Obtains an existing [`RoomBridge`] or launches a new one.
-    pub async fn get_or_create_room(&self, room_id: u64, admin_account: u64) -> Arc<RoomBridge> {
+    /// Obtains an existing [`RoomBridge`] or launches a new one from the persisted head.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the room head cannot be read from the database or
+    /// when banquette cannot be spawned / connected. A head that exists but
+    /// cannot be restored surfaces here instead of yielding an empty room.
+    pub async fn get_or_create_room(
+        &self,
+        room_id: u64,
+        admin_account: u64,
+    ) -> Result<Arc<RoomBridge>> {
+        // Held across the awaited spawn so two concurrent callers cannot start
+        // two banquette processes for the same room.
         let mut rooms = self.rooms.write().await;
         if let Some(bridge) = rooms.get(&room_id) {
-            return Arc::clone(bridge);
+            return Ok(Arc::clone(bridge));
         }
+
+        let room_id_hex = format!("{room_id:016x}");
+        let room_head = self.db.get_room_head(&room_id_hex)?;
 
         let initial_done = self
             .room_done_status
@@ -396,16 +446,21 @@ impl RoomBridgeManager {
             });
         };
 
-        let bridge = Arc::new(RoomBridge::new(
-            room_id,
-            admin_account,
-            Arc::clone(&self.spawner),
-            on_term,
-        ));
+        let bridge = Arc::new(
+            RoomBridge::new(
+                room_id,
+                admin_account,
+                room_head,
+                Arc::clone(&self.spawner),
+                self.db.clone(),
+                on_term,
+            )
+            .await?,
+        );
         bridge.set_done(initial_done);
 
         rooms.insert(room_id, Arc::clone(&bridge));
-        bridge
+        Ok(bridge)
     }
 
     /// Explicitly removes a room from management.

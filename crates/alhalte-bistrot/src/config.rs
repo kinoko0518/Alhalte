@@ -116,6 +116,13 @@ impl BistrotConfig {
                 "banquette chunk-size-exponent must be between 1 and 30".to_string(),
             ));
         }
+        if let Some(token) = &self.cellar.service_token
+            && token.trim().is_empty()
+        {
+            return Err(BistrotError::ConfigValidation(
+                "cellar service-token must not be empty when set".to_string(),
+            ));
+        }
         if self.argenterie.port == 0 {
             return Err(BistrotError::ConfigValidation(
                 "argenterie port must not be 0".to_string(),
@@ -387,6 +394,16 @@ pub struct CellarConfig {
     /// Defaults to `false`. Never enable this in a production configuration.
     #[serde(default, alias = "allow_all_sessions")]
     pub allow_all_sessions: bool,
+
+    /// Internal service token shared by `maitre-d` / `banquette` / `cellar`.
+    ///
+    /// rops-managed secret. `maitre-d` forwards it to every spawned banquette,
+    /// which sends it as `X-Alhalte-Service-Token` for room state persistence;
+    /// `cellar` accepts it for internal store / unregister calls while still
+    /// verifying user sessions for the public proxy. When omitted, internal
+    /// room persistence fails unless a real user session is supplied.
+    #[serde(default, alias = "service_token")]
+    pub service_token: Option<String>,
 }
 
 /// Configuration for `alhalte-banquette` (in-memory room session processes).

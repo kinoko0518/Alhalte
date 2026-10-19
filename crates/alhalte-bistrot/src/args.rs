@@ -58,6 +58,11 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         args.push(bin.display().to_string());
     }
 
+    if let Some(ref token) = config.cellar.service_token {
+        args.push("--service-token".to_string());
+        args.push(token.clone());
+    }
+
     args
 }
 
@@ -97,6 +102,11 @@ pub fn generate_cellar_args(config: &BistrotConfig) -> Vec<String> {
 
     if config.cellar.anti_oracle {
         args.push("--anti-oracle".to_string());
+    }
+
+    if let Some(ref token) = config.cellar.service_token {
+        args.push("--service-token".to_string());
+        args.push(token.clone());
     }
 
     args

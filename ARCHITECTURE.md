@@ -100,8 +100,16 @@ client 総体 = cutlery
 1. ブラウザは部屋 URL `/rooms/<roomId>#<roomKey>` を開く。`roomKey` はフラグメントにだけ存在し、サーバーへ送らない。
 2. `argenterie` は `maitre-d` の `/ws/room/<roomId>?account_id=...&session_id=...` へ WebSocket 接続する。
 3. `maitre-d` はセッションを検証し、`rooms` に登録済みか確認する。未登録は 404、権限がなく `done=false` なら 403 で拒否する。
-4. 許可された接続は `banquette` の UNIX ソケットへ `ClientConnected` として流し込む。bridge の `admin_account` は部屋の作成者 / DB の GM で、接続順には依存しない。banquette が未起動なら起動し、接続待ちのフレームはキューに積む。
+4. 許可された接続は `banquette` の UNIX ソケットへ `ClientConnected` として流し込む。bridge の `admin_account` は部屋の作成者 / DB の GM で、接続順には依存しない。banquette が未起動なら `room_heads` の head を渡して起動する。head があり復元できない場合は 500 で失敗し、空部屋は作らない。head がなければ新しい部屋を起動する。
 5. banquette はクライアントをルートシーン `/` に入室させる。
+
+### 部屋の永続化
+
+1. banquette は heartbeat（既定 4 分）ごとに部屋全体を `alhalte/banquette` Tin として cellar に保存し、成功した tin id を `RoomPersisted` で `maitre-d` へ返す。
+2. `maitre-d` は `room_heads(room_id, tin_id, updated_at)` に head を記録する。
+3. 新 head の保存後、banquette は旧 head の参照を best-effort で unregister し、cellar GC が実体を回収できるようにする。現在の head は削除しない。
+4. idle 終了などの graceful shutdown では、終了直前にもう一度 persist してから終了する。
+5. 次回 spawn 時は head から scenes / state / characters / log biblio / admins / done を復元する。
 
 ### 発言
 
@@ -121,7 +129,7 @@ client 総体 = cutlery
 ### エクスポート
 
 1. `maitre-d` の `GET /api/room/<roomId>/export/zip?type=full|logs` は `rooms` を引き、未登録は 404、非メンバーかつ `done=false` は 403 で拒否する。空の部屋を暗黙作成しない。
-2. 許可された場合、`banquette` に `ExportRoom` を送る。bridge が未起動なら作成者 / DB GM を admin として起動する。
+2. 許可された場合、`banquette` に `ExportRoom` を送る。bridge が未起動なら作成者 / DB GM を admin として起動し、`room_heads` の head から部屋を復元する。復元できない場合は 5xx を返し、空の ZIP を返さない。
 3. banquette は権限のある scene と log chunk を `RoomData` にまとめて返す。
 4. `maitre-d` は `alhalte-kitchen` で ZIP を組み立てて返す。
 5. `alhalte-kitchen` CLI は ZIP / tar.gz を読み、`RoomGraph` を作り、HTML5 または EPUB に変換する。
@@ -154,7 +162,7 @@ client 総体 = cutlery
 
 ### 権限
 
-現行 main では、`maitre-d` が SQLite の `rooms(room_id, name, creator_account, created_at)` で部屋を管理し、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保持する。WebSocket 接続時の入場可否と viewer の mutate 遮断を行う。部屋は `POST /api/rooms` で明示的に作成し、未登録の部屋への WS / export は 404 で拒否する。`banquette` 側は `done` フラグと `std::admins` による scene アクセス制御を持つ。
+現行 main では、`maitre-d` が SQLite の `rooms(room_id, name, creator_account, created_at)` で部屋を管理し、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保持する。WebSocket 接続時の入場可否と viewer の mutate 遮断を行う。部屋は `POST /api/rooms` で明示的に作成し、未登録の部屋への WS / export は 404 で拒否する。`banquette` 側は `done` フラグと `std::admins` による scene アクセス制御を持つ。部屋状態の永続 head は `room_heads` が持ち、内部書き込みの認可は `cellar.service-token` が担う。
 
 Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせる構成へ、`banquette` は `Denied` / `Viewer` / `Participant` / `Admin` の 4 段階へ移行中である。移行の詳細と現時点の未接続点は [banquette](crates/alhalte-banquette/ARCHITECTURE.md) と [maitre-d](crates/alhalte-maitre-d/ARCHITECTURE.md) に記す。
 
@@ -164,6 +172,15 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 - 公開 API に rustdoc。ライブラリ内で `unwrap` / `expect` / `panic!` を使わない（テストは可）。
 - エラーは `thiserror` で型付けする。
 - 外部ネットワークに依存するテストを書かない。
+
+### 内部資格情報
+
+ブラウザ以外の内部書き込み（banquette の部屋状態 persistence）は、ユーザー session を詐称せず `cellar.service-token` を使う。
+
+- `Bistrot.toml` の `[cellar] service-token`（rops 管理）を `maitre-d` と `cellar` に渡す。
+- `maitre-d` は spawn する banquette に `--service-token` を伝播し、banquette は `X-Alhalte-Service-Token` で cellar に送る。
+- cellar は提示されたトークンを定数時間比較し、一致すれば内部書き込みを許可する。ユーザー session の検証は公開 proxy / 通常クライアント経路で維持する。
+- トークンはログに出さない。`--client-secret` と同様に引数で渡るため `ps` から読める点は既知の制約で、`EnvironmentFile` 化は今後の課題。
 
 ## 拡張機能
 
@@ -187,6 +204,8 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 | 領域 | 設計時の記述 | 現在の実装 |
 | --- | --- | --- |
 | 権限 | 部屋の `done` フラグと `std::admins` | `maitre-d` の SQLite `gm/pl/viewer` と `done` を併用。Issue #114 で 4 段階権限へ移行中。 |
+| 部屋状態 | 部屋プロセスは揮発 | `maitre-d` の `room_heads` と cellar の `alhalte/banquette` Tin で永続化し、spawn 時に復元する。復元失敗は空部屋にフォールバックしない。 |
+| 内部書き込み | ユーザー session で認可 | `cellar.service-token` による内部認証。合成 session（旧 `system_session_id = 1`）は廃止。 |
 | 拡張 ABI | `process-generast(Generast) -> Generast` | `process_generast(ptr, len) -> i64`。`(Generast, speaker_id)` の Tin を入出力し、`alhalte_abi_version` / `alloc` / `dealloc` / `self_introduction` を持つ。 |
 | canner | クライアント側 wasm の `encode-*` / `encrypt-*` | Rust ライブラリとして実装済み。WASM ABI は未エクスポート。ブラウザでは `pantry` の TS 実装が暗号・展開を担う。 |
 | アセット | `pantry` が cellar から取得・復号・キャッシュ | `argenterie` は `pantry` の `encodeTin` で RoomKey 暗号化した Tin を maitre-d の `/api/cellar/*` proxy 経由で cellar へ保存し、進捗・失敗・再試行をカードに出す。room アセットのメタデータは `/` の state、personal は localStorage のみ。拡張 wasm も同じ経路で `tinId` だけを state に持つ。 |

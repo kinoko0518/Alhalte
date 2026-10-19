@@ -180,6 +180,12 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_room_permissions_room ON room_permissions(room_id);
             CREATE INDEX IF NOT EXISTS idx_room_permissions_account ON room_permissions(account_id);
+
+            CREATE TABLE IF NOT EXISTS room_heads (
+                room_id TEXT PRIMARY KEY,
+                tin_id BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
             ",
         )?;
 
@@ -735,6 +741,89 @@ impl Database {
             .optional()?;
 
         Ok(room)
+    }
+
+    /// Retrieves the persisted `RoomData` head tin for a room.
+    ///
+    /// The `room_heads` row is external metadata: the `RoomData` wire schema is
+    /// unchanged. `None` means the room has never been persisted and a new room
+    /// may be started.
+    pub fn get_room_head(&self, room_id: &str) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare("SELECT tin_id FROM room_heads WHERE room_id = ?1")?;
+        let blob: Option<Vec<u8>> = stmt
+            .query_row(params![room_id], |row| row.get(0))
+            .optional()?;
+
+        match blob {
+            None => Ok(None),
+            Some(bytes) => {
+                let len = bytes.len();
+                bytes.try_into().map(Some).map_err(|_| {
+                    MaitreDError::Database(rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        Box::new(std::io::Error::other(format!(
+                            "room_heads.tin_id for {room_id} must be 32 bytes, got {len}"
+                        ))),
+                    ))
+                })
+            }
+        }
+    }
+
+    /// Stores or replaces the persisted `RoomData` head tin for a room.
+    ///
+    /// Returns the previously recorded head tin, if any. Callers may use it to
+    /// reclaim the superseded head from cellar; the banquette process performs
+    /// that best-effort unregister itself for the normal path.
+    pub fn set_room_head(
+        &self,
+        room_id: &str,
+        tin_id: &[u8; 32],
+        now: i64,
+    ) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let previous: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT tin_id FROM room_heads WHERE room_id = ?1",
+                params![room_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        conn.execute(
+            "INSERT INTO room_heads (room_id, tin_id, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (room_id) DO UPDATE SET tin_id = excluded.tin_id,
+                                                 updated_at = excluded.updated_at",
+            params![room_id, tin_id.as_slice(), now],
+        )?;
+
+        match previous {
+            None => Ok(None),
+            Some(bytes) => {
+                if bytes.len() == 32 {
+                    let mut out = [0u8; 32];
+                    out.copy_from_slice(&bytes);
+                    Ok(Some(out))
+                } else {
+                    // A corrupt legacy row is replaced by the new head; report no
+                    // usable previous head rather than failing the write.
+                    Ok(None)
+                }
+            }
+        }
     }
 
     /// Sets or updates the permission role for an account in a room.
