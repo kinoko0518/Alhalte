@@ -17,25 +17,18 @@ socket-dir = ".alhalte/sockets"
 
 [maitre-d]
 port = 8080
-client-id = "alhalte-local-client"
-# ローカル開発専用の平文 secret。本番は age armor にする。
-client-secret = "alhalte-local-secret"
+# debug-login では Google OAuth を使わないが、MaitreDConfig は
+# client-id / client-secret を必須フィールドとして要求する。
+# Google ログインを使う場合は Bistrot.local.toml（実資格情報）で起動する。
+client-id = "debug-client-id"
+client-secret = "debug-client-secret"
 salt = "alhalte-local-instance-salt-0001"
+debug-login = true
 
 [cellar]
 port = 8081
 anti-oracle = false
-# maitre-d の session 検証エンドポイント。未指定なら
-# http://<restaurant.host>:<maitre-d.port>（0.0.0.0 / :: は 127.0.0.1）を使う。
-# maitre-d-url = "http://127.0.0.1:8080"
-# maitre-d-socket = ".alhalte/sockets/maitre-d.sock"
-# ローカル開発専用。true にするとすべての session を許可する（既定 false）。
 allow-all-sessions = false
-# 内部書き込み用のサービス間トークン（age armor で暗号化する秘密値）。
-# maitre-d / banquette / cellar が同じ値を使う。未設定の場合、banquette の
-# 部屋状態 persistence は cellar に拒否される（本番では必ず設定する）。
-# 下記はローカル開発専用の既定値。本番では
-# `alhalte-bistrot encrypt-value` で作った armored 値に必ず差し替えること。
 service-token = "alhalte-local-service-token"
 
 [banquette]

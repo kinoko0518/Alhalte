@@ -111,9 +111,9 @@
 
 ホーム画面は mount 時に `fetchServerInfo`（`GET /api/server-info`）を呼び、`debug_login === true` なら全画面警告を出す。`alhalte-maitre-d --debug-login` は account 名だけでサインインできるため、公開インスタンスで有効にしてはならない。
 
-- 警告は `role="alert"` の fixed 全画面レイヤ（`data-testid="debug-login-warning"`）。ホーム画面の内容の上に重ねる。
+- 警告は `role="alertdialog"` / `aria-modal="true"` の fixed 全画面レイヤ（`data-testid="debug-login-warning"`）。ホーム画面の内容の上に重ねる。
 - 中央大文字の見出し「管理者向けの警告」と、本文「現在デバッグログインが有効になっています。公開されるインスタンスでこの機能を利用するのは推奨されません。」
-- 閉じるボタンは置かない（警告を消して通常運用に見せかけられないようにする）。
+- 「閉じる」ボタン（`data-testid="debug-login-warning-close"`）でそのマウント中は非表示にできる。再読み込みすると再表示される。
 - `fetchServerInfo` は 404 / 通信失敗 / 不正な body をすべて `{ debug_login: false }` に落とす。警告の取得失敗でホーム画面を壊さない。
 - サインイン導線は従来どおり `GET /auth/login` のままで、debug 時は maitre-d が `/auth/debug/login` へ 302 する。argenterie 側に分岐は無い。
 

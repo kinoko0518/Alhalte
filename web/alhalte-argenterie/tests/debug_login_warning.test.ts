@@ -86,7 +86,8 @@ describe('Debug login warning (Issue #150)', () => {
     const warning = target.querySelector<HTMLElement>('[data-testid="debug-login-warning"]')!;
 
     // 中央大文字の警告 and the fixed sentence.
-    expect(warning.getAttribute('role')).toBe('alert');
+    expect(warning.getAttribute('role')).toBe('alertdialog');
+    expect(warning.getAttribute('aria-modal')).toBe('true');
     expect(warning.textContent).toContain('管理者向けの警告');
     expect(warning.textContent).toContain(
       '現在デバッグログインが有効になっています。公開されるインスタンスでこの機能を利用するのは推奨されません。',
@@ -97,6 +98,17 @@ describe('Debug login warning (Issue #150)', () => {
     const card = warning.querySelector('.debug-login-warning-card');
     expect(card).toBeTruthy();
     expect(target.querySelector('[data-testid="home-screen"]')).toBeTruthy();
+
+    // It can be dismissed for the current mount.
+    const close = target.querySelector<HTMLButtonElement>(
+      '[data-testid="debug-login-warning-close"]',
+    );
+    expect(close).toBeTruthy();
+    close!.click();
+    await vi.waitFor(() =>
+      expect(target.querySelector('[data-testid="debug-login-warning"]')).toBeNull(),
+    );
+    expect(target.querySelector('[data-testid="create-room-button"]')).toBeTruthy();
 
     unmount(instance);
     target.remove();

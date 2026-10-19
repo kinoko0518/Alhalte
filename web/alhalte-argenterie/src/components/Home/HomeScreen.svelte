@@ -254,19 +254,34 @@
   {#if debugLogin}
     <!-- Issue #150: `maitre-d --debug-login` is a development-only mode that
          accepts a name as the whole credential. The warning is a full-screen
-         overlay on the home screen so it cannot be mistaken for normal
-         operation; it is deliberately not dismissible. -->
+         dialog on the home screen so it cannot be mistaken for normal
+         operation. It can be dismissed for the current mount and reappears on
+         the next full load. -->
     <div
       class="debug-login-warning"
-      role="alert"
-      aria-live="assertive"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="debug-login-warning-title"
+      aria-describedby="debug-login-warning-body"
       data-testid="debug-login-warning"
     >
       <div class="debug-login-warning-card">
-        <h1 class="debug-login-warning-title">管理者向けの警告</h1>
-        <p class="debug-login-warning-body">
+        <h1 id="debug-login-warning-title" class="debug-login-warning-title">
+          管理者向けの警告
+        </h1>
+        <p id="debug-login-warning-body" class="debug-login-warning-body">
           現在デバッグログインが有効になっています。公開されるインスタンスでこの機能を利用するのは推奨されません。
         </p>
+        <button
+          type="button"
+          class="debug-login-warning-close"
+          data-testid="debug-login-warning-close"
+          onclick={() => {
+            debugLogin = false;
+          }}
+        >
+          閉じる
+        </button>
       </div>
     </div>
   {/if}
@@ -498,8 +513,7 @@
     overflow-y: auto;
   }
   /* Issue #150: full-screen warning while `maitre-d --debug-login` is active.
-     It covers the home screen in every layout and cannot be dismissed: a
-     debug-login instance must not be mistaken for a normal one. */
+     It covers the home screen in every layout until the user dismisses it. */
   .debug-login-warning {
     position: fixed;
     inset: 0;
@@ -531,6 +545,25 @@
     margin: 0;
     font-size: 1rem;
     line-height: 1.7;
+  }
+  .debug-login-warning-close {
+    align-self: center;
+    min-width: 8rem;
+    padding: 0.7rem 1.4rem;
+    border: 1px solid currentColor;
+    border-radius: 999px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    font-weight: 700;
+    cursor: pointer;
+  }
+  .debug-login-warning-close:hover {
+    background: color-mix(in srgb, currentColor 12%, transparent);
+  }
+  .debug-login-warning-close:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 3px;
   }
   .brand-emblem {
     display: flex;
