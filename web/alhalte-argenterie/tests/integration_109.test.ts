@@ -9,7 +9,8 @@
  * - send timeout → durable outbox → reconnect flush → echo,
  * - scene create ack applies the scene, timeout keeps the list untouched,
  * - character save timeout queues and the reconnect flush applies it,
- * - extension tab offline state dims and disables the tab even for an admin,
+ * - extension tab offline state stays readable while its actions are disabled
+ *   even for an admin (Issue #146 / #149),
  * - asset upload progress / failure through a mocked cellar transfer.
  *
  * No network: `cellarTransfer` is mocked, the socket is
@@ -397,8 +398,9 @@ describe('Issue #109 cross-feature integration (#146)', () => {
     expect(await getOutbox().list(ROOM.id!, 'character')).toHaveLength(0);
   });
 
-  // spec: Issue #145 オフライン時は管理者でも拡張機能タブを暗転・操作不可にする (Issue #146)
-  it('dims and disables the extension tab while offline even for an admin', async () => {
+  // spec: Issue #145 オフライン時は管理者でも拡張機能の操作を無効化する (Issue #146)
+  // spec: Issue #149 オフラインでも一覧は読め・スクロールでき、シェルは暗転しない
+  it('keeps the extension tab readable while disabling its actions offline', async () => {
     const socket = new FakeRoomSocket();
     socket.autoAnswerStateQueries = false;
     const { connectionManager } = mountApp(socket);
@@ -413,14 +415,26 @@ describe('Issue #109 cross-feature integration (#146)', () => {
 
     const root = extensionTabRoot();
     expect(root?.classList.contains('extensions-offline')).toBe(true);
-    expect(root?.getAttribute('aria-disabled')).toBe('true');
+    // The shell is not disabled/dimmed as a whole (Issue #149).
+    expect(root?.getAttribute('aria-disabled')).toBeNull();
     expect(
       target.querySelector('[data-testid="extension-offline-notice"]')?.textContent,
     ).toContain('サーバーと通信できませんでした');
+    // The list remains readable and scrollable while offline.
+    expect(target.querySelector('[data-testid="extension-list"]')).toBeTruthy();
+    expect(
+      target.querySelector('[data-testid="ext-name-alhalte-dsl"]')?.textContent?.trim(),
+    ).toBe('Alhalte DSL');
+    expect(root?.querySelector('.extension-tab-container')).toBeTruthy();
 
-    // Admin is still `isAdmin`, yet the offline gate blocks the write.
+    // Admin is still `isAdmin`, yet the offline gate disables the toggle only.
+    const offlineToggle = target.querySelector<HTMLInputElement>(
+      '[data-testid="ext-toggle-alhalte-dsl"]',
+    );
+    expect(offlineToggle?.disabled).toBe(true);
+    expect(offlineToggle?.getAttribute('aria-disabled')).toBe('true');
     const writesBefore = socket.requestUpdateStateCalls.length;
-    target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-alhalte-dsl"]')?.click();
+    offlineToggle?.click();
     await tick(20);
     expect(socket.requestUpdateStateCalls).toHaveLength(writesBefore);
 

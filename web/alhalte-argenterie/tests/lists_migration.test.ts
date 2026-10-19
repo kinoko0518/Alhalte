@@ -210,8 +210,8 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/extensions-abi 非管理者時の無効化・暗転制御
-  it('locks and grays out extension management tab for non-admin users with opacity and pointer-events', () => {
+  // spec: alhalte-argenterie/extensions-abi 非管理者時の無効化（読み取り専用・暗転しない）(Issue #149)
+  it('keeps extension management readable for non-admin users and disables only the actions', () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -234,19 +234,32 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
     const rootEl = target.querySelector<HTMLDivElement>('[data-testid="extension-management-tab"]');
     expect(rootEl).toBeTruthy();
     expect(rootEl?.classList.contains('non-admin-locked')).toBe(true);
+    // Issue #149: the shell is not disabled/dimmed; the list stays readable.
+    expect(rootEl?.getAttribute('aria-disabled')).toBeNull();
+    expect(target.querySelector('[data-testid="extension-list"]')).toBeTruthy();
+    expect(
+      target.querySelector('[data-testid="ext-name-ext-calc"]')?.textContent?.trim(),
+    ).toBe('計算拡張');
 
     // Lock indicator
     expect(target.querySelector('[data-testid="lock-indicator"]')).toBeTruthy();
 
-    // Admin-only upload button must not exist
+    // Admin-only upload and reorder controls must not exist
     expect(target.querySelector('[data-testid="upload-extension-btn"]')).toBeNull();
+    expect(target.querySelector('[data-testid="move-up-btn-ext-calc"]')).toBeNull();
 
-    // Switch and More button must be disabled
+    // Switch and More button must be disabled and marked aria-disabled.
     const switchInput = target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-ext-calc"]');
     expect(switchInput?.disabled).toBe(true);
+    expect(switchInput?.getAttribute('aria-disabled')).toBe('true');
 
     const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="ext-more-btn-ext-calc"]');
     expect(moreBtn?.disabled).toBe(true);
+    expect(moreBtn?.getAttribute('aria-disabled')).toBe('true');
+
+    const deleteItem = target.querySelector<HTMLElement>('[data-testid="ext-delete-btn-ext-calc"]');
+    expect(deleteItem).toBeTruthy();
+    expect(deleteItem?.getAttribute('aria-disabled')).toBe('true');
 
     unmount(instance);
     target.remove();

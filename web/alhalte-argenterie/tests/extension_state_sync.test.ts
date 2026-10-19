@@ -1,14 +1,17 @@
 /**
  * Integration tests for the extension tab server synchronization.
  *
- * Contract under test (Issue #109 / sub-issue #145):
+ * Contract under test (Issue #109 / sub-issue #145, Issue #149):
  * - opening the extensions tab sends `QueryState('/')` and shows a contained M3
  *   `LoadingIndicator` over the cached list,
  * - the server metadata is merged into the local list (built-in official ids
  *   stay, custom ids absent remotely are removed, local wasm is kept when the
  *   tin id did not change),
  * - a timeout flips the tab into the offline state ("サーバーと通信できませんでした",
- *   dimmed, `aria-disabled`, inert even for admins) and a reconnect retries,
+ *   readable banner, `aria-disabled` only on the mutation controls, inert
+ *   actions even for admins) and a reconnect retries,
+ * - the offline / non-admin shell itself is never dimmed and has no
+ *   `pointer-events: none`: the list stays readable and scrollable (Issue #149),
  * - toggle / reorder / delete send the matching state write and update the local
  *   model only after the acknowledgement (wavy `CircularProgress` while pending),
  * - a failed write leaves the list unchanged and flips the tab offline,
@@ -104,6 +107,19 @@ function seededState(overrides: Record<string, unknown> = {}): Record<string, un
 const markdownWasm = fs.readFileSync(
   path.resolve(__dirname, '../public/extensions/markdown.wasm'),
 );
+
+/** Raw component source, used to assert the Issue #149 shell CSS contract. */
+const EXTENSION_TAB_SOURCE = fs.readFileSync(
+  path.resolve(__dirname, '../src/components/Control/tabs/ExtensionManagementTab.svelte'),
+  'utf8',
+);
+
+/** Declarations of the first rule whose selector matches exactly. */
+function styleRule(selector: string): string | null {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = EXTENSION_TAB_SOURCE.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+  return match ? match[1] : null;
+}
 
 function tick(ms = 20): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -308,6 +324,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
   });
 
   // spec: Issue #145 タイムアウトでオフライン表示・管理者でも操作不可・再接続で再試行
+  // spec: Issue #149 オフラインでもシェルは暗転せず、操作ボタンだけを無効化する
   it('enters the offline state on a timeout, ignores admin input, and retries after reconnect', async () => {
     const socket = new FakeRoomSocket();
     socket.autoAnswerStateQueries = false;
@@ -323,14 +340,18 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
 
     const root = extensionTabRoot();
     expect(root?.classList.contains('extensions-offline')).toBe(true);
-    expect(root?.getAttribute('aria-disabled')).toBe('true');
+    // Issue #149: the shell is not disabled as a whole; only the actions are.
+    expect(root?.getAttribute('aria-disabled')).toBeNull();
     expect(offlineNotice()?.textContent).toContain('サーバーと通信できませんでした');
     expect(target.querySelector('[data-testid="extension-loading-indicator"]')).toBeNull();
-    // The cached list is kept (not cleared) while offline.
+    // The cached list is kept (not cleared) and stays readable while offline.
     expect(extName('alhalte-dsl')).toBe('Alhalte DSL');
+    expect(target.querySelector('[data-testid="extension-list"]')).toBeTruthy();
 
     // Even an admin cannot mutate the room state while offline.
     const writesBefore = socket.requestUpdateStateCalls.length;
+    expect(toggle('alhalte-dsl')?.disabled).toBe(true);
+    expect(toggle('alhalte-dsl')?.getAttribute('aria-disabled')).toBe('true');
     toggle('alhalte-dsl')?.click();
     await tick(20);
     expect(socket.requestUpdateStateCalls).toHaveLength(writesBefore);
@@ -478,11 +499,96 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     await tick(40);
 
     expect(extensionTabRoot()?.classList.contains('extensions-offline')).toBe(true);
-    expect(extensionTabRoot()?.getAttribute('aria-disabled')).toBe('true');
+    // Issue #149: the shell stays readable; the failed row's action is disabled.
+    expect(extensionTabRoot()?.getAttribute('aria-disabled')).toBeNull();
+    expect(toggle('markdown')?.disabled).toBe(true);
+    expect(toggle('markdown')?.getAttribute('aria-disabled')).toBe('true');
+    expect(extName('markdown')).toBe('Markdown スタイル');
     expect(offlineNotice()?.textContent).toContain('サーバーと通信できませんでした');
     // The local model was not updated.
     expect(toggle('markdown')?.getAttribute('aria-checked')).toBe('true');
     expect(target.querySelector('[data-testid="ext-pending-markdown"]')).toBeNull();
+  });
+
+  // spec: Issue #149 オフラインでも一覧は読め・スクロールでき、操作ボタンだけが無効になる
+  it('keeps the offline list readable and scrollable and disables only the mutation controls', async () => {
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerStateQueries = false;
+    mountApp(socket);
+    await tick(30);
+    openExtensionsTab();
+    await tick(30);
+
+    socket.rejectStateQuery(new OperationTimeoutError('queryState', 8000));
+    await tick(40);
+
+    const root = extensionTabRoot()!;
+    expect(root.classList.contains('extensions-offline')).toBe(true);
+    // The shell itself must not be disabled; only the controls below are.
+    expect(root.getAttribute('aria-disabled')).toBeNull();
+
+    // Readable banner: assertive alert with title and hint.
+    const notice = offlineNotice()!;
+    expect(notice.getAttribute('role')).toBe('alert');
+    expect(notice.getAttribute('aria-live')).toBe('assertive');
+    expect(notice.textContent).toContain('サーバーと通信できませんでした');
+    expect(notice.textContent).toContain('接続が戻ると自動的に再試行します');
+
+    // The list stays visible and sits inside the scrollable tab container.
+    const list = target.querySelector('[data-testid="extension-list"]');
+    expect(list).toBeTruthy();
+    expect(extName('alhalte-dsl')).toBe('Alhalte DSL');
+    expect(extName('markdown')).toBe('Markdown スタイル');
+    const scrollContainer = root.querySelector('.extension-tab-container');
+    expect(scrollContainer).toBeTruthy();
+    expect(scrollContainer?.contains(list)).toBe(true);
+
+    // Every mutation control is `disabled` + `aria-disabled` for an admin too.
+    const controls: HTMLElement[] = [
+      target.querySelector('[data-testid="upload-extension-btn"]')!,
+      toggle('alhalte-dsl')!,
+      target.querySelector('[data-testid="ext-more-btn-alhalte-dsl"]')!,
+      target.querySelector('[data-testid="ext-delete-btn-alhalte-dsl"]')!,
+      target.querySelector('[data-testid="move-up-btn-alhalte-dsl"]')!,
+      target.querySelector('[data-testid="move-down-btn-alhalte-dsl"]')!,
+    ];
+    for (const control of controls) {
+      expect(control).toBeTruthy();
+      expect(control.getAttribute('aria-disabled')).toBe('true');
+      if (control instanceof HTMLButtonElement || control instanceof HTMLInputElement) {
+        expect(control.disabled).toBe(true);
+      }
+    }
+  });
+
+  // spec: Issue #149 オフライン / 非管理者のシェルと一覧を暗転・クリック透過にしない
+  it('never dims or makes the offline / non-admin shell inert in CSS', () => {
+    for (const selector of [
+      '.extension-tab-shell.extensions-offline',
+      '.extension-tab-shell.non-admin-locked',
+    ]) {
+      const declarations = styleRule(selector) ?? '';
+      expect(declarations).not.toMatch(/opacity\s*:/);
+      expect(declarations).not.toMatch(/pointer-events\s*:/);
+      expect(declarations).not.toMatch(/filter\s*:/);
+    }
+
+    // The list scrolls inside the tab container while the rows stay visible.
+    expect(styleRule('.extension-tab-container')).toContain('overflow-y: auto');
+    expect(styleRule('.extension-list-wrapper')).not.toMatch(/pointer-events\s*:|opacity\s*:/);
+    // No grayscale dimming anywhere in the tab (Issue #149).
+    expect(EXTENSION_TAB_SOURCE).not.toMatch(/grayscale/);
+
+    // The offline banner uses full-contrast error tokens (no dimmed text).
+    const notice = styleRule('.extension-offline-notice') ?? '';
+    expect(notice).toContain('background: var(--np-color-error-container)');
+    expect(notice).toContain('color: var(--np-color-on-error-container)');
+    expect(notice).not.toMatch(/opacity\s*:/);
+    expect(styleRule('.offline-hint')).not.toMatch(/opacity\s*:/);
+
+    // Only the loading overlay is click-through; the shell / list never are.
+    expect(EXTENSION_TAB_SOURCE.match(/pointer-events\s*:/g)).toHaveLength(1);
+    expect(styleRule('.extension-loading-overlay')).toContain('pointer-events: none');
   });
 
   // spec: Issue #145 アップロードは検証→cellar 保存→state 更新の順で行い、wasm は state に載せない
