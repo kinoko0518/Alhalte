@@ -931,7 +931,7 @@ path = "dummy.wasm"
     assert!(parse_bistrot_toml(toml_str).is_err());
 }
 
-// spec: alhalte-bistrot/stage-extensions
+// spec: alhalte-bistrot/stage-extensions 0001 every configured wasm is copied and listed in manifest.json
 #[test]
 fn test_stage_extensions_files_and_manifest() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -944,8 +944,6 @@ fn test_stage_extensions_files_and_manifest() {
 
     let wasm2_path = src_dir.join("ext_2.wasm");
     std::fs::write(&wasm2_path, b"\0asm\x01\0\0\0dummy2").unwrap();
-
-    let missing_wasm_path = src_dir.join("missing.wasm");
 
     let toml_str = format!(
         r#"
@@ -966,22 +964,15 @@ enabled = true
 id = "second-ext"
 path = "{}"
 enabled = false
-
-[[extensions]]
-id = "missing-ext"
-name = "Missing Ext"
-path = "{}"
-enabled = true
 "#,
         wasm1_path.display(),
         wasm2_path.display(),
-        missing_wasm_path.display(),
     );
 
     let config = parse_bistrot_toml(&toml_str).unwrap();
     let manifest_entries = config.stage_extensions(&out_dir).unwrap();
 
-    assert_eq!(manifest_entries.len(), 3);
+    assert_eq!(manifest_entries.len(), 2);
 
     // Check entry 0
     assert_eq!(manifest_entries[0].id, "first-ext");
@@ -997,13 +988,6 @@ enabled = true
     assert!(!manifest_entries[1].enabled);
     assert_eq!(manifest_entries[1].priority, 1);
 
-    // Check entry 2
-    assert_eq!(manifest_entries[2].id, "missing-ext");
-    assert_eq!(manifest_entries[2].name, "Missing Ext");
-    assert_eq!(manifest_entries[2].url, "/extensions/missing-ext.wasm");
-    assert!(manifest_entries[2].enabled);
-    assert_eq!(manifest_entries[2].priority, 2);
-
     // Verify files copied
     assert_eq!(
         std::fs::read(out_dir.join("first-ext.wasm")).unwrap(),
@@ -1013,13 +997,124 @@ enabled = true
         std::fs::read(out_dir.join("second-ext.wasm")).unwrap(),
         b"\0asm\x01\0\0\0dummy2"
     );
-    assert!(!out_dir.join("missing-ext.wasm").exists());
 
     // Verify manifest.json on disk
     let manifest_content = std::fs::read_to_string(out_dir.join("manifest.json")).unwrap();
     let parsed_manifest: Vec<ExtensionManifestEntry> =
         serde_json::from_str(&manifest_content).unwrap();
     assert_eq!(parsed_manifest, manifest_entries);
+}
+
+// spec: alhalte-bistrot/stage-extensions 0002 a missing wasm fails staging without partial output
+#[test]
+fn test_stage_extensions_missing_wasm_is_an_error_without_partial_output() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let src_dir = temp_dir.path().join("src");
+    std::fs::create_dir_all(&src_dir).unwrap();
+    let out_dir = temp_dir.path().join("staged");
+
+    let wasm_path = src_dir.join("present.wasm");
+    std::fs::write(&wasm_path, b"\0asm\x01\0\0\0present").unwrap();
+    let missing_wasm_path = src_dir.join("missing.wasm");
+
+    let toml_str = format!(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[[extensions]]
+id = "present-ext"
+path = "{}"
+enabled = true
+
+[[extensions]]
+id = "missing-ext"
+name = "Missing Ext"
+path = "{}"
+enabled = true
+"#,
+        wasm_path.display(),
+        missing_wasm_path.display(),
+    );
+
+    let config = parse_bistrot_toml(&toml_str).unwrap();
+    let err = config.stage_extensions(&out_dir).unwrap_err();
+
+    match err {
+        alhalte_bistrot::BistrotError::ExtensionWasmMissing { id, path } => {
+            assert_eq!(id, "missing-ext");
+            assert_eq!(path, missing_wasm_path);
+        }
+        other => panic!("expected ExtensionWasmMissing, got {other:?}"),
+    }
+
+    // Nothing is staged and no manifest entry can point at the missing wasm.
+    assert!(!out_dir.join("missing-ext.wasm").exists());
+    assert!(!out_dir.join("present-ext.wasm").exists());
+    assert!(!out_dir.join("manifest.json").exists());
+}
+
+// spec: alhalte-bistrot/stage-extensions 0003 relative paths resolve against base_dir and must exist
+#[test]
+fn test_stage_extensions_with_base_resolves_relative_paths() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let base_dir = temp_dir.path().join("config");
+    let wasm_dir = base_dir.join("wasm");
+    std::fs::create_dir_all(&wasm_dir).unwrap();
+    std::fs::write(wasm_dir.join("rel.wasm"), b"\0asm\x01\0\0\0rel").unwrap();
+    let out_dir = temp_dir.path().join("staged");
+
+    let relative_toml = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[[extensions]]
+id = "rel-ext"
+path = "wasm/rel.wasm"
+"#;
+    let config = parse_bistrot_toml(relative_toml).unwrap();
+    let entries = config
+        .stage_extensions_with_base(&out_dir, Some(&base_dir))
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].url, "/extensions/rel-ext.wasm");
+    assert!(out_dir.join("rel-ext.wasm").exists());
+
+    // A relative path that does not resolve inside base_dir is a configuration
+    // error, reported with the path that was actually checked.
+    let missing_toml = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[[extensions]]
+id = "gone-ext"
+path = "wasm/gone.wasm"
+"#;
+    let missing_config = parse_bistrot_toml(missing_toml).unwrap();
+    let missing_out = temp_dir.path().join("staged-missing");
+    let err = missing_config
+        .stage_extensions_with_base(&missing_out, Some(&base_dir))
+        .unwrap_err();
+    match err {
+        alhalte_bistrot::BistrotError::ExtensionWasmMissing { id, path } => {
+            assert_eq!(id, "gone-ext");
+            assert_eq!(path, base_dir.join("wasm/gone.wasm"));
+        }
+        other => panic!("expected ExtensionWasmMissing, got {other:?}"),
+    }
+    assert!(!missing_out.join("manifest.json").exists());
 }
 
 // spec: alhalte-bistrot/extensions

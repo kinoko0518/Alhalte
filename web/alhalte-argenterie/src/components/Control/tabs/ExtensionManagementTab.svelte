@@ -14,6 +14,15 @@
    * (`utils/extensions.ts`); missing wasm bodies are downloaded from the cellar
    * and registered with the pipeline through `onRegisterExtension`.
    *
+   * ## One-time seed and server authority (Issue #165)
+   *
+   * When the room root state has no `extension::__seeded` marker, a GM writes
+   * the official defaults the server does not list and then the marker. After
+   * that the server state is authoritative: an official default that is not
+   * listed was deleted and never comes back on reload / reconnect. Rows whose
+   * wasm could not be loaded show `wasm がありません` and cannot be enabled
+   * (delete / reorder still work so the admin can clean up).
+   *
    * ## Ack-before-model
    *
    * Toggle / delete / reorder / upload never update optimistically:
@@ -57,11 +66,15 @@
   import type { ConnectionState } from '../../../utils/connection.js';
   import type { RoomSocket } from '../../../utils/roomSocket.js';
   import {
+    EXTENSION_SEEDED_MARKER_VALUE,
+    EXTENSION_SEEDED_STATE_KEY,
     EXTENSION_STATE_SCENE_ID,
     applyRemoteExtensions,
+    buildExtensionSeed,
     extensionStateKey,
     extensionToMetadata,
     isExtensionStateKey,
+    isExtensionStateSeeded,
     loadExtensionWasm,
     uploadExtensionWasm,
   } from '../../../utils/extensions.js';
@@ -200,18 +213,61 @@
     }
   });
 
-  /** Queries `/` state, merges the metadata and downloads missing wasm. */
+  /**
+   * Queries `/` state, seeds the official defaults exactly once (Issue #165),
+   * merges the metadata and downloads missing wasm.
+   *
+   * Seeding rules:
+   * - marker absent + GM: write every official default the server does not list,
+   *   then the marker (`extension::__seeded`) **last**. A failed seed therefore
+   *   retries on the next connection instead of marking a half-seeded room.
+   * - marker absent + non-GM: nothing is written; the official defaults stay in
+   *   the read-only local list until a GM opens the tab.
+   * - marker present: the server state is authoritative. An official default id
+   *   that is not listed was deleted and is not re-added on reload / reconnect.
+   */
   async function queryExtensions(socket: RoomSocket): Promise<void> {
     loadState = 'loading';
     writeFailed = false;
     try {
-      const states = await socket.queryState(EXTENSION_STATE_SCENE_ID);
+      const states = (await socket.queryState(EXTENSION_STATE_SCENE_ID)) ?? {};
       const remoteEntries = new Map<string, unknown>();
-      for (const [key, value] of Object.entries(states ?? {})) {
+      for (const [key, value] of Object.entries(states)) {
         if (isExtensionStateKey(key)) remoteEntries.set(key, value);
       }
 
-      const merged = await applyRemoteExtensions(extensions, remoteEntries, loadWasmFromCellar);
+      const seeded = isExtensionStateSeeded(remoteEntries);
+      let authoritativeEntries = remoteEntries;
+      let keepMissingOfficialDefaults = false;
+
+      if (!seeded) {
+        if (canAdmin) {
+          const seed = buildExtensionSeed(extensions, remoteEntries);
+          const seededEntries = new Map(remoteEntries);
+          for (const { key, value } of seed) {
+            await socket.requestUpdateState(EXTENSION_STATE_SCENE_ID, key, value);
+            seededEntries.set(key, value);
+          }
+          // The marker write comes last on purpose (see the method docs).
+          await socket.requestUpdateState(
+            EXTENSION_STATE_SCENE_ID,
+            EXTENSION_SEEDED_STATE_KEY,
+            EXTENSION_SEEDED_MARKER_VALUE,
+          );
+          seededEntries.set(EXTENSION_SEEDED_STATE_KEY, EXTENSION_SEEDED_MARKER_VALUE);
+          authoritativeEntries = seededEntries;
+        } else {
+          // Only a GM may seed; a viewer keeps the read-only official set.
+          keepMissingOfficialDefaults = true;
+        }
+      }
+
+      const merged = await applyRemoteExtensions(
+        extensions,
+        authoritativeEntries,
+        loadWasmFromCellar,
+        { keepMissingOfficialDefaults },
+      );
       registerDownloadedWasm(merged);
       // `App` owns the list: it is replaced only after the merge succeeded.
       onUpdateExtensions?.(merged);
@@ -592,10 +648,12 @@
         <List class="extension-list" data-testid="extension-list" aria-busy={isBusy}>
           {#each sortedExtensions as ext, idx (ext.id)}
             {@const pending = pendingIds.has(ext.id)}
+            {@const wasmMissing = ext.wasmMissing === true}
             <ListItem
               type="text"
-              class="extension-item-row"
+              class="extension-item-row{wasmMissing ? ' ext-unavailable' : ''}"
               data-testid="extension-item-{ext.id}"
+              data-wasm-missing={wasmMissing ? 'true' : undefined}
             >
               {#snippet start()}
                 <div class="ext-start-group">
@@ -651,6 +709,16 @@
               </span>
 
               {#snippet supportingText()}
+                {#if wasmMissing}
+                  <!-- Issue #165: a metadata-only row must never look runnable. -->
+                  <span
+                    class="ext-wasm-missing"
+                    data-testid="ext-wasm-missing-{ext.id}"
+                    role="status"
+                  >
+                    wasm がありません
+                  </span>
+                {/if}
                 {#if ext.description}
                   <span class="ext-description" data-testid="ext-description-{ext.id}">
                     {ext.description}
@@ -663,11 +731,12 @@
                   <span class="priority-badge">#{ext.priority + 1}</span>
                   <Switch
                     selected={ext.enabled}
-                    disabled={!canAdmin || offline || isBusy}
+                    disabled={!canAdmin || offline || isBusy || wasmMissing}
                     onchange={() => handleToggle(ext.id)}
                     data-testid="ext-toggle-{ext.id}"
                     aria-label="{ext.name}の有効/無効化"
                     aria-checked={ext.enabled ? 'true' : 'false'}
+                    title={wasmMissing ? 'wasm がないため有効化できません' : undefined}
                   />
                   <div class="more-menu-wrapper">
                     <IconButton
@@ -937,6 +1006,23 @@
     line-height: 1.35;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+  /* Issue #165: unavailable (wasm がありません) rows stay deletable but cannot be
+     enabled, so they are tinted with the error container. */
+  .ext-wasm-missing {
+    display: inline-block;
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--np-color-error);
+    margin-bottom: 2px;
+  }
+  :global(.extension-item-row.ext-unavailable.np-item) {
+    background: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+  }
+  :global(.extension-item-row.ext-unavailable .ext-icon-themed) {
+    background: var(--np-color-surface-container-high);
+    color: var(--np-color-error);
   }
   .ext-end-actions {
     display: flex;

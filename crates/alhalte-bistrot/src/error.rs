@@ -36,6 +36,19 @@ pub enum BistrotError {
     #[error("Configuration validation error: {0}")]
     ConfigValidation(String),
 
+    /// A configured extension `.wasm` file does not exist.
+    ///
+    /// This is a `Bistrot.toml` configuration error (the path is wrong or the
+    /// wasm was not built). Staging fails instead of publishing a `manifest.json`
+    /// entry whose `url` would 404 in the browser.
+    #[error("extension '{id}' wasm not found: {path}; build it or fix the path in Bistrot.toml")]
+    ExtensionWasmMissing {
+        /// Extension id from `[[extensions]]`.
+        id: String,
+        /// Path that was checked (configured path or `base_dir`-relative fallback).
+        path: std::path::PathBuf,
+    },
+
     /// Unknown module name for argument generation.
     #[error("Unknown module name '{0}'; expected 'maitre-d', 'cellar', 'banquette', or 'all'")]
     UnknownModule(String),

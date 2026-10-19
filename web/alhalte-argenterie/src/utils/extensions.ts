@@ -23,15 +23,28 @@
  * wasmBytes                       ────────▶ (never; cellar only)
  * ```
  *
- * ## Merge rule (fixed for this sub-issue)
+ * ## Merge rule (Issue #145 / #165)
  *
  * - The server metadata is authoritative for every id it lists.
- * - Built-in official ids ({@link DEFAULT_OFFICIAL_EXTENSIONS}) stay when the
- *   server does not list them; their locally loaded wasm is kept.
+ * - After the one-time seed (marker {@link EXTENSION_SEEDED_STATE_KEY} present)
+ *   an official default id that the server does not list is treated as deleted
+ *   and is **not** re-added (Issue #165).
+ * - Only in a legacy room without the seed marker (no GM opened the tab yet)
+ *   are built-in official ids ({@link DEFAULT_OFFICIAL_EXTENSIONS}) kept when
+ *   the server does not list them, so their locally loaded wasm stays usable.
  * - Custom local ids that the server does not list are removed.
  * - Local `wasmBytes` are kept when the id matches and the server entry has no
  *   new tin id (same tin id or no tin id at all). A different tin id means the
  *   bytes changed and must be downloaded again.
+ *
+ * ## Seeding
+ *
+ * A room starts without extension state. The first GM who opens the extensions
+ * tab writes the missing official defaults and then the marker
+ * (`extension::__seeded`) via `requestUpdateState`, so the server becomes
+ * authoritative from that point on ({@link buildExtensionSeed}). The marker is
+ * written **last**: a failed seed therefore retries on the next connection
+ * instead of marking a half-seeded room.
  *
  * ## Cache
  *
@@ -62,6 +75,18 @@ export const EXTENSION_STATE_SCENE_ID = '/';
 
 /** Prefix of every extension metadata key (`extension::<extensionId>`). */
 export const EXTENSION_STATE_KEY_PREFIX = 'extension::';
+
+/**
+ * Scene state key of the one-time seed marker.
+ *
+ * Written after the initial official-default seed; while it is absent the room
+ * is treated as a legacy / fresh room and official defaults may still be seeded
+ * (Issue #165).
+ */
+export const EXTENSION_SEEDED_STATE_KEY = 'extension::__seeded';
+
+/** Value written to {@link EXTENSION_SEEDED_STATE_KEY} after a successful seed. */
+export const EXTENSION_SEEDED_MARKER_VALUE = true;
 
 /** Label of an extension wasm body tin (`alhalte/argenterie/extension-wasm`). */
 export const EXTENSION_WASM_LABEL: bigint = labelHash('alhalte/argenterie/extension-wasm');
@@ -119,6 +144,94 @@ export function extensionStateKey(extensionId: string): string {
 /** Extracts the extension id from an `extension::<id>` state key. */
 export function extensionIdFromStateKey(key: string): string {
   return isExtensionStateKey(key) ? key.slice(EXTENSION_STATE_KEY_PREFIX.length) : '';
+}
+
+/** True when `key` is the one-time seed marker (`extension::__seeded`). */
+export function isExtensionSeedMarkerKey(key: string): boolean {
+  return key === EXTENSION_SEEDED_STATE_KEY;
+}
+
+/** Reads the seed marker value: `true`, or a non-empty / non-`false` string. */
+function isSeedMarkerValueSet(value: unknown): boolean {
+  if (value === true) return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized.length > 0 && normalized !== 'false' && normalized !== '0';
+  }
+  return false;
+}
+
+/**
+ * True when the room root state carries a positive seed marker.
+ *
+ * A missing / `false` / empty marker means the room still has to be seeded;
+ * after seeding the server state is authoritative (Issue #165).
+ *
+ * @param remoteEntries Decoded `/` scene state entries.
+ */
+export function isExtensionStateSeeded(
+  remoteEntries:
+    | Map<string, unknown>
+    | Record<string, unknown>
+    | Iterable<readonly [string, unknown]>,
+): boolean {
+  for (const [key, value] of remoteEntriesToPairs(remoteEntries)) {
+    if (isExtensionSeedMarkerKey(key)) return isSeedMarkerValueSet(value);
+  }
+  return false;
+}
+
+/** True when `id` is one of the built-in official extension ids. */
+function isOfficialExtensionId(id: string): boolean {
+  return DEFAULT_OFFICIAL_EXTENSIONS.some((official) => official.id === id);
+}
+
+/** One `requestUpdateState` write produced by {@link buildExtensionSeed}. */
+export interface ExtensionSeedEntry {
+  /** `extension::<id>` state key. */
+  key: string;
+  /** Metadata published in the room root scene. */
+  value: ExtensionMetadata;
+}
+
+/**
+ * Computes the one-time seed writes for a room without the seed marker
+ * (Issue #165).
+ *
+ * Only **official default** metadata that the server does not already list is
+ * returned, in the local list order. Existing server metadata (e.g. a legacy
+ * room whose priority / enabled flags were already edited) is never
+ * overwritten; the seed only fills in the missing official ids. The caller
+ * writes {@link EXTENSION_SEEDED_STATE_KEY} after these entries.
+ *
+ * @param local Local extension list (official metadata source).
+ * @param remoteEntries Decoded `/` scene state entries (marker excluded).
+ * @returns One metadata write per missing official extension.
+ */
+export function buildExtensionSeed(
+  local: ExtensionItem[],
+  remoteEntries:
+    | Map<string, unknown>
+    | Record<string, unknown>
+    | Iterable<readonly [string, unknown]>,
+): ExtensionSeedEntry[] {
+  const present = new Set<string>();
+  for (const [key, value] of remoteEntriesToPairs(remoteEntries)) {
+    if (!isExtensionStateKey(key) || isExtensionSeedMarkerKey(key)) continue;
+    const keyId = extensionIdFromStateKey(key);
+    if (keyId) present.add(keyId);
+    if (isPlainRecord(value) && typeof value.id === 'string' && value.id.length > 0) {
+      present.add(value.id);
+    }
+  }
+
+  const seed: ExtensionSeedEntry[] = [];
+  for (const item of local) {
+    if (!isOfficialExtensionId(item.id) || present.has(item.id)) continue;
+    present.add(item.id);
+    seed.push({ key: extensionStateKey(item.id), value: extensionToMetadata(item) });
+  }
+  return seed;
 }
 
 /** True for a plain record (not an array / null). */
@@ -222,15 +335,30 @@ function remoteEntriesToPairs(
   return Object.entries(remoteEntries as Record<string, unknown>);
 }
 
+/** Options for {@link mergeExtensionState}. */
+export interface ExtensionMergeOptions {
+  /**
+   * Keep official defaults that the server does not list.
+   *
+   * Only legacy rooms without the seed marker may set this: once
+   * {@link EXTENSION_SEEDED_STATE_KEY} exists an absent official id means the
+   * extension was deleted and must stay deleted (Issue #165). Defaults to
+   * `false`.
+   */
+  keepMissingOfficialDefaults?: boolean;
+}
+
 /**
  * Merges server extension metadata into the local extension list.
  *
  * Pure and synchronous: the wasm download is the caller's job (see
  * {@link applyRemoteExtensions}). See the module documentation for the exact
- * merge rule.
+ * merge rule. The seed marker (`extension::__seeded`) is never exposed as an
+ * extension row.
  *
  * @param local Local list (`App.extensions`, seeded by `loadDefaultExtensions`).
  * @param remoteEntries Decoded `extension::<id>` state entries.
+ * @param options Merge options (`keepMissingOfficialDefaults` for unseeded rooms).
  * @returns The merged list sorted by priority (ties keep server order).
  */
 export function mergeExtensionState(
@@ -239,6 +367,7 @@ export function mergeExtensionState(
     | Map<string, unknown>
     | Record<string, unknown>
     | Iterable<readonly [string, unknown]>,
+  options: ExtensionMergeOptions = {},
 ): ExtensionItem[] {
   const localById = new Map<string, ExtensionItem>();
   for (const item of local) localById.set(item.id, item);
@@ -247,7 +376,8 @@ export function mergeExtensionState(
   const seen = new Set<string>();
 
   for (const [key, value] of remoteEntriesToPairs(remoteEntries)) {
-    if (!isExtensionStateKey(key)) continue;
+    // The seed marker is room bookkeeping, not an extension (Issue #165).
+    if (!isExtensionStateKey(key) || isExtensionSeedMarkerKey(key)) continue;
     const fallbackId = extensionIdFromStateKey(key);
 
     let remoteItem: ExtensionItem;
@@ -274,18 +404,28 @@ export function mergeExtensionState(
       }
     }
 
+    // A manifest / earlier download failure for the same id stays visible until
+    // the metadata points at a new wasm source (Issue #165).
+    if (!remoteItem.wasmBytes && !remoteItem.cellarTinId && localItem?.wasmMissing) {
+      remoteItem.wasmMissing = true;
+    }
+
     merged.push(remoteItem);
     seen.add(remoteItem.id);
   }
 
-  // Built-in official extensions absent from the server stay on the client so
-  // a room that never published extension state still has the official set.
-  for (const official of DEFAULT_OFFICIAL_EXTENSIONS) {
-    if (seen.has(official.id)) continue;
-    const localItem = localById.get(official.id);
-    if (!localItem) continue;
-    merged.push({ ...localItem });
-    seen.add(official.id);
+  // Legacy rooms (no seed marker, so no GM seeded yet) keep the official set
+  // even before it is published. Once the marker exists the server is
+  // authoritative: an absent official id is a deletion and must not reappear
+  // (Issue #165).
+  if (options.keepMissingOfficialDefaults === true) {
+    for (const official of DEFAULT_OFFICIAL_EXTENSIONS) {
+      if (seen.has(official.id)) continue;
+      const localItem = localById.get(official.id);
+      if (!localItem) continue;
+      merged.push({ ...localItem });
+      seen.add(official.id);
+    }
   }
 
   return merged.sort((a, b) => a.priority - b.priority);
@@ -302,12 +442,15 @@ export type ExtensionWasmLoader = (
  *
  * The metadata merge is {@link mergeExtensionState}; every merged item that
  * references a `tinId` without local bytes is passed to `wasmLoader`. A failed
- * download keeps the metadata (the row is still listed) and only leaves
- * `wasmBytes` undefined, so one broken tin cannot hide the whole tab.
+ * download keeps the metadata (the row is still listed) but marks it
+ * `wasmMissing: true` so the tab renders `wasm がありません` instead of acting as
+ * if the extension were runnable (Issue #165); one broken tin cannot hide the
+ * whole tab.
  *
  * @param local Local extension list.
  * @param remoteEntries Decoded `extension::<id>` state entries.
  * @param wasmLoader Download hook (usually `loadExtensionWasm` bound to the room key).
+ * @param options Merge options (`keepMissingOfficialDefaults` for unseeded rooms).
  */
 export async function applyRemoteExtensions(
   local: ExtensionItem[],
@@ -316,8 +459,9 @@ export async function applyRemoteExtensions(
     | Record<string, unknown>
     | Iterable<readonly [string, unknown]>,
   wasmLoader: ExtensionWasmLoader,
+  options: ExtensionMergeOptions = {},
 ): Promise<ExtensionItem[]> {
-  const merged = mergeExtensionState(local, remoteEntries);
+  const merged = mergeExtensionState(local, remoteEntries, options);
   const result: ExtensionItem[] = [];
 
   for (const item of merged) {
@@ -332,10 +476,32 @@ export async function applyRemoteExtensions(
     } catch {
       bytes = undefined;
     }
-    result.push(bytes && bytes.length > 0 ? { ...item, wasmBytes: bytes } : item);
+    result.push(withWasmMissing(item, !bytes || bytes.length === 0, bytes));
   }
 
   return result;
+}
+
+/**
+ * Returns a copy of `item` with the derived `wasmMissing` flag set / cleared.
+ *
+ * @param item Extension row.
+ * @param missing Whether the wasm body is known to be unavailable.
+ * @param bytes Newly loaded bytes to attach when available.
+ */
+function withWasmMissing(
+  item: ExtensionItem,
+  missing: boolean,
+  bytes?: Uint8Array,
+): ExtensionItem {
+  const next: ExtensionItem = { ...item };
+  if (bytes && bytes.length > 0) next.wasmBytes = bytes;
+  if (missing && !next.wasmBytes) {
+    next.wasmMissing = true;
+  } else {
+    delete next.wasmMissing;
+  }
+  return next;
 }
 
 /** Options for {@link uploadExtensionWasm}. */

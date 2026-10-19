@@ -121,7 +121,7 @@ enabled = true
 
 ### 拡張機能 staging
 
-`stage_extensions_with_base` は設定順を 0-based の `priority` とし、`<output_dir>/<id>.wasm` へコピーする。`ext.path` が存在しない場合は `Bistrot.toml` の親ディレクトリからの相対パスも試す。`manifest.json` は `id`、`name`、`url`、`enabled`、`priority` を持つ。
+`stage_extensions_with_base` は設定順を 0-based の `priority` とし、`<output_dir>/<id>.wasm` へコピーする。`ext.path` が存在しない場合は `Bistrot.toml` の親ディレクトリからの相対パスも試す。宣言された wasm がどちらにも無い場合は `BistrotError::ExtensionWasmMissing { id, path }` で失敗し、コピーも `manifest.json` の書き込みも行わない（Issue #165）。`Bistrot.toml` のパス間違いや wasm のビルド忘れを起動時に検出するため、`manifest.json` には存在しない wasm を指す entry を作らない。全 wasm を解決してからコピーするため、失敗時に中途半端な staging 出力は残らない。`manifest.json` は `id`、`name`、`url`、`enabled`、`priority` を持つ。
 
 ### rops
 

@@ -203,12 +203,62 @@ export class WasmExtensionInstance {
 }
 
 /**
+ * Severity-free reason why an enabled extension did not run (Issue #165).
+ */
+export type ExtensionPipelineWarningCode = 'missing-wasm';
+
+/**
+ * Non-fatal pipeline problem.
+ *
+ * The pipeline keeps the last run's warnings in {@link ExtensionPipeline.getLastWarnings}
+ * and optionally reports them through {@link ExtensionPipelineRunOptions.onWarning}
+ * so the UI can show `wasm がありません` instead of silently skipping the
+ * extension (Issue #165).
+ */
+export interface ExtensionPipelineWarning {
+  /** Machine readable reason. */
+  code: ExtensionPipelineWarningCode;
+  /** Id of the skipped extension. */
+  extensionId: string;
+  /** Display name of the skipped extension. */
+  extensionName: string;
+  /** Japanese message suitable for a status notice. */
+  message: string;
+}
+
+/** Options for {@link ExtensionPipeline.executePipeline}. */
+export interface ExtensionPipelineRunOptions {
+  /** Called once per skipped extension (same objects as `getLastWarnings()`). */
+  onWarning?: (warning: ExtensionPipelineWarning) => void;
+}
+
+/**
+ * Formats pipeline warnings for the App-level `pipeline-warning` notice.
+ *
+ * @param warnings Warnings of the last pipeline run.
+ * @returns `''` when nothing was skipped, otherwise a Japanese notice naming the
+ * extensions whose wasm is missing.
+ */
+export function formatExtensionPipelineWarning(
+  warnings: readonly ExtensionPipelineWarning[],
+): string {
+  if (warnings.length === 0) return '';
+  const names = [...new Set(warnings.map((warning) => warning.extensionName).filter(Boolean))];
+  const named = names.map((name) => `「${name}」`).join('、');
+  return named.length > 0
+    ? `拡張機能${named}の wasm がありません。適用せず原文を送信します。`
+    : 'wasm がない拡張機能は適用せず原文を送信します。';
+}
+
+/**
  * Extension pipeline runner.
  *
  * Runs enabled extensions sequentially in priority order.
  */
 export class ExtensionPipeline {
   private instances: Map<string, WasmExtensionInstance> = new Map();
+  /** Warnings collected by the most recent {@link executePipeline} run. */
+  private lastWarnings: ExtensionPipelineWarning[] = [];
 
   /**
    * Registers or updates a loaded wasm instance for an extension item.
@@ -225,16 +275,43 @@ export class ExtensionPipeline {
   }
 
   /**
+   * Warnings collected by the most recent {@link executePipeline} run.
+   *
+   * An enabled extension without a wasm body is reported here instead of being
+   * skipped silently (Issue #165).
+   */
+  public getLastWarnings(): ExtensionPipelineWarning[] {
+    return [...this.lastWarnings];
+  }
+
+  /** Records a warning and forwards it to the caller's hook. */
+  private warn(
+    warning: ExtensionPipelineWarning,
+    options: ExtensionPipelineRunOptions,
+  ): void {
+    this.lastWarnings.push(warning);
+    options.onWarning?.(warning);
+  }
+
+  /**
    * Executes the extension pipeline on an initial Generast Tin payload.
+   *
+   * Enabled extensions without a wasm body (and without a registered instance)
+   * are reported through {@link getLastWarnings} / `options.onWarning` and
+   * skipped; the remaining extensions still run in priority order.
    *
    * @param extensions List of extensions in room
    * @param initialTin Initial plaintext Tin with label alhalte/generast
+   * @param options Optional warning hook
    * @returns Transformed Generast Tin payload
    */
   public async executePipeline(
     extensions: ExtensionItem[],
     initialTin: Uint8Array,
+    options: ExtensionPipelineRunOptions = {},
   ): Promise<Uint8Array> {
+    this.lastWarnings = [];
+
     // Filter active and sort by priority ascending
     const active = extensions
       .filter((ext) => ext.enabled)
@@ -250,15 +327,28 @@ export class ExtensionPipeline {
         this.instances.set(ext.id, instance);
       }
 
-      if (instance) {
-        try {
-          currentPayload = instance.processGenerast(currentPayload);
-        } catch (err) {
-          console.error(`Error executing extension "${ext.name}":`, err);
-          // If extension execution fails, in Alhalte it may wrap in syntax-error
-          // or propagate. We continue or rethrow depending on pipeline mode.
-          throw err;
-        }
+      if (!instance) {
+        // Issue #165: an enabled extension without wasm must stay visible as a
+        // warning / UI state; silently dropping it hid broken deployments.
+        this.warn(
+          {
+            code: 'missing-wasm',
+            extensionId: ext.id,
+            extensionName: ext.name,
+            message: `拡張機能「${ext.name}」の wasm がありません。`,
+          },
+          options,
+        );
+        continue;
+      }
+
+      try {
+        currentPayload = instance.processGenerast(currentPayload);
+      } catch (err) {
+        console.error(`Error executing extension "${ext.name}":`, err);
+        // If extension execution fails, in Alhalte it may wrap in syntax-error
+        // or propagate. We continue or rethrow depending on pipeline mode.
+        throw err;
       }
     }
 
@@ -422,6 +512,12 @@ export interface ExtensionManifestItem {
  * Loads default official extensions from `/extensions/manifest.json` (staged by `alhalte-bistrot`),
  * instantiating each `.wasm` binary to read `self_introduction()` metadata, and falling back
  * gracefully to `DEFAULT_OFFICIAL_EXTENSIONS` when offline or in test environments.
+ *
+ * A manifest entry whose `.wasm` cannot be fetched / instantiated is returned with
+ * `wasmMissing: true` (Issue #165) so the UI can show `wasm がありません` instead of
+ * listing a metadata-only extension as runnable. When the manifest itself is
+ * unreachable the static defaults are returned unchanged: availability is
+ * unknown there, so no row is marked.
  */
 export async function loadDefaultExtensions(
   fetchFn: typeof fetch | undefined = typeof globalThis.fetch === 'function'
@@ -455,17 +551,19 @@ export async function loadDefaultExtensions(
         try {
           const wasmRes = await fetchFn(entry.url);
           if (wasmRes.ok) {
-            const buf = await wasmRes.arrayBuffer();
-            wasmBytes = new Uint8Array(buf);
-            const instance = await WasmExtensionInstance.instantiate(wasmBytes);
+            const bytes = new Uint8Array(await wasmRes.arrayBuffer());
+            const instance = await WasmExtensionInstance.instantiate(bytes);
+            wasmBytes = bytes;
             intro = instance.selfIntroduction();
           }
         } catch {
-          // Fall back to static metadata if wasm binary is not yet compiled or reachable
+          // Missing / unreadable / ABI-incompatible wasm: keep the metadata but
+          // surface the row as unavailable (Issue #165).
+          wasmBytes = undefined;
         }
       }
 
-      items.push({
+      const item: ExtensionItem = {
         id: entry.id,
         name: intro?.name || entry.name || fallback?.name || entry.id,
         iconSvg: intro?.iconSvg || fallback?.iconSvg,
@@ -473,7 +571,9 @@ export async function loadDefaultExtensions(
         enabled: entry.enabled ?? fallback?.enabled ?? true,
         priority: entry.priority ?? idx,
         wasmBytes,
-      });
+      };
+      if (!wasmBytes) item.wasmMissing = true;
+      items.push(item);
     }
 
     return items.sort((a, b) => a.priority - b.priority);

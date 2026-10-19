@@ -222,6 +222,14 @@ export interface ExtensionItem {
   priority: number; // Order index
   wasmBytes?: Uint8Array;
   cellarTinId?: string;
+  /**
+   * True when the extension declares a wasm body that could not be loaded
+   * (manifest fetch / instantiate or cellar download failed, Issue #165).
+   *
+   * The tab shows `wasm がありません` for these rows instead of silently
+   * treating a metadata-only entry as a runnable extension.
+   */
+  wasmMissing?: boolean;
 }
 
 /**

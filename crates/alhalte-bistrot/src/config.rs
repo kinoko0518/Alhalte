@@ -245,11 +245,14 @@ impl BistrotConfig {
     ///
     /// Creates `output_dir` if it does not already exist.
     /// For each extension in `self.extensions` (with 0-based priority index):
-    /// - If `ext.path` exists on disk, copies it to `<output_dir>/<ext.id>.wasm`.
-    /// - Adds an entry to `manifest.json`.
+    /// - The configured `.wasm` must exist; a missing wasm fails staging.
+    /// - The wasm is copied to `<output_dir>/<ext.id>.wasm`.
+    /// - An entry is added to `manifest.json`.
     ///
     /// # Errors
     ///
+    /// Returns [`BistrotError::ExtensionWasmMissing`] when a configured `.wasm`
+    /// does not exist.
     /// Returns [`BistrotError`] if filesystem operations or JSON serialization fail.
     pub fn stage_extensions(
         &self,
@@ -261,12 +264,19 @@ impl BistrotConfig {
     /// Stages configured extensions into the specified target directory, optionally resolving relative paths against `base_dir`.
     ///
     /// Creates `output_dir` if it does not already exist.
-    /// For each extension in `self.extensions` (with 0-based priority index):
-    /// - If `ext.path` exists on disk (or relative to `base_dir`), copies it to `<output_dir>/<ext.id>.wasm`.
-    /// - Adds an entry to `manifest.json`.
+    /// Every configured `.wasm` must exist (at `ext.path`, or relative to `base_dir`):
+    /// - A missing wasm is a `Bistrot.toml` configuration error and fails staging
+    ///   before anything is copied, so no `manifest.json` entry can point at a
+    ///   file that was never staged (Issue #165).
+    /// - Each existing wasm is copied to `<output_dir>/<ext.id>.wasm`.
+    /// - Every extension gets an entry in `manifest.json`, in configuration order
+    ///   (0-based `priority`).
     ///
     /// # Errors
     ///
+    /// Returns [`BistrotError::ExtensionWasmMissing`] when a configured wasm does
+    /// not exist. In that case nothing is copied and `manifest.json` is not
+    /// written.
     /// Returns [`BistrotError`] if filesystem operations or JSON serialization fail.
     pub fn stage_extensions_with_base(
         &self,
@@ -274,31 +284,43 @@ impl BistrotConfig {
         base_dir: Option<&std::path::Path>,
     ) -> Result<Vec<ExtensionManifestEntry>> {
         let out_path = output_dir.as_ref();
+
+        // Resolve every source before copying anything: a configuration error
+        // must not leave a partially staged directory or a manifest that points
+        // at a missing wasm (the browser would silently skip it).
+        let mut sources = Vec::with_capacity(self.extensions.len());
+        for ext in &self.extensions {
+            let configured = ext.path.clone();
+            let checked = if configured.exists() {
+                configured.clone()
+            } else if let Some(base) = base_dir {
+                let candidate = base.join(&configured);
+                if candidate.exists() {
+                    candidate
+                } else {
+                    return Err(BistrotError::ExtensionWasmMissing {
+                        id: ext.id.clone(),
+                        path: candidate,
+                    });
+                }
+            } else {
+                return Err(BistrotError::ExtensionWasmMissing {
+                    id: ext.id.clone(),
+                    path: configured,
+                });
+            };
+            sources.push(checked);
+        }
+
         if !out_path.exists() {
             std::fs::create_dir_all(out_path)?;
         }
 
         let mut manifest = Vec::with_capacity(self.extensions.len());
-        for (priority, ext) in self.extensions.iter().enumerate() {
+        for (priority, (ext, src)) in self.extensions.iter().zip(sources).enumerate() {
             let dest_wasm_name = format!("{}.wasm", ext.id);
             let dest_wasm_path = out_path.join(&dest_wasm_name);
-
-            let source_path = if ext.path.exists() {
-                Some(ext.path.clone())
-            } else if let Some(base) = base_dir {
-                let candidate = base.join(&ext.path);
-                if candidate.exists() {
-                    Some(candidate)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-
-            if let Some(src) = source_path {
-                std::fs::copy(&src, &dest_wasm_path)?;
-            }
+            std::fs::copy(&src, &dest_wasm_path)?;
 
             let entry = ExtensionManifestEntry {
                 id: ext.id.clone(),
