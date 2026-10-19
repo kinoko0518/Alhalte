@@ -5,7 +5,8 @@
 //! ## Overview
 //!
 //! `alhalte-cellar` stores binary `tin` files as physical entities on disk and indexes references
-//! as rows in an SQLite database: `(tin_id: [u8; 32], path: String, owner: u64, wrapped_key: Option<Vec<u8>>)`.
+//! as rows in an SQLite database: `(tin_id: [u8; 32], owner: u64, wrapped_key: Option<Vec<u8>>)`.
+//! The entity file name on disk is always `hex(tin_id)`; no path is persisted.
 //!
 //! When receiving a store request:
 //! - Validates the owner's session rights via [`SessionVerifier`].
@@ -16,8 +17,8 @@
 //!     entity is linked, a new DB reference row is inserted, and no upload is needed.
 //!   - `already_owned`: the tin is already owned by the same owner.
 //! - In **anti-oracle** mode (`--anti-oracle true`): always answers
-//!   `upload_required` and discards the uploaded payload into `/dev/null` if the
-//!   entity is already present.
+//!   `upload_required` and discards the uploaded payload if the entity is
+//!   already present.
 //!
 //! ## Example
 //!

@@ -212,14 +212,7 @@ impl CellarService {
             Ok(StoreStatus::AlreadyOwned)
         } else if file_exists {
             // Deduplicated: file exists in storage from another owner, add reference row
-            let relative_path = StorageManager::relative_name(&req.tin_id);
-            Database::insert_reference(
-                &conn,
-                &req.tin_id,
-                &relative_path,
-                req.owner,
-                req.wrapped_key.as_deref(),
-            )?;
+            Database::insert_reference(&conn, &req.tin_id, req.owner, req.wrapped_key.as_deref())?;
             Ok(StoreStatus::Deduplicated)
         } else {
             // File does not exist yet; client needs to upload it
@@ -229,8 +222,8 @@ impl CellarService {
 
     /// Stores an uploaded tin payload.
     ///
-    /// Verifies session authorization, saves to disk (or discards to `/dev/null` if anti-oracle
-    /// and entity already exists), and records the ownership row in the SQLite database.
+    /// Verifies session authorization, saves to disk (or discards the payload if anti-oracle
+    /// and the entity already exists), and records the ownership row in the SQLite database.
     pub async fn store_payload(
         &self,
         owner: u64,
@@ -259,8 +252,8 @@ impl CellarService {
 
         let file_exists = self.storage.has_tin_file(&tin_id);
         let written_to_disk = if self.anti_oracle && file_exists {
-            // Anti-oracle mode: file already exists, discard uploaded data to /dev/null
-            StorageManager::discard_to_dev_null(data);
+            // Anti-oracle mode: the entity already exists, so drop the uploaded bytes
+            StorageManager::discard(data);
             false
         } else if !file_exists {
             // File does not exist, write to disk
@@ -272,14 +265,7 @@ impl CellarService {
         };
 
         let conn = self.db.lock().await;
-        let relative_path = StorageManager::relative_name(&tin_id);
-        Database::insert_reference(
-            &conn,
-            &tin_id,
-            &relative_path,
-            owner,
-            wrapped_key.as_deref(),
-        )?;
+        Database::insert_reference(&conn, &tin_id, owner, wrapped_key.as_deref())?;
 
         Ok(StoreResult {
             tin_id,

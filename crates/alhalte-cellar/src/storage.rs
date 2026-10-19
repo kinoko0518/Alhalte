@@ -128,8 +128,11 @@ impl StorageManager {
         Ok(results)
     }
 
-    /// Explicit sink representing discarding received bytes into `/dev/null` for anti-oracle mode.
-    pub fn discard_to_dev_null(_data: &[u8]) {
-        // Discard data without writing to disk
+    /// Discards received bytes without writing them to disk, for anti-oracle mode.
+    ///
+    /// The caller still records the ownership reference, so a discarded upload
+    /// is indistinguishable from a stored one.
+    pub fn discard(_data: &[u8]) {
+        // Intentionally empty: the bytes are dropped on the floor.
     }
 }
