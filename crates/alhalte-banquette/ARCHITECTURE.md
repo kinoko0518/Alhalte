@@ -193,7 +193,7 @@ load 後と権限変更後に呼び、次を検証する。違反は `InvalidRoo
 - `maitre-d` の DB role（`room_permissions`）と部屋の権限表はまだ接続していない。`SetAdmins` を撤去したため、実行中の部屋の権限は `SetMemberPermission` / `SetDefaultPermission` でしか変わらず、DB の role 変更は次回 spawn でも反映されない。接続は #200。
 - その帰結として、`maitre-d` の DB で `pl` / `viewer` の account も banquette からは `Denied`（`default_permission`）に見える。`Viewer` の mutate 遮断は当面 `maitre-d` の WS ゲートが担い、banquette 側の拒否と二重になる。#200 で DB role を部屋権限表へ移すと解消する。
 - `maitre-d` の pre-spawn gate（`rooms.done`）は #200 で部屋権限表に置き換えた。banquette は `QueryAccountPermission` で実効権限を答えるだけで、head や `default_permission` を報告しない（head 報告の `RoomPersisted` は #192 で削除）。
-- `alhalte-kitchen` の `RoomArchive.done` は `RoomData.default_permission != Denied` の射影で残している。アーカイブ形式は #184 で凍結するため、権限表そのものは運ばない。banquette 側の export は `RoomData` をそのまま ZIP に格納し、`export.rs` の `RoomArchive` で権限表ごと読み戻すので `done` 射影を持たない（#193）。
+- `alhalte-kitchen` は main から削除し、`kitchen-freeze` ブランチに保存した（#184）。banquette の export は `RoomData` をそのまま ZIP に格納し、`export.rs` の `RoomArchive` で権限表ごと読み戻す。`done` 射影は持たない（#193）。
 - `SetMemberPermission` / `SetDefaultPermission` の ack は要求元にだけ返し、部屋全体へは broadcast しない。降格された account は次回 `QueryPermissions` まで自分の権限変化を知らない（UI 追従は #201）。
 - `EnterScene` は権限が無い場合に無言で何もしない。`maitre-d` は自前の `client_scenes` で broadcast 先を決めるため、接続時の入場可否は当面 `maitre-d` のゲートが正で、banquette 側の判定は defense in depth。#200 で一本化する。
 - log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。

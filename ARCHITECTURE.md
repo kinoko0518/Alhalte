@@ -59,7 +59,6 @@ client 総体 = cutlery
 
   pantry (browser) ── HTTP GET /tin/{id} ──▶ cellar
   alhalte-bistrot ── Bistrot.toml ──▶ 引数 / systemd unit
-  alhalte-kitchen ── archive ──▶ RoomGraph ──▶ HTML5 / EPUB（saignant 使用）
 ```
 
 ### レイヤ
@@ -67,7 +66,7 @@ client 総体 = cutlery
 - **共有ライブラリ**: `tin`、`generast`。全モジュールが同じバイト表現と AST を使う。
 - **サーバー**: `alhalte-maitre-d`（認証・玄関口）、`alhalte-banquette`（部屋プロセス）、`alhalte-cellar`（重複排除ストレージ）。
 - **クライアント**: `web/alhalte-argenterie`（UI）、`web/alhalte-pantry`（tin キャッシュ・復号）、`alhalte-saignant`（HTML レンダラ、WASM でも動作）。
-- **変換・配布**: `alhalte-canner`（再エンコード・暗号化）、`alhalte-kitchen`（アーカイブ・グラフ・EPUB/HTML5）、`extensions/*`（構文木変換 wasm）。
+- **変換・配布**: `alhalte-canner`（再エンコード・暗号化）、`extensions/*`（構文木変換 wasm）。`alhalte-kitchen` は `kitchen-freeze` ブランチに保存し、main からは削除した。
 - **運用**: `alhalte-bistrot`（設定・引数・systemd 生成）。
 
 ## モジュール一覧
@@ -80,7 +79,6 @@ client 総体 = cutlery
 | alhalte-maitre-d | `crates/alhalte-maitre-d` | Google OAuth、account/session、HTTP/WS 玄関口、demux | [crates/alhalte-maitre-d/ARCHITECTURE.md](crates/alhalte-maitre-d/ARCHITECTURE.md) |
 | alhalte-cellar | `crates/alhalte-cellar` | tin 実体の重複排除保存、参照管理、GC | [crates/alhalte-cellar/ARCHITECTURE.md](crates/alhalte-cellar/ARCHITECTURE.md) |
 | alhalte-canner | `crates/alhalte-canner` | 画像・音声の決定論的再エンコード、高低エントロピー暗号化 | [crates/alhalte-canner/ARCHITECTURE.md](crates/alhalte-canner/ARCHITECTURE.md) |
-| alhalte-kitchen | `crates/alhalte-kitchen` | 部屋アーカイブ、滞在グラフ、HTML5/EPUB 変換 | [crates/alhalte-kitchen/ARCHITECTURE.md](crates/alhalte-kitchen/ARCHITECTURE.md) |
 | alhalte-saignant | `crates/alhalte-saignant` | log / Generast の HTML レンダリング、CSS、WASM ABI | [crates/alhalte-saignant/ARCHITECTURE.md](crates/alhalte-saignant/ARCHITECTURE.md) |
 | alhalte-bistrot | `crates/alhalte-bistrot` | `Bistrot.toml`、引数生成、systemd 生成、rops | [crates/alhalte-bistrot/ARCHITECTURE.md](crates/alhalte-bistrot/ARCHITECTURE.md) |
 | alhalte-pantry | `web/alhalte-pantry` | ブラウザ側 tin キャッシュ、取得、復号、展開 | [web/alhalte-pantry/ARCHITECTURE.md](web/alhalte-pantry/ARCHITECTURE.md) |
@@ -132,7 +130,7 @@ client 総体 = cutlery
 2. 許可された場合、`banquette` に `ExportRoom` を送る。bridge が未起動なら作成者を admin として起動する。banquette は cellar の alias `room/<room_id>/head` から部屋を復元してから応答する（#193 で ZIP 化）。復元できない場合は 5xx を返し、空の ZIP を返さない。
 3. banquette は権限のある scene の `RoomData` と log chunk を集め、`room.tin` + `chunks/<tin-id>.tin` の ZIP にまとめて bytes で返す。`type=logs` は ZIP 化の前に全 scene の state を空にする。
 4. `maitre-d` は受け取った ZIP bytes を `application/zip` と `Content-Disposition` 付きでそのまま返す。ZIP は組み立てない。
-5. `alhalte-kitchen` CLI は ZIP / tar.gz を読み、`RoomGraph` を作り、HTML5 または EPUB に変換する。
+5. HTML5 / EPUB への変換は `kitchen-freeze` ブランチの `alhalte-kitchen` が担う。main のサーバー経路は ZIP までで、変換を含まない。
 
 ### 起動
 
