@@ -272,8 +272,9 @@ async fn debug_login_creates_or_reuses_an_account_from_the_account_name() {
     );
     let session_id = session_id_from_cookie(&cookie);
 
-    // The cookie resolves to the account named after the input.
-    let session: SessionResponse = client
+    // The cookie resolves to the account named after the input. The session ID
+    // is a decimal string so a browser can keep all 64 bits (Issue #220).
+    let session_body: serde_json::Value = client
         .get(format!("http://{addr}/api/session"))
         .header(reqwest::header::COOKIE, format!("session_id={session_id}"))
         .send()
@@ -282,6 +283,12 @@ async fn debug_login_creates_or_reuses_an_account_from_the_account_name() {
         .json()
         .await
         .unwrap();
+    assert_eq!(
+        session_body["session_id"],
+        serde_json::Value::String(session_id.to_string()),
+        "GET /api/session must serialize session_id as a decimal string"
+    );
+    let session: SessionResponse = serde_json::from_value(session_body).unwrap();
     assert_eq!(session.session_id, session_id);
     assert_eq!(session.account.handle_name, "Alice");
 
