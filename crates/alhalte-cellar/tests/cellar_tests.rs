@@ -1,11 +1,13 @@
 //! Integration tests for `alhalte-cellar`.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use alhalte_cellar::CellarError;
 use alhalte_cellar::CellarService;
 use alhalte_cellar::db::Database;
 use alhalte_cellar::model::{StoreRequest, StoreStatus, UnregisterRequest, format_tin_id};
+use alhalte_cellar::run_garbage_collection;
 use alhalte_cellar::storage::StorageManager;
 use alhalte_cellar::verifier::{
     InMemorySessionVerifier, MaitreDVerifier, SessionVerifier, VerifierMode,
@@ -42,24 +44,23 @@ async fn test_sqlite_and_file_entity_model() {
     let conn = Database::open(&db_path).unwrap();
 
     let (tin_bytes, tin_id) = create_test_tin("test entity model");
-    let relative_path = StorageManager::relative_name(&tin_id);
+    let tin_hex = format_tin_id(&tin_id);
     let wrapped_key = Some(vec![1, 2, 3, 4, 5]);
 
-    // 1. Write file to storage
+    // 1. Write file to storage. The on-disk name is always hex(tin_id).
     let saved_path = storage.write_tin(&tin_id, &tin_bytes).unwrap();
     assert!(saved_path.is_file());
+    assert_eq!(saved_path.file_name().unwrap().to_str().unwrap(), tin_hex);
     assert!(storage.has_tin_file(&tin_id));
 
     // 2. Insert reference to SQLite DB
-    Database::insert_reference(&conn, &tin_id, &relative_path, 100, wrapped_key.as_deref())
-        .unwrap();
+    Database::insert_reference(&conn, &tin_id, 100, wrapped_key.as_deref()).unwrap();
 
     // 3. Verify reference query
     let reference = Database::get_reference(&conn, &tin_id, Some(100))
         .unwrap()
         .expect("reference row must exist");
     assert_eq!(reference.tin_id, tin_id);
-    assert_eq!(reference.path, relative_path);
     assert_eq!(reference.owner, 100);
     assert_eq!(reference.wrapped_key, wrapped_key);
 
@@ -68,6 +69,157 @@ async fn test_sqlite_and_file_entity_model() {
         .unwrap()
         .expect("reference row must exist without owner filter");
     assert_eq!(any_ref.owner, 100);
+}
+
+// spec: alhalte-cellar/storage 0001 the entity file name is hex(tin_id) (Issue #197)
+#[test]
+fn test_entity_file_name_is_hex_tin_id() {
+    let dir = tempdir().unwrap();
+    let storage = StorageManager::new(dir.path()).unwrap();
+    let (tin_bytes, tin_id) = create_test_tin("file name invariant");
+    let tin_hex = format_tin_id(&tin_id);
+
+    assert_eq!(StorageManager::relative_name(&tin_id), tin_hex);
+
+    let saved_path = storage.write_tin(&tin_id, &tin_bytes).unwrap();
+    assert_eq!(saved_path, dir.path().join(&tin_hex));
+    assert_eq!(
+        saved_path.file_name().and_then(|n| n.to_str()),
+        Some(tin_hex.as_str())
+    );
+
+    let files = storage.list_tin_files().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, tin_id);
+    assert_eq!(
+        files[0].1.file_name().and_then(|n| n.to_str()),
+        Some(tin_hex.as_str())
+    );
+}
+
+/// Returns whether `table` currently exposes a column named `column`.
+fn table_has_column(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .unwrap();
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    names.iter().any(|name| name == column)
+}
+
+/// Returns whether an index named `name` exists in the schema.
+fn index_exists(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+        [name],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+// spec: alhalte-cellar/db 0001 legacy `path` column is dropped without losing references (Issue #197)
+#[tokio::test]
+async fn test_migration_drops_legacy_path_column() {
+    let dir = tempdir().unwrap();
+    let storage_dir = dir.path().join("tin");
+    let db_path = dir.path().join("legacy.sqlite3");
+
+    let (tin_bytes, tin_id) = create_test_tin("legacy row content");
+    let tin_hex = format_tin_id(&tin_id);
+    let wrapped_key = vec![0xAA, 0xBB];
+
+    // Build a pre-#197 database: tin_references still carries `path`.
+    {
+        let legacy = rusqlite::Connection::open(&db_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE tin_references (
+                    tin_id BLOB NOT NULL,
+                    path TEXT NOT NULL,
+                    owner INTEGER NOT NULL,
+                    wrapped_key BLOB,
+                    PRIMARY KEY (tin_id, owner)
+                );
+                CREATE INDEX idx_tin_references_path ON tin_references(path);
+                CREATE INDEX idx_tin_references_tin_id ON tin_references(tin_id);",
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO tin_references (tin_id, path, owner, wrapped_key)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![tin_id.as_slice(), tin_hex, 7i64, wrapped_key],
+            )
+            .unwrap();
+    }
+
+    // Re-open through the production entry point, which migrates in place.
+    let conn = Database::open(&db_path).unwrap();
+
+    // The legacy column and its index are gone.
+    assert!(!table_has_column(&conn, "tin_references", "path"));
+    assert!(!index_exists(&conn, "idx_tin_references_path"));
+
+    // The reference survived the migration: tin_id / owner / wrapped_key are intact.
+    let reference = Database::get_reference(&conn, &tin_id, Some(7))
+        .unwrap()
+        .expect("migrated reference row must survive");
+    assert_eq!(reference.tin_id, tin_id);
+    assert_eq!(reference.owner, 7);
+    assert_eq!(reference.wrapped_key, Some(wrapped_key));
+    assert_eq!(
+        Database::get_all_referenced_tin_ids(&conn).unwrap(),
+        HashSet::from([tin_id])
+    );
+
+    // The migrated database accepts new writes without a path argument.
+    let storage = StorageManager::new(&storage_dir).unwrap();
+    storage.write_tin(&tin_id, &tin_bytes).unwrap();
+    Database::insert_reference(&conn, &tin_id, 8, None).unwrap();
+    assert!(Database::has_owner_reference(&conn, &tin_id, 8).unwrap());
+    assert!(Database::has_owner_reference(&conn, &tin_id, 7).unwrap());
+
+    // ...and GC keeps the file because the migrated rows still reference it.
+    let stats = run_garbage_collection(&storage, &conn).unwrap();
+    assert_eq!(stats.scanned_files, 1);
+    assert_eq!(stats.deleted_files, 0);
+    assert!(storage.has_tin_file(&tin_id));
+}
+
+// spec: alhalte-cellar/gc 0001 GC matches files by hex(tin_id) of the referenced set (Issue #197)
+#[test]
+fn test_gc_keeps_exactly_the_referenced_tin_set() {
+    let dir = tempdir().unwrap();
+    let storage = StorageManager::new(dir.path()).unwrap();
+    let conn = Database::open_in_memory().unwrap();
+
+    let mut referenced = Vec::new();
+    for text in ["kept one", "kept two"] {
+        let (tin_bytes, tin_id) = create_test_tin(text);
+        storage.write_tin(&tin_id, &tin_bytes).unwrap();
+        Database::insert_reference(&conn, &tin_id, 1, None).unwrap();
+        referenced.push(format_tin_id(&tin_id));
+    }
+
+    let (orphan_bytes, orphan_id) = create_test_tin("orphaned content");
+    storage.write_tin(&orphan_id, &orphan_bytes).unwrap();
+    assert_eq!(referenced.len(), 2);
+
+    let stats = run_garbage_collection(&storage, &conn).unwrap();
+    assert_eq!(stats.scanned_files, 3);
+    assert_eq!(stats.deleted_files, 1);
+
+    let remaining: HashSet<String> = storage
+        .list_tin_files()
+        .unwrap()
+        .into_iter()
+        .map(|(tin_id, _, _)| format_tin_id(&tin_id))
+        .collect();
+    assert_eq!(remaining, referenced.into_iter().collect());
+    assert!(!storage.has_tin_file(&orphan_id));
 }
 
 // spec: alhalte-cellar/session-verifier
@@ -441,7 +593,7 @@ async fn test_anti_oracle_mode() {
     let status = service.store_check(&req20).await.unwrap();
     assert_eq!(status, StoreStatus::UploadRequired);
 
-    // Owner 20 sends payload: It should be discarded into /dev/null (written_to_disk: false),
+    // Owner 20 sends payload: It should be discarded (written_to_disk: false),
     // but reference_added should still be true!
     let res20 = service
         .store_payload(20, 200, tin_id, &tin_bytes, Some(vec![9, 9, 9]))

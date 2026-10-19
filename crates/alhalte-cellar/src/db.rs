@@ -2,7 +2,10 @@
 //!
 //! According to ARCHITECTURE.md:
 //! References are stored as the Cartesian product of:
-//! `(tin_id: [u8; 32], path: String, owner: u64, wrapped_key: Option<Vec<u8>>)`.
+//! `(tin_id: [u8; 32], owner: u64, wrapped_key: Option<Vec<u8>>)`.
+//!
+//! The entity file name is not stored: it is always `hex(tin_id)` (see
+//! [`crate::storage::StorageManager::relative_name`]).
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -12,6 +15,13 @@ use tin::TinId;
 
 use crate::error::Result;
 use crate::model::TinReference;
+
+/// Table holding ownership references to stored tin entities.
+const TIN_REFERENCES_TABLE: &str = "tin_references";
+/// Legacy index on the removed `path` column.
+const LEGACY_PATH_INDEX: &str = "idx_tin_references_path";
+/// Legacy column that duplicated `hex(tin_id)`.
+const LEGACY_PATH_COLUMN: &str = "path";
 
 /// Database connection and operations for `alhalte-cellar`.
 pub struct Database;
@@ -45,20 +55,53 @@ impl Database {
         Ok(conn)
     }
 
-    /// Initializes the database tables and indices if not already present.
+    /// Initializes the database tables and indices, migrating any legacy schema.
     pub fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS tin_references (
                 tin_id BLOB NOT NULL,
-                path TEXT NOT NULL,
                 owner INTEGER NOT NULL,
                 wrapped_key BLOB,
                 PRIMARY KEY (tin_id, owner)
             );
-            CREATE INDEX IF NOT EXISTS idx_tin_references_path ON tin_references(path);
             CREATE INDEX IF NOT EXISTS idx_tin_references_tin_id ON tin_references(tin_id);",
         )?;
+        Self::migrate_drop_path_column(conn)?;
         Ok(())
+    }
+
+    /// Drops the legacy `path` column and its index when they are still present.
+    ///
+    /// `path` always duplicated `hex(tin_id)`, so dropping it loses no
+    /// information: `tin_id`, `owner` and `wrapped_key` are left untouched.
+    /// SQLite refuses to drop a column that an index still references, so the
+    /// legacy index goes first. Both statements run in one transaction, so a
+    /// failure keeps the old schema and every reference row intact.
+    fn migrate_drop_path_column(conn: &Connection) -> Result<()> {
+        if !Self::has_column(conn, TIN_REFERENCES_TABLE, LEGACY_PATH_COLUMN)? {
+            return Ok(());
+        }
+
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(&format!(
+            "DROP INDEX IF EXISTS {LEGACY_PATH_INDEX};
+             ALTER TABLE {TIN_REFERENCES_TABLE} DROP COLUMN {LEGACY_PATH_COLUMN};",
+        ))?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Returns whether `table` currently exposes a column named `column`.
+    fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name.eq_ignore_ascii_case(column) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Checks if a reference for `(tin_id, owner)` already exists.
@@ -88,18 +131,16 @@ impl Database {
     pub fn insert_reference(
         conn: &Connection,
         tin_id: &TinId,
-        path: &str,
         owner: u64,
         wrapped_key: Option<&[u8]>,
     ) -> Result<()> {
         let mut stmt = conn.prepare_cached(
-            "INSERT INTO tin_references (tin_id, path, owner, wrapped_key)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO tin_references (tin_id, owner, wrapped_key)
+             VALUES (?1, ?2, ?3)
              ON CONFLICT (tin_id, owner) DO UPDATE SET
-                 path = excluded.path,
                  wrapped_key = COALESCE(excluded.wrapped_key, tin_references.wrapped_key)",
         )?;
-        stmt.execute(params![tin_id.as_slice(), path, owner as i64, wrapped_key])?;
+        stmt.execute(params![tin_id.as_slice(), owner as i64, wrapped_key])?;
         Ok(())
     }
 
@@ -111,10 +152,10 @@ impl Database {
     ) -> Result<Option<TinReference>> {
         let sql = match owner {
             Some(_) => {
-                "SELECT tin_id, path, owner, wrapped_key FROM tin_references WHERE tin_id = ?1 AND owner = ?2 LIMIT 1"
+                "SELECT tin_id, owner, wrapped_key FROM tin_references WHERE tin_id = ?1 AND owner = ?2 LIMIT 1"
             }
             None => {
-                "SELECT tin_id, path, owner, wrapped_key FROM tin_references WHERE tin_id = ?1 LIMIT 1"
+                "SELECT tin_id, owner, wrapped_key FROM tin_references WHERE tin_id = ?1 LIMIT 1"
             }
         };
 
@@ -140,13 +181,11 @@ impl Database {
         let mut tin_id = [0u8; 32];
         tin_id.copy_from_slice(&tin_id_blob);
 
-        let path: String = row.get(1)?;
-        let owner_i64: i64 = row.get(2)?;
-        let wrapped_key: Option<Vec<u8>> = row.get(3)?;
+        let owner_i64: i64 = row.get(1)?;
+        let wrapped_key: Option<Vec<u8>> = row.get(2)?;
 
         Ok(TinReference {
             tin_id,
-            path,
             owner: owner_i64 as u64,
             wrapped_key,
         })
@@ -170,18 +209,11 @@ impl Database {
         Ok(count as usize)
     }
 
-    /// Returns the set of all unique paths referenced in the database.
-    pub fn get_all_referenced_paths(conn: &Connection) -> Result<HashSet<String>> {
-        let mut stmt = conn.prepare_cached("SELECT DISTINCT path FROM tin_references")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut paths = HashSet::new();
-        for path_res in rows {
-            paths.insert(path_res?);
-        }
-        Ok(paths)
-    }
-
     /// Returns the set of all unique tin IDs referenced in the database.
+    ///
+    /// The corresponding entity file name is `hex(tin_id)` (see
+    /// [`crate::storage::StorageManager::relative_name`]); GC derives it from
+    /// this set because no path is persisted.
     pub fn get_all_referenced_tin_ids(conn: &Connection) -> Result<HashSet<TinId>> {
         let mut stmt = conn.prepare_cached("SELECT DISTINCT tin_id FROM tin_references")?;
         let rows = stmt.query_map([], |r| {

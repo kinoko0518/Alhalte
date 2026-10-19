@@ -6,7 +6,7 @@
 
 ## 責務
 
-tin の実体をファイルとして保存し、`(tin_id, path, owner, wrapped_key)` の参照行を SQLite に持つ、重複排除ストレージ。所有者の session を検証し、既に実体がある場合は再送させず参照だけを追加する。信頼された内部サービス（`alhalte-banquette`）は `X-Alhalte-Service-Token` で書き込める。参照されなくなった実体を GC で削除する。
+tin の実体をファイルとして保存し、`(tin_id, owner, wrapped_key)` の参照行を SQLite に持つ、重複排除ストレージ。所有者の session を検証し、既に実体がある場合は再送させず参照だけを追加する。信頼された内部サービス（`alhalte-banquette`）は `X-Alhalte-Service-Token` で書き込める。参照されなくなった実体を GC で削除する。
 
 ## 公開 API / 外部接続点
 
@@ -42,7 +42,7 @@ tin の実体をファイルとして保存し、`(tin_id, path, owner, wrapped_
 | `deduplicated` | Deduplicated。実体は既にあり、参照行を追加した。 |
 | `already_owned` | Already Owned。同じ owner が既に参照を持つ。 |
 
-anti-oracle が有効な場合、`/store` は常に `upload_required` を返し、既存実体への再送は `/dev/null` へ捨てる。
+anti-oracle が有効な場合、`/store` は常に `upload_required` を返し、既存実体への再送は破棄する。
 
 認可・入力・未検出・内部エラーは従来どおり HTTP status（401 / 400 / 404 / 5xx）で返す。旧 210 / 211 / 212 は廃止し、受理しない。
 
@@ -67,18 +67,19 @@ CLI（`CliArgs`）: `--host`、`--port`、`--storage-path`、`--db-path`、`--an
 ```sql
 tin_references(
   tin_id BLOB NOT NULL,
-  path TEXT NOT NULL,
   owner INTEGER NOT NULL,
   wrapped_key BLOB,
   PRIMARY KEY (tin_id, owner)
 )
 ```
 
-`tin_id` は 32 バイト BLOB。`path` は実体ファイルの相対名で、現在は tin id の hex。索引は `path` と `tin_id`。
+`tin_id` は 32 バイト BLOB。実体ファイルの位置は列に持たず、常に `hex(tin_id)` から導出する。索引は `tin_id`。
+
+旧 schema の `path` 列と `idx_tin_references_path` は `Database::init_schema` が起動時に削除する。`path` は常に `hex(tin_id)` の重複だったため、`tin_id` / `owner` / `wrapped_key` を保ったまま lossless に移行できる。
 
 ### ファイル
 
-`StorageManager` は `storage_path/<tin_id hex>` に実体を置く。書き込みは一時ファイル + `sync_all` + rename で原子的に行う。`.tmp.*` は GC の走査対象外。
+`StorageManager` は `storage_path/<tin_id hex>` に実体を置く。ファイル名は常に `hex(tin_id)` で、`path` のような別名は持たない。書き込みは一時ファイル + `sync_all` + rename で原子的に行う。`.tmp.*` は GC の走査対象外。
 
 ## 内部フロー
 
@@ -97,7 +98,7 @@ tin_references(
 1. 認可（session または service token）を再検証する。
 2. anti-oracle かつ実体が既にある場合はデータを捨てる。
 3. 実体がなければ原子的に書き込む。
-4. `(tin_id, path, owner, wrapped_key)` を upsert する。
+4. `(tin_id, owner, wrapped_key)` を upsert する。
 5. `StoreResult` を返す。
 
 ### 内部サービス認可
@@ -116,9 +117,9 @@ tin_references(
 
 - ダウンロードは session 検証を行わない。`owner` は参照の絞り込みにだけ使う。
 - `/store` は常に `200 OK` を返し、結果は body の `result`（`upload_required` / `deduplicated` / `already_owned`）で表す。旧 210 / 211 / 212 は廃止済みで、受理しない。
-- `path` は現状 tin id の hex で、ディレクトリ階層は持たない。
-- anti-oracle 時の `/dev/null` は `StorageManager::discard_to_dev_null` による no-op で、実際のファイルディスクリプタは開かない。
-- GC は DB の参照だけを見る。tin 間の参照関係（chunk 内の tin id など）は追跡しない。
+- `path` 列は廃止した。実体ファイル名は常に `hex(tin_id)` で、別名を持たない。既存 DB は起動時 migration で `path` 列を落とす（参照行は失わない）。
+- anti-oracle 時の破棄は `StorageManager::discard` による no-op で、実際のファイルディスクリプタは開かない。
+- GC は DB の参照だけを見る。参照集合は `DISTINCT tin_id` から `hex(tin_id)` を作って得て、ファイル名と照合する。tin 間の参照関係（chunk 内の tin id など）は追跡しない。
 - upload は `Bytes` extractor でリクエスト全量をメモリにバッファする（上限 64 MiB）。maitre-d proxy も同じ上限・同じバッファリングを行う。
 - service token は平文で設定・比較する。ローテーション機構はなく、変更するには `cellar` / `maitre-d` / 全 banquette の再起動と設定更新が必要。
 - service token は `--service-token` 引数でも渡せるため `ps` から読める。本番では環境変数か systemd の `EnvironmentFile` を使うのが望ましい。

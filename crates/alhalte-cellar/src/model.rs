@@ -113,14 +113,14 @@ pub mod opt_hex_bytes {
 /// Represents a stored reference to a tin entity in the SQLite database.
 ///
 /// In accordance with ARCHITECTURE.md:
-/// `(tin_id: [u8; 32], path: String, owner: u64, wrapped_key: Option<Vec<u8>>)`
+/// `(tin_id: [u8; 32], owner: u64, wrapped_key: Option<Vec<u8>>)`
+///
+/// The entity file itself is located by `hex(tin_id)`, so no path is stored.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinReference {
     /// 256-bit Tin ID.
     #[serde(with = "hex_tin_id")]
     pub tin_id: TinId,
-    /// Path (or relative filename) pointing to the actual entity file in storage.
-    pub path: String,
     /// Owner account ID.
     pub owner: u64,
     /// Nullable wrapped key.
@@ -179,7 +179,7 @@ pub struct StoreResult {
     pub tin_id: TinId,
     /// Owner account ID.
     pub owner: u64,
-    /// Whether the file was written to disk (`true`), or discarded into `/dev/null` (`false`).
+    /// Whether the file was written to disk (`true`), or the upload was discarded (`false`).
     pub written_to_disk: bool,
     /// Whether a new DB row was registered.
     pub reference_added: bool,
