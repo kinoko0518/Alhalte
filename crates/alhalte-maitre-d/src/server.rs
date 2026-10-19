@@ -1492,19 +1492,6 @@ fn resolve_room_role(
         })
 }
 
-/// Pushes the current database `gm` set to a live room without restarting it.
-async fn sync_room_admin_set(state: &AppState, room_id: &RoomId) {
-    match state.db.get_room_admin_ids(&room_id.to_string()) {
-        Ok(admins) => {
-            state
-                .room_manager
-                .sync_room_admins(room_id.as_u64(), admins)
-                .await;
-        }
-        Err(e) => tracing::error!("Failed to read administrators for room {room_id}: {e}"),
-    }
-}
-
 /// Handles `GET /api/room/{room_id}/permissions`.
 ///
 /// Requires a valid session and room membership.
@@ -1574,7 +1561,10 @@ async fn set_room_permission_handler(
         .set_room_permission(&room_id_str, req.account_id, req.role, now)
     {
         Ok(()) => {
-            sync_room_admin_set(&state, &room_id).await;
+            // TODO(#200): push the change into the running room through the
+            // banquette permission table. Issue #199 removed the `SetAdmins`
+            // control frame, so a live room keeps its own permissions until the
+            // next spawn reads the room head.
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -1614,7 +1604,7 @@ async fn delete_room_permission_handler(
         .delete_room_permission(&room_id.to_string(), account_id)
     {
         Ok(_) => {
-            sync_room_admin_set(&state, &room_id).await;
+            // TODO(#200): see set_room_permission_handler.
             (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
         }
         Err(e) => (
@@ -1626,6 +1616,15 @@ async fn delete_room_permission_handler(
 }
 
 /// Checks whether a [`ClientFrame`] mutates room state, scene structure, or logs.
+///
+/// Banquette enforces the four-level room permissions itself (Issue #199), so
+/// this predicate only drives the `maitre-d` viewer gate kept for the legacy
+/// database roles. `SetMemberPermission` / `SetDefaultPermission` are included
+/// because they change the room permission table.
+///
+/// TODO(#200): delete the local viewer gate together with the database role
+/// rows; the room permission table in `RoomData` becomes the single source of
+/// truth.
 pub fn is_mutate_frame(frame: &ClientFrame) -> bool {
     matches!(
         frame,
@@ -1637,7 +1636,8 @@ pub fn is_mutate_frame(frame: &ClientFrame) -> bool {
             | ClientFrame::DeleteState { .. }
             | ClientFrame::CreateScene { .. }
             | ClientFrame::DeleteScene { .. }
-            | ClientFrame::SetDone { .. }
+            | ClientFrame::SetMemberPermission { .. }
+            | ClientFrame::SetDefaultPermission { .. }
             | ClientFrame::CreateCharacter { .. }
             | ClientFrame::UpdateCharacter { .. }
             | ClientFrame::DeleteCharacter { .. }

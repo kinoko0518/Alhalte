@@ -12,7 +12,9 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::error::CellarError;
-use crate::model::{StoreRequest, StoreResponse, UnregisterRequest, format_tin_id, parse_tin_id};
+use crate::model::{
+    SYSTEM_OWNER, StoreRequest, StoreResponse, UnregisterRequest, format_tin_id, parse_tin_id,
+};
 use crate::service::CellarService;
 
 /// Maximum accepted request body for tin uploads (64 MiB).
@@ -36,6 +38,36 @@ pub const SERVICE_TOKEN_HEADER: &str = "X-Alhalte-Service-Token";
 fn service_token_from_headers(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(SERVICE_TOKEN_HEADER)?.to_str().ok()?;
     if value.is_empty() { None } else { Some(value) }
+}
+
+/// Reads a `u64` from a request header, ignoring absent or malformed values.
+fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
+    headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+}
+
+/// Resolves the credential and reference label of an upload / unregister.
+///
+/// A service-token request does not need `owner` / `session_id`: the token is
+/// the credential and the reference label is always [`SYSTEM_OWNER`], so a body
+/// or header `owner` can neither authorize nor label an internal write. Without
+/// a token, both are required because [`crate::SessionVerifier`] binds the label
+/// to the session, and a missing pair is rejected with 401.
+fn resolve_write_credentials(
+    owner: Option<u64>,
+    session_id: Option<u64>,
+    service_token: Option<&str>,
+) -> std::result::Result<(u64, u64), CellarError> {
+    match (owner, session_id) {
+        (Some(owner), Some(session_id)) => Ok((owner, session_id)),
+        _ if service_token.is_some() => Ok((SYSTEM_OWNER, 0)),
+        _ => Err(CellarError::Unauthorized {
+            owner: SYSTEM_OWNER,
+            session_id: 0,
+        }),
+    }
 }
 
 /// Query parameters for download requests.
@@ -148,28 +180,13 @@ async fn handle_store_upload(
 ) -> std::result::Result<Response, CellarError> {
     let tin_id = parse_tin_id(&tin_id_hex)?;
 
-    // Extract owner from header or query param
-    let owner = headers
-        .get("X-Alhalte-Owner")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(query.owner)
-        .ok_or_else(|| {
-            CellarError::Internal(
-                "Missing required owner (header X-Alhalte-Owner or query parameter owner)"
-                    .to_string(),
-            )
-        })?;
-
-    // Extract session_id from header or query param
-    let session_id = headers
-        .get("X-Alhalte-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(query.session_id)
-        .ok_or_else(|| {
-            CellarError::Internal("Missing required session_id (header X-Alhalte-Session-Id or query parameter session_id)".to_string())
-        })?;
+    // A service-token upload needs neither header: the token is the credential.
+    let service_token = service_token_from_headers(&headers);
+    let (owner, session_id) = resolve_write_credentials(
+        header_u64(&headers, "X-Alhalte-Owner").or(query.owner),
+        header_u64(&headers, "X-Alhalte-Session-Id").or(query.session_id),
+        service_token,
+    )?;
 
     // Extract wrapped_key from header or query param
     let wrapped_key_hex = headers
@@ -184,14 +201,7 @@ async fn handle_store_upload(
     };
 
     let result = service
-        .store_payload_with_token(
-            owner,
-            session_id,
-            tin_id,
-            &body,
-            wrapped_key,
-            service_token_from_headers(&headers),
-        )
+        .store_payload_with_token(owner, session_id, tin_id, &body, wrapped_key, service_token)
         .await?;
 
     Ok((StatusCode::CREATED, Json(result)).into_response())
@@ -293,34 +303,15 @@ async fn handle_unregister_delete(
 ) -> std::result::Result<Response, CellarError> {
     let tin_id = parse_tin_id(&tin_id_hex)?;
 
-    let owner = headers
-        .get("X-Alhalte-Owner")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(query.owner)
-        .ok_or_else(|| {
-            CellarError::Internal(
-                "Missing required owner (header X-Alhalte-Owner or query parameter owner)"
-                    .to_string(),
-            )
-        })?;
-
-    let session_id = headers
-        .get("X-Alhalte-Session-Id")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(query.session_id)
-        .ok_or_else(|| {
-            CellarError::Internal("Missing required session_id (header X-Alhalte-Session-Id or query parameter session_id)".to_string())
-        })?;
+    let service_token = service_token_from_headers(&headers);
+    let (owner, session_id) = resolve_write_credentials(
+        header_u64(&headers, "X-Alhalte-Owner").or(query.owner),
+        header_u64(&headers, "X-Alhalte-Session-Id").or(query.session_id),
+        service_token,
+    )?;
 
     let deleted = service
-        .unregister_with_token(
-            owner,
-            session_id,
-            &tin_id,
-            service_token_from_headers(&headers),
-        )
+        .unregister_with_token(owner, session_id, &tin_id, service_token)
         .await?;
 
     if deleted {

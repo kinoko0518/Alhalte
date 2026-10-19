@@ -11,7 +11,7 @@ use alhalte_banquette::labels::{
     LABEL_ALHALTE_BANQUETTE_LOG_CHUNK, LABEL_ALHALTE_BANQUETTE_SCENE,
 };
 use alhalte_banquette::log::{CharacterCameEvent, CharacterGoneEvent, LogChunk};
-use alhalte_banquette::room::RoomData;
+use alhalte_banquette::room::{RoomData, RoomPermissionLevel};
 use alhalte_banquette::scene::SceneData;
 use alhalte_saignant::LogEntry;
 use flate2::Compression as GzCompression;
@@ -379,12 +379,28 @@ fn parse_entry_tin(
     (SceneEvent::Speech(log_entry), None)
 }
 
+/// Maps a room's default permission onto the archive `done` flag.
+///
+/// `RoomArchive.done` predates the four-level permission model introduced by
+/// Issue #199. A room counts as public when its default permission grants at
+/// least viewer access, which is the closest projection of the removed
+/// `RoomData.done`.
+///
+/// TODO(#184/#200): drop this shim once the frozen archive format carries the
+/// permission table itself.
+fn room_is_public(room_data: &RoomData) -> bool {
+    room_data.default_permission != RoomPermissionLevel::Denied
+}
+
 /// Unpacked room archive containing room metadata, character definitions, and scenes.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RoomArchive {
     /// Optional 64-bit room identifier.
     pub room_id: Option<u64>,
-    /// Whether room is fully public (`done` flag).
+    /// Whether the room defaults to at least viewer access.
+    ///
+    /// Projection of [`RoomData::default_permission`] kept for the frozen archive
+    /// format; see [`room_is_public`].
     pub done: bool,
     /// Log chunk size exponent $N$.
     pub chunk_exponent: u8,
@@ -474,7 +490,7 @@ impl RoomArchive {
                 if tin.label == LABEL_ALHALTE_BANQUETTE {
                     if let Ok(room_data) = postcard::from_bytes::<RoomData>(&tin.payload) {
                         archive.room_id = Some(room_data.room_id);
-                        archive.done = room_data.done;
+                        archive.done = room_is_public(&room_data);
                         archive.chunk_exponent = room_data.chunk_exponent;
                         archive.characters = room_data.character_biblio.all().clone();
 
@@ -521,7 +537,7 @@ impl RoomArchive {
             if filename.ends_with(".json") {
                 if let Ok(room_data) = serde_json::from_slice::<RoomData>(bytes) {
                     archive.room_id = Some(room_data.room_id);
-                    archive.done = room_data.done;
+                    archive.done = room_is_public(&room_data);
                     archive.chunk_exponent = room_data.chunk_exponent;
                     archive.characters = room_data.character_biblio.all().clone();
 

@@ -20,7 +20,7 @@ use alhalte_banquette::character::{Character, get_character_name, set_character_
 use alhalte_banquette::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
 };
-use alhalte_banquette::room::Room;
+use alhalte_banquette::room::{Room, RoomPermissionLevel};
 use alhalte_banquette::server::{BanquetteServer, ServerConfig};
 use tin::Tin;
 
@@ -33,7 +33,7 @@ fn tin_id_hex(byte: u8) -> String {
 }
 
 #[test]
-// spec: alhalte-banquette/protocol backward compatible variant indices
+// spec: alhalte-banquette/protocol frame round-trips and variant indices
 fn test_new_frames_are_appended_and_roundtrip() {
     let frames = [
         ServerFrame::SceneCreated {
@@ -46,7 +46,14 @@ fn test_new_frames_are_appended_and_roundtrip() {
             character_id: 7,
             to_scene_id: "dungeon".to_string(),
         },
-        ServerFrame::DoneUpdated { done: true },
+        ServerFrame::PermissionsSnapshot {
+            default_permission: RoomPermissionLevel::Participant,
+            permissions: std::collections::BTreeMap::from([(10, RoomPermissionLevel::Admin)]),
+        },
+        ServerFrame::PermissionsUpdated {
+            default_permission: RoomPermissionLevel::Viewer,
+            permissions: std::collections::BTreeMap::from([(55, RoomPermissionLevel::Denied)]),
+        },
     ];
 
     for frame in frames {
@@ -57,31 +64,84 @@ fn test_new_frames_are_appended_and_roundtrip() {
         assert_eq!(postcard::from_bytes::<ServerFrame>(&bytes).unwrap(), frame);
     }
 
-    // The permission-sync control frames round-trip as well.
-    let set_admins = MaitreDToBanquette::SetAdmins {
-        admins: vec![10, 55],
+    // The permission frames round-trip on the client and control channels too.
+    let client_frames = [
+        ClientFrame::SetMemberPermission {
+            account_id: 55,
+            permission: RoomPermissionLevel::Admin,
+        },
+        ClientFrame::SetDefaultPermission {
+            permission: RoomPermissionLevel::Viewer,
+        },
+        ClientFrame::QueryPermissions,
+    ];
+    for frame in client_frames {
+        let json = serde_json::to_string(&frame).unwrap();
+        assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
+        let bytes = postcard::to_allocvec(&frame).unwrap();
+        assert_eq!(postcard::from_bytes::<ClientFrame>(&bytes).unwrap(), frame);
+    }
+
+    let query_account_permission = MaitreDToBanquette::QueryAccountPermission {
+        request_id: 9,
+        account_id: 55,
     };
-    let bytes = postcard::to_allocvec(&set_admins).unwrap();
+    let bytes = postcard::to_allocvec(&query_account_permission).unwrap();
     assert_eq!(
         postcard::from_bytes::<MaitreDToBanquette>(&bytes).unwrap(),
-        set_admins
+        query_account_permission
     );
-    let admins_updated = BanquetteToMaitreD::AdminsUpdated {
-        admins: vec![10, 55],
+    let permission_response = BanquetteToMaitreD::AccountPermissionResponse {
+        request_id: 9,
+        account_id: 55,
+        permission: RoomPermissionLevel::Viewer,
     };
-    let bytes = postcard::to_allocvec(&admins_updated).unwrap();
+    let bytes = postcard::to_allocvec(&permission_response).unwrap();
     assert_eq!(
         postcard::from_bytes::<BanquetteToMaitreD>(&bytes).unwrap(),
-        admins_updated
+        permission_response
+    );
+    let persisted = BanquetteToMaitreD::RoomPersisted {
+        tin_id: [7u8; 32],
+        default_permission: RoomPermissionLevel::Denied,
+    };
+    let bytes = postcard::to_allocvec(&persisted).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<BanquetteToMaitreD>(&bytes).unwrap(),
+        persisted
     );
 
-    // Backward compatibility: the postcard variant index is a positional varint, so new
-    // variants must be appended last. These values pin the pre-existing indices.
+    // The postcard variant index is a positional varint. Issue #199 removed
+    // `SetDone` / `DoneUpdated` / `SetAdmins` / `AdminsUpdated`, so the indices
+    // after the removed variant shifted; these values pin the new layout.
     assert_eq!(
         postcard::to_allocvec(&ClientFrame::HeartbeatResponse)
             .unwrap()
             .first(),
+        Some(&22u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&ClientFrame::SetMemberPermission {
+            account_id: 0,
+            permission: RoomPermissionLevel::Denied,
+        })
+        .unwrap()
+        .first(),
         Some(&23u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&ClientFrame::SetDefaultPermission {
+            permission: RoomPermissionLevel::Denied,
+        })
+        .unwrap()
+        .first(),
+        Some(&24u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&ClientFrame::QueryPermissions)
+            .unwrap()
+            .first(),
+        Some(&25u8)
     );
     assert_eq!(
         postcard::to_allocvec(&ServerFrame::Error {
@@ -110,21 +170,40 @@ fn test_new_frames_are_appended_and_roundtrip() {
         Some(&21u8)
     );
     assert_eq!(
-        postcard::to_allocvec(&ServerFrame::DoneUpdated { done: false })
-            .unwrap()
-            .first(),
+        postcard::to_allocvec(&ServerFrame::PermissionsSnapshot {
+            default_permission: RoomPermissionLevel::Denied,
+            permissions: std::collections::BTreeMap::new(),
+        })
+        .unwrap()
+        .first(),
         Some(&22u8)
     );
     assert_eq!(
-        postcard::to_allocvec(&MaitreDToBanquette::SetAdmins { admins: vec![] })
-            .unwrap()
-            .first(),
+        postcard::to_allocvec(&ServerFrame::PermissionsUpdated {
+            default_permission: RoomPermissionLevel::Denied,
+            permissions: std::collections::BTreeMap::new(),
+        })
+        .unwrap()
+        .first(),
+        Some(&23u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&MaitreDToBanquette::QueryAccountPermission {
+            request_id: 0,
+            account_id: 0,
+        })
+        .unwrap()
+        .first(),
         Some(&5u8)
     );
     assert_eq!(
-        postcard::to_allocvec(&BanquetteToMaitreD::AdminsUpdated { admins: vec![] })
-            .unwrap()
-            .first(),
+        postcard::to_allocvec(&BanquetteToMaitreD::AccountPermissionResponse {
+            request_id: 0,
+            account_id: 0,
+            permission: RoomPermissionLevel::Denied,
+        })
+        .unwrap()
+        .first(),
         Some(&7u8)
     );
 }
@@ -139,7 +218,6 @@ async fn start_test_server() -> (tempfile::TempDir, ClientSink, ServerStream, Jo
     let config = ServerConfig {
         socket_path: sock_path.clone(),
         heartbeat_interval: Duration::from_secs(3600),
-        admin_account: 10,
     };
 
     let server = BanquetteServer::new(config, room, cellar);
@@ -931,12 +1009,13 @@ async fn test_state_acks_are_direct_and_broadcast() {
     server_task.abort();
 }
 
-// spec: alhalte-banquette/protocol SetDone success ack and admin-set control frame
+// spec: alhalte-banquette/permissions 0002 permission changes are admin-only and acknowledged
 #[tokio::test]
-async fn test_set_done_ack_and_admin_set_control_frame() {
+async fn test_permission_frames_require_admin() {
     let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
 
-    // Client 101 (account 55) is a plain participant.
+    // Client 101 (account 55) is unknown to the permission table, so the closed
+    // default permission makes it `Denied`.
     sink.send(MaitreDToBanquette::ClientConnected {
         client_id: 101,
         account_id: 55,
@@ -945,8 +1024,17 @@ async fn test_set_done_ack_and_admin_set_control_frame() {
     .await
     .unwrap();
 
-    // A non-admin SetDone is rejected and emits SetDoneFailed, never DoneUpdated.
-    send_frame(&mut sink, 101, ClientFrame::SetDone { done: true }).await;
+    // A non-admin SetMemberPermission is rejected with
+    // SetMemberPermissionFailed and never emits PermissionsUpdated.
+    send_frame(
+        &mut sink,
+        101,
+        ClientFrame::SetMemberPermission {
+            account_id: 55,
+            permission: RoomPermissionLevel::Admin,
+        },
+    )
+    .await;
     let (client_id, frame) = expect_send_to_client(
         wait_for_frame(&mut stream, |f| {
             matches!(f, BanquetteToMaitreD::SendToClient { .. })
@@ -954,48 +1042,48 @@ async fn test_set_done_ack_and_admin_set_control_frame() {
         .await,
     );
     assert_eq!(client_id, 101);
-    assert!(matches!(frame, ServerFrame::Error { code, .. } if code == "SetDoneFailed"));
+    assert!(
+        matches!(&frame, ServerFrame::Error { code, .. } if code == "SetMemberPermissionFailed"),
+        "expected SetMemberPermissionFailed, got {frame:?}"
+    );
 
-    // maitre-d applies the database GM set without a room-client caller check.
-    sink.send(MaitreDToBanquette::SetAdmins {
-        admins: vec![10, 55],
-    })
-    .await
-    .unwrap();
-    match wait_for_frame(&mut stream, |f| {
-        matches!(f, BanquetteToMaitreD::AdminsUpdated { .. })
-    })
-    .await
-    {
-        BanquetteToMaitreD::AdminsUpdated { admins } => assert_eq!(admins, vec![10, 55]),
-        other => panic!("expected AdminsUpdated, got {other:?}"),
-    }
-
-    // The promoted account now succeeds; the success ack carries the new flag.
-    send_frame(&mut sink, 101, ClientFrame::SetDone { done: true }).await;
+    // A non-admin SetDefaultPermission is rejected too.
+    send_frame(
+        &mut sink,
+        101,
+        ClientFrame::SetDefaultPermission {
+            permission: RoomPermissionLevel::Viewer,
+        },
+    )
+    .await;
     let (client_id, frame) = expect_send_to_client(
         wait_for_frame(&mut stream, |f| {
-            matches!(
-                f,
-                BanquetteToMaitreD::SendToClient {
-                    frame: ServerFrame::DoneUpdated { .. },
-                    ..
-                }
-            )
+            matches!(f, BanquetteToMaitreD::SendToClient { .. })
         })
         .await,
     );
     assert_eq!(client_id, 101);
-    assert_eq!(frame, ServerFrame::DoneUpdated { done: true });
+    assert!(
+        matches!(&frame, ServerFrame::Error { code, .. } if code == "SetDefaultPermissionFailed"),
+        "expected SetDefaultPermissionFailed, got {frame:?}"
+    );
 
-    // The original administrator still succeeds too.
-    send_frame(&mut sink, 100, ClientFrame::SetDone { done: false }).await;
+    // The last administrator cannot demote itself (Issues #199).
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::SetMemberPermission {
+            account_id: 10,
+            permission: RoomPermissionLevel::Participant,
+        },
+    )
+    .await;
     let (client_id, frame) = expect_send_to_client(
         wait_for_frame(&mut stream, |f| {
             matches!(
                 f,
                 BanquetteToMaitreD::SendToClient {
-                    frame: ServerFrame::DoneUpdated { .. },
+                    frame: ServerFrame::Error { .. },
                     ..
                 }
             )
@@ -1003,7 +1091,95 @@ async fn test_set_done_ack_and_admin_set_control_frame() {
         .await,
     );
     assert_eq!(client_id, 100);
-    assert_eq!(frame, ServerFrame::DoneUpdated { done: false });
+    assert!(
+        matches!(frame, ServerFrame::Error { code, .. } if code == "SetMemberPermissionFailed")
+    );
+
+    // The room administrator promotes account 55: no restart needed.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::SetMemberPermission {
+            account_id: 55,
+            permission: RoomPermissionLevel::Admin,
+        },
+    )
+    .await;
+    let (client_id, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::PermissionsUpdated { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    assert_eq!(client_id, 100);
+    match frame {
+        ServerFrame::PermissionsUpdated { permissions, .. } => {
+            assert_eq!(permissions.get(&55), Some(&RoomPermissionLevel::Admin))
+        }
+        other => panic!("expected PermissionsUpdated, got {other:?}"),
+    }
+
+    // The promoted account now succeeds and the ack carries the new table.
+    send_frame(
+        &mut sink,
+        101,
+        ClientFrame::SetDefaultPermission {
+            permission: RoomPermissionLevel::Viewer,
+        },
+    )
+    .await;
+    let (client_id, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::PermissionsUpdated { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    assert_eq!(client_id, 101);
+    match frame {
+        ServerFrame::PermissionsUpdated {
+            default_permission, ..
+        } => assert_eq!(default_permission, RoomPermissionLevel::Viewer),
+        other => panic!("expected PermissionsUpdated, got {other:?}"),
+    }
+
+    // QueryPermissions answers an account with access with the full table.
+    send_frame(&mut sink, 100, ClientFrame::QueryPermissions).await;
+    let (client_id, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::PermissionsSnapshot { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    assert_eq!(client_id, 100);
+    match frame {
+        ServerFrame::PermissionsSnapshot {
+            default_permission,
+            permissions,
+        } => {
+            assert_eq!(default_permission, RoomPermissionLevel::Viewer);
+            assert_eq!(permissions.get(&10), Some(&RoomPermissionLevel::Admin));
+            assert_eq!(permissions.get(&55), Some(&RoomPermissionLevel::Admin));
+        }
+        other => panic!("expected PermissionsSnapshot, got {other:?}"),
+    }
 
     server_task.abort();
 }

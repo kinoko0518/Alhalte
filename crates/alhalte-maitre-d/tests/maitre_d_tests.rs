@@ -2232,17 +2232,40 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
     );
     let (mut gm_stream, _) = connect_async(&gm_ws_url).await.unwrap();
 
-    // 4. GM marks the room done (public)
-    let set_done_frame = serde_json::to_string(&ClientFrame::SetDone { done: true }).unwrap();
+    // 4. GM opens the room to viewers (the four-level permission model replaced
+    // the `done` flag with a default permission, Issue #199).
+    let set_default_permission = serde_json::to_string(&ClientFrame::SetDefaultPermission {
+        permission: alhalte_banquette::RoomPermissionLevel::Viewer,
+    })
+    .unwrap();
     gm_stream
-        .send(WsMessage::Text(set_done_frame.into()))
+        .send(WsMessage::Text(set_default_permission.into()))
         .await
         .unwrap();
 
-    // Give a brief moment for set_done processing
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for the acknowledgement so `rooms.done` is already recorded when the
+    // outsider reconnects.
+    let mut acknowledged = false;
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(t))) =
+            tokio::time::timeout(Duration::from_millis(500), gm_stream.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::PermissionsUpdated { .. }) =
+                serde_json::from_str::<ServerFrame>(&t)
+        {
+            acknowledged = true;
+            break;
+        }
+    }
+    assert!(
+        acknowledged,
+        "the room must acknowledge the permission change"
+    );
 
-    // 5. Now outsider attempts to connect again -> succeeds because room is done!
+    // 5. Now outsider attempts to connect again -> succeeds because the room
+    // default permission grants viewer access!
     let (mut outsider_stream, _) = connect_async(&outsider_ws_url).await.unwrap();
     let list_scenes = serde_json::to_string(&ClientFrame::ListScenes).unwrap();
     outsider_stream

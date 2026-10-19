@@ -8,7 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use alhalte_banquette::{
-    CellarSink, ClientFrame, HttpCellarSink, InMemoryCellarSink, Room, ServerFrame,
+    CellarSink, ClientFrame, HttpCellarSink, InMemoryCellarSink, Room, RoomPermissionLevel,
+    ServerFrame,
 };
 use alhalte_cellar::{CellarService, InMemorySessionVerifier};
 use alhalte_maitre_d::{
@@ -252,9 +253,17 @@ async fn test_room_state_restored_after_banquette_restart() {
     })
     .await;
 
-    bridge.send_client_frame(1, ClientFrame::SetDone { done: true });
-    // SetDone has no direct ack; the final export asserts the flag below.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Issue #199: the room-wide default permission replaced the `done` flag.
+    bridge.send_client_frame(
+        1,
+        ClientFrame::SetDefaultPermission {
+            permission: RoomPermissionLevel::Viewer,
+        },
+    );
+    wait_for_frame(&mut rx, |frame| {
+        matches!(frame, ServerFrame::PermissionsUpdated { .. })
+    })
+    .await;
 
     // Graceful shutdown persists the final state and reports the head.
     assert!(
@@ -275,7 +284,11 @@ async fn test_room_state_restored_after_banquette_restart() {
         .expect("export of the restored room");
 
     assert_eq!(room_data.room_id, ROOM_ID);
-    assert!(room_data.done, "done flag must be restored");
+    assert_eq!(
+        room_data.default_permission,
+        RoomPermissionLevel::Viewer,
+        "default permission must be restored"
+    );
     assert_eq!(room_data.chunk_exponent, 8);
     assert!(room_data.scenes.contains_key("/"));
     let tavern = room_data.scenes.get("tavern").expect("tavern restored");
@@ -303,15 +316,21 @@ async fn test_room_state_restored_after_banquette_restart() {
     );
     assert!(tavern.present_characters.contains(&character_id));
     assert_eq!(room_data.character_biblio.len(), 1);
-    let root_admins = room_data
-        .scenes
-        .get("/")
-        .unwrap()
-        .states
-        .get("std::admins")
-        .expect("admins restored");
-    let admins: Vec<u64> = postcard::from_bytes(&root_admins.payload).unwrap();
-    assert_eq!(admins, vec![ADMIN]);
+    // Issue #199: room permissions are part of `RoomData`, not `"/"` state.
+    assert_eq!(
+        room_data.permissions.get(&ADMIN),
+        Some(&RoomPermissionLevel::Admin),
+        "administrator set must be restored"
+    );
+    assert!(
+        !room_data
+            .scenes
+            .get("/")
+            .unwrap()
+            .states
+            .contains_key("std::admins"),
+        "room permissions must not be mirrored into scene state"
+    );
 
     // The restored banquette serves the same data over the client protocol.
     let mut rx = restored.register_client(2, account_id, session_id).await;
@@ -500,7 +519,7 @@ async fn test_internal_service_token_store_and_old_head_retention() {
     .unwrap();
 
     // The store succeeds without any user session; only the service token authorizes it.
-    let first_head = room.persist(&sink, ADMIN).await.expect("token store");
+    let first_head = room.persist(&sink).await.expect("token store");
     assert_eq!(room.head_tin, Some(first_head));
     assert!(service.download(&first_head, None).await.is_ok());
 
@@ -512,7 +531,7 @@ async fn test_internal_service_token_store_and_old_head_retention() {
         Tin::from_string("snow"),
     )
     .unwrap();
-    let second_head = room.persist(&sink, ADMIN).await.expect("token store");
+    let second_head = room.persist(&sink).await.expect("token store");
     assert_ne!(first_head, second_head);
     assert!(
         service.download(&first_head, None).await.is_err(),
@@ -544,7 +563,7 @@ async fn test_internal_service_token_store_and_old_head_retention() {
     // A sink without the token is rejected by the cellar verifier (401).
     let untokened = HttpCellarSink::new(format!("http://{addr}"));
     let err = room
-        .persist(&untokened, ADMIN)
+        .persist(&untokened)
         .await
         .expect_err("session-less internal write without a token must fail");
     assert!(
@@ -676,7 +695,7 @@ async fn test_default_bistrot_config_authorizes_room_persistence() {
     let mut room = Room::new(ROOM_ID, ADMIN, config.banquette.chunk_size_exponent).unwrap();
     room.create_scene(ADMIN, "tavern", None).unwrap();
     let head = room
-        .persist(&sink, ADMIN)
+        .persist(&sink)
         .await
         .expect("the default local configuration must authorize persistence");
     assert!(service.download(&head, None).await.is_ok());
@@ -724,14 +743,15 @@ async fn test_done_persists_across_maitre_d_restart_for_get_and_ws_gate() {
         );
         let (addr, server) = serve_app(state).await;
 
-        // A GM marks the room public through the real WebSocket path.
+        // A GM opens the room to viewers through the real WebSocket path
+        // (Issue #199: the default permission replaced the `done` flag).
         let (mut ws, _) = tokio_tungstenite::connect_async(format!(
             "ws://{addr}/ws/room/{room_id}?account_id={admin}&session_id={admin_session}"
         ))
         .await
         .expect("admin WebSocket");
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::json!({ "SetDone": { "done": true } })
+            serde_json::json!({ "SetDefaultPermission": { "permission": "Viewer" } })
                 .to_string()
                 .into(),
         ))
@@ -746,7 +766,10 @@ async fn test_done_persists_across_maitre_d_restart_for_get_and_ws_gate() {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(persisted, "SetDone must persist rooms.done");
+        assert!(
+            persisted,
+            "SetDefaultPermission must persist the pre-spawn gate"
+        );
 
         let _ = ws.close(None).await;
         server.abort();
@@ -828,10 +851,12 @@ async fn test_restored_room_data_done_is_reflected_in_the_database() {
     let temp_dir = tempdir().unwrap();
     let cellar: Arc<dyn CellarSink> = Arc::new(InMemoryCellarSink::new());
 
-    // A previously-public room persisted to cellar.
+    // A previously-public room persisted to cellar (Issue #199: the default
+    // permission replaced the `done` flag).
     let mut room = Room::new(ROOM_ID, ADMIN, 8).unwrap();
-    room.set_done(ADMIN, true).unwrap();
-    let head = room.persist(cellar.as_ref(), ADMIN).await.unwrap();
+    room.set_default_permission(ADMIN, RoomPermissionLevel::Viewer)
+        .unwrap();
+    let head = room.persist(cellar.as_ref()).await.unwrap();
 
     // A fresh maitre-d DB registers the room as private and points at the head.
     let db = Database::new_in_memory().unwrap();
@@ -850,9 +875,9 @@ async fn test_restored_room_data_done_is_reflected_in_the_database() {
         .await
         .expect("the persisted head must restore");
 
-    // The restored RoomData carries done=true.
+    // The restored RoomData carries default_permission = Viewer.
     let (room_data, _) = bridge.export_room(Some(ADMIN)).await.unwrap();
-    assert!(room_data.done);
+    assert_eq!(room_data.default_permission, RoomPermissionLevel::Viewer);
 
     // The successful persist of the restored room reports done back to maitre-d.
     let mut reflected = false;
@@ -872,10 +897,10 @@ async fn test_restored_room_data_done_is_reflected_in_the_database() {
     spawner.shutdown_room(ROOM_ID).await;
 }
 
-// spec: alhalte-maitre-d/permissions 0001 runtime GM changes reach a running banquette
-// spec: alhalte-maitre-d/room-done 0004 SetDone persists only after the banquette ack
+// spec: alhalte-maitre-d/room-done 0004 a permission change persists only after the banquette ack
+// spec: alhalte-banquette/permissions 0003 runtime permission changes need no restart
 #[tokio::test]
-async fn test_runtime_gm_sync_and_set_done_ack_ordering() {
+async fn test_runtime_permission_change_ack_ordering() {
     let temp_dir = tempdir().unwrap();
     let db = Database::new_in_memory().unwrap();
     let room_id = "0a1b2c3d4e5f6071";
@@ -900,7 +925,8 @@ async fn test_runtime_gm_sync_and_set_done_ack_ordering() {
     );
     let (addr, server) = serve_app(state).await;
 
-    // The GM connects first and starts the room process.
+    // The GM connects first and starts the room process. `Room::new` makes the
+    // creator the initial room administrator (Issue #199).
     let (mut gm_ws, _) = tokio_tungstenite::connect_async(format!(
         "ws://{addr}/ws/room/{room_id}?account_id={gm}&session_id={gm_session}"
     ))
@@ -919,86 +945,126 @@ async fn test_runtime_gm_sync_and_set_done_ack_ordering() {
     })
     .await;
 
-    // A participant (PL) connects to the same running room.
+    // A participant (PL) connects to the same running room. The database `pl`
+    // role is a `maitre-d` concept only: banquette starts the account as
+    // `Denied` because the room permission table is the source of truth.
     let (mut player_ws, _) = tokio_tungstenite::connect_async(format!(
         "ws://{addr}/ws/room/{room_id}?account_id={player}&session_id={player_session}"
     ))
     .await
     .expect("player WebSocket");
 
-    // A non-admin SetDone is rejected and must not touch `rooms.done`.
+    // A non-admin SetDefaultPermission is rejected and must not touch
+    // `rooms.done`.
     player_ws
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&ClientFrame::SetDone { done: true })
-                .unwrap()
-                .into(),
+            serde_json::to_string(&ClientFrame::SetDefaultPermission {
+                permission: RoomPermissionLevel::Viewer,
+            })
+            .unwrap()
+            .into(),
         ))
         .await
         .unwrap();
-    wait_for_ws_frame(
-        &mut player_ws,
-        |frame| matches!(frame, ServerFrame::Error { code, .. } if code == "SetDoneFailed"),
-    )
+    wait_for_ws_frame(&mut player_ws, |frame| {
+        matches!(frame, ServerFrame::Error { code, .. } if code == "SetDefaultPermissionFailed")
+    })
     .await;
     assert_ne!(db.get_room_done(room_id).unwrap(), Some(true));
 
-    // Promote the already-connected player through the GM API: no restart.
-    let client = reqwest::Client::new();
-    let promote = client
-        .post(format!(
-            "http://{addr}/api/room/{room_id}/permissions?account_id={gm}&session_id={gm_session}"
+    // The GM grants the already-connected player admin rights inside the running
+    // room: no restart and no database round-trip to banquette.
+    gm_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientFrame::SetMemberPermission {
+                account_id: player,
+                permission: RoomPermissionLevel::Admin,
+            })
+            .unwrap()
+            .into(),
         ))
-        .json(&serde_json::json!({ "account_id": player, "role": "gm" }))
-        .send()
         .await
         .unwrap();
-    assert_eq!(promote.status(), reqwest::StatusCode::OK);
+    let granted = wait_for_ws_frame(&mut gm_ws, |frame| {
+        matches!(frame, ServerFrame::PermissionsUpdated { .. })
+    })
+    .await;
+    match granted {
+        ServerFrame::PermissionsUpdated { permissions, .. } => assert_eq!(
+            permissions.get(&player),
+            Some(&RoomPermissionLevel::Admin),
+            "the promoted account must be an administrator"
+        ),
+        other => panic!("expected PermissionsUpdated, got {other:?}"),
+    }
 
-    // The running room now accepts the admin-only operation. The database is
-    // updated only once the DoneUpdated acknowledgement is observed.
+    // The promoted account now succeeds. `rooms.done` -- the pre-spawn gate kept
+    // until Issue #200 -- is derived from the new default permission once the
+    // acknowledgement is observed.
     player_ws
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&ClientFrame::SetDone { done: true })
-                .unwrap()
-                .into(),
+            serde_json::to_string(&ClientFrame::SetDefaultPermission {
+                permission: RoomPermissionLevel::Viewer,
+            })
+            .unwrap()
+            .into(),
         ))
         .await
         .unwrap();
-    let ack = wait_for_ws_frame(
-        &mut player_ws,
-        |frame| matches!(frame, ServerFrame::DoneUpdated { done } if *done),
-    )
+    let ack = wait_for_ws_frame(&mut player_ws, |frame| {
+        matches!(
+            frame,
+            ServerFrame::PermissionsUpdated {
+                default_permission: RoomPermissionLevel::Viewer,
+                ..
+            }
+        )
+    })
     .await;
-    assert_eq!(ack, ServerFrame::DoneUpdated { done: true });
+    assert!(matches!(
+        ack,
+        ServerFrame::PermissionsUpdated {
+            default_permission: RoomPermissionLevel::Viewer,
+            ..
+        }
+    ));
     assert_eq!(db.get_room_done(room_id).unwrap(), Some(true));
 
-    // Removing the GM role drops admin rights on the same live connection.
-    let demote = client
-        .delete(format!(
-            "http://{addr}/api/room/{room_id}/permissions/{player}?account_id={gm}&session_id={gm_session}"
+    // Demoting the player back removes admin rights on the same live connection.
+    gm_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientFrame::SetMemberPermission {
+                account_id: player,
+                permission: RoomPermissionLevel::Viewer,
+            })
+            .unwrap()
+            .into(),
         ))
-        .send()
         .await
         .unwrap();
-    assert_eq!(demote.status(), reqwest::StatusCode::OK);
+    wait_for_ws_frame(&mut gm_ws, |frame| {
+        matches!(frame, ServerFrame::PermissionsUpdated { .. })
+    })
+    .await;
 
     player_ws
         .send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&ClientFrame::SetDone { done: false })
-                .unwrap()
-                .into(),
+            serde_json::to_string(&ClientFrame::SetDefaultPermission {
+                permission: RoomPermissionLevel::Denied,
+            })
+            .unwrap()
+            .into(),
         ))
         .await
         .unwrap();
-    wait_for_ws_frame(
-        &mut player_ws,
-        |frame| matches!(frame, ServerFrame::Error { code, .. } if code == "SetDoneFailed"),
-    )
+    wait_for_ws_frame(&mut player_ws, |frame| {
+        matches!(frame, ServerFrame::Error { code, .. } if code == "SetDefaultPermissionFailed")
+    })
     .await;
     assert_eq!(
         db.get_room_done(room_id).unwrap(),
         Some(true),
-        "a denied SetDone must not change rooms.done"
+        "a denied permission change must not change rooms.done"
     );
 
     let _ = gm_ws.close(None).await;
