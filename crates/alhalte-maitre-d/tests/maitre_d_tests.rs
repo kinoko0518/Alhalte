@@ -2534,22 +2534,24 @@ fn test_resolve_banquette_bin_paths() {
     assert_eq!(fallback, dummy);
 }
 
-// spec: alhalte-maitre-d/ws-permissions ChangeBgm mutates the scene log
+// spec: alhalte-maitre-d/ws-permissions state and log writes mutate the room
 #[test]
-fn test_change_bgm_is_mutate_frame() {
-    let set_bgm = ClientFrame::ChangeBgm {
-        scene_id: "/".to_string(),
-        slot: 1,
-        tin_id: Some("ab".repeat(32)),
-    };
-    assert!(is_mutate_frame(&set_bgm));
+fn test_mutate_frames_are_detected() {
+    use alhalte_banquette::protocol::ClientFrame;
+    use tin::Tin;
 
-    // Stopping a slot (`tin_id = None`) also appends a log entry, so a viewer
-    // must be blocked here too.
-    let stop_bgm = ClientFrame::ChangeBgm {
+    let update = ClientFrame::UpdateState {
         scene_id: "/".to_string(),
-        slot: 1,
-        tin_id: None,
+        key: "std::name".to_string(),
+        value: Tin::from_string("広間"),
     };
-    assert!(is_mutate_frame(&stop_bgm));
+    assert!(is_mutate_frame(&update));
+
+    let append = ClientFrame::AppendLog {
+        scene_id: "/".to_string(),
+        entry: None,
+    };
+    assert!(is_mutate_frame(&append));
+
+    assert!(!is_mutate_frame(&ClientFrame::HeartbeatResponse));
 }

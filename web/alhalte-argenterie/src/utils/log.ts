@@ -80,31 +80,6 @@ export function normalizeLogSystemEvent(value: unknown): LogSystemEvent | undefi
   if (!value || typeof value !== 'object') return undefined;
   const event = value as Record<string, unknown>;
   switch (event.type) {
-    case 'change-bgm': {
-      const slot = Number(event.slot);
-      return {
-        type: 'change-bgm',
-        slot: Number.isFinite(slot) ? slot : 1,
-        ...(typeof event.bgmTinId === 'string' ? { bgmTinId: event.bgmTinId } : {}),
-        ...(typeof event.volume === 'number' && Number.isFinite(event.volume)
-          ? { volume: event.volume }
-          : {}),
-        ...(typeof event.trackIndex === 'number' && Number.isFinite(event.trackIndex)
-          ? { trackIndex: event.trackIndex }
-          : {}),
-      };
-    }
-    case 'change-bg-img':
-      return {
-        type: 'change-bg-img',
-        ...(typeof event.imageTinId === 'string' ? { imageTinId: event.imageTinId } : {}),
-        ...(typeof event.width === 'number' && Number.isFinite(event.width)
-          ? { width: event.width }
-          : {}),
-        ...(typeof event.height === 'number' && Number.isFinite(event.height)
-          ? { height: event.height }
-          : {}),
-      };
     case 'character-came':
     case 'character-gone':
       if (typeof event.characterId !== 'string' && typeof event.characterId !== 'number') {

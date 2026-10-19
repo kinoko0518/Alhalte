@@ -1436,7 +1436,6 @@ pub fn is_mutate_frame(frame: &ClientFrame) -> bool {
             | ClientFrame::UpdateCharacter { .. }
             | ClientFrame::DeleteCharacter { .. }
             | ClientFrame::MoveCharacter { .. }
-            | ClientFrame::ChangeBgm { .. }
     )
 }
 

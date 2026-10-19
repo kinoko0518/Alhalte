@@ -1,11 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { hexToBytes } from '@alhalte/pantry';
 import {
   RoomSocket,
   DEFAULT_OPERATION_TIMEOUT_MS,
   OperationTimeoutError,
   ServerOperationError,
-  LABEL_BANQUETTE_LOG_CHANGE_BGM,
   LABEL_JSON,
   LABEL_LOG_RECORD,
   jsonToTin,
@@ -84,32 +82,6 @@ function lastSentFrame(ws: MockWebSocket): ClientFrame {
 /** Decodes a Tin JSON payload as UTF-8 JSON. */
 function decodeJsonPayload(tin: TinJson): any {
   return JSON.parse(new TextDecoder().decode(Uint8Array.from(tin.payload)));
-}
-
-/** Encodes a postcard `ChangeBgmEvent` payload (tin id, volume, slot, track index). */
-function changeBgmPayload(tinIdHex: string | null, slot: number, volume: number | null): number[] {
-  const bytes: number[] = [];
-  if (tinIdHex) {
-    bytes.push(1, ...Array.from(hexToBytes(tinIdHex)));
-  } else {
-    bytes.push(0);
-  }
-  if (volume === null) {
-    bytes.push(0);
-  } else {
-    const buffer = new Uint8Array(4);
-    new DataView(buffer.buffer).setFloat32(0, volume, true);
-    bytes.push(1, ...Array.from(buffer));
-  }
-  let rest = slot;
-  do {
-    let byte = rest & 0x7f;
-    rest >>>= 7;
-    if (rest) byte |= 0x80;
-    bytes.push(byte);
-  } while (rest);
-  bytes.push(0); // track_index: None
-  return bytes;
 }
 
 const sampleRecord: LogRecord = {
@@ -421,56 +393,6 @@ describe('Promise-based server operations (Issue #136)', () => {
     });
     ws.receive({ LogEventRewound: { scene_id: '/', chunk_index: 3, position: 4 } });
     await expect(promise).resolves.toEqual({ scene_id: '/', chunk_index: 3, position: 4 });
-  });
-
-  it('resolves requestChangeBgm on the LogEventAppended echo for the same slot and tin id', async () => {
-    const { socket, ws } = connectSocket();
-    const tinId = '07'.repeat(32);
-
-    const promise = socket.requestChangeBgm('/', 2, tinId);
-    expect(lastSentFrame(ws)).toEqual({
-      ChangeBgm: { scene_id: '/', slot: 2, tin_id: tinId },
-    });
-
-    // A different slot must not resolve it.
-    ws.receive({
-      LogEventAppended: {
-        scene_id: '/',
-        chunk_index: 0,
-        position: 4,
-        entry: {
-          label: LABEL_BANQUETTE_LOG_CHANGE_BGM,
-          payload: changeBgmPayload(tinId, 1, null),
-        },
-      },
-    });
-    expect(socket.getPendingOperationCount()).toBe(1);
-
-    ws.receive({
-      LogEventAppended: {
-        scene_id: '/',
-        chunk_index: 0,
-        position: 5,
-        entry: {
-          label: LABEL_BANQUETTE_LOG_CHANGE_BGM,
-          payload: changeBgmPayload(tinId, 2, null),
-        },
-      },
-    });
-    await expect(promise).resolves.toMatchObject({ position: 5 });
-
-    // Stopping a slot (tinId null) is correlated by the null tin id.
-    const stopPromise = socket.requestChangeBgm('/', 2, null);
-    expect((lastSentFrame(ws) as any).ChangeBgm.tin_id).toBeNull();
-    ws.receive({
-      LogEventAppended: {
-        scene_id: '/',
-        chunk_index: 0,
-        position: 6,
-        entry: { label: LABEL_BANQUETTE_LOG_CHANGE_BGM, payload: changeBgmPayload(null, 2, null) },
-      },
-    });
-    await expect(stopPromise).resolves.toMatchObject({ position: 6 });
   });
 
   it('rejects the matching operation on Error and all operations on PermissionDenied', async () => {

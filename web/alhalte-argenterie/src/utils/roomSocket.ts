@@ -110,16 +110,6 @@ export const LABEL_PRIMITIVE_F32 = Number(labelHash('primitive/f32'));
 /** Label of a 64-bit float payload (`primitive/f64`). */
 export const LABEL_PRIMITIVE_F64 = Number(labelHash('primitive/f64'));
 
-/** Label of a BGM change log event (`alhalte/banquette/log/change-bgm`). */
-export const LABEL_BANQUETTE_LOG_CHANGE_BGM = Number(
-  labelHash('alhalte/banquette/log/change-bgm'),
-);
-
-/** Label of a background image change log event (`alhalte/banquette/log/change-bg-img`). */
-export const LABEL_BANQUETTE_LOG_CHANGE_BG_IMG = Number(
-  labelHash('alhalte/banquette/log/change-bg-img'),
-);
-
 /** Label of a character entrance log event (`alhalte/banquette/log/character-came`). */
 export const LABEL_BANQUETTE_LOG_CHARACTER_CAME = Number(
   labelHash('alhalte/banquette/log/character-came'),
@@ -378,37 +368,10 @@ function readPostcardVarint(cursor: PostcardCursor): bigint | null {
   return null;
 }
 
-/** Reads a Postcard `Option` discriminant (0 = none, 1 = some). */
-function readPostcardOptionTag(cursor: PostcardCursor): boolean | null {
-  if (cursor.offset >= cursor.bytes.length) return null;
-  const tag = cursor.bytes[cursor.offset++];
-  if (tag === 0) return false;
-  if (tag === 1) return true;
-  return null;
-}
-
-/** Reads a fixed-size byte string (e.g. a 32-byte `TinId`) as lowercase hex. */
-function readPostcardFixedHex(cursor: PostcardCursor, length: number): string | null {
-  if (cursor.bytes.length < cursor.offset + length) return null;
-  const slice = Uint8Array.from(cursor.bytes.slice(cursor.offset, cursor.offset + length));
-  cursor.offset += length;
-  return bytesToHex(slice);
-}
-
-/** Reads a little-endian IEEE 754 `f32`. */
-function readPostcardF32(cursor: PostcardCursor): number | null {
-  if (cursor.bytes.length < cursor.offset + 4) return null;
-  const bytes = Uint8Array.from(cursor.bytes.slice(cursor.offset, cursor.offset + 4));
-  cursor.offset += 4;
-  return new DataView(bytes.buffer, bytes.byteOffset, 4).getFloat32(0, true);
-}
-
 /**
  * Decodes a banquette system-event Tin into a {@link LogSystemEvent}.
  *
  * Field order follows the serde definitions in `alhalte-banquette/src/log.rs`:
- * - `change-bgm`: `Option<TinId>`, `Option<f32>`, `u32`, `Option<u8>`
- * - `change-bg-img`: `Option<TinId>`, `Option<u32>`, `Option<u32>`
  * - `character-came` / `character-gone`: `u64`
  *
  * Returns `null` for unknown labels or malformed payloads; callers then fall
@@ -428,72 +391,6 @@ export function decodeLogSystemEvent(entry: unknown): LogSystemEvent | null {
     const characterId = readPostcardVarint(cursor);
     if (characterId === null) return null;
     return { type: 'character-gone', characterId: characterId.toString() };
-  }
-  if (label === LABEL_BANQUETTE_LOG_CHANGE_BGM) {
-    const hasTinId = readPostcardOptionTag(cursor);
-    if (hasTinId === null) return null;
-    let bgmTinId: string | undefined;
-    if (hasTinId) {
-      const hex = readPostcardFixedHex(cursor, 32);
-      if (hex === null) return null;
-      bgmTinId = hex;
-    }
-    const hasVolume = readPostcardOptionTag(cursor);
-    if (hasVolume === null) return null;
-    let volume: number | undefined;
-    if (hasVolume) {
-      const value = readPostcardF32(cursor);
-      if (value === null) return null;
-      volume = value;
-    }
-    const slotValue = readPostcardVarint(cursor);
-    if (slotValue === null) return null;
-    const hasTrack = readPostcardOptionTag(cursor);
-    if (hasTrack === null) return null;
-    let trackIndex: number | undefined;
-    if (hasTrack) {
-      if (cursor.offset >= cursor.bytes.length) return null;
-      trackIndex = cursor.bytes[cursor.offset++];
-    }
-    return {
-      type: 'change-bgm',
-      slot: Number(slotValue),
-      ...(bgmTinId !== undefined ? { bgmTinId } : {}),
-      ...(volume !== undefined ? { volume } : {}),
-      ...(trackIndex !== undefined ? { trackIndex } : {}),
-    };
-  }
-  if (label === LABEL_BANQUETTE_LOG_CHANGE_BG_IMG) {
-    const hasTinId = readPostcardOptionTag(cursor);
-    if (hasTinId === null) return null;
-    let imageTinId: string | undefined;
-    if (hasTinId) {
-      const hex = readPostcardFixedHex(cursor, 32);
-      if (hex === null) return null;
-      imageTinId = hex;
-    }
-    const hasWidth = readPostcardOptionTag(cursor);
-    if (hasWidth === null) return null;
-    let width: number | undefined;
-    if (hasWidth) {
-      const value = readPostcardVarint(cursor);
-      if (value === null) return null;
-      width = Number(value);
-    }
-    const hasHeight = readPostcardOptionTag(cursor);
-    if (hasHeight === null) return null;
-    let height: number | undefined;
-    if (hasHeight) {
-      const value = readPostcardVarint(cursor);
-      if (value === null) return null;
-      height = Number(value);
-    }
-    return {
-      type: 'change-bg-img',
-      ...(imageTinId !== undefined ? { imageTinId } : {}),
-      ...(width !== undefined ? { width } : {}),
-      ...(height !== undefined ? { height } : {}),
-    };
   }
 
   return null;
@@ -532,11 +429,9 @@ function systemEventToLogRecord(
   );
 }
 
-/** Returns true for the four banquette system-event labels. */
+/** Returns true for the banquette system-event labels. */
 function isBanquetteSystemEventLabel(label: number): boolean {
   return (
-    label === LABEL_BANQUETTE_LOG_CHANGE_BGM ||
-    label === LABEL_BANQUETTE_LOG_CHANGE_BG_IMG ||
     label === LABEL_BANQUETTE_LOG_CHARACTER_CAME ||
     label === LABEL_BANQUETTE_LOG_CHARACTER_GONE
   );
@@ -754,52 +649,6 @@ function readClientOpId(entry: unknown): string | null {
   return null;
 }
 
-/**
- * Decodes the leading fields of a postcard-encoded `ChangeBgmEvent`.
- *
- * Field order is `bgm_tin_id: Option<TinId>`, `volume: Option<f32>`,
- * `slot: u32` (varint), `track_index: Option<u8>`. Only the tin id and the slot
- * are needed for acknowledgement correlation.
- */
-function decodeChangeBgmEntry(
-  entry: unknown,
-): { tinIdHex: string | null; slot: number | null } | null {
-  if (!isTinJson(entry) || Number(entry.label) !== LABEL_BANQUETTE_LOG_CHANGE_BGM) {
-    return null;
-  }
-  const payload = toByteArray(entry.payload);
-  let offset = 0;
-
-  const tinIdTag = payload[offset++];
-  if (tinIdTag !== 0 && tinIdTag !== 1) return null;
-  let tinIdHex: string | null = null;
-  if (tinIdTag === 1) {
-    if (payload.length < offset + 32) return null;
-    tinIdHex = bytesToHex(Uint8Array.from(payload.slice(offset, offset + 32)));
-    offset += 32;
-  }
-
-  const volumeTag = payload[offset++];
-  if (volumeTag === 1) {
-    if (payload.length < offset + 4) return null;
-    offset += 4;
-  } else if (volumeTag !== 0) {
-    return null;
-  }
-
-  let slot = 0;
-  let shift = 0;
-  for (;;) {
-    if (offset >= payload.length || shift > 28) return null;
-    const byte = payload[offset++];
-    slot += (byte & 0x7f) * 2 ** shift;
-    shift += 7;
-    if ((byte & 0x80) === 0) break;
-  }
-
-  return { tinIdHex, slot };
-}
-
 /** Summary of one scene as sent by banquette (`SceneList` / `SceneInfo`). */
 export interface SceneSummary {
   /** Scene identifier. */
@@ -896,7 +745,6 @@ export type ClientFrame =
   | { UpdateCharacter: { character_id: number; data: any } }
   | { DeleteCharacter: { character_id: number } }
   | { MoveCharacter: { character_id: number; to_scene_id: string } }
-  | { ChangeBgm: { scene_id: string; slot: number; tin_id: string | null } }
   | { WebRtcSignal: { to_client_id: number; payload: any } }
   | 'HeartbeatResponse';
 
@@ -1195,7 +1043,6 @@ type OperationKind =
   | 'updateCharacter'
   | 'deleteCharacter'
   | 'rewindLog'
-  | 'changeBgm'
   | 'setDone'
   | 'querySceneList'
   | 'queryState'
@@ -2174,41 +2021,6 @@ export class RoomSocket {
     );
 
     this.send({ RewindLog: { scene_id: sceneId, chunk_index: chunkIndex, position } });
-    return promise;
-  }
-
-  /**
-   * Changes the BGM of a scene slot (or stops it with `tinId = null`).
-   *
-   * The server appends a `ChangeBgmEvent` log entry and announces it with
-   * `LogEventAppended`; the matching broadcast resolves this operation.
-   */
-  public requestChangeBgm(
-    sceneId: string,
-    slot: number,
-    tinId: string | null,
-    timeoutMs?: number,
-  ): Promise<LogAppendedAck> {
-    const expectedTinId = tinId ? tinId.trim().toLowerCase() : null;
-    const promise = this.registerOperation<LogAppendedAck>(
-      'changeBgm',
-      ['ChangeBgmFailed'],
-      (frame) => {
-        if (typeof frame !== 'object' || frame === null || !('LogEventAppended' in frame)) {
-          return { matched: false };
-        }
-        const event = frame.LogEventAppended;
-        if (event.scene_id !== sceneId) return { matched: false };
-        const decoded = decodeChangeBgmEntry(event.entry);
-        if (!decoded) return { matched: false };
-        if (decoded.slot !== null && decoded.slot !== Number(slot)) return { matched: false };
-        if (decoded.tinIdHex !== expectedTinId) return { matched: false };
-        return { matched: true, value: event };
-      },
-      timeoutMs,
-    );
-
-    this.send({ ChangeBgm: { scene_id: sceneId, slot, tin_id: tinId ?? null } });
     return promise;
   }
 

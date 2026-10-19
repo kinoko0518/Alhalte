@@ -11,9 +11,9 @@ use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::codec::Framed;
 
 use crate::cellar_sink::CellarSink;
-use crate::error::{BanquetteError, Result};
+use crate::error::Result;
 use crate::labels::KEY_STD_NAME;
-use crate::log::{ChangeBgmEvent, CharacterCameEvent, CharacterGoneEvent, LogOperationEvent};
+use crate::log::{CharacterCameEvent, CharacterGoneEvent, LogOperationEvent};
 use crate::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
 };
@@ -101,18 +101,6 @@ async fn broadcast_to_room(out_tx: &mpsc::Sender<BanquetteToMaitreD>, frame: Ser
     let _ = out_tx
         .send(BanquetteToMaitreD::BroadcastToRoom { frame })
         .await;
-}
-
-/// Decodes a 64 hexadecimal character tin ID into a [`TinId`].
-fn decode_tin_id_hex(value: &str) -> Result<TinId> {
-    let bytes = hex::decode(value)
-        .map_err(|e| BanquetteError::Serialization(format!("invalid tin id hex '{value}': {e}")))?;
-    let len = bytes.len();
-    bytes.as_slice().try_into().map_err(|_| {
-        BanquetteError::Serialization(format!(
-            "tin id must be 32 bytes (64 hex characters), got {len} bytes"
-        ))
-    })
 }
 
 /// The Banquette UNIX domain socket server instance.
@@ -1092,89 +1080,6 @@ impl BanquetteServer {
                             client_id,
                             ServerFrame::Error {
                                 code: "MoveCharacterFailed".to_string(),
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                    }
-                }
-            }
-            ClientFrame::ChangeBgm {
-                scene_id,
-                slot,
-                tin_id,
-            } => {
-                // Decode the optional 64-hex tin ID and append a `ChangeBgmEvent` log entry.
-                let bgm_tin_id = match tin_id.as_deref().map(decode_tin_id_hex).transpose() {
-                    Ok(id) => id,
-                    Err(e) => {
-                        send_to_client(
-                            out_tx,
-                            client_id,
-                            ServerFrame::Error {
-                                code: "ChangeBgmFailed".to_string(),
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                };
-
-                let event = ChangeBgmEvent {
-                    bgm_tin_id,
-                    volume: None,
-                    slot,
-                    track_index: None,
-                };
-                let entry = match event.to_tin() {
-                    Ok(tin) => tin,
-                    Err(e) => {
-                        send_to_client(
-                            out_tx,
-                            client_id,
-                            ServerFrame::Error {
-                                code: "ChangeBgmFailed".to_string(),
-                                message: e.to_string(),
-                            },
-                        )
-                        .await;
-                        return Ok(());
-                    }
-                };
-
-                let mut r = room.write().await;
-                match r
-                    .append_log(
-                        account_id,
-                        session_id,
-                        &scene_id,
-                        Some(entry),
-                        cellar.as_ref(),
-                    )
-                    .await
-                {
-                    Ok(LogOperationEvent::Appended { position, entry }) => {
-                        // Success is observed by the requester as this broadcast.
-                        broadcast_to_scene(
-                            out_tx,
-                            &scene_id,
-                            ServerFrame::LogEventAppended {
-                                scene_id: scene_id.clone(),
-                                chunk_index: position.0,
-                                position: position.1,
-                                entry,
-                            },
-                        )
-                        .await;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        send_to_client(
-                            out_tx,
-                            client_id,
-                            ServerFrame::Error {
-                                code: "ChangeBgmFailed".to_string(),
                                 message: e.to_string(),
                             },
                         )

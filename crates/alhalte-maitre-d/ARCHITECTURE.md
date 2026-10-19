@@ -115,7 +115,7 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 10. banquette からの `RoomPersisted { tin_id, done }` は `room_heads` と `rooms.done` に記録する。head が次回 spawn 時の復元点になり、`done` が pre-spawn の入場判定に使われる。
 11. banquette からの `DoneUpdated { done }` を受けたときだけ `rooms.done` と bridge の in-memory `done` を更新し、そのままクライアントへ転送する。`SetDone` のリクエスト時点では DB / shadow を更新しない。
 
-`is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetDone`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter`、`ChangeBgm` を mutate とみなす。
+`is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetDone`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter` を mutate とみなす。
 
 ### cellar proxy
 

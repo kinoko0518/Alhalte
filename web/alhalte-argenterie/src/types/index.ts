@@ -113,34 +113,10 @@ export interface Scene {
  * Kind of a log record.
  *
  * - `chat`: A user-authored message rendered by Saignant.
- * - `system`: A banquette event (`change-bgm`, `change-bg-img`,
- *   `character-came`, `character-gone`) rendered as a status row.
+ * - `system`: A banquette event (`character-came`, `character-gone`) rendered
+ *   as a status row.
  */
 export type LogRecordKind = 'chat' | 'system';
-
-/** A BGM change system event (`alhalte/banquette/log/change-bgm`). */
-export interface LogChangeBgmEvent {
-  type: 'change-bgm';
-  /** Tin ID of the new track, or `undefined` when playback stopped. */
-  bgmTinId?: string;
-  /** Playback volume in the `0.0..=1.0` range. */
-  volume?: number;
-  /** 1-based BGM slot. */
-  slot: number;
-  /** Legacy track index, when present. */
-  trackIndex?: number;
-}
-
-/** A background image change system event (`alhalte/banquette/log/change-bg-img`). */
-export interface LogChangeBgImgEvent {
-  type: 'change-bg-img';
-  /** Tin ID of the new image, or `undefined` when the background was cleared. */
-  imageTinId?: string;
-  /** Optional target width. */
-  width?: number;
-  /** Optional target height. */
-  height?: number;
-}
 
 /** A character entrance system event (`alhalte/banquette/log/character-came`). */
 export interface LogCharacterCameEvent {
@@ -155,11 +131,7 @@ export interface LogCharacterGoneEvent {
 }
 
 /** Decoded banquette system event carried by a {@link LogRecord}. */
-export type LogSystemEvent =
-  | LogChangeBgmEvent
-  | LogChangeBgImgEvent
-  | LogCharacterCameEvent
-  | LogCharacterGoneEvent;
+export type LogSystemEvent = LogCharacterCameEvent | LogCharacterGoneEvent;
 
 /**
  * Log entry parsed from pantry / cellar / banquette.

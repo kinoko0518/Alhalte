@@ -533,12 +533,6 @@
     const characterName = (id: string): string =>
       characters.find((c) => c.id === id)?.name || `キャラクター ${id}`;
     switch (event.type) {
-      case 'change-bgm':
-        return event.bgmTinId
-          ? `BGM スロット ${event.slot} を変更しました`
-          : `BGM スロット ${event.slot} を停止しました`;
-      case 'change-bg-img':
-        return event.imageTinId ? '背景画像を変更しました' : '背景画像を解除しました';
       case 'character-came':
         return `${characterName(event.characterId)} が入室しました`;
       case 'character-gone':
@@ -551,10 +545,6 @@
   /** Icon glyph shown at the start of a system row. */
   function systemEventGlyph(record: LogRecord): string {
     switch (record.event?.type) {
-      case 'change-bgm':
-        return '♪';
-      case 'change-bg-img':
-        return '▣';
       case 'character-came':
         return '→';
       case 'character-gone':
