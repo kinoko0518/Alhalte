@@ -104,9 +104,7 @@ impl IntoResponse for CellarError {
             | Self::Json(_)
             | Self::InvalidBody(_)
             | Self::SizeMismatch { .. }
-            | Self::InvalidAlias(_) => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
+            | Self::InvalidAlias(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Self::Io(_)
             | Self::Database(_)
             | Self::Tin(_)

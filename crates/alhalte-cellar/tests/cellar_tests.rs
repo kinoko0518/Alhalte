@@ -1790,11 +1790,24 @@ async fn test_gc_keeps_the_tin_an_alias_points_at() {
     let (second_bytes, second_tin) = create_test_tin("second aliased head");
     for (bytes, tin_id) in [(&first_bytes, first_tin), (&second_bytes, second_tin)] {
         service
-            .store_payload(1, 10, tin_id, bytes, None)
+            .store_payload_with_token(
+                tin_id,
+                bytes,
+                None,
+                alhalte_cellar::WriteCredentials::service(),
+                Some("service-secret"),
+            )
             .await
             .unwrap();
         // The alias (not the reference row) is what keeps the head alive below.
-        service.unregister(1, 10, &tin_id).await.unwrap();
+        service
+            .unregister_with_token(
+                &tin_id,
+                alhalte_cellar::WriteCredentials::service(),
+                Some("service-secret"),
+            )
+            .await
+            .unwrap();
     }
 
     // Point the alias at the first head, then move it to the second before GC.
