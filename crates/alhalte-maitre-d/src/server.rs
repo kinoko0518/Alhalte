@@ -17,12 +17,12 @@ use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tower_http::cors::CorsLayer;
 
-use alhalte_banquette::{ClientFrame, ServerFrame};
+use alhalte_banquette::{ClientFrame, RoomPermissionLevel};
 
 use crate::crypto;
-use crate::db::{Account, Database, Room, RoomRole};
+use crate::db::{Account, Database, Room};
 use crate::error::MaitreDError;
-use crate::gateway::RoomBridgeManager;
+use crate::gateway::{RoomBridge, RoomBridgeManager};
 use crate::oauth::OAuthProvider;
 use crate::room_id::RoomId;
 
@@ -325,13 +325,86 @@ impl From<Account> for AccountResponse {
     }
 }
 
+/// Room role as exposed by the maitre-d HTTP API.
+///
+/// The names mirror `alhalte-banquette`'s four permission levels. This is a
+/// transport DTO only: `maitre-d` stores no permission of its own and answers
+/// every access question by asking the room's banquette
+/// (`QueryAccountPermission` / `QueryPermissions`).
+///
+/// The legacy three-level names (`gm` / `pl`) are accepted as deserialization
+/// aliases so the pre-#201 argenterie build keeps working; they always serialize
+/// back as `admin` / `participant`.
+///
+/// TODO(#201): remove the `gm` / `pl` aliases once the room UI speaks the
+/// four-level model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoomRole {
+    /// Full access, including the room permission table.
+    #[serde(alias = "gm")]
+    Admin,
+    /// Read/write the scenes an administrator moved the account into.
+    #[serde(alias = "pl")]
+    Participant,
+    /// Read-only access to every scene.
+    Viewer,
+    /// No access to the room.
+    Denied,
+}
+
+impl RoomRole {
+    /// Returns the JSON / query-string name of this role.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::Participant => "participant",
+            Self::Viewer => "viewer",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+impl From<RoomPermissionLevel> for RoomRole {
+    fn from(level: RoomPermissionLevel) -> Self {
+        match level {
+            RoomPermissionLevel::Admin => Self::Admin,
+            RoomPermissionLevel::Participant => Self::Participant,
+            RoomPermissionLevel::Viewer => Self::Viewer,
+            RoomPermissionLevel::Denied => Self::Denied,
+        }
+    }
+}
+
+impl std::fmt::Display for RoomRole {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// One entry of the room permission table returned by `GET /api/room/{id}/permissions`.
+///
+/// `username` / `icon_url` are joined from the maitre-d `accounts` table; the
+/// permission itself comes from banquette's `RoomData`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RoomPermissionItem {
+    /// 64-bit account ID.
+    pub account_id: u64,
+    /// User name / handle name.
+    pub username: String,
+    /// Avatar icon URL if available.
+    pub icon_url: Option<String>,
+    /// Effective role in the room.
+    pub role: RoomRole,
+}
+
 /// Request payload for setting room permission.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SetRoomPermissionRequest {
     /// Account ID to assign permission.
     pub account_id: u64,
     /// Assigned role in the room.
-    pub role: crate::db::RoomRole,
+    pub role: RoomRole,
 }
 
 /// Query parameters for `GET /auth/login`.
@@ -448,10 +521,10 @@ pub struct RoomInfoResponse {
     pub room_id: String,
     /// Human-readable room name.
     pub name: String,
-    /// Caller role in the room (`gm`, `pl`, or `viewer`).
+    /// Caller role in the room (`admin`, `participant`, `viewer`, or `denied`).
+    ///
+    /// `denied` is never returned: a caller without access gets `403` instead.
     pub role: RoomRole,
-    /// Whether the room has been marked as done (fully public).
-    pub done: bool,
 }
 
 /// Maximum number of random room IDs tried when the caller omits `room_id`.
@@ -1248,14 +1321,16 @@ fn generate_room_id() -> RoomId {
 }
 
 /// Builds the success response for a newly registered room.
+///
+/// The creator becomes the room's `Admin` when banquette first starts the room
+/// (`Room::new` in `alhalte-banquette`); `maitre-d` writes no permission row.
 fn room_created_response(room: Room) -> Response {
     (
         StatusCode::OK,
         Json(RoomInfoResponse {
             room_id: room.room_id,
             name: room.name,
-            role: RoomRole::Gm,
-            done: false,
+            role: RoomRole::Admin,
         }),
     )
         .into_response()
@@ -1355,10 +1430,127 @@ async fn create_room_handler(
         .into_response()
 }
 
+/// Error message returned when the caller has no access to a room.
+const ROOM_ACCESS_DENIED_MESSAGE: &str =
+    "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください";
+
+/// Error message returned when an anonymous caller has no access to a room.
+const ANONYMOUS_ROOM_ACCESS_DENIED_MESSAGE: &str = "匿名接続は全体公開された部屋でのみ許可されます";
+
+/// Resolves a registered room and its live bridge, spawning banquette if needed.
+///
+/// An unknown room is `404` and never starts a process. The bridge
+/// administrator is always `rooms.creator_account`; the caller neither picks it
+/// nor influences it (Issue #200).
+#[allow(clippy::result_large_err)]
+async fn resolve_room_bridge(
+    state: &AppState,
+    room_id: &RoomId,
+) -> std::result::Result<(Room, Arc<RoomBridge>), Response> {
+    let room_id_str = room_id.to_string();
+    let room = match state.db.get_room(&room_id_str) {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Room not found" })),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response());
+        }
+    };
+
+    match state
+        .room_manager
+        .get_or_create_room(room_id.as_u64(), room.creator_account)
+        .await
+    {
+        Ok(bridge) => Ok((room, bridge)),
+        Err(error) => {
+            tracing::error!("Failed to start banquette for room {room_id_str}: {error}");
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to restore the room process: {error}")
+                })),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Asks the room's banquette for the effective role of `account_id`.
+///
+/// `account_id == 0` asks for the room default, i.e. what an anonymous caller
+/// gets. The answer is banquette's `RoomData`; `maitre-d` keeps no role table.
+#[allow(clippy::result_large_err)]
+async fn resolve_room_role(
+    bridge: &RoomBridge,
+    account_id: u64,
+) -> std::result::Result<RoomRole, Response> {
+    match bridge.query_account_permission(account_id).await {
+        Ok(level) => Ok(RoomRole::from(level)),
+        Err(error) => {
+            tracing::error!(
+                "Failed to query the permission of account {account_id} in room {}: {error}",
+                bridge.room_id
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to read the room permission: {error}")
+                })),
+            )
+                .into_response())
+        }
+    }
+}
+
+/// Rejects a caller whose banquette role is `Denied`.
+#[allow(clippy::result_large_err)]
+fn require_room_access(role: RoomRole, anonymous: bool) -> std::result::Result<(), Response> {
+    if role == RoomRole::Denied {
+        let message = if anonymous {
+            ANONYMOUS_ROOM_ACCESS_DENIED_MESSAGE
+        } else {
+            ROOM_ACCESS_DENIED_MESSAGE
+        };
+        return Err(error_response(StatusCode::FORBIDDEN, message));
+    }
+    Ok(())
+}
+
+/// Maps a failed banquette permission operation to an HTTP response.
+///
+/// banquette refuses a permission change with an `Error` frame (not an
+/// administrator, last administrator demotion); that is a `403`. Everything else
+/// is a room-process failure and stays a `500`.
+fn permission_error_response(error: MaitreDError) -> Response {
+    match error {
+        MaitreDError::RoomPermissionRefused(message) => {
+            error_response(StatusCode::FORBIDDEN, message)
+        }
+        other => {
+            tracing::error!("banquette permission request failed: {other}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to apply the room permission: {other}"),
+            )
+        }
+    }
+}
+
 /// Handles `GET /api/rooms/{room_id}`.
 ///
-/// Returns the room metadata for members. Non-members may read a room that is
-/// marked done (`role = "viewer"`); otherwise the response is `403 Forbidden`.
+/// Requires a session. The room process is started on first use and its
+/// banquette is asked for the caller's role: `denied` is `403`, otherwise
+/// `200` with the four-level role.
 async fn get_room_info_handler(
     State(state): State<AppState>,
     AxumPath(room_id): AxumPath<RoomId>,
@@ -1371,158 +1563,95 @@ async fn get_room_info_handler(
             Err(response) => return response.into_response(),
         };
 
-    let room_id_str = room_id.to_string();
-    let room = match state.db.get_room(&room_id_str) {
-        Ok(Some(room)) => room,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Room not found" })),
-            )
-                .into_response();
-        }
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
-                .into_response();
-        }
+    let (room, bridge) = match resolve_room_bridge(&state, &room_id).await {
+        Ok(values) => values,
+        Err(response) => return response,
     };
 
-    let done = room.done;
-    let role = match state.db.get_room_role(&room_id_str, caller) {
-        Ok(Some(role)) => role,
-        Ok(None) if done => RoomRole::Viewer,
-        Ok(None) => {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください"
-                })),
-            )
-                .into_response();
-        }
-        Err(error) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
-                .into_response();
-        }
+    let role = match resolve_room_role(&bridge, caller).await {
+        Ok(role) => role,
+        Err(response) => return response,
     };
+    if let Err(response) = require_room_access(role, false) {
+        return response;
+    }
 
     Json(RoomInfoResponse {
         room_id: room.room_id,
         name: room.name,
         role,
-        done,
     })
     .into_response()
 }
 
-/// Rejects callers without an explicit membership row.
-// `Response` is axum's handler return type; boxing it here would only move the
-// allocation to every caller without reducing a real hot-path cost.
-#[allow(clippy::result_large_err)]
-fn require_room_member(role: Option<RoomRole>) -> std::result::Result<(), Response> {
-    if role.is_none() {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "Room membership is required" })),
-        )
-            .into_response());
-    }
-    Ok(())
-}
-
-/// Rejects callers that are not a `gm`.
-#[allow(clippy::result_large_err)]
-fn require_room_gm(role: Option<RoomRole>) -> std::result::Result<(), Response> {
-    if role != Some(RoomRole::Gm) {
-        return Err((
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({ "error": "Only a room GM may change permissions" })),
-        )
-            .into_response());
-    }
-    Ok(())
-}
-
-/// Resolves a valid session plus the registered room and caller role.
-#[allow(clippy::result_large_err)]
-fn resolve_room_role(
-    state: &AppState,
-    headers: &HeaderMap,
-    query: &RoomSessionQuery,
-    room_id: &RoomId,
-) -> std::result::Result<Option<RoomRole>, Response> {
-    let account_id =
-        resolve_authenticated_account(state, headers, query.account_id, query.session_id)
-            .map_err(IntoResponse::into_response)?;
-
-    let room_id_str = room_id.to_string();
-    match state.db.get_room(&room_id_str) {
-        Ok(Some(_)) => {}
-        Ok(None) => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Room not found" })),
-            )
-                .into_response());
-        }
-        Err(error) => {
-            return Err((
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
-                .into_response());
-        }
-    }
-
-    state
-        .db
-        .get_room_role(&room_id_str, account_id)
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": error.to_string() })),
-            )
-                .into_response()
-        })
-}
-
 /// Handles `GET /api/room/{room_id}/permissions`.
 ///
-/// Requires a valid session and room membership.
+/// Requires a session and room access. The table is banquette's
+/// `RoomData.permissions` (read through `QueryPermissions`), joined with the
+/// maitre-d account profile for display. `maitre-d` never answers it from its
+/// own database.
 async fn get_room_permissions_handler(
     State(state): State<AppState>,
     AxumPath(room_id): AxumPath<RoomId>,
     headers: HeaderMap,
     Query(query): Query<RoomSessionQuery>,
 ) -> Response {
-    if let Err(response) =
-        resolve_room_role(&state, &headers, &query, &room_id).and_then(require_room_member)
-    {
+    let caller =
+        match resolve_authenticated_account(&state, &headers, query.account_id, query.session_id) {
+            Ok(account_id) => account_id,
+            Err(response) => return response.into_response(),
+        };
+
+    let (_room, bridge) = match resolve_room_bridge(&state, &room_id).await {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+
+    let role = match resolve_room_role(&bridge, caller).await {
+        Ok(role) => role,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_room_access(role, false) {
         return response;
     }
 
-    match state.db.get_room_permissions(&room_id.to_string()) {
-        Ok(perms) => (StatusCode::OK, Json(perms)).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
-    }
+    let permissions = match bridge.permissions_snapshot(caller).await {
+        Ok(Some((_default, permissions))) => permissions,
+        Ok(None) => {
+            return error_response(StatusCode::FORBIDDEN, ROOM_ACCESS_DENIED_MESSAGE);
+        }
+        Err(error) => return permission_error_response(error),
+    };
+
+    let items: Vec<RoomPermissionItem> = permissions
+        .into_iter()
+        .map(|(account_id, level)| {
+            // Display information comes from the maitre-d account table; an
+            // account that no longer exists still lists its permission.
+            let account = state.db.get_account(account_id).ok().flatten();
+            RoomPermissionItem {
+                account_id,
+                username: account
+                    .as_ref()
+                    .map(|account| account.handle_name.clone())
+                    .unwrap_or_default(),
+                icon_url: account
+                    .as_ref()
+                    .and_then(|account| account.icon_tin_id)
+                    .map(|id| format!("/api/cellar/tin/{}", hex::encode(id))),
+                role: RoomRole::from(level),
+            }
+        })
+        .collect();
+
+    (StatusCode::OK, Json(items)).into_response()
 }
 
 /// Handles `POST /api/room/{room_id}/permissions`.
 ///
-/// Requires a valid session and GM role. After the database update the full
-/// `gm` set is pushed to a running room through
-/// [`RoomBridgeManager::sync_room_admins`], so role changes take effect without
-/// a restart.
+/// Thin proxy over banquette's `SetMemberPermission`: the caller's account is
+/// the caller identity, so banquette itself decides whether the change is
+/// allowed (`admin` only). `maitre-d` writes nothing.
 async fn set_room_permission_handler(
     State(state): State<AppState>,
     AxumPath(room_id): AxumPath<RoomId>,
@@ -1530,121 +1659,95 @@ async fn set_room_permission_handler(
     Query(query): Query<RoomSessionQuery>,
     Json(req): Json<SetRoomPermissionRequest>,
 ) -> Response {
-    if let Err(response) =
-        resolve_room_role(&state, &headers, &query, &room_id).and_then(require_room_gm)
-    {
-        return response;
-    }
+    let caller =
+        match resolve_authenticated_account(&state, &headers, query.account_id, query.session_id) {
+            Ok(account_id) => account_id,
+            Err(response) => return response.into_response(),
+        };
 
+    let (registered_room, bridge) = match resolve_room_bridge(&state, &room_id).await {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+
+    // The target account is a maitre-d entity, so it is validated here.
     match state.db.get_account(req.account_id) {
         Ok(Some(_)) => {}
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Account not found" })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+        Ok(None) => return error_response(StatusCode::NOT_FOUND, "Account not found"),
+        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 
-    let now = chrono::Utc::now().timestamp();
-    let room_id_str = room_id.to_string();
-    match state
-        .db
-        .set_room_permission(&room_id_str, req.account_id, req.role, now)
-    {
-        Ok(()) => {
-            // TODO(#200): push the change into the running room through the
-            // banquette permission table. Issue #199 removed the `SetAdmins`
-            // control frame, so a live room keeps its own permissions until the
-            // next spawn reads the room head.
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "status": "ok",
-                    "room_id": room_id_str,
-                    "account_id": req.account_id,
-                    "role": req.role
-                })),
-            )
-                .into_response()
+    let permission = match permission_level(req.role) {
+        Some(level) => level,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "role must not be denied for a member permission change",
+            );
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
+    };
+
+    match bridge
+        .set_member_permission(caller, req.account_id, permission)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "ok",
+                "room_id": registered_room.room_id,
+                "account_id": req.account_id,
+                "role": req.role
+            })),
         )
             .into_response(),
+        Err(error) => permission_error_response(error),
     }
 }
 
 /// Handles `DELETE /api/room/{room_id}/permissions/{account_id}`.
 ///
-/// Requires a valid session and GM role.
+/// Removing a member means setting an explicit `Denied` entry, which overrides
+/// the room's default permission in `RoomData.permissions`. banquette enforces
+/// that only an administrator may do it.
 async fn delete_room_permission_handler(
     State(state): State<AppState>,
     AxumPath((room_id, account_id)): AxumPath<(RoomId, u64)>,
     headers: HeaderMap,
     Query(query): Query<RoomSessionQuery>,
 ) -> Response {
-    if let Err(response) =
-        resolve_room_role(&state, &headers, &query, &room_id).and_then(require_room_gm)
-    {
-        return response;
-    }
+    let caller =
+        match resolve_authenticated_account(&state, &headers, query.account_id, query.session_id) {
+            Ok(account_id) => account_id,
+            Err(response) => return response.into_response(),
+        };
 
-    match state
-        .db
-        .delete_room_permission(&room_id.to_string(), account_id)
+    let (_room, bridge) = match resolve_room_bridge(&state, &room_id).await {
+        Ok(values) => values,
+        Err(response) => return response,
+    };
+
+    match bridge
+        .set_member_permission(caller, account_id, RoomPermissionLevel::Denied)
+        .await
     {
-        Ok(_) => {
-            // TODO(#200): see set_room_permission_handler.
-            (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
-        }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Ok(()) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Err(error) => permission_error_response(error),
     }
 }
 
-/// Checks whether a [`ClientFrame`] mutates room state, scene structure, or logs.
+/// Maps a role that grants room access onto banquette's permission level.
 ///
-/// Banquette enforces the four-level room permissions itself (Issue #199), so
-/// this predicate only drives the `maitre-d` viewer gate kept for the legacy
-/// database roles. `SetMemberPermission` / `SetDefaultPermission` are included
-/// because they change the room permission table.
-///
-/// TODO(#200): delete the local viewer gate together with the database role
-/// rows; the room permission table in `RoomData` becomes the single source of
-/// truth.
-pub fn is_mutate_frame(frame: &ClientFrame) -> bool {
-    matches!(
-        frame,
-        ClientFrame::AppendLog { .. }
-            | ClientFrame::EditLog { .. }
-            | ClientFrame::DeleteLog { .. }
-            | ClientFrame::RewindLog { .. }
-            | ClientFrame::UpdateState { .. }
-            | ClientFrame::DeleteState { .. }
-            | ClientFrame::CreateScene { .. }
-            | ClientFrame::DeleteScene { .. }
-            | ClientFrame::SetMemberPermission { .. }
-            | ClientFrame::SetDefaultPermission { .. }
-            | ClientFrame::CreateCharacter { .. }
-            | ClientFrame::UpdateCharacter { .. }
-            | ClientFrame::DeleteCharacter { .. }
-            | ClientFrame::MoveCharacter { .. }
-    )
+/// `Denied` is not a member role; a permission change uses the delete route (or
+/// an explicit `denied` body on the same route) instead.
+fn permission_level(role: RoomRole) -> Option<RoomPermissionLevel> {
+    match role {
+        RoomRole::Admin => Some(RoomPermissionLevel::Admin),
+        RoomRole::Participant => Some(RoomPermissionLevel::Participant),
+        RoomRole::Viewer => Some(RoomPermissionLevel::Viewer),
+        RoomRole::Denied => None,
+    }
 }
-
 /// Handles `/ws` with query or header parameters.
 async fn ws_handler(
     State(state): State<AppState>,
@@ -1762,145 +1865,50 @@ async fn handle_ws_upgrade(
         }
     };
 
-    // A room must be registered in the room registry before it can be joined.
-    // Permission rows alone do not create a room, and an unknown room never
-    // causes a banquette process to be spawned.
-    let room_id_str = room_id.to_string();
-    let room_id_u64 = room_id.as_u64();
-    let room = match state.db.get_room(&room_id_str) {
-        Ok(Some(room)) => room,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Room not found" })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+    // A room must be registered in the room registry before it can be joined;
+    // an unknown room is 404 and never starts a banquette process.
+    let (_room, bridge) = match resolve_room_bridge(&state, &room_id).await {
+        Ok(values) => values,
+        Err(response) => return response,
     };
 
-    // The persisted `rooms.done` row drives the pre-spawn gate, so a room that
-    // was made public stays reachable after a maitre-d restart (and a private
-    // room still returns 403) even before banquette is restored.
-    let is_done = room.done;
-    let user_role = if auth_account != 0 {
-        match state.db.get_room_role(&room_id_str, auth_account) {
-            Ok(r) => r,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response();
-            }
-        }
-    } else {
-        None
+    // Authorization belongs to banquette: the room process is started first and
+    // asked for the caller's effective permission. `0` is the anonymous account,
+    // so an anonymous caller is judged by the room's default permission.
+    let role = match resolve_room_role(&bridge, auth_account).await {
+        Ok(role) => role,
+        Err(response) => return response,
     };
-
-    // Anonymous callers (no account / no session) are only accepted for a
-    // public room, where they behave as a read-only viewer. A private room is
-    // rejected before banquette is spawned.
-    if auth_account == 0 && !is_done {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "匿名接続は全体公開された部屋でのみ許可されます"
-            })),
-        )
-            .into_response();
+    if let Err(response) = require_room_access(role, auth_account == 0) {
+        return response;
     }
-
-    if user_role.is_none() && !is_done {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください"
-            })),
-        )
-            .into_response();
-    }
-
-    let is_viewer = match user_role {
-        Some(RoomRole::Viewer) => true,
-        Some(_) => false,
-        None => true,
-    };
 
     let client_id = state.next_client_id();
-    // The bridge administrator is the room creator / database GM, never the
-    // account that happens to connect first.
-    let admin_account = match state.db.get_room_gm(&room_id_str) {
-        Ok(Some(gm_id)) => gm_id,
-        Ok(None) => room.creator_account,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    let bridge = match state
-        .room_manager
-        .get_or_create_room(room_id_u64, admin_account)
-        .await
-    {
-        Ok(bridge) => bridge,
-        Err(e) => {
-            tracing::error!("Failed to start banquette for room {room_id_str}: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("failed to restore the room process: {e}")
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let state_clone = state.clone();
     ws.on_upgrade(move |socket| {
         handle_websocket(
             socket,
             WsClientContext {
                 bridge,
-                state: state_clone,
-                room_id,
                 client_id,
                 account_id: auth_account,
                 session_id: auth_session,
-                is_viewer_initial: is_viewer,
             },
         )
     })
 }
 
 struct WsClientContext {
-    bridge: Arc<crate::gateway::RoomBridge>,
-    state: AppState,
-    room_id: RoomId,
+    bridge: Arc<RoomBridge>,
     client_id: u64,
     account_id: u64,
     session_id: u64,
-    is_viewer_initial: bool,
 }
 
 async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
     let client_id = ctx.client_id;
     let account_id = ctx.account_id;
     let session_id = ctx.session_id;
-    let room_id = ctx.room_id;
-    let state = ctx.state;
     let bridge = ctx.bridge;
-    let is_viewer_initial = ctx.is_viewer_initial;
 
     let mut server_frame_rx = bridge
         .register_client(client_id, account_id, session_id)
@@ -1926,8 +1934,12 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
     });
 
     // Incoming task: WebSocket -> ClientFrame -> Bridge
+    //
+    // Every frame is forwarded unchanged. Authorization (the viewer/full-access
+    // split, scene grants, admin-only permission changes) is enforced by
+    // banquette's room permission table; maitre-d keeps no gate of its own and
+    // invents no `Error` responses (Issue #200).
     let bridge_ref = Arc::clone(&bridge);
-    let room_id_str = room_id.to_string();
 
     while let Some(msg_res) = ws_receiver.next().await {
         let msg = match msg_res {
@@ -1940,39 +1952,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
 
         match msg {
             Message::Text(text) => match serde_json::from_str::<ClientFrame>(&text) {
-                Ok(frame) => {
-                    if is_mutate_frame(&frame) {
-                        let is_viewer = if account_id != 0 {
-                            match state.db.get_room_role(&room_id_str, account_id) {
-                                Ok(Some(RoomRole::Viewer)) => true,
-                                Ok(Some(_)) => false,
-                                _ => is_viewer_initial,
-                            }
-                        } else {
-                            is_viewer_initial
-                        };
-
-                        if is_viewer {
-                            bridge_ref
-                                .send_to_client(
-                                    client_id,
-                                    ServerFrame::Error {
-                                        code: "PermissionDenied".to_string(),
-                                        message:
-                                            "閲覧者権限のため、状態変更操作は許可されていません"
-                                                .to_string(),
-                                    },
-                                )
-                                .await;
-                            continue;
-                        }
-                    }
-
-                    // `SetDone` is forwarded unchanged: `rooms.done` and the
-                    // bridge's in-memory flag are updated only when banquette
-                    // acknowledges the request with `DoneUpdated`.
-                    bridge_ref.send_client_frame(client_id, frame);
-                }
+                Ok(frame) => bridge_ref.send_client_frame(client_id, frame),
                 Err(e) => {
                     tracing::warn!("Failed to deserialize ClientFrame from JSON: {e:?}");
                 }
@@ -1981,38 +1961,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
                 let frame = postcard::from_bytes::<ClientFrame>(&bytes)
                     .or_else(|_| serde_json::from_slice::<ClientFrame>(&bytes));
                 match frame {
-                    Ok(f) => {
-                        if is_mutate_frame(&f) {
-                            let is_viewer = if account_id != 0 {
-                                match state.db.get_room_role(&room_id_str, account_id) {
-                                    Ok(Some(RoomRole::Viewer)) => true,
-                                    Ok(Some(_)) => false,
-                                    _ => is_viewer_initial,
-                                }
-                            } else {
-                                is_viewer_initial
-                            };
-
-                            if is_viewer {
-                                bridge_ref
-                                    .send_to_client(
-                                        client_id,
-                                        ServerFrame::Error {
-                                            code: "PermissionDenied".to_string(),
-                                            message:
-                                                "閲覧者権限のため、状態変更操作は許可されていません"
-                                                    .to_string(),
-                                        },
-                                    )
-                                    .await;
-                                continue;
-                            }
-                        }
-
-                        // See the text branch: the DB is updated only from the
-                        // banquette `DoneUpdated` acknowledgement.
-                        bridge_ref.send_client_frame(client_id, f);
-                    }
+                    Ok(f) => bridge_ref.send_client_frame(client_id, f),
                     Err(e) => {
                         tracing::warn!("Failed to deserialize binary ClientFrame: {e:?}");
                     }
@@ -2109,84 +2058,23 @@ async fn export_room_zip_handler(
         }
     };
 
-    // Export never creates a room implicitly. Unknown rooms are rejected before
-    // a banquette process is considered, and private rooms require membership.
-    let room_id_str = room_id.to_string();
-    let room = match state.db.get_room(&room_id_str) {
-        Ok(Some(room)) => room,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "error": "Room not found" })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+    // Export never creates a room implicitly. An unknown room is 404 and never
+    // starts a banquette process.
+    let (_room, bridge) = match resolve_room_bridge(&state, &room_id).await {
+        Ok(values) => values,
+        Err(response) => return response,
     };
 
-    let is_done = room.done;
-    let caller_role = match caller_account {
-        Some(account_id) => match state.db.get_room_role(&room_id_str, account_id) {
-            Ok(role) => role,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response();
-            }
-        },
-        None => None,
+    // banquette is the authority: ask it for the caller's effective permission
+    // (account `0` = the room default for an anonymous export) and reject
+    // `denied` before any scene is read.
+    let role = match resolve_room_role(&bridge, caller_account.unwrap_or(0)).await {
+        Ok(role) => role,
+        Err(response) => return response,
     };
-
-    if caller_role.is_none() && !is_done {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(serde_json::json!({
-                "error": "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください"
-            })),
-        )
-            .into_response();
+    if let Err(response) = require_room_access(role, caller_account.is_none()) {
+        return response;
     }
-
-    let admin_account = match state.db.get_room_gm(&room_id_str) {
-        Ok(Some(gm_id)) => gm_id,
-        Ok(None) => room.creator_account,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    // A bridge is only created for a registered room, and it restores the room
-    // from the persisted head. If that head cannot be loaded, return an error
-    // instead of exporting a freshly fabricated empty room.
-    let bridge = match state
-        .room_manager
-        .get_or_create_room(room_id.as_u64(), admin_account)
-        .await
-    {
-        Ok(bridge) => bridge,
-        Err(e) => {
-            tracing::error!("Failed to start banquette for export of room {room_id_str}: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("failed to restore the room state for export: {e}")
-                })),
-            )
-                .into_response();
-        }
-    };
 
     let (mut room_data, chunks) = match bridge.export_room(caller_account).await {
         Ok(data) => data,
