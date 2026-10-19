@@ -14,6 +14,8 @@
 
 | 接続先 | 内容 |
 | --- | --- |
+| `maitre-d` `POST /api/rooms` | 認証必須。`{ name, room_id? }` で部屋を登録し、作成者を `gm` にする（`utils/home.ts` の `createRoom`）。`room_id` はクライアント生成の 16 hex を送ってもよいが、返却値が正。 |
+| `maitre-d` `GET /api/rooms/{room_id}` | 入室 preflight。部屋名・caller の `role`・`done` を返す（`utils/home.ts` の `fetchRoomInfo`）。403 / 404 は事前に判別する。 |
 | `maitre-d` `/api/room/{room_id}/permissions` | 部屋権限の取得・設定・削除（`utils/session.ts`）。`room_id` は 16 hex。 |
 | `maitre-d` `/api/accounts/search` | account 検索。 |
 | `maitre-d` `/api/account/{account_id}` | account 取得・更新。アカウントメニューの表示名・アイコン取得に使う（`utils/account.ts`）。 |
@@ -21,7 +23,7 @@
 | `maitre-d` `/auth/google/callback` | 認可コードを session に交換（POST、`utils/account.ts`）。 |
 | `maitre-d` `/api/room/{room_id}/export/zip?type=full|logs` | ZIP ダウンロード（`CommonHeader.svelte`）。 |
 | `maitre-d` `/api/cellar/store`、`/api/cellar/store/{tin_id}`、`/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。アセット・拡張 wasm の Tin を XHR で送受信する（`utils/cellarTransfer.ts`）。進捗は `upload.onprogress`、失敗は型付き `CellarTransferError`。 |
-| Vite dev proxy | `/api`、`/room` を `http://127.0.0.1:8080`、`/ws` を `ws://127.0.0.1:8080` へ転送。 |
+| Vite dev proxy | `/api`、`/auth`、`/room` を `http://127.0.0.1:8080`、`/ws` を `ws://127.0.0.1:8080` へ転送。`/auth` は Google サインインの URL 取得と callback に必要。 |
 
 ### WebSocket
 
@@ -29,7 +31,7 @@
 
 - **URL 構築**: `buildRoomWebSocketUrl` は招待ページ URL（`https://host/rooms/<id>#<key>`）からは **origin だけ** を使い、`ws(s)://host/ws/room/<id>` を組み立てる。`/rooms/<id>` などのパスを WebSocket URL に引き継がない。明示的な `ws(s)://.../ws/room/...` だけをそのまま使い、それ以外の `ws(s)` URL も origin から作り直す。
 - **room ID 検証**: `utils/home.ts` の `parseRoomUrl` は 16 hex（または移行用 decimal）だけを受理し、`room-1` のような任意文字列は `null` で拒否する。`generateRoomUrl` は 16 hex を作る。
-- **close 通知と再接続**: `RoomSocket` は `onclose(event)` を `onClose` callback と `getLastCloseEvent()` で公開する。`1008` / `4403` / `4404` は再試行不能として自動再接続を止め、`App` はこれらを `isForbidden`（`GateScreen`）に反映する。HTTP 403 の完全な preflight は #156。
+- **close 通知と再接続**: `RoomSocket` は `onclose(event)` を `onClose` callback と `getLastCloseEvent()` で公開する。`1008` / `4403` / `4404` は再試行不能として自動再接続を止め、`App` はこれらを `isForbidden`（`GateScreen`）に反映する。入室前の HTTP 403 / 404 は `GET /api/rooms/{id}` の preflight で判別する。
 
 - **Tin エンコード**: banquette が `Tin` を期待する frame（`AppendLog.entry`、character の `data`）は、`jsonToTin` / `logRecordToTin` / `characterToTinMap` で Tin JSON `{ label, payload }` に変換してから送る。label は pantry の `labelHash` で用途別定数（`LABEL_LOG_RECORD`、`LABEL_JSON`、`LABEL_BANQUETTE_LOG_CHANGE_BGM` など）を使う。受信側は `tinToJson` / `tinToLogRecord` / `tinMapToCharacter` で戻す。
 - **Promise API と ack**: mutate 用の `request*` と query 用の `query*` が Promise を返す。既存の void API（`appendLog`、`updateState`、`createCharacter` など）は残している。
@@ -85,11 +87,21 @@
 
 ### 入室
 
-1. `main.ts` が `App` を mount する。開発エントリは `isAdmin: true` を渡す。
+1. `main.ts` が `App` を mount する。管理者は `isAdmin` ではなくサーバーの `role` から決める。
 2. `App.svelte` は `resolveRoomFromLocation` で URL から部屋を解決する。
-3. `RoomSocket` を作り、account / session をクエリに付けて接続する。
-4. `ServerFrame` の `SceneList`、`CharacterList`、`StateUpdated`、`StateDeleted`、`LogEventAppended`、`SceneCreated` / `SceneDeleted` / `CharacterMoved` などを Svelte の state に反映する。
-5. ログタブは入室時と scene 切り替え時に最新 chunk を読む（後述）。403 や「全体公開されていない部屋です」を受けたら `isForbidden` を立て、`GateScreen` を出す。
+3. 入室前に `GET /api/rooms/{room_id}` を preflight する。成功時は返却された `name` を `currentRoom.name` に、`role` を `userRole` に反映してから `RoomSocket` を作る。403 / 401 は `GateScreen`、404 は not-found 画面、ネットワーク / 5xx は 2 秒間隔・最大 5 回の再試行後に再試行 UI を出す。403 / 404 は再試行しない。
+4. `RoomSocket` を作り、account / session をクエリに付けて接続する。preflight が `ok` になるまで WebSocket は開かない。`initialRoom` prop はテスト / プレビュー用の明示 override で、preflight と `userRole` の上書きをスキップする。
+5. `ServerFrame` の `SceneList`、`CharacterList`、`StateUpdated`、`StateDeleted`、`LogEventAppended`、`SceneCreated` / `SceneDeleted` / `CharacterMoved` などを Svelte の state に反映する。
+6. ログタブは入室時と scene 切り替え時に最新 chunk を読む（後述）。WebSocket の `Error` frame や close code（`1008` / `4403` / `4404`）も `isForbidden` のフォールバックとして `GateScreen` を出す。
+
+`isAdmin` は `userRole === 'gm'`（viewer は常に false）で導出し、`isAdmin` prop はテスト / プレビュー用の明示 override に限定する。`VisitedRoom.isAdmin` は localStorage 互換のために保存するだけで、権限判定には使わない。
+
+### 部屋作成
+
+1. ホーム画面の「部屋の新規作成」は、表示用に 16 hex の `room_id` と 32 byte の部屋鍵をクライアントで生成する。
+2. 「入室する」で `POST /api/rooms` に `{ name, room_id }` を送る。account / session が無い場合は送信せず、ダイアログ内にサインイン導線を出す。
+3. 成功時だけ、返却された `room_id` とクライアント生成の部屋鍵から招待 URL を作り、最近の部屋へ保存して入室する。`role` はサーバーが返した値を localStorage 互換の `isAdmin` に反映するだけ。
+4. 401 はサインイン導線、403 / 通信失敗 / その他の HTTP 失敗はダイアログ内のエラーとして表示し、ローカル部屋の作成や入室は行わない。ダイアログは開いたまま再試行できる。
 
 ### 門前払い画面
 
@@ -159,11 +171,11 @@
 - アップロードは `encodeRoomTin`（RoomKey 暗号化 + LZ4）→ `uploadTin` で cellar へ送る。進捗は実 XHR の `upload.onprogress` のみを使い、カード内に波線 `LinearProgress` を出す。成功時は `asset.id` に `tinId` を付け、room scope はさらに `/` の state key `asset::<id>` にメタデータ（id, name, mediaType, mimeType, size, tinId, createdAt, ownerAccountId）を `requestUpdateState` で保存する。失敗時はカード内に「アップロードに失敗しました」と再試行ボタンを出す。
 - personal のメタデータは localStorage のみに置き、`tinId` を他者へ公開しない。本体は cellar に置く。
 - モーダルを開くたびに `syncRoomAssets` が `queryState('/')` で `asset::*` を取得してローカルへマージし、欠けている tin は `downloadTin` で取得する。同期失敗時は静かに既存キャッシュを表示する。アセットは 30 日 TTL の対象外（永続）。
-- `App` は `AssetPickerModal` に `roomSocket` と解決済みの部屋鍵を渡す。
+- `App` は `AssetPickerModal` に `roomSocket` と解決済みの部屋鍵を渡す。部屋鍵が無い場合、`AssetPickerModal` / `SceneSettingsTab` の背景・BGM upload は開始せず、カード内に失敗を表示する。
 
 ### 権限 UI
 
-`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。viewer の場合はフッターの送信・ダイス・scene 変更などを無効化する。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
+`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。`App` は `isViewer` を `SceneSettingsTab`（シーン作成・削除・メンバー移動）、`SceneGraphTab`（シーン削除）、`CharacterManagementTab`（作成・編集・削除・駒配置）、`ExtensionManagementTab`（追加・並べ替え・削除・toggle）へ渡し、viewer では該当操作を無効化する。viewer の場合はフッターの送信・ダイス・scene 変更も無効化する。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
 
 ## 既知の差分・制約
 
@@ -174,9 +186,10 @@
 - 公式既定拡張の削除はサーバーに `extension::<id>` の削除を送るが、サーバーが列挙しない公式既定 id は常にローカルの wasm ごと保持されるため再表示される。削除の永続性は保証されない。
 - タイムアウトは 8 秒で、権限問い合わせのようにサーバーが黙って破棄する操作では唯一の失敗シグナルになる。`PermissionDenied` が返らない経路はタイムアウトとして扱う。
 - Saignant WASM は character resolver を受け取らないため、mention は `Anonymous` になる。
-- `main.ts` の `isAdmin: true` は開発用エントリの既定値。実運用では account / 権限から決定する必要がある。
-- 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。
+- 開発エントリ（`main.ts`）は `isAdmin` を渡さない。管理者は `GET /api/rooms/{id}` の `role === 'gm'` から決まる。`isAdmin` prop はテスト / プレビュー用の明示 override で、既定は false。`initialRoom` prop も同じくテスト / プレビュー用で preflight をスキップする。
+- 入室 preflight のネットワーク / 5xx 失敗は 2 秒間隔・最大 5 回で打ち切り、`OfflineIndicator` の再試行導線に合流する。403 / 401 / 404 は再試行しない。401 は `GateScreen`（サインイン導線）として扱う。
+- 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。`App` は `roomKey` prop → `currentRoom.url` のフラグメント → `window.location.hash` の順に解決し、64 hex を検証する。鍵が無い場合、アセット・拡張 wasm の cellar upload は試行せずエラーを表示する。
 - ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
 - OAuth の `redirect_uri` は現在のパス（クエリ・フラグメントを除く）を使う。Google Cloud Console 側でこの URL を登録する必要がある。`state` は sessionStorage に保存した値と照合し、一致しない交換は行わない。
 - `AccountMenu` は account ごとに `GET /api/account/{id}` を呼ぶ。プロフィール取得に失敗してもサインイン状態は維持し、イニシャル表示にフォールバックする。
-- 現行 main では WebSocket の HTTP 403 status をブラウザから直接読めないため、`isForbidden` は権限一覧 API の結果と `Error` frame の文字列から立てている。Issue #114 の権限モデル移行後は、banquette / maitre-d の正式な拒否通知に接続する必要がある。このため、`room_permissions` に行があり `done` が true の部屋でも、権限一覧に自分がいないだけで門前払い画面になる可能性がある。
+- 入室可否は `GET /api/rooms/{id}` の preflight を正とする。`isForbidden` は WebSocket の `Error` frame / close code でもフォールバックとして立つが、権限一覧 API の結果からは導出しない（権限一覧は `RoomPermissionModal` の表示にだけ使う）。`room_permissions` に行があり `done` が true の部屋でも、preflight が `viewer` を返せば入室できる。

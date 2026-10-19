@@ -7,6 +7,7 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### ホーム画面`
    * - GitHub Issue #32: Rich Material 3 Expressive HomeScreen & theme selection
    */
+  import { hexToBytes } from '@alhalte/pantry';
   import { AppBar, Button, Card, ExtendedFab, IconButton, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { VisitedRoom } from '../../types/index.js';
@@ -18,19 +19,25 @@
     saveRecentRoom,
   } from '../../utils/recentRooms.js';
   import {
+    createRoom,
     generateRoomUrl,
     getVisitedRooms,
     removeVisitedRoom,
+    RoomApiError,
     saveVisitedRoom,
   } from '../../utils/home.js';
+  import { beginGoogleSignIn, isSignedIn } from '../../utils/account.js';
   import AccountMenu from '../Control/AccountMenu.svelte';
 
   let {
     baseUrl = typeof window !== 'undefined' ? window.location.origin : 'https://example.com',
+    fetchFn,
     onEnterRoom,
     onSelectRoom,
   }: {
     baseUrl?: string;
+    /** Injectable fetch implementation for tests / embedders. */
+    fetchFn?: typeof fetch;
     onEnterRoom?: (room: RecentRoom | VisitedRoom) => void;
     onSelectRoom?: (room: RecentRoom | VisitedRoom) => void;
   } = $props();
@@ -41,6 +48,14 @@
   let newRoomName = $state('');
   let generatedUrlData = $state<{ roomId: string; roomKeyHex: string; roomUrl: string } | null>(null);
   let copyNotice = $state('');
+  /** True while `POST /api/rooms` is in flight; blocks double submits. */
+  let isCreating = $state(false);
+  /** Non-retryable / guidance error shown inside the create dialog. */
+  let createError = $state('');
+  /** True when the user must sign in before a room can be created. */
+  let createNeedsSignIn = $state(false);
+  /** True while the OAuth redirect is being started from the dialog. */
+  let isStartingSignIn = $state(false);
 
   function loadRooms() {
     recentRooms = getRecentRooms();
@@ -49,11 +64,14 @@
   function openCreateDialog() {
     newRoomName = '';
     copyNotice = '';
+    createError = '';
+    createNeedsSignIn = !isSignedIn();
     generatedUrlData = generateRoomUrl(baseUrl);
     isCreateDialogOpen = true;
   }
 
   function closeCreateDialog() {
+    if (isCreating) return;
     isCreateDialogOpen = false;
   }
 
@@ -87,26 +105,87 @@
     }
   }
 
-  function handleJoinRoom() {
-    if (!generatedUrlData) return;
-    const room: RecentRoom = {
-      roomId: generatedUrlData.roomId,
-      roomName: newRoomName.trim() || '名称未設定',
-      url: generatedUrlData.roomUrl,
-      roomUrl: generatedUrlData.roomUrl,
-      visitedAt: Date.now(),
-      isAdmin: true, // The creator is the initial admin
-      id: generatedUrlData.roomId,
-      name: newRoomName.trim() || '名称未設定',
-      lastVisited: Date.now(),
-    };
-    saveRecentRoom(room);
-    saveVisitedRoom(room as any);
-    loadRooms();
-    isCreateDialogOpen = false;
-    pushRoomToHistory(room);
-    onSelectRoom?.(room);
-    onEnterRoom?.(room);
+  /** Starts (or restarts) Google OAuth from the create dialog. */
+  async function handleCreateSignIn() {
+    if (isStartingSignIn) return;
+    isStartingSignIn = true;
+    createError = '';
+    try {
+      await beginGoogleSignIn({ baseUrl, ...(fetchFn ? { fetchFn } : {}) });
+    } catch {
+      createError = 'サインインを開始できませんでした。右上のアカウントメニューから再試行してください。';
+      isStartingSignIn = false;
+    }
+  }
+
+  /**
+   * Registers the room on the server, then enters it.
+   *
+   * The invitation URL is only built after the server confirms the room; a
+   * failure leaves the user on the Home screen and never saves or enters a
+   * local-only room (Issue #156).
+   */
+  async function handleJoinRoom() {
+    if (!generatedUrlData || isCreating) return;
+
+    if (!isSignedIn()) {
+      createNeedsSignIn = true;
+      createError = '';
+      return;
+    }
+
+    const name = newRoomName.trim() || '名称未設定';
+    isCreating = true;
+    createError = '';
+    createNeedsSignIn = false;
+
+    try {
+      const created = await createRoom(name, {
+        baseUrl,
+        ...(fetchFn ? { fetchFn } : {}),
+        roomId: generatedUrlData.roomId,
+      });
+      const roomKeyBytes = hexToBytes(generatedUrlData.roomKeyHex);
+      const invitation = generateRoomUrl(baseUrl, created.room_id, roomKeyBytes);
+      const now = Date.now();
+      const room: RecentRoom = {
+        roomId: created.room_id,
+        roomName: created.name || name,
+        url: invitation.roomUrl,
+        roomUrl: invitation.roomUrl,
+        visitedAt: now,
+        // Kept for backwards-compatible local storage only; the server role is
+        // the authority and `App` re-fetches it on entry.
+        isAdmin: created.role === 'gm',
+        id: created.room_id,
+        name: created.name || name,
+        lastVisited: now,
+      };
+      saveRecentRoom(room);
+      saveVisitedRoom(room as any);
+      loadRooms();
+      isCreateDialogOpen = false;
+      pushRoomToHistory(room);
+      onSelectRoom?.(room);
+      onEnterRoom?.(room);
+    } catch (error) {
+      if (error instanceof RoomApiError) {
+        if (error.kind === 'unauthorized') {
+          createNeedsSignIn = true;
+          createError = 'サインインが必要です。右上のアカウントメニューからサインインしてください。';
+        } else if (error.kind === 'forbidden') {
+          createError = '部屋を作成する権限がありません。';
+        } else if (error.kind === 'network') {
+          createError = 'サーバーと通信できませんでした。時間をおいて再試行してください。';
+        } else {
+          createError = `部屋を作成できませんでした（HTTP ${error.status ?? 'error'}）。`;
+        }
+      } else {
+        createError = '部屋を作成できませんでした。時間をおいて再試行してください。';
+      }
+    } finally {
+      isCreating = false;
+    }
   }
 
   function handleSelectRoom(room: RecentRoom | VisitedRoom) {
@@ -319,14 +398,44 @@
           <div class="copy-notice" data-testid="copy-notice">{copyNotice}</div>
         {/if}
 
+        {#if createNeedsSignIn}
+          <div class="create-signin-guidance" data-testid="create-room-signin-guidance">
+            <p class="create-signin-text">
+              部屋を作成するにはサインインが必要です。
+            </p>
+            <Button
+              variant="tonal"
+              onclick={handleCreateSignIn}
+              disabled={isStartingSignIn}
+              data-testid="create-room-signin-button"
+            >
+              サインイン
+            </Button>
+          </div>
+        {/if}
+
+        {#if createError}
+          <div class="create-error" role="alert" data-testid="create-room-error">
+            {createError}
+          </div>
+        {/if}
+
         <p class="dialog-warning-centered" data-testid="dialog-warning">
           このリンクを紛失した場合、部屋へのアクセスは永久に失われます！
         </p>
 
         <div class="dialog-actions">
-          <Button variant="text" onclick={closeCreateDialog}>キャンセル</Button>
-          <Button variant="filled" onclick={handleJoinRoom} data-testid="join-created-room-button">
-            入室する
+          <Button variant="text" onclick={closeCreateDialog} disabled={isCreating}>
+            キャンセル
+          </Button>
+          <Button
+            variant="filled"
+            onclick={handleJoinRoom}
+            disabled={isCreating || createNeedsSignIn}
+            aria-busy={isCreating}
+            data-testid="join-created-room-button"
+          >
+            {isCreating ? '作成中…' : '入室する'}
           </Button>
         </div>
       </div>
@@ -640,6 +749,30 @@
     color: var(--np-color-primary);
     text-align: right;
     font-weight: 600;
+  }
+  .create-signin-guidance {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-radius: var(--np-shape-corner-medium);
+    background: var(--np-color-surface-container-highest);
+    color: var(--np-color-on-surface);
+  }
+  .create-signin-text {
+    margin: 0;
+    font-size: 0.86rem;
+    line-height: 1.4;
+  }
+  .create-error {
+    padding: 10px 14px;
+    border-radius: var(--np-shape-corner-medium);
+    background: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+    font-size: 0.86rem;
+    font-weight: 600;
+    line-height: 1.4;
   }
   .dialog-warning-centered {
     margin: 8px 0;

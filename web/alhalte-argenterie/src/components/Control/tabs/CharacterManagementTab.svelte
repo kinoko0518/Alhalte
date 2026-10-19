@@ -17,6 +17,7 @@
   let {
     characters = [],
     isAdmin = false,
+    isViewer = false,
     roomSocket = null,
     roomId,
     pendingCharacterCount,
@@ -32,6 +33,8 @@
   }: {
     characters?: Character[];
     isAdmin?: boolean;
+    /** Viewers cannot create, edit, delete, or place characters (Issue #156). */
+    isViewer?: boolean;
     /**
      * Socket used to query the authoritative character list when the tab is
      * shown (Issue #109 / sub-issue #144). Without it the tab renders the
@@ -139,6 +142,7 @@
   }
 
   function openEdit(char: Character) {
+    if (isViewer) return;
     if (onRequestEditCharacter) {
       onRequestEditCharacter(char);
     } else {
@@ -148,6 +152,7 @@
   }
 
   function openDeleteConfirm(char: Character) {
+    if (isViewer) return;
     if (onRequestDeleteCharacter) {
       onRequestDeleteCharacter({ id: char.id, name: char.name });
     } else {
@@ -165,6 +170,7 @@
   }
 
   function handleCreateNewChar() {
+    if (isViewer) return;
     const newChar: Character = {
       id: `char-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       name: '新規キャラクター',
@@ -197,6 +203,7 @@
     <IconButton
       variant="filled"
       onclick={handleCreateNewChar}
+      disabled={isViewer}
       aria-label="新規作成"
       title="新規作成"
       data-testid="create-character-btn"
@@ -238,6 +245,7 @@
                 e.stopPropagation();
                 openEdit(char);
               }}
+              disabled={isViewer}
               title="キャラクター編集"
               data-testid="edit-char-btn-{char.id}"
             >
@@ -262,6 +270,7 @@
               <IconButton
                 variant="tonal"
                 onclick={() => onTogglePiece?.(char.id)}
+                disabled={isViewer}
                 aria-label="駒として配置"
                 title="駒として配置"
                 data-testid="piece-char-btn-{char.id}"
@@ -271,6 +280,7 @@
               <IconButton
                 variant="text"
                 onclick={() => openDeleteConfirm(char)}
+                disabled={isViewer}
                 aria-label="キャラクターを削除"
                 title="キャラクターを削除"
                 data-testid="delete-char-btn-{char.id}"
@@ -321,7 +331,7 @@
   {#if isEditOpen}
     <CharacterEditModal
       character={editingCharacter}
-      {isAdmin}
+      isAdmin={isAdmin && !isViewer}
       {onRequestAssetPicker}
       onSave={(updated) => {
         isEditOpen = false;

@@ -16,9 +16,9 @@ try {
   }
 }
 
+// Admin is derived from the room role returned by maitre-d (Issue #156).
 const app = mount(App, {
   target: document.getElementById('app')!,
-  props: { isAdmin: true },
 });
 
 export default app;

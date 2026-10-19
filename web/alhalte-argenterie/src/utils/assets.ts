@@ -749,7 +749,9 @@ async function transferAssetBytes(
   options: AssetTransferOptions,
 ): Promise<AssetUploadResult> {
   const storage = options.storage;
-  const roomKey = options.roomKey ?? getRoomKeyFromLocation();
+  // An explicit `null` means "no key for this room"; only fall back to the
+  // location fragment when the caller did not supply a key at all.
+  const roomKey = options.roomKey !== undefined ? options.roomKey : getRoomKeyFromLocation();
   if (!isRoomKey(roomKey)) {
     return failAssetTransfer(
       asset,

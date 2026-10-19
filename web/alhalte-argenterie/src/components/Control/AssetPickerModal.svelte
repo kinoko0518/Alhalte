@@ -31,7 +31,6 @@
     type AssetMediaType,
     type AssetScope,
   } from '../../utils/assets.js';
-  import { getRoomKeyFromLocation } from '../../utils/cellarTransfer.js';
   import type { RoomSocket } from '../../utils/roomSocket.js';
 
   let {
@@ -40,7 +39,7 @@
     initialScope = 'personal',
     isAdmin = false,
     roomSocket = null,
-    roomKey = getRoomKeyFromLocation(),
+    roomKey,
     roomId,
     onSelect,
     onClose,

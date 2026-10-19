@@ -16,7 +16,7 @@
   import type { BgmSlot, Character, ExtensionItem, LogRecord, Scene, ViewTransform, VisitedRoom } from '../types/index.js';
   import { saveRecentRoom, type RecentRoom } from '../utils/recentRooms.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
-  import { resolveRoomFromLocation } from '../utils/home.js';
+  import { fetchRoomInfo, resolveRoomFromLocation, RoomApiError } from '../utils/home.js';
   import { ChunkLogManager } from '../utils/log.js';
   import type { SceneMovementEvent } from '../utils/sceneGraph.js';
   import { createDefaultJuices, getNormalizedBgmSlots, inheritJuices, moveMemberToScene } from '../utils/sceneSettings.js';
@@ -48,7 +48,7 @@
     tinToJson,
   } from '../utils/roomSocket.js';
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
-  import { getRoomKeyFromLocation } from '../utils/cellarTransfer.js';
+  import { resolveRoomKey } from '../utils/cellarTransfer.js';
   import {
     getRoomPermissions,
     getSavedAccountId,
@@ -63,7 +63,7 @@
     initialCharacters = [],
     initialExtensions = [],
     initialMovements = [],
-    isAdmin = false,
+    isAdmin: isAdminOverride,
     userRole: initialUserRole = null,
     isViewer: explicitIsViewer,
     isForbidden: initialIsForbidden = false,
@@ -75,12 +75,17 @@
     debugAlwaysShow = false,
     roomSocket: customRoomSocket,
     roomKey,
+    fetchFn,
   }: {
     initialRoom?: VisitedRoom | null;
     initialScenes?: Scene[];
     initialCharacters?: Character[];
     initialExtensions?: ExtensionItem[];
     initialMovements?: SceneMovementEvent[];
+    /**
+     * Explicit test / preview override for the GM-only UI. When omitted, the
+     * server role (`userRole === 'gm'`) is authoritative (Issue #156).
+     */
     isAdmin?: boolean;
     userRole?: RoomRole | null;
     isViewer?: boolean;
@@ -94,10 +99,12 @@
     roomSocket?: RoomSocket;
     /**
      * 32-byte room key used to encrypt / decrypt extension wasm in the cellar
-     * (Issue #109 / sub-issue #145). Defaults to the URL fragment; tests and
-     * embedders can inject one.
+     * (Issue #109 / sub-issue #145). Defaults to `currentRoom.url` and then the
+     * URL fragment; tests and embedders can inject one.
      */
     roomKey?: Uint8Array | null;
+    /** Injectable fetch implementation for the room preflight (tests). */
+    fetchFn?: typeof fetch;
   } = $props();
 
   let activeConnectionManager = $derived(customConnectionManager ?? defaultConnectionManager);
@@ -125,6 +132,11 @@
   });
 
   async function handleReconnectFromIndicator() {
+    // A failed join preflight blocks the socket; retry the HTTP check first.
+    if (initialRoom === undefined && activeRoomId && preflightStatus !== 'ok') {
+      handleRetryPreflight();
+      return;
+    }
     await activeConnectionManager.reconnect();
   }
 
@@ -132,12 +144,156 @@
     initialRoom !== undefined ? initialRoom : resolveRoomFromLocation(),
   );
 
-  // User role & permission states (Issue #94)
+  // User role & permission states (Issue #94 / #156)
   let userRole = $state<RoomRole | null>(initialUserRole);
   let isViewer = $derived(explicitIsViewer !== undefined ? explicitIsViewer : userRole === 'viewer');
+  /**
+   * GM-only UI. The server role is authoritative; `isAdmin` is only an explicit
+   * test / preview override, and a viewer can never be an admin (Issue #156).
+   */
+  let isAdmin = $derived(
+    !isViewer && (isAdminOverride !== undefined ? isAdminOverride : userRole === 'gm'),
+  );
   let isForbidden = $state(initialIsForbidden);
   let isPermissionModalOpen = $state(false);
   let roomPermissions = $state<RoomPermissionItem[]>([...initialPermissions]);
+
+  /**
+   * Join preflight state (Issue #156).
+   *
+   * `GET /api/rooms/{room_id}` runs before any WebSocket is opened so 403 / 404
+   * are known up front. `initialRoom` is an explicit test / preview override:
+   * it skips the preflight (and keeps the role supplied by props).
+   */
+  type RoomPreflightStatus =
+    | 'idle'
+    | 'checking'
+    | 'ok'
+    | 'forbidden'
+    | 'not-found'
+    | 'error';
+  let preflightStatus = $state<RoomPreflightStatus>(initialRoom !== undefined ? 'ok' : 'idle');
+  let preflightError = $state<string | null>(null);
+
+  /** Room id that the preflight / socket effects follow. */
+  let activeRoomId = $derived(
+    currentRoom?.id || (currentRoom as any)?.roomId || null,
+  );
+
+  /** Same 2-second cadence as `RoomSocket`; failures are bounded, not infinite. */
+  const PREFLIGHT_RETRY_DELAY_MS = 2000;
+  const MAX_PREFLIGHT_RETRIES = 5;
+  let preflightAttempts = 0;
+  let preflightToken = 0;
+  let preflightTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function clearPreflightTimer(): void {
+    if (preflightTimer !== null) {
+      clearTimeout(preflightTimer);
+      preflightTimer = null;
+    }
+  }
+
+  /** Stops an in-flight preflight (room change / unmount). */
+  function cancelPreflight(): void {
+    preflightToken += 1;
+    preflightAttempts = 0;
+    clearPreflightTimer();
+  }
+
+  /** Runs the join preflight for `roomId`, resetting any previous retry loop. */
+  async function beginPreflight(roomId: string): Promise<void> {
+    cancelPreflight();
+    const token = preflightToken;
+    preflightStatus = 'checking';
+    preflightError = null;
+    await attemptPreflight(roomId, token);
+  }
+
+  async function attemptPreflight(roomId: string, token: number): Promise<void> {
+    try {
+      const info = await fetchRoomInfo(roomId, fetchFn ? { fetchFn } : {});
+      if (token !== preflightToken) return;
+
+      if (currentRoom) {
+        // Mutate in place: replacing the object would retrigger the preflight
+        // effect through `activeRoomId` even though the id did not change.
+        currentRoom.name = info.name;
+      }
+      userRole = info.role;
+      isForbidden = false;
+      preflightStatus = 'ok';
+      preflightAttempts = 0;
+      preflightError = null;
+      activeConnectionManager.setState('connected');
+    } catch (error) {
+      if (token !== preflightToken) return;
+
+      if (error instanceof RoomApiError) {
+        if (error.kind === 'unauthorized') {
+          // Sign-in is the only useful next step; the Gate screen offers it.
+          preflightStatus = 'forbidden';
+          isForbidden = true;
+          activeConnectionManager.setState('disconnected');
+          return;
+        }
+        if (error.kind === 'forbidden') {
+          preflightStatus = 'forbidden';
+          isForbidden = true;
+          activeConnectionManager.setState('disconnected');
+          return;
+        }
+        if (error.kind === 'not-found') {
+          preflightStatus = 'not-found';
+          activeConnectionManager.setState('disconnected');
+          return;
+        }
+        if (error.kind !== 'network' && (error.status ?? 0) < 500) {
+          // A protocol failure will not fix itself; show the retry UI once.
+          preflightStatus = 'error';
+          preflightError = error.message;
+          activeConnectionManager.setState('disconnected');
+          return;
+        }
+      }
+
+      preflightAttempts += 1;
+      if (preflightAttempts > MAX_PREFLIGHT_RETRIES) {
+        preflightStatus = 'error';
+        preflightError =
+          'サーバーと通信できませんでした。接続が回復したら再試行してください。';
+        activeConnectionManager.setState('disconnected');
+        return;
+      }
+
+      preflightStatus = 'checking';
+      preflightError = null;
+      activeConnectionManager.setState('reconnecting');
+      preflightTimer = setTimeout(() => {
+        preflightTimer = null;
+        void attemptPreflight(roomId, token);
+      }, PREFLIGHT_RETRY_DELAY_MS);
+    }
+  }
+
+  /** Manual retry used by the preflight error screen / offline indicator. */
+  function handleRetryPreflight(): void {
+    if (!activeRoomId) return;
+    void beginPreflight(String(activeRoomId));
+  }
+
+  /** Leaves the room / gate / error state and returns to the Home screen. */
+  function returnHome(): void {
+    cancelPreflight();
+    isForbidden = false;
+    preflightStatus = 'idle';
+    preflightError = null;
+    userRole = null;
+    currentRoom = null;
+    if (typeof window !== 'undefined' && window.history?.pushState) {
+      window.history.pushState(null, '', '/');
+    }
+  }
 
   let isLandscape = $state(
     typeof window !== 'undefined' ? window.innerWidth >= window.innerHeight : true,
@@ -177,12 +333,16 @@
   let selectedCharacterId = $state<string | undefined>(characters[0]?.id);
 
   /**
-   * Room key used for extension wasm cellar transfers (Issue #109 / #145).
+   * Room key used for cellar transfers (Issue #109 / #145 / #156).
    *
-   * Defaults to the URL fragment (`#<64 hex>`), never leaves the browser.
+   * Resolution order: explicit prop, `currentRoom.url` fragment, then the
+   * browser URL fragment. Never leaves the browser.
    */
   let extensionRoomKey = $derived(
-    roomKey === undefined ? getRoomKeyFromLocation() : roomKey,
+    resolveRoomKey({
+      roomKey,
+      roomUrl: currentRoom?.url || (currentRoom as any)?.roomUrl,
+    }),
   );
   /**
    * True once the extension tab handed back an authoritative list. It stops the
@@ -447,27 +607,16 @@
   });
 
   $effect(() => {
-    const rId = currentRoom?.id || (currentRoom as any)?.roomId;
+    const rId = activeRoomId;
     if (rId && typeof fetch !== 'undefined') {
+      // The permission list only feeds `RoomPermissionModal`; role and entry
+      // authority come from the `GET /api/rooms/{id}` preflight (Issue #156).
       getRoomPermissions(rId)
         .then((perms) => {
           roomPermissions = perms;
-          if (perms.length > 0) {
-            const aidStr = getSavedAccountId();
-            const aid = aidStr ? Number(aidStr) : 0;
-            const myPerm = aid ? perms.find((p) => p.account_id === aid) : undefined;
-            if (myPerm) {
-              userRole = myPerm.role;
-            } else if (!isAdmin && !currentRoom?.isAdmin) {
-              userRole = null;
-              isForbidden = true;
-            }
-          }
         })
-        .catch((err) => {
-          if (err?.message?.includes('403')) {
-            isForbidden = true;
-          }
+        .catch(() => {
+          // Keep the cached list; the modal reports its own errors.
         });
     }
   });
@@ -834,13 +983,41 @@
     });
   });
 
+  // Join preflight: resolve the room on the server before opening the socket
+  // (Issue #156). `initialRoom` is an explicit test / preview override and skips
+  // the check so embedders can supply a role directly.
+  $effect(() => {
+    if (initialRoom !== undefined) return;
+
+    const roomId = activeRoomId;
+    if (!roomId) {
+      cancelPreflight();
+      preflightStatus = 'idle';
+      return;
+    }
+
+    void beginPreflight(String(roomId));
+    return () => {
+      cancelPreflight();
+    };
+  });
+
   $effect(() => {
     if (customRoomSocket) {
       roomSocket = customRoomSocket;
       return;
     }
 
-    const roomId = currentRoom?.id || (currentRoom as any)?.roomId;
+    // Never open the WebSocket until the preflight confirmed the room.
+    if (preflightStatus !== 'ok') {
+      if (roomSocket) {
+        roomSocket.disconnect();
+        roomSocket = null;
+      }
+      return;
+    }
+
+    const roomId = activeRoomId;
     if (roomId) {
       const socket = new RoomSocket({
         roomId,
@@ -861,9 +1038,9 @@
           }
         },
         onClose: (event) => {
-          // 1008 / 4403 / 4404 mean the server rejected the join. The HTTP
-          // status is not readable from the browser, so this is best effort
-          // until the #156 preflight lands.
+          // 1008 / 4403 / 4404 mean the server rejected the join. HTTP 403 /
+          // 404 are already classified by the preflight; this remains the
+          // fallback for a socket that closes after a successful preflight.
           if (event.code === 1008 || event.code === 4403 || event.code === 4404) {
             isForbidden = true;
           }
@@ -1740,17 +1917,38 @@
   />
 
   {#if isForbidden}
-    <GateScreen
-      onReturnHome={() => {
-        isForbidden = false;
-        currentRoom = null;
-        if (typeof window !== 'undefined' && window.history?.pushState) {
-          window.history.pushState(null, '', '/');
-        }
-      }}
-    />
+    <GateScreen onReturnHome={returnHome} />
+  {:else if preflightStatus === 'not-found'}
+    <div class="room-state-screen" data-testid="room-not-found">
+      <h1 class="room-state-title">部屋が見つかりません</h1>
+      <p class="room-state-message">
+        この部屋は存在しないか、削除されています。招待リンクを確認してください。
+      </p>
+      <Button variant="filled" onclick={returnHome} data-testid="room-not-found-home-button">
+        ホームに戻る
+      </Button>
+    </div>
   {:else if !currentRoom}
-    <HomeScreen onEnterRoom={handleEnterRoom} onSelectRoom={handleEnterRoom} />
+    <HomeScreen onEnterRoom={handleEnterRoom} onSelectRoom={handleEnterRoom} {fetchFn} />
+  {:else if preflightStatus === 'checking' || preflightStatus === 'idle'}
+    <div class="room-state-screen" data-testid="room-preflight-loading" role="status">
+      <p class="room-state-message">部屋を確認しています…</p>
+    </div>
+  {:else if preflightStatus === 'error'}
+    <div class="room-state-screen" data-testid="room-preflight-error" role="alert">
+      <h1 class="room-state-title">部屋に入室できませんでした</h1>
+      <p class="room-state-message">
+        {preflightError ?? 'サーバーと通信できませんでした。'}
+      </p>
+      <div class="room-state-actions">
+        <Button variant="filled" onclick={handleRetryPreflight} data-testid="room-preflight-retry">
+          再試行
+        </Button>
+        <Button variant="text" onclick={returnHome} data-testid="room-preflight-home-button">
+          ホームに戻る
+        </Button>
+      </div>
+    </div>
   {:else}
     <div
       class="room-layout-container"
@@ -1809,7 +2007,7 @@
                   {movements}
                   {accessibleSceneIds}
                   {selectedCharacterId}
-                  isAdmin={isAdmin || currentRoom.isAdmin}
+                  {isAdmin}
                   {isViewer}
                   sending={isSending}
                   {pendingMessageCount}
@@ -1903,7 +2101,7 @@
                 {movements}
                 {accessibleSceneIds}
                 {selectedCharacterId}
-                isAdmin={isAdmin || currentRoom.isAdmin}
+                {isAdmin}
                 {isViewer}
                 sending={isSending}
                 {pendingMessageCount}
@@ -2105,7 +2303,7 @@
         open={true}
         initialMediaType={activeOverlay.mediaType}
         initialScope={activeOverlay.initialScope}
-        isAdmin={isAdmin || (currentRoom ? currentRoom.isAdmin : false)}
+        {isAdmin}
         {roomSocket}
         roomKey={extensionRoomKey}
         roomId={currentRoom?.id}
@@ -2131,7 +2329,7 @@
     >
       <CharacterEditModal
         character={activeCharacterEdit}
-        isAdmin={isAdmin || (currentRoom ? currentRoom.isAdmin : false)}
+        {isAdmin}
         saving={characterSaving}
         error={characterSaveError}
         onRequestAssetPicker={handleRequestAssetPicker}
@@ -2178,6 +2376,40 @@
     color: var(--np-color-on-background);
     display: flex;
     flex-direction: column;
+  }
+  .room-state-screen {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    padding: 24px;
+    box-sizing: border-box;
+    text-align: center;
+    background-color: var(--np-color-background);
+    color: var(--np-color-on-background);
+  }
+  .room-state-title {
+    margin: 0;
+    font-size: clamp(1.4rem, 3vw, 2rem);
+    font-weight: 800;
+    color: var(--np-color-on-surface);
+  }
+  .room-state-message {
+    margin: 0;
+    max-width: 560px;
+    font-size: 0.95rem;
+    line-height: 1.6;
+    color: var(--np-color-on-surface-variant);
+  }
+  .room-state-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    justify-content: center;
   }
   .room-layout-container {
     width: 100%;

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
 import CommonFooter from '../src/components/Control/CommonFooter.svelte';
 import HomeScreen from '../src/components/Home/HomeScreen.svelte';
@@ -75,11 +75,28 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
     const target = document.createElement('div');
     document.body.appendChild(target);
 
+    localStorage.setItem('alhalte:account-id', '42');
+    localStorage.setItem('alhalte:session-id', '99');
     let enteredRoom: VisitedRoom | null = null;
+    const fetchFn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      const posted = JSON.parse(String(init?.body)) as { name: string; room_id: string };
+      return {
+        ok: true,
+        status: 201,
+        statusText: 'Created',
+        json: async () => ({
+          room_id: posted.room_id,
+          name: posted.name,
+          role: 'gm',
+          done: false,
+        }),
+      } as Response;
+    });
     const instance = mount(HomeScreen, {
       target,
       props: {
         baseUrl: 'https://alhalte.example',
+        fetchFn: fetchFn as unknown as typeof fetch,
         onEnterRoom: (r) => {
           enteredRoom = r;
         },
@@ -119,7 +136,7 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
     await new Promise((r) => setTimeout(r, 20));
 
     target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]')?.click();
-    expect(enteredRoom).toBeTruthy();
+    await vi.waitFor(() => expect(enteredRoom).toBeTruthy());
     expect(enteredRoom?.name).toBe('アーカム図書館');
 
     unmount(instance);

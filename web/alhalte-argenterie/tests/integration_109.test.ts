@@ -37,6 +37,8 @@ const cellar = vi.hoisted(() => {
     uploadTin: vi.fn(),
     downloadTin: vi.fn(),
     getRoomKeyFromLocation: vi.fn(() => null),
+    getRoomKeyFromUrl: vi.fn(() => null),
+    resolveRoomKey: vi.fn((options: { roomKey?: Uint8Array | null } = {}) => options.roomKey ?? null),
     isCellarTransferError: (error: unknown) => error instanceof MockCellarTransferError,
     CellarTransferError: MockCellarTransferError,
   };

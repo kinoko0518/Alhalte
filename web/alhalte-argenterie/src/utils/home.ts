@@ -10,8 +10,217 @@
 import { bytesToHex } from '@alhalte/pantry';
 import type { VisitedRoom } from '../types/index.js';
 import { removeRecentRoom, saveRecentRoom } from './recentRooms.js';
+import { buildAuthHeaders, type RoomRole } from './session.js';
 
 export const LOCAL_STORAGE_VISITED_ROOMS_KEY = 'alhalte:visited-rooms';
+
+/**
+ * Room metadata returned by `POST /api/rooms` and `GET /api/rooms/{room_id}`.
+ *
+ * Reference: `crates/alhalte-maitre-d/ARCHITECTURE.md` (`RoomInfoResponse`).
+ */
+export interface RoomInfo {
+  /** Canonical 16-hex room ID. */
+  room_id: string;
+  /** Human-readable room name. */
+  name: string;
+  /** Role of the authenticated caller in the room. */
+  role: RoomRole;
+  /** Whether the room is marked done (fully public). */
+  done: boolean;
+}
+
+/**
+ * Failure classification for the room registry API.
+ *
+ * `unauthorized` / `forbidden` / `not-found` mirror the HTTP statuses the
+ * server uses; `network` means the request never produced a response and may be
+ * retried, while `http` / `invalid-response` are protocol failures.
+ */
+export type RoomApiErrorKind =
+  | 'unauthorized'
+  | 'forbidden'
+  | 'not-found'
+  | 'http'
+  | 'network'
+  | 'invalid-response';
+
+/**
+ * Typed error raised by {@link createRoom} / {@link fetchRoomInfo}.
+ *
+ * The status is `null` for network failures (no response was received).
+ */
+export class RoomApiError extends Error {
+  readonly kind: RoomApiErrorKind;
+  readonly status: number | null;
+
+  constructor(kind: RoomApiErrorKind, message: string, status: number | null = null) {
+    super(message);
+    this.name = 'RoomApiError';
+    this.kind = kind;
+    this.status = status;
+  }
+}
+
+/** Options shared by the room registry helpers. */
+export interface RoomApiOptions {
+  /** Optional API base URL (tests / reverse-proxy prefixes). */
+  baseUrl?: string;
+  /** Injectable fetch implementation for tests. */
+  fetchFn?: typeof fetch;
+  /** Account ID override (defaults to the saved account). */
+  accountId?: string | number | null;
+  /** Session ID override (defaults to the saved session). */
+  sessionId?: string | number | null;
+}
+
+/** Options for {@link createRoom}. */
+export interface CreateRoomOptions extends RoomApiOptions {
+  /**
+   * Optional client-generated 16-hex room ID.
+   *
+   * The Home screen generates one so the invitation URL can be previewed before
+   * the server registers the room; the server always returns the canonical ID.
+   */
+  roomId?: string;
+}
+
+function resolveFetch(fetchFn?: typeof fetch): typeof fetch {
+  const resolved = fetchFn ?? (typeof fetch !== 'undefined' ? fetch : undefined);
+  if (!resolved) {
+    throw new RoomApiError('network', 'fetch is not available in this environment');
+  }
+  return resolved;
+}
+
+function statusErrorKind(status: number): RoomApiErrorKind {
+  if (status === 401) return 'unauthorized';
+  if (status === 403) return 'forbidden';
+  if (status === 404) return 'not-found';
+  return 'http';
+}
+
+function isRoomRole(value: unknown): value is RoomRole {
+  return value === 'gm' || value === 'pl' || value === 'viewer';
+}
+
+/** Validates the room registry response before it reaches the UI. */
+function parseRoomInfo(payload: unknown): RoomInfo {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw new RoomApiError('invalid-response', 'Room response must be a JSON object');
+  }
+  const record = payload as Record<string, unknown>;
+  const roomId = record.room_id;
+  const name = record.name;
+  const role = record.role;
+  const done = record.done;
+  if (typeof roomId !== 'string' || !isValidRoomId(roomId)) {
+    throw new RoomApiError('invalid-response', 'Room response is missing a valid room_id');
+  }
+  if (typeof name !== 'string') {
+    throw new RoomApiError('invalid-response', 'Room response is missing a room name');
+  }
+  if (!isRoomRole(role)) {
+    throw new RoomApiError('invalid-response', 'Room response is missing a valid role');
+  }
+  if (typeof done !== 'boolean') {
+    throw new RoomApiError('invalid-response', 'Room response is missing the done flag');
+  }
+  return { room_id: roomId, name, role, done };
+}
+
+async function requestRoomJson(
+  url: string,
+  init: RequestInit,
+  fetchFn: typeof fetch,
+): Promise<RoomInfo> {
+  let response: Response;
+  try {
+    response = await fetchFn(url, init);
+  } catch (error) {
+    throw new RoomApiError(
+      'network',
+      `Room request failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+
+  if (!response.ok) {
+    throw new RoomApiError(
+      statusErrorKind(response.status),
+      `Room request failed with HTTP ${response.status} ${response.statusText}`,
+      response.status,
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch (error) {
+    throw new RoomApiError(
+      'invalid-response',
+      `Room response is not valid JSON: ${error instanceof Error ? error.message : String(error)}`,
+      response.status,
+    );
+  }
+  return parseRoomInfo(payload);
+}
+
+/**
+ * Registers a room on `alhalte-maitre-d` (`POST /api/rooms`).
+ *
+ * Requires an authenticated session: the server derives the creator and its
+ * initial `gm` role from the session, never from the request body.
+ *
+ * @throws {RoomApiError} with `unauthorized`, `forbidden`, `http`, `network`, or
+ * `invalid-response`.
+ */
+export async function createRoom(
+  name: string,
+  options: CreateRoomOptions = {},
+): Promise<RoomInfo> {
+  const fetchFn = resolveFetch(options.fetchFn);
+  const base = (options.baseUrl || '').replace(/\/+$/, '');
+  const body: { name: string; room_id?: string } = { name };
+  if (options.roomId) {
+    body.room_id = options.roomId;
+  }
+
+  return requestRoomJson(
+    `${base}/api/rooms`,
+    {
+      method: 'POST',
+      headers: buildAuthHeaders(options.accountId, options.sessionId),
+      credentials: 'include',
+      body: JSON.stringify(body),
+    },
+    fetchFn,
+  );
+}
+
+/**
+ * Fetches room metadata (`GET /api/rooms/{room_id}`).
+ *
+ * Used as the join preflight so a 403 (`forbidden`) or 404 (`not-found`) is
+ * known before the WebSocket is opened.
+ *
+ * @throws {RoomApiError} with the same classifications as {@link createRoom}.
+ */
+export async function fetchRoomInfo(
+  roomId: string,
+  options: RoomApiOptions = {},
+): Promise<RoomInfo> {
+  const fetchFn = resolveFetch(options.fetchFn);
+  const base = (options.baseUrl || '').replace(/\/+$/, '');
+  return requestRoomJson(
+    `${base}/api/rooms/${encodeURIComponent(String(roomId))}`,
+    {
+      method: 'GET',
+      headers: buildAuthHeaders(options.accountId, options.sessionId),
+      credentials: 'include',
+    },
+    fetchFn,
+  );
+}
 
 /**
  * Generates a client-side room invitation URL with a 256-bit random room key in the URL fragment.
@@ -30,12 +239,13 @@ export function generateRoomUrl(
   roomUrl: string;
 } {
   // Generate 64-bit (8 bytes = 16 hex chars) room ID if not supplied
-  let roomId = customRoomId;
-  if (!roomId) {
-    const idBytes = new Uint8Array(8);
-    crypto.getRandomValues(idBytes);
-    roomId = bytesToHex(idBytes);
-  }
+  const roomId =
+    customRoomId ??
+    (() => {
+      const idBytes = new Uint8Array(8);
+      crypto.getRandomValues(idBytes);
+      return bytesToHex(idBytes);
+    })();
 
   // Generate 256-bit (32 bytes = 64 hex chars) room key if not supplied
   const keyBytes = customRoomKey ?? new Uint8Array(32);
@@ -58,7 +268,11 @@ export function generateRoomUrl(
 /**
  * Loads visited rooms from localStorage.
  *
- * Excludes rooms where the user is an admin (`isAdmin === true`).
+ * Excludes rooms where the user is an admin (`isAdmin === true`). This is a
+ * legacy display preference kept for the stored room list; it is not an
+ * authority for room access or the GM UI (Issue #156). The server role from
+ * `GET /api/rooms/{id}` is authoritative.
+ *
  * ARCHITECTURE.md: "自身が管理者である部屋のリストの表示は行わず、localStorageに保存された、訪れたことのある部屋のリストをカードとして表示"
  */
 export function getVisitedRooms(storage?: Storage): VisitedRoom[] {

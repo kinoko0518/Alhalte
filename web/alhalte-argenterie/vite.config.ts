@@ -10,6 +10,11 @@ export default defineConfig({
         target: 'http://127.0.0.1:8080',
         changeOrigin: true,
       },
+      // Google OAuth endpoints (`/auth/google/url`, `/auth/google/callback`).
+      '/auth': {
+        target: 'http://127.0.0.1:8080',
+        changeOrigin: true,
+      },
       '/room': {
         target: 'http://127.0.0.1:8080',
         changeOrigin: true,

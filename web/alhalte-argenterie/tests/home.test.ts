@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
 import {
   generateRoomUrl,
@@ -8,18 +8,37 @@ import {
   parseRoomUrl,
   resolveRoomFromLocation,
 } from '../src/utils/home.js';
+import { getRecentRooms } from '../src/utils/recentRooms.js';
 import HomeScreen from '../src/components/Home/HomeScreen.svelte';
 import App from '../src/components/App.svelte';
 import type { VisitedRoom } from '../src/types/index.js';
 
+/** Minimal `Response`-shaped object for mocked fetch calls. */
+function jsonResponse(payload: unknown, status = 200): Response {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    statusText: status === 200 ? 'OK' : 'Error',
+    json: async () => payload,
+  } as Response;
+}
+
+/** Signs the test session in through the same storage the app reads. */
+function signIn(): void {
+  localStorage.setItem('alhalte:account-id', '42');
+  localStorage.setItem('alhalte:session-id', '99');
+}
+
 describe('Home Screen & Room URL', () => {
   beforeEach(() => {
     localStorage.clear();
+    document.cookie = 'session_id=; path=/; max-age=0; SameSite=Lax';
     window.history.replaceState(null, '', '/');
   });
 
   afterEach(() => {
     window.history.replaceState(null, '', '/');
+    vi.restoreAllMocks();
   });
 
   // spec: alhalte-argenterie/home 招待URL生成・URLフラグメント
@@ -153,11 +172,25 @@ describe('Home Screen & Room URL', () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
+    let posted: { name: string; room_id?: string } | null = null;
+    const fetchFn = vi.fn(async (url: string | URL | Request, init?: RequestInit) => {
+      expect(String(url)).toBe('https://alhalte.example/api/rooms');
+      expect(init?.method).toBe('POST');
+      posted = JSON.parse(String(init?.body)) as { name: string; room_id?: string };
+      return jsonResponse({
+        room_id: posted.room_id,
+        name: posted.name,
+        role: 'gm',
+        done: false,
+      });
+    });
+
     let enteredRoom: VisitedRoom | null = null;
     const instance = mount(HomeScreen, {
       target,
       props: {
         baseUrl: 'https://alhalte.example',
+        fetchFn: fetchFn as unknown as typeof fetch,
         onEnterRoom: (r) => {
           enteredRoom = r;
         },
@@ -193,6 +226,8 @@ describe('Home Screen & Room URL', () => {
     const createBtn = target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]');
     expect(createBtn).toBeTruthy();
     expect(createBtn?.classList.contains('np-extended-fab')).toBe(true);
+    // Creation requires an authenticated session (Issue #156).
+    signIn();
     createBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
@@ -224,31 +259,201 @@ describe('Home Screen & Room URL', () => {
     }
 
     const joinBtn = target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]');
+    expect(joinBtn?.disabled).toBe(false);
     joinBtn?.click();
 
-    expect(enteredRoom).toBeTruthy();
+    await vi.waitFor(() => expect(enteredRoom).toBeTruthy());
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(posted?.name).toBe('新セッション部屋');
+    expect(posted?.room_id).toMatch(/^[0-9a-f]{16}$/);
     expect(enteredRoom?.name).toBe('新セッション部屋');
+    // The creator is `gm` according to the server response.
     expect(enteredRoom?.isAdmin).toBe(true);
-    expect(window.location.pathname).toContain('/rooms/');
+    expect(enteredRoom?.url).toMatch(
+      new RegExp(`^https://alhalte\\.example/rooms/${posted?.room_id}#[0-9a-f]{64}$`),
+    );
+    expect(getRecentRooms().some((room) => room.roomId === posted?.room_id)).toBe(true);
+    expect(window.location.pathname).toContain(`/rooms/${posted?.room_id}`);
 
     unmount(instance);
     target.remove();
   });
 
-  // spec: alhalte-argenterie/home 招待リンク直接アクセスで部屋へ直接入室 (#34)
-  it('directly enters the room when App is mounted at a room invitation URL', () => {
+  // spec: alhalte-argenterie/home 未サインインでは部屋を作成できない (Issue #156)
+  it('does not create a room while signed out and shows the sign-in guidance', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const fetchFn = vi.fn();
+    let enteredRoom: VisitedRoom | null = null;
+    const instance = mount(HomeScreen, {
+      target,
+      props: {
+        baseUrl: 'https://alhalte.example',
+        fetchFn: fetchFn as unknown as typeof fetch,
+        onEnterRoom: (r) => {
+          enteredRoom = r;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(target.querySelector('[data-testid="create-room-signin-guidance"]')).toBeTruthy();
+    const joinBtn = target.querySelector<HTMLButtonElement>(
+      '[data-testid="join-created-room-button"]',
+    );
+    expect(joinBtn?.disabled).toBe(true);
+
+    joinBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(enteredRoom).toBeNull();
+    expect(getRecentRooms()).toHaveLength(0);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/home 401 はサインイン導線を出す (Issue #156)
+  it('shows sign-in guidance on a 401 and never enters or saves a local room', async () => {
+    signIn();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const fetchFn = vi.fn(async () => jsonResponse({ error: 'Unauthorized' }, 401));
+    let enteredRoom: VisitedRoom | null = null;
+    const instance = mount(HomeScreen, {
+      target,
+      props: {
+        baseUrl: 'https://alhalte.example',
+        fetchFn: fetchFn as unknown as typeof fetch,
+        onEnterRoom: (r) => {
+          enteredRoom = r;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]')?.click();
+
+    await vi.waitFor(() =>
+      expect(target.querySelector('[data-testid="create-room-error"]')).toBeTruthy(),
+    );
+    expect(target.querySelector('[data-testid="create-room-signin-guidance"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="create-room-error"]')?.textContent).toContain(
+      'サインインが必要です',
+    );
+    expect(enteredRoom).toBeNull();
+    expect(getRecentRooms()).toHaveLength(0);
+    expect(window.location.pathname).toBe('/');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/home 通信/HTTP 失敗では入室しない (Issue #156)
+  it('stays on Home with an error on a network failure and does not enter', async () => {
+    signIn();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const fetchFn = vi.fn(async () => {
+      throw new Error('network down');
+    });
+    let enteredRoom: VisitedRoom | null = null;
+    const instance = mount(HomeScreen, {
+      target,
+      props: {
+        baseUrl: 'https://alhalte.example',
+        fetchFn: fetchFn as unknown as typeof fetch,
+        onEnterRoom: (r) => {
+          enteredRoom = r;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]')?.click();
+
+    await vi.waitFor(() =>
+      expect(target.querySelector('[data-testid="create-room-error"]')?.textContent).toContain(
+        '通信できませんでした',
+      ),
+    );
+    expect(enteredRoom).toBeNull();
+    expect(getRecentRooms()).toHaveLength(0);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  it('stays on Home with an error on an HTTP failure and does not enter', async () => {
+    signIn();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const fetchFn = vi.fn(async () => jsonResponse({ error: 'boom' }, 500));
+    let enteredRoom: VisitedRoom | null = null;
+    const instance = mount(HomeScreen, {
+      target,
+      props: {
+        baseUrl: 'https://alhalte.example',
+        fetchFn: fetchFn as unknown as typeof fetch,
+        onEnterRoom: (r) => {
+          enteredRoom = r;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]')?.click();
+
+    await vi.waitFor(() =>
+      expect(target.querySelector('[data-testid="create-room-error"]')?.textContent).toContain(
+        'HTTP 500',
+      ),
+    );
+    expect(enteredRoom).toBeNull();
+    expect(getRecentRooms()).toHaveLength(0);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/home 招待リンク直接アクセスで部屋へ直接入室 (#34 / #156 preflight)
+  it('directly enters the room after the server preflight when App is mounted at a room invitation URL', async () => {
     const key = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
     window.history.replaceState(null, '', `/rooms/1122334455667788#${key}`);
 
     const target = document.createElement('div');
     document.body.appendChild(target);
 
+    const fetchFn = vi.fn(async (url: string | URL | Request) => {
+      const parsed = new URL(String(url), window.location.origin);
+      expect(parsed.pathname).toBe('/api/rooms/1122334455667788');
+      return jsonResponse({
+        room_id: '1122334455667788',
+        name: 'サーバー部屋',
+        role: 'pl',
+        done: false,
+      });
+    });
     const instance = mount(App, {
       target,
+      props: { fetchFn: fetchFn as unknown as typeof fetch },
     });
 
-    expect(target.querySelector('[data-testid="room-layout"]')).toBeTruthy();
+    await vi.waitFor(() =>
+      expect(target.querySelector('[data-testid="room-layout"]')).toBeTruthy(),
+    );
     expect(target.querySelector('[data-testid="home-screen"]')).toBeNull();
+    expect(target.textContent).toContain('サーバー部屋');
 
     unmount(instance);
     target.remove();
