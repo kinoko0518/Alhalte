@@ -198,17 +198,60 @@ pub struct TinReference {
     pub wrapped_key: Option<Vec<u8>>,
 }
 
+/// Credentials that authorize a cellar write, taken from request headers.
+///
+/// The caller's identity is **never** part of a request body (Issue #191):
+/// `alhalte-cellar` reads `X-Alhalte-Owner` / `X-Alhalte-Session-Id` (see
+/// [`crate::handlers::OWNER_HEADER`] and [`crate::handlers::SESSION_ID_HEADER`])
+/// or the internal service token instead. A body that still carries a legacy
+/// `owner` / `session_id` is rejected with 400.
+///
+/// `owner` is a reference label, not an authorization boundary: a user session
+/// must own it (otherwise 401), and the service token always overrides it with
+/// [`SYSTEM_OWNER`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteCredentials {
+    /// Account ID claimed by the `X-Alhalte-Owner` header.
+    pub owner: Option<u64>,
+    /// Session ID claimed by the `X-Alhalte-Session-Id` header.
+    pub session_id: Option<u64>,
+}
+
+impl WriteCredentials {
+    /// Builds the credentials of a user-session write.
+    ///
+    /// The pair must satisfy [`crate::SessionVerifier`]; a claim that does not
+    /// match the session is rejected with 401.
+    #[must_use]
+    pub const fn session(owner: u64, session_id: u64) -> Self {
+        Self {
+            owner: Some(owner),
+            session_id: Some(session_id),
+        }
+    }
+
+    /// Builds owner-less credentials for a service-token write.
+    ///
+    /// The token is the credential and the reference label is always
+    /// [`SYSTEM_OWNER`], so no owner / session is claimed.
+    #[must_use]
+    pub const fn service() -> Self {
+        Self {
+            owner: None,
+            session_id: None,
+        }
+    }
+}
+
 /// Store metadata request received from a client.
 ///
-/// `owner` and `session_id` authenticate user writes. For service-token writes
-/// they are ignored: the reference label is always [`SYSTEM_OWNER`]. The fields
-/// stay in the type until the separate cleanup that removes them (#191).
+/// The body carries metadata only: `tin_id`, `size`, and `wrapped_key`. The
+/// writer's identity comes from the request headers (see [`WriteCredentials`]);
+/// `#[serde(deny_unknown_fields)]` rejects a legacy `owner` / `session_id` (or
+/// any other stray field) with 400 instead of silently ignoring it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreRequest {
-    /// Owner account ID (reference label for user writes; ignored with a service token).
-    pub owner: u64,
-    /// Active session ID issued by `maitre-d` (ignored with a service token).
-    pub session_id: u64,
     /// 256-bit tin ID.
     #[serde(with = "hex_tin_id")]
     pub tin_id: TinId,
@@ -262,14 +305,12 @@ pub struct StoreResult {
 
 /// Unregister request to remove ownership of a tin.
 ///
-/// `owner` and `session_id` authenticate user writes. For service-token writes
-/// they are ignored and the [`SYSTEM_OWNER`] reference is removed.
+/// Like [`StoreRequest`], the body carries only `tin_id`: the writer's identity
+/// comes from the request headers (see [`WriteCredentials`]), and a legacy
+/// `owner` / `session_id` in the body is rejected with 400.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnregisterRequest {
-    /// Owner account ID (reference label for user writes; ignored with a service token).
-    pub owner: u64,
-    /// Active session ID (ignored with a service token).
-    pub session_id: u64,
     /// 256-bit tin ID.
     #[serde(with = "hex_tin_id")]
     pub tin_id: TinId,

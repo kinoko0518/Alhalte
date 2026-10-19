@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
 use axum::http::header::{CONTENT_TYPE, HeaderMap};
 use axum::http::{StatusCode, header};
@@ -13,7 +14,7 @@ use serde::Deserialize;
 
 use crate::error::CellarError;
 use crate::model::{
-    AliasRequest, AliasResponse, SYSTEM_OWNER, StoreRequest, StoreResponse, UnregisterRequest,
+    AliasRequest, AliasResponse, StoreRequest, StoreResponse, UnregisterRequest, WriteCredentials,
     format_tin_id, parse_tin_id,
 };
 use crate::service::CellarService;
@@ -32,6 +33,15 @@ pub const MAX_STORE_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// writes do not need a synthetic user session. The value is never logged.
 pub const SERVICE_TOKEN_HEADER: &str = "X-Alhalte-Service-Token";
 
+/// Header name carrying the reference label (owner) of a write.
+///
+/// `alhalte-maitre-d` always sets it from the authenticated session; the request
+/// body never carries an ownership claim (Issue #191).
+pub const OWNER_HEADER: &str = "X-Alhalte-Owner";
+
+/// Header name carrying the session ID that authorizes a user write.
+pub const SESSION_ID_HEADER: &str = "X-Alhalte-Session-Id";
+
 /// Reads the internal service token from request headers, if present.
 ///
 /// An empty header value is treated as absent so a misconfigured client cannot
@@ -49,26 +59,24 @@ fn header_u64(headers: &HeaderMap, name: &str) -> Option<u64> {
         .and_then(|s| s.parse::<u64>().ok())
 }
 
-/// Resolves the credential and reference label of an upload / unregister.
+/// Reads the write credentials from the request headers.
 ///
-/// A service-token request does not need `owner` / `session_id`: the token is
-/// the credential and the reference label is always [`SYSTEM_OWNER`], so a body
-/// or header `owner` can neither authorize nor label an internal write. Without
-/// a token, both are required because [`crate::SessionVerifier`] binds the label
-/// to the session, and a missing pair is rejected with 401.
-fn resolve_write_credentials(
-    owner: Option<u64>,
-    session_id: Option<u64>,
-    service_token: Option<&str>,
-) -> std::result::Result<(u64, u64), CellarError> {
-    match (owner, session_id) {
-        (Some(owner), Some(session_id)) => Ok((owner, session_id)),
-        _ if service_token.is_some() => Ok((SYSTEM_OWNER, 0)),
-        _ => Err(CellarError::Unauthorized {
-            owner: SYSTEM_OWNER,
-            session_id: 0,
-        }),
+/// Only [`OWNER_HEADER`] / [`SESSION_ID_HEADER`] are accepted: query parameters
+/// and request bodies never authenticate a write (Issue #191).
+fn credentials_from_headers(headers: &HeaderMap) -> WriteCredentials {
+    WriteCredentials {
+        owner: header_u64(headers, OWNER_HEADER),
+        session_id: header_u64(headers, SESSION_ID_HEADER),
     }
+}
+
+/// Maps an Axum JSON rejection to a `400 Bad Request`.
+///
+/// Axum answers `422 Unprocessable Entity` for a body that deserializes badly,
+/// but a legacy `owner` / `session_id` field (or any other unknown field) is a
+/// malformed request for cellar, so the contract is a plain 400.
+fn json_rejection(rejection: JsonRejection) -> CellarError {
+    CellarError::InvalidBody(rejection.to_string())
 }
 
 /// Query parameters for download requests.
@@ -78,13 +86,9 @@ pub struct DownloadQuery {
     pub owner: Option<u64>,
 }
 
-/// Query parameters for upload requests (fallback if headers not used).
+/// Query parameters for upload requests.
 #[derive(Debug, Deserialize)]
 pub struct UploadQuery {
-    /// Owner account ID.
-    pub owner: Option<u64>,
-    /// Session ID.
-    pub session_id: Option<u64>,
     /// Optional wrapped key in hex.
     pub wrapped_key: Option<String>,
 }
@@ -96,7 +100,11 @@ impl IntoResponse for CellarError {
             Self::Unauthorized { .. } => (StatusCode::UNAUTHORIZED, self.to_string()),
             Self::NotFound(_) | Self::AliasNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Self::AlreadyOwned { .. } => (StatusCode::CONFLICT, self.to_string()),
-            Self::Hex(_) | Self::Json(_) | Self::SizeMismatch { .. } | Self::InvalidAlias(_) => {
+            Self::Hex(_)
+            | Self::Json(_)
+            | Self::InvalidBody(_)
+            | Self::SizeMismatch { .. }
+            | Self::InvalidAlias(_) => {
                 (StatusCode::BAD_REQUEST, self.to_string())
             }
             Self::Io(_)
@@ -164,20 +172,31 @@ async fn health_check() -> impl IntoResponse {
 /// Always returns `200 OK` with a [`StoreResponse`] body whose `result` is
 /// `upload_required`, `deduplicated`, or `already_owned`; errors keep their
 /// usual status (401 / 400 / 5xx). Authorization is either the internal service
-/// token (see [`SERVICE_TOKEN_HEADER`]) or the owner's user session.
+/// token (see [`SERVICE_TOKEN_HEADER`]) or the owner's user session, both taken
+/// from request headers. A body carrying `owner` / `session_id` is rejected with
+/// 400.
 async fn handle_store_check(
     State(service): State<Arc<CellarService>>,
     headers: HeaderMap,
-    Json(payload): Json<StoreRequest>,
+    payload: std::result::Result<Json<StoreRequest>, JsonRejection>,
 ) -> std::result::Result<Response, CellarError> {
+    let Json(payload) = payload.map_err(json_rejection)?;
+
     let result = service
-        .store_check_with_token(&payload, service_token_from_headers(&headers))
+        .store_check_with_token(
+            &payload,
+            credentials_from_headers(&headers),
+            service_token_from_headers(&headers),
+        )
         .await?;
 
     Ok((StatusCode::OK, Json(StoreResponse { result })).into_response())
 }
 
 /// Tin payload upload handler.
+///
+/// Identity comes from the `X-Alhalte-Owner` / `X-Alhalte-Session-Id` headers or
+/// the service token; query parameters are only used for `wrapped_key`.
 async fn handle_store_upload(
     State(service): State<Arc<CellarService>>,
     AxPath(tin_id_hex): AxPath<String>,
@@ -189,11 +208,7 @@ async fn handle_store_upload(
 
     // A service-token upload needs neither header: the token is the credential.
     let service_token = service_token_from_headers(&headers);
-    let (owner, session_id) = resolve_write_credentials(
-        header_u64(&headers, "X-Alhalte-Owner").or(query.owner),
-        header_u64(&headers, "X-Alhalte-Session-Id").or(query.session_id),
-        service_token,
-    )?;
+    let credentials = credentials_from_headers(&headers);
 
     // Extract wrapped_key from header or query param
     let wrapped_key_hex = headers
@@ -208,13 +223,16 @@ async fn handle_store_upload(
     };
 
     let result = service
-        .store_payload_with_token(owner, session_id, tin_id, &body, wrapped_key, service_token)
+        .store_payload_with_token(tin_id, &body, wrapped_key, credentials, service_token)
         .await?;
 
     Ok((StatusCode::CREATED, Json(result)).into_response())
 }
 
 /// Download handler returning raw tin binary and optional wrapped key header.
+///
+/// Download never authorizes: `X-Alhalte-Owner` (or `?owner=`) only narrows the
+/// reference row that is looked up.
 async fn handle_download(
     State(service): State<Arc<CellarService>>,
     AxPath(tin_id_hex): AxPath<String>,
@@ -223,11 +241,7 @@ async fn handle_download(
 ) -> std::result::Result<Response, CellarError> {
     let tin_id = parse_tin_id(&tin_id_hex)?;
 
-    let owner = headers
-        .get("X-Alhalte-Owner")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(query.owner);
+    let owner = header_u64(&headers, OWNER_HEADER).or(query.owner);
 
     let (data, wrapped_key) = service.download(&tin_id, owner).await?;
 
@@ -256,11 +270,7 @@ async fn handle_tin_metadata(
 ) -> std::result::Result<Response, CellarError> {
     let tin_id = parse_tin_id(&tin_id_hex)?;
 
-    let owner = headers
-        .get("X-Alhalte-Owner")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.parse::<u64>().ok())
-        .or(query.owner);
+    let owner = header_u64(&headers, OWNER_HEADER).or(query.owner);
 
     let (data, wrapped_key) = service.download(&tin_id, owner).await?;
 
@@ -275,17 +285,20 @@ async fn handle_tin_metadata(
 
 /// Unregister handler via JSON POST.
 ///
-/// Authorization is either the internal service token or the owner's session.
+/// Authorization is either the internal service token or the owner's session,
+/// both taken from request headers. A body carrying `owner` / `session_id` is
+/// rejected with 400.
 async fn handle_unregister(
     State(service): State<Arc<CellarService>>,
     headers: HeaderMap,
-    Json(payload): Json<UnregisterRequest>,
+    payload: std::result::Result<Json<UnregisterRequest>, JsonRejection>,
 ) -> std::result::Result<Response, CellarError> {
+    let Json(payload) = payload.map_err(json_rejection)?;
+
     let deleted = service
         .unregister_with_token(
-            payload.owner,
-            payload.session_id,
             &payload.tin_id,
+            credentials_from_headers(&headers),
             service_token_from_headers(&headers),
         )
         .await?;
@@ -302,23 +315,22 @@ async fn handle_unregister(
 }
 
 /// Unregister handler via DELETE.
+///
+/// Identity comes from the request headers only; a `?owner=` / `?session_id=`
+/// query parameter is not accepted.
 async fn handle_unregister_delete(
     State(service): State<Arc<CellarService>>,
     AxPath(tin_id_hex): AxPath<String>,
     headers: HeaderMap,
-    Query(query): Query<UploadQuery>,
 ) -> std::result::Result<Response, CellarError> {
     let tin_id = parse_tin_id(&tin_id_hex)?;
 
-    let service_token = service_token_from_headers(&headers);
-    let (owner, session_id) = resolve_write_credentials(
-        header_u64(&headers, "X-Alhalte-Owner").or(query.owner),
-        header_u64(&headers, "X-Alhalte-Session-Id").or(query.session_id),
-        service_token,
-    )?;
-
     let deleted = service
-        .unregister_with_token(owner, session_id, &tin_id, service_token)
+        .unregister_with_token(
+            &tin_id,
+            credentials_from_headers(&headers),
+            service_token_from_headers(&headers),
+        )
         .await?;
 
     if deleted {

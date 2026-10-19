@@ -30,7 +30,10 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use alhalte_cellar::{CellarConfig, CellarService, InMemorySessionVerifier, StoreRequest, StoreStatus};
+//! use alhalte_cellar::{
+//!     CellarConfig, CellarService, InMemorySessionVerifier, StoreRequest, StoreStatus,
+//!     WriteCredentials,
+//! };
 //! use tempfile::tempdir;
 //!
 //! # #[tokio::main]
@@ -40,15 +43,16 @@
 //! verifier.allow(42, 100);
 //!
 //! let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false)?;
+//! // The body carries metadata only; the caller is identified by the headers.
 //! let req = StoreRequest {
-//!     owner: 42,
-//!     session_id: 100,
 //!     tin_id: [1u8; 32],
 //!     size: 10,
 //!     wrapped_key: None,
 //! };
 //!
-//! let status = service.store_check(&req).await?;
+//! let status = service
+//!     .store_check(&req, WriteCredentials::session(42, 100))
+//!     .await?;
 //! assert_eq!(status, StoreStatus::UploadRequired);
 //! # Ok(())
 //! # }
@@ -76,8 +80,8 @@ pub use gc::run_garbage_collection;
 pub use handlers::create_router;
 pub use model::{
     AliasRequest, AliasResponse, GcStats, MAX_ALIAS_NAME_BYTES, SYSTEM_OWNER, StoreRequest,
-    StoreResponse, StoreResult, StoreStatus, TinReference, UnregisterRequest, format_tin_id,
-    parse_tin_id, validate_alias_name,
+    StoreResponse, StoreResult, StoreStatus, TinReference, UnregisterRequest, WriteCredentials,
+    format_tin_id, parse_tin_id, validate_alias_name,
 };
 pub use secret_file::{SecretFileError, read_secret_file, resolve_secret};
 pub use service::{CellarConfig, CellarService};
