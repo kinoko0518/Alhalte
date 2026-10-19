@@ -55,7 +55,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = ServerConfig {
         socket_path: args.socket,
         heartbeat_interval: Duration::from_secs(args.heartbeat_interval_secs),
-        admin_account: args.admin,
     };
 
     // Flush the final `RoomData` to cellar when the service manager or an

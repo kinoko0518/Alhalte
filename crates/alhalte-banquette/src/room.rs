@@ -655,21 +655,29 @@ impl Room {
     /// The store is authorized by the cellar service token carried by the
     /// [`CellarSink`] (or by a real user session when no token is configured);
     /// internal writes never impersonate a synthetic session, so
-    /// [`INTERNAL_WRITE_SESSION_ID`] is sent.
+    /// [`INTERNAL_WRITE_SESSION_ID`] is sent. The reference label is
+    /// [`alhalte_cellar::SYSTEM_OWNER`]: the room administrator is not the owner
+    /// of internal room writes, and `owner` is not an authorization boundary.
     ///
     /// After a successful store the previous head tin is unregistered on a
     /// best-effort basis so cellar GC can reclaim it. The current head is never
     /// unregistered, and retention failures are logged but do not fail the store.
     ///
     /// Returns the tin ID of the stored `RoomData`.
-    pub async fn persist(&mut self, cellar: &dyn CellarSink, owner: u64) -> Result<TinId> {
+    pub async fn persist(&mut self, cellar: &dyn CellarSink) -> Result<TinId> {
         let room_tin = self.to_tin()?;
         let (wire_bytes, tin_id) = room_tin
             .encode_plaintext(Compression::Zstd)
             .map_err(BanquetteError::Tin)?;
 
         cellar
-            .store_tin(owner, INTERNAL_WRITE_SESSION_ID, &wire_bytes, &tin_id, None)
+            .store_tin(
+                alhalte_cellar::SYSTEM_OWNER,
+                INTERNAL_WRITE_SESSION_ID,
+                &wire_bytes,
+                &tin_id,
+                None,
+            )
             .await?;
 
         let previous = self.head_tin.replace(tin_id);
@@ -677,7 +685,11 @@ impl Room {
             && previous != tin_id
         {
             match cellar
-                .unregister_tin(owner, INTERNAL_WRITE_SESSION_ID, &previous)
+                .unregister_tin(
+                    alhalte_cellar::SYSTEM_OWNER,
+                    INTERNAL_WRITE_SESSION_ID,
+                    &previous,
+                )
                 .await
             {
                 Ok(true) => tracing::debug!(
@@ -705,12 +717,8 @@ impl Room {
     ///   reported as `None` so the process keeps running and retries next cycle.
     /// - Checks client activity. If no client activity occurred during the cycle, increments `missed_heartbeats`.
     /// - If 3 consecutive missed heartbeats are accumulated, returns [`HeartbeatOutcome::ShouldExit`].
-    pub async fn step_heartbeat(
-        &mut self,
-        cellar: &dyn CellarSink,
-        owner: u64,
-    ) -> Result<HeartbeatResult> {
-        let persisted_tin = match self.persist(cellar, owner).await {
+    pub async fn step_heartbeat(&mut self, cellar: &dyn CellarSink) -> Result<HeartbeatResult> {
+        let persisted_tin = match self.persist(cellar).await {
             Ok(tin_id) => Some(tin_id),
             Err(e) => {
                 tracing::error!("Failed to persist room state to cellar: {e}");

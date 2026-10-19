@@ -20,7 +20,10 @@ use crate::error::{BanquetteError, Result};
 /// Room state persistence is authorized by the cellar service token
 /// (`X-Alhalte-Service-Token`), never by a synthetic user session, so no real
 /// session is sent. Client-session writes (log chunks, scene unloads) still use
-/// the real session of the client that triggered them.
+/// the real session of the client that triggered them. Internal room writes also
+/// use [`alhalte_cellar::SYSTEM_OWNER`] as their reference label instead of the
+/// room administrator: `owner` is a reference label, not an authorization
+/// boundary.
 pub const INTERNAL_WRITE_SESSION_ID: u64 = 0;
 
 /// Storage abstraction for sending sealed chunks and persisted scene/room tins to cellar.

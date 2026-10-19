@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use alhalte_cellar::CellarError;
 use alhalte_cellar::CellarService;
+use alhalte_cellar::SYSTEM_OWNER;
 use alhalte_cellar::db::Database;
 use alhalte_cellar::model::{StoreRequest, StoreStatus, UnregisterRequest, format_tin_id};
 use alhalte_cellar::run_garbage_collection;
@@ -1149,4 +1150,184 @@ async fn test_service_token_header_is_accepted_by_the_router() {
         .unwrap();
     let resp = app.oneshot(request).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #198: `owner` is a reference label, not an authorization boundary
+// ---------------------------------------------------------------------------
+
+// spec: alhalte-cellar/owner-label 0001 service-token writes are labelled SYSTEM_OWNER
+#[tokio::test]
+async fn test_service_token_store_and_unregister_use_the_system_owner_label() {
+    let dir = tempdir().unwrap();
+    // The verifier denies every session, so success can only come from the token.
+    let service = CellarService::new_with_in_memory_db(
+        dir.path(),
+        Arc::new(InMemorySessionVerifier::new()),
+        false,
+    )
+    .unwrap()
+    .with_service_token("service-secret");
+
+    let (tin_bytes, tin_id) = create_test_tin("system-owned room state");
+    // The claimed owner is ignored: the credential decides the reference label.
+    let req = StoreRequest {
+        owner: 42,
+        session_id: 0,
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+    assert_eq!(
+        service
+            .store_check_with_token(&req, Some("service-secret"))
+            .await
+            .unwrap(),
+        StoreStatus::UploadRequired
+    );
+    let result = service
+        .store_payload_with_token(42, 0, tin_id, &tin_bytes, None, Some("service-secret"))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.owner, SYSTEM_OWNER,
+        "service-token writes must be labelled with the system owner"
+    );
+
+    // The row exists under the system owner and not under the claimed owner.
+    assert!(service.download(&tin_id, Some(SYSTEM_OWNER)).await.is_ok());
+    assert!(matches!(
+        service.download(&tin_id, Some(42)).await.unwrap_err(),
+        CellarError::NotFound(_)
+    ));
+
+    // A second store is already_owned for the system owner, independent of the claim.
+    let other_claim = StoreRequest { owner: 999, ..req };
+    assert_eq!(
+        service
+            .store_check_with_token(&other_claim, Some("service-secret"))
+            .await
+            .unwrap(),
+        StoreStatus::AlreadyOwned
+    );
+
+    // Unregister is normalized the same way, so GC reclaims the entity.
+    assert!(
+        service
+            .unregister_with_token(42, 0, &tin_id, Some("service-secret"))
+            .await
+            .unwrap()
+    );
+    let stats = service.run_gc().await.unwrap();
+    assert_eq!(
+        stats.deleted_files, 1,
+        "GC must reclaim the system-owned entity: {stats:?}"
+    );
+    assert!(service.download(&tin_id, None).await.is_err());
+}
+
+// spec: alhalte-cellar/owner-label 0002 service-token uploads need no owner / session
+#[tokio::test]
+async fn test_service_token_upload_without_owner_headers() {
+    let dir = tempdir().unwrap();
+    let service = Arc::new(
+        CellarService::new_with_in_memory_db(
+            dir.path(),
+            Arc::new(InMemorySessionVerifier::new()),
+            false,
+        )
+        .unwrap()
+        .with_service_token("service-secret"),
+    );
+    let app = Arc::clone(&service).into_router();
+
+    let (tin_bytes, tin_id) = create_test_tin("router internal store without owner");
+    let upload = Request::builder()
+        .method("POST")
+        .uri(format!("/store/{}", format_tin_id(&tin_id)))
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(tin_bytes.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(upload).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["owner"], SYSTEM_OWNER);
+
+    // The reference is readable without an owner filter. Download never
+    // authorizes; `owner` only narrows the row lookup.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/tin/{}", format_tin_id(&tin_id)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Without a token, an upload with no owner / session is rejected.
+    let (other_bytes, other_tin) = create_test_tin("router anonymous store");
+    let anonymous = Request::builder()
+        .method("POST")
+        .uri(format!("/store/{}", format_tin_id(&other_tin)))
+        .body(Body::from(other_bytes))
+        .unwrap();
+    let resp = app.oneshot(anonymous).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+// spec: alhalte-cellar/owner-label 0003 user sessions keep their own label, spoofing fails
+#[tokio::test]
+async fn test_user_session_owner_label_is_bound_to_the_session() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    verifier.allow(7, 70);
+    let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false)
+        .unwrap()
+        .with_service_token("service-secret");
+
+    let (tin_bytes, tin_id) = create_test_tin("user-owned content");
+    let req = StoreRequest {
+        owner: 7,
+        session_id: 70,
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+    assert_eq!(
+        service.store_check(&req).await.unwrap(),
+        StoreStatus::UploadRequired
+    );
+    let result = service
+        .store_payload(7, 70, tin_id, &tin_bytes, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        result.owner, 7,
+        "a user session keeps its own account as the reference label"
+    );
+    assert!(service.download(&tin_id, Some(7)).await.is_ok());
+    assert!(
+        service.download(&tin_id, Some(SYSTEM_OWNER)).await.is_err(),
+        "a user write must not be labelled with the system owner"
+    );
+
+    // Claiming another owner with this session is rejected; the body cannot
+    // change the label because the session verifier checks the pair.
+    let spoofed = StoreRequest {
+        owner: 8,
+        session_id: 70,
+        ..req
+    };
+    assert!(matches!(
+        service.store_check(&spoofed).await.unwrap_err(),
+        CellarError::Unauthorized {
+            owner: 8,
+            session_id: 70
+        }
+    ));
 }
