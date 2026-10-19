@@ -32,7 +32,7 @@ use alhalte_banquette::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
     WebRtcSignalPayload,
 };
-use alhalte_banquette::room::{HeartbeatOutcome, Room, RoomPermissionLevel};
+use alhalte_banquette::room::{HeartbeatOutcome, Room, RoomPermissionLevel, room_head_alias};
 use alhalte_banquette::server::{BanquetteServer, ServerConfig};
 use alhalte_banquette::state::SceneState;
 use alhalte_cellar::SYSTEM_OWNER;
@@ -762,6 +762,14 @@ impl CellarSink for RecordingCellarSink {
         self.unregisters.lock().unwrap().push(*tin_id);
         self.inner.unregister_tin(owner, session_id, tin_id).await
     }
+
+    async fn get_alias(&self, name: &str) -> Result<Option<TinId>, PersistenceError> {
+        self.inner.get_alias(name).await
+    }
+
+    async fn set_alias(&self, name: &str, tin_id: &TinId) -> Result<(), PersistenceError> {
+        self.inner.set_alias(name, tin_id).await
+    }
 }
 
 /// Builds a room containing scenes, state, characters, log entries, and permissions.
@@ -1083,26 +1091,32 @@ async fn test_heartbeat_reports_persisted_tin_and_uses_internal_credential() {
     assert_eq!(failing_room.head_tin, None);
 }
 
-// spec: alhalte-banquette/persistence 0005 heartbeat sends RoomPersisted to maitre-d
+// spec: alhalte-banquette/persistence 0005 heartbeat moves the room head alias
+//
+// Issue #192 moved the head pointer from maitre-d's `room_heads` to cellar's
+// generic alias, so a persist is observed in cellar instead of a
+// `RoomPersisted` protocol frame.
 #[tokio::test]
-async fn test_heartbeat_reports_room_persisted_frame() {
+async fn test_heartbeat_moves_the_room_head_alias() {
     let dir = tempdir().unwrap();
     let sock_path = dir.path().join("banquette.sock");
     let cellar = Arc::new(InMemoryCellarSink::new());
+    let room_id = 2002;
+    let alias = room_head_alias(room_id);
+    let cellar_sink: Arc<dyn CellarSink> = Arc::clone(&cellar) as Arc<dyn CellarSink>;
 
     let server = BanquetteServer::new(
         ServerConfig {
             socket_path: sock_path.clone(),
             heartbeat_interval: Duration::from_millis(50),
         },
-        Room::new(2002, 10, 8).unwrap(),
-        Arc::clone(&cellar) as Arc<dyn CellarSink>,
+        Room::new(room_id, 10, 8).unwrap(),
+        Arc::clone(&cellar_sink),
     );
     let server_task = tokio::spawn(async move { server.run().await });
 
-    // Connect as soon as the listener exists: the heartbeat interval is short and
-    // a room with no connected client exits after three missed beats, which would
-    // otherwise race the first `RoomPersisted` frame under a loaded test runner.
+    // Keep a client connected so the room is not considered idle and does not
+    // shut down (and persist) before the heartbeat path has run.
     for _ in 0..400 {
         if sock_path.exists() {
             break;
@@ -1113,10 +1127,6 @@ async fn test_heartbeat_reports_room_persisted_frame() {
     let (read_half, write_half) = stream.into_split();
     let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
     let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
-
-    // Register a client so the room is not considered idle and shut down before
-    // it has emitted a `RoomPersisted` frame. Waiting for the `Pong` also proves
-    // the connection (and its persistence subscription) is active.
     writer
         .send(MaitreDToBanquette::ClientConnected {
             client_id: 1,
@@ -1125,38 +1135,46 @@ async fn test_heartbeat_reports_room_persisted_frame() {
         })
         .await
         .unwrap();
+    // Waiting for the `Pong` proves the connection is being handled, so the
+    // client is registered before the next heartbeat tick.
     writer.send(MaitreDToBanquette::Ping).await.unwrap();
-
-    let mut persisted = None;
-    for _ in 0..40 {
-        match tokio::time::timeout(Duration::from_millis(500), reader.next()).await {
-            Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted {
-                tin_id,
-                default_permission: _,
-            }))) => {
-                persisted = Some(tin_id);
-                break;
-            }
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
+            Ok(Some(Ok(BanquetteToMaitreD::Pong))) => break,
             Ok(Some(Ok(_))) => continue,
-            Ok(Some(Err(e))) => panic!("protocol error before RoomPersisted: {e:?}"),
-            Ok(None) => panic!("connection closed before RoomPersisted"),
-            Err(_) => continue,
+            other => panic!("expected Pong before the heartbeat: {other:?}"),
         }
     }
-    let tin_id = persisted.expect("heartbeat must report the stored room tin");
+
+    let mut head = None;
+    for _ in 0..100 {
+        if let Some(tin_id) = cellar.get_alias(&alias).await.unwrap() {
+            head = Some(tin_id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let tin_id = head.expect("the heartbeat must move the room head alias");
     assert!(cellar.contains(&tin_id).await);
+
+    // The aliased head is the restore point and decodes back into the room.
+    let restored = Room::load_from_cellar(cellar_sink.as_ref(), &tin_id, room_id)
+        .await
+        .expect("the aliased head must restore");
+    assert!(restored.scene_biblio.contains_key("/"));
 
     server_task.abort();
 }
 
 // spec: alhalte-banquette/persistence 0006 graceful shutdown persists once more
 #[tokio::test]
-async fn test_graceful_shutdown_persists_room_head() {
+async fn test_graceful_shutdown_moves_the_room_head_alias() {
     let dir = tempdir().unwrap();
     let sock_path = dir.path().join("banquette.sock");
     let cellar = Arc::new(InMemoryCellarSink::new());
+    let room_id = 2003;
 
-    let mut room = Room::new(2003, 10, 8).unwrap();
+    let mut room = Room::new(room_id, 10, 8).unwrap();
     room.set_default_permission(10, RoomPermissionLevel::Viewer)
         .unwrap();
 
@@ -1172,49 +1190,112 @@ async fn test_graceful_shutdown_persists_room_head() {
     let server_task = tokio::spawn(async move { server.run_until_shutdown(shutdown_rx).await });
 
     tokio::time::sleep(Duration::from_millis(100)).await;
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
-    let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
-
-    // Wait until the connection is handled so the persistence subscription is active.
-    writer.send(MaitreDToBanquette::Ping).await.unwrap();
-    loop {
-        match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
-            Ok(Some(Ok(BanquetteToMaitreD::Pong))) => break,
-            Ok(Some(Ok(_))) => continue,
-            other => panic!("expected Pong before shutdown: {other:?}"),
-        }
-    }
-
     shutdown_tx.send(true).unwrap();
+    let _ = server_task.await.unwrap();
 
-    let mut persisted = None;
-    for _ in 0..20 {
-        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted {
-            tin_id,
-            default_permission,
-        }))) = tokio::time::timeout(Duration::from_millis(500), reader.next()).await
-        {
-            persisted = Some((tin_id, default_permission));
-            break;
-        }
-    }
-    let (tin_id, default_permission) =
-        persisted.expect("graceful shutdown must report the final room tin");
-    assert_eq!(
-        default_permission,
-        RoomPermissionLevel::Viewer,
-        "the final persist must report the room default permission"
-    );
+    let tin_id = cellar
+        .get_alias(&room_head_alias(room_id))
+        .await
+        .unwrap()
+        .expect("graceful shutdown must move the final head alias");
     assert!(cellar.contains(&tin_id).await);
 
-    let restored = Room::load_from_cellar(&*cellar, &tin_id, 2003)
+    let restored = Room::load_from_cellar(&*cellar, &tin_id, room_id)
         .await
         .unwrap();
     assert_eq!(restored.default_permission, RoomPermissionLevel::Viewer);
+}
 
-    let _ = server_task.await;
+// spec: alhalte-banquette/persistence 0010 banquette restores itself from the head alias
+#[tokio::test]
+async fn test_load_or_create_restores_from_the_head_alias() {
+    let cellar = InMemoryCellarSink::new();
+    let room_id = 2010u64;
+    let alias = room_head_alias(room_id);
+    assert_eq!(alias, "room/00000000000007da/head");
+
+    // With no alias the room was never persisted, so it starts new.
+    let mut room = Room::load_or_create(&cellar, room_id, 42, 8).await.unwrap();
+    assert_eq!(room.room_id, room_id);
+    assert!(room.is_admin(42));
+    assert_eq!(room.head_tin, None);
+    assert_eq!(cellar.get_alias(&alias).await.unwrap(), None);
+
+    // A successful persist moves the alias to the stored head.
+    room.create_scene(42, "tavern", None).unwrap();
+    let head = room.persist(&cellar).await.unwrap();
+    assert_eq!(room.head_tin, Some(head));
+    assert_eq!(cellar.get_alias(&alias).await.unwrap(), Some(head));
+
+    // A restart restores that state instead of opening an empty room.
+    let restored = Room::load_or_create(&cellar, room_id, 42, 8).await.unwrap();
+    assert_eq!(restored.head_tin, Some(head));
+    assert!(restored.scene_biblio.contains_key("tavern"));
+}
+
+// spec: alhalte-banquette/persistence 0011 a broken head alias fails startup
+#[tokio::test]
+async fn test_load_or_create_fails_on_a_broken_head_alias() {
+    let cellar = InMemoryCellarSink::new();
+    let room_id = 2011u64;
+    let alias = room_head_alias(room_id);
+    let assert_restore_error = |err: PersistenceError| {
+        assert!(
+            err.to_string().contains("failed to restore room"),
+            "a restore failure must be explicit, got: {err}"
+        );
+    };
+
+    // 1. The alias points at a tin that is not stored.
+    cellar.set_alias(&alias, &[0xABu8; 32]).await.unwrap();
+    let err = Room::load_or_create(&cellar, room_id, 42, 8)
+        .await
+        .expect_err("a missing tin must fail startup");
+    assert_restore_error(err);
+
+    // 2. The alias points at a stored payload that is not a RoomData tin.
+    let (wrong_label_bytes, wrong_label_id) = Tin::from_string("not room data")
+        .encode_plaintext(tin::Compression::Zstd)
+        .unwrap();
+    cellar
+        .store_tin(42, 0, &wrong_label_bytes, &wrong_label_id, None)
+        .await
+        .unwrap();
+    cellar.set_alias(&alias, &wrong_label_id).await.unwrap();
+    let err = Room::load_or_create(&cellar, room_id, 42, 8)
+        .await
+        .expect_err("a wrong label must fail startup");
+    assert_restore_error(err);
+
+    // 3. The stored bytes do not hash to the aliased tin id.
+    let (_, expected_id) = Tin::from_string("hash mismatch expected")
+        .encode_plaintext(tin::Compression::Zstd)
+        .unwrap();
+    let (other_bytes, _) = Tin::from_string("hash mismatch actual")
+        .encode_plaintext(tin::Compression::Zstd)
+        .unwrap();
+    cellar
+        .store_tin(42, 0, &other_bytes, &expected_id, None)
+        .await
+        .unwrap();
+    cellar.set_alias(&alias, &expected_id).await.unwrap();
+    let err = Room::load_or_create(&cellar, room_id, 42, 8)
+        .await
+        .expect_err("a content hash mismatch must fail startup");
+    assert_restore_error(err);
+
+    // 4. A valid RoomData for another room ID is not opened as this room.
+    let mut other = Room::new(room_id + 1, 42, 8).unwrap();
+    let other_head = other.persist(&cellar).await.unwrap();
+    cellar.set_alias(&alias, &other_head).await.unwrap();
+    let err = Room::load_or_create(&cellar, room_id, 42, 8)
+        .await
+        .expect_err("a room ID mismatch must fail startup");
+    assert_restore_error(err);
+
+    // None of the failures replaced the alias, so the broken head is still the
+    // recorded restore point until an operator fixes cellar.
+    assert_eq!(cellar.get_alias(&alias).await.unwrap(), Some(other_head));
 }
 
 // spec: alhalte-banquette/persistence 0008 the cellar service token is never logged
@@ -1303,27 +1384,32 @@ async fn test_sigterm_runs_graceful_final_persist() {
     let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
     assert_eq!(sent, 0, "failed to send SIGTERM to banquette");
 
-    let mut persisted = None;
+    // The final persist is observable as the moved `room/<room_id>/head` alias.
+    let room_id = 0x5151515151515151u64;
+    let alias = room_head_alias(room_id);
+    let mut head = None;
     for _ in 0..40 {
-        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted {
-            tin_id,
-            default_permission,
-        }))) = tokio::time::timeout(Duration::from_millis(500), reader.next()).await
-        {
-            persisted = Some((tin_id, default_permission));
+        if let Some(tin_id) = service.get_alias(&alias).await.unwrap() {
+            head = Some(tin_id);
             break;
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let (tin_id, default_permission) =
-        persisted.expect("SIGTERM must trigger the final RoomPersisted");
-    assert_eq!(
-        default_permission,
-        RoomPermissionLevel::Denied,
-        "a newly created room must stay closed"
-    );
+    let tin_id = head.expect("SIGTERM must move the final room head alias");
     assert!(
         service.download(&tin_id, None).await.is_ok(),
         "the final RoomData must be stored in cellar"
+    );
+
+    let sink = alhalte_banquette::HttpCellarSink::new(format!("http://{cellar_addr}"))
+        .with_service_token("sigterm-service-token");
+    let restored = Room::load_from_cellar(&sink, &tin_id, room_id)
+        .await
+        .expect("the final room must restore through the service token");
+    assert_eq!(
+        restored.default_permission,
+        RoomPermissionLevel::Denied,
+        "a newly created room must stay closed"
     );
 
     let status = tokio::time::timeout(Duration::from_secs(5), child.wait())

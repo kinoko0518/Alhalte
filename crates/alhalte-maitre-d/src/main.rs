@@ -62,7 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let spawner = Arc::new(spawner);
 
-    let room_manager = RoomBridgeManager::new(spawner, db.clone());
+    let room_manager = RoomBridgeManager::new(spawner);
 
     let mut state = AppState::new(db, args.salt, oauth, room_manager)
         .with_public_url(&args.public_url)

@@ -15,6 +15,7 @@ use crate::gc::run_garbage_collection;
 use crate::handlers::create_router;
 use crate::model::{
     GcStats, SYSTEM_OWNER, StoreRequest, StoreResult, StoreStatus, WriteCredentials,
+    validate_alias_name,
 };
 use crate::storage::StorageManager;
 use crate::verifier::SessionVerifier;
@@ -62,6 +63,14 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         diff |= a ^ b;
     }
     diff == 0
+}
+
+/// Current UNIX timestamp in seconds, stored in `aliases.updated_at`.
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Builds the 401 error for incomplete or rejected header credentials.
@@ -382,6 +391,72 @@ impl CellarService {
 
         let conn = self.db.lock().await;
         Database::delete_reference(&conn, tin_id, owner)
+    }
+
+    /// Rejects a write unless the internal service token authorized it.
+    ///
+    /// Alias writes are infrastructure state (a room head pointer), not a
+    /// user-owned reference, so a valid user session must not be able to move
+    /// them. A missing token, a wrong token, or a cellar without a configured
+    /// token all fail closed with the same 401 as an invalid session.
+    fn require_service_token(&self, presented: Option<&str>) -> Result<()> {
+        let authorized = match (presented, self.service_token.as_deref()) {
+            (Some(presented), Some(expected)) => {
+                constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            }
+            _ => false,
+        };
+        if authorized {
+            Ok(())
+        } else {
+            Err(CellarError::Unauthorized {
+                owner: SYSTEM_OWNER,
+                session_id: 0,
+            })
+        }
+    }
+
+    /// Reads the generic alias `name`, e.g. `room/<room_id>/head`.
+    ///
+    /// Reads are unauthenticated, like [`Self::download`]: the alias only names
+    /// a tin, and the tin body is fetched through the same unauthenticated
+    /// download envelope. `Ok(None)` means the name was never set.
+    pub async fn get_alias(&self, name: &str) -> Result<Option<TinId>> {
+        let name = validate_alias_name(name)?;
+        let conn = self.db.lock().await;
+        Database::get_alias(&conn, name)
+    }
+
+    /// Points the generic alias `name` at `tin_id` and reports the previous target.
+    ///
+    /// Only the internal service token may write an alias (see
+    /// [`Self::require_service_token`]). The tin does not have to be stored
+    /// yet; callers normally store the `RoomData` tin first and then move the
+    /// head alias, so a failed alias write leaves the previous head intact.
+    pub async fn set_alias_with_token(
+        &self,
+        name: &str,
+        tin_id: &TinId,
+        service_token: Option<&str>,
+    ) -> Result<Option<TinId>> {
+        let name = validate_alias_name(name)?;
+        self.require_service_token(service_token)?;
+        let conn = self.db.lock().await;
+        Database::set_alias(&conn, name, tin_id, unix_timestamp())
+    }
+
+    /// Deletes the generic alias `name`, returning whether a row was removed.
+    ///
+    /// Only the internal service token may delete an alias.
+    pub async fn delete_alias_with_token(
+        &self,
+        name: &str,
+        service_token: Option<&str>,
+    ) -> Result<bool> {
+        let name = validate_alias_name(name)?;
+        self.require_service_token(service_token)?;
+        let conn = self.db.lock().await;
+        Database::delete_alias(&conn, name)
     }
 
     /// Runs garbage collection over the storage directory.

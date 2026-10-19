@@ -14,7 +14,8 @@ use serde::Deserialize;
 
 use crate::error::CellarError;
 use crate::model::{
-    StoreRequest, StoreResponse, UnregisterRequest, WriteCredentials, format_tin_id, parse_tin_id,
+    AliasRequest, AliasResponse, StoreRequest, StoreResponse, UnregisterRequest, WriteCredentials,
+    format_tin_id, parse_tin_id,
 };
 use crate::service::CellarService;
 
@@ -97,11 +98,13 @@ impl IntoResponse for CellarError {
     fn into_response(self) -> Response {
         let (status, msg) = match self {
             Self::Unauthorized { .. } => (StatusCode::UNAUTHORIZED, self.to_string()),
-            Self::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            Self::NotFound(_) | Self::AliasNotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
             Self::AlreadyOwned { .. } => (StatusCode::CONFLICT, self.to_string()),
-            Self::Hex(_) | Self::Json(_) | Self::InvalidBody(_) | Self::SizeMismatch { .. } => {
-                (StatusCode::BAD_REQUEST, self.to_string())
-            }
+            Self::Hex(_)
+            | Self::Json(_)
+            | Self::InvalidBody(_)
+            | Self::SizeMismatch { .. }
+            | Self::InvalidAlias(_) => (StatusCode::BAD_REQUEST, self.to_string()),
             Self::Io(_)
             | Self::Database(_)
             | Self::Tin(_)
@@ -147,6 +150,12 @@ pub fn create_router(service: Arc<CellarService>) -> Router {
         .route("/download/{tin_id}", get(handle_download))
         .route("/download/{tin_id}/meta", get(handle_tin_metadata))
         .route("/unregister", post(handle_unregister))
+        .route(
+            "/alias/{*name}",
+            get(handle_get_alias)
+                .put(handle_put_alias)
+                .delete(handle_delete_alias),
+        )
         .route("/gc", post(handle_gc))
         .with_state(service)
 }
@@ -339,4 +348,65 @@ async fn handle_gc(
 ) -> std::result::Result<Response, CellarError> {
     let stats = service.run_gc().await?;
     Ok((StatusCode::OK, Json(stats)).into_response())
+}
+
+/// Generic alias read handler (`GET /alias/{name}`).
+///
+/// The name is a wildcard path segment, so hierarchical names such as
+/// `room/<room_id>/head` work without escaping the slashes. Reads are
+/// unauthenticated, like downloads. An unset alias is `404`.
+async fn handle_get_alias(
+    State(service): State<Arc<CellarService>>,
+    AxPath(name): AxPath<String>,
+) -> std::result::Result<Response, CellarError> {
+    let tin_id = service
+        .get_alias(&name)
+        .await?
+        .ok_or(CellarError::AliasNotFound(name))?;
+
+    Ok((StatusCode::OK, Json(AliasResponse { tin_id })).into_response())
+}
+
+/// Generic alias write handler (`PUT /alias/{name}`).
+///
+/// Requires the internal service token; a user session is rejected because an
+/// alias is shared infrastructure state, not a user-owned reference.
+async fn handle_put_alias(
+    State(service): State<Arc<CellarService>>,
+    AxPath(name): AxPath<String>,
+    headers: HeaderMap,
+    Json(payload): Json<AliasRequest>,
+) -> std::result::Result<Response, CellarError> {
+    service
+        .set_alias_with_token(&name, &payload.tin_id, service_token_from_headers(&headers))
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(AliasResponse {
+            tin_id: payload.tin_id,
+        }),
+    )
+        .into_response())
+}
+
+/// Generic alias delete handler (`DELETE /alias/{name}`).
+///
+/// Requires the internal service token. The answer reports whether a row was
+/// removed so a repeated delete is not an error. Deleting an alias releases the
+/// tin for the next GC when no other reference remains.
+async fn handle_delete_alias(
+    State(service): State<Arc<CellarService>>,
+    AxPath(name): AxPath<String>,
+    headers: HeaderMap,
+) -> std::result::Result<Response, CellarError> {
+    let deleted = service
+        .delete_alias_with_token(&name, service_token_from_headers(&headers))
+        .await?;
+
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({ "deleted": deleted })),
+    )
+        .into_response())
 }

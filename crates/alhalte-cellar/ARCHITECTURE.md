@@ -8,6 +8,8 @@
 
 tin の実体をファイルとして保存し、`(tin_id, owner, wrapped_key)` の参照行を SQLite に持つ、重複排除ストレージ。所有者の session を検証し、既に実体がある場合は再送させず参照だけを追加する。信頼された内部サービス（`alhalte-banquette`）は `X-Alhalte-Service-Token` で書き込める。参照されなくなった実体を GC で削除する。
 
+汎用 alias（`name -> tin_id` の単一ポインタ）も持つ。`alhalte-banquette` は部屋の head を `room/<room_id>/head` としてここに置き、起動時に自分で読む（Issue #192）。alias は参照の一種で、GC は alias の指す実体を削除しない。
+
 ## 公開 API / 外部接続点
 
 ### HTTP API
@@ -25,10 +27,17 @@ tin の実体をファイルとして保存し、`(tin_id, owner, wrapped_key)` 
 | `POST` | `/unregister` | `UnregisterRequest` で参照を削除する。 |
 | `DELETE` | `/store/{tin_id}` / `/tin/{tin_id}` | 参照を削除する。 |
 | `POST` | `/gc` | GC を実行し、`GcStats` を返す。 |
+| `GET` | `/alias/{name}` | alias の `AliasResponse`（`{"tin_id": ...}`）を返す。未登録は 404。 |
+| `PUT` | `/alias/{name}` | `AliasRequest`（`{"tin_id": ...}`）で alias を設定する。service token 必須。 |
+| `DELETE` | `/alias/{name}` | alias を削除し、`{"deleted": bool}` を返す。service token 必須。 |
+
+`{name}` は `room/<room_id>/head` のような `/` を含む階層名を取れる wildcard（`/alias/{*name}`）。名前は 1〜256 バイトの ASCII 英数字と `-_.:/` のみ（`validate_alias_name`）。alias 名はファイルパスではなく DB のキーで、実体ファイルとの対応は `tin_id` だけが決める。
 
 書き込みの認証情報はヘッダ `X-Alhalte-Owner` / `X-Alhalte-Session-Id` のみで受け取る。クエリ `owner` / `session_id` は受理しない（ダウンロードの `owner` は参照行の絞り込み専用）。wrapped key は `X-Alhalte-Wrapped-Key`（hex）またはクエリ `wrapped_key`。`StoreRequest` / `UnregisterRequest` の body は `tin_id`（と `POST /store` では `size` / `wrapped_key`）だけで、`owner` / `session_id` を body で送ると 400 になる（Issue #191）。
 
 `/store`、`/store/{tin_id}`、`/tin/{tin_id}`（upload）、`/unregister` はヘッダ `X-Alhalte-Service-Token` でも認可できる。これは `--service-token` で設定した内部トークンとの一致だけを検証し、ユーザー session とは独立している。ヘッダを付けたリクエストは session 検証へフォールバックしない（不一致は 401）。ヘッダのないリクエストは従来どおり `SessionVerifier` で検証する。
+
+`PUT` / `DELETE /alias/{name}` は service token 専用で、有効なユーザー session でも書けない。alias は利用者ごとの参照行ではなくサービス間で共有するインフラ状態（部屋 head）だから。`GET /alias/{name}` は download と同じく認可しない（alias は tin を名指しするだけで、本体は従来の download 経路で取る）。
 
 `/store/{tin_id}` と `/tin/{tin_id}` の upload は Axum 既定の 2 MiB を超える Tin を受け取れるよう、`DefaultBodyLimit::max(64 MiB)`（`MAX_STORE_BODY_BYTES`）を route 単位で設定する。他の route は既定のまま。
 
@@ -50,9 +59,10 @@ anti-oracle が有効な場合、`/store` は常に `upload_required` を返し�
 
 - `CellarConfig`、`CellarService`
 - `StoreRequest`、`StoreResponse`、`StoreResult`、`StoreStatus`、`UnregisterRequest`、`WriteCredentials`、`TinReference`、`GcStats`
+- `AliasRequest`、`AliasResponse`、`MAX_ALIAS_NAME_BYTES`、`validate_alias_name`
 - `Database`、`StorageManager`、`SessionVerifier`、`InMemorySessionVerifier`、`MaitreDVerifier`
 - `create_router`、`run_garbage_collection`、`parse_tin_id` / `format_tin_id`
-- `CellarService::with_service_token` / `has_service_token` と `store_check_with_token` / `store_payload_with_token` / `unregister_with_token`、`handlers::SERVICE_TOKEN_HEADER` / `OWNER_HEADER` / `SESSION_ID_HEADER`
+- `CellarService::with_service_token` / `has_service_token` と `store_check_with_token` / `store_payload_with_token` / `unregister_with_token` / `get_alias` / `set_alias_with_token` / `delete_alias_with_token`、`handlers::SERVICE_TOKEN_HEADER` / `OWNER_HEADER` / `SESSION_ID_HEADER`
 
 `StoreRequest` / `UnregisterRequest` は `#[serde(deny_unknown_fields)]` で、body の未知フィールド（旧 `owner` / `session_id` を含む）は 400 になる。認可と参照ラベルは `CellarService` が `WriteCredentials`（ヘッダ由来）と service token から決める。`WriteCredentials::session(owner, session_id)` と `WriteCredentials::service()` がその構築口。
 
@@ -73,9 +83,17 @@ tin_references(
   wrapped_key BLOB,
   PRIMARY KEY (tin_id, owner)
 )
+
+aliases(
+  name TEXT PRIMARY KEY,
+  tin_id BLOB NOT NULL,
+  updated_at INTEGER NOT NULL
+)
 ```
 
 `tin_id` は 32 バイト BLOB。実体ファイルの位置は列に持たず、常に `hex(tin_id)` から導出する。索引は `tin_id`。
+
+`aliases` は `name` 一意の単一ポインタ。1 つの名前は 1 つの tin だけを指し、同じ tin を複数の名前が指してよい。`updated_at` は設定時刻（UNIX 秒）。`tin_references` と独立していて、alias だけが参照する tin も存在しうる（それが部屋 head の通常状態）。`tin_id` が 32 バイトでない行は壊れた DB としてエラーにする（黙って無視すると GC が参照先を消してしまうため）。
 
 旧 schema の `path` 列と `idx_tin_references_path` は `Database::init_schema` が起動時に削除する。`path` は常に `hex(tin_id)` の重複だったため、`tin_id` / `owner` / `wrapped_key` を保ったまま lossless に移行できる。
 
@@ -113,7 +131,15 @@ tin_references(
 
 ### unregister / GC
 
-`unregister` は認可（session または service token）を検証して `(tin_id, owner)` の参照を削除する。GC は storage 配下の tin ファイルを走査し、`tin_references` に 1 行も参照がないファイルを削除する。`gc_interval` があればバックグラウンドで定期実行する。banquette が部屋の新 head を保存したあと旧 head を `POST /unregister` するため、旧 `RoomData` は次の GC で回収される。
+`unregister` は認可（session または service token）を検証して `(tin_id, owner)` の参照を削除する。GC は storage 配下の tin ファイルを走査し、`tin_references` にも `aliases` にも参照がないファイルを削除する（参照集合は 2 つの `DISTINCT tin_id` の union）。`gc_interval` があればバックグラウンドで定期実行する。banquette は部屋の新 head を保存したあと alias を新 head へ移し、その後に旧 head を `POST /unregister` するため、旧 `RoomData` は alias からも参照行からも外れて次の GC で回収される。現在の head は alias が指しているので削除されない。
+
+### alias
+
+1. 名前を `validate_alias_name` で検証する（違反は 400）。
+2. `PUT` / `DELETE` は service token を定数時間比較で検証する（不一致・未設定は 401）。
+3. `PUT` は既存の値を読んでから upsert し、置き換え前の tin id を返す。`DELETE` は削除したかを返す。
+4. `GET` は未登録なら 404（`CellarError::AliasNotFound`）。
+5. 参照先の tin が既に storage にあるかは検証しない。呼び出し側（banquette）は store 成功後に alias を移すので、alias 書き込みが失敗した場合は旧 head が有効なまま残る。
 
 ## 既知の差分・制約
 
@@ -121,7 +147,9 @@ tin_references(
 - `/store` は常に `200 OK` を返し、結果は body の `result`（`upload_required` / `deduplicated` / `already_owned`）で表す。旧 210 / 211 / 212 は廃止済みで、受理しない。
 - `path` 列は廃止した。実体ファイル名は常に `hex(tin_id)` で、別名を持たない。既存 DB は起動時 migration で `path` 列を落とす（参照行は失わない）。
 - anti-oracle 時の破棄は `StorageManager::discard` による no-op で、実際のファイルディスクリプタは開かない。
-- GC は DB の参照だけを見る。参照集合は `DISTINCT tin_id` から `hex(tin_id)` を作って得て、ファイル名と照合する。tin 間の参照関係（chunk 内の tin id など）は追跡しない。
+- GC は DB の参照だけを見る。参照集合は `tin_references` と `aliases` の `DISTINCT tin_id` の union から `hex(tin_id)` を作って得て、ファイル名と照合する。tin 間の参照関係（chunk 内の tin id など）は追跡しない。
+- alias は名前空間を共有する単一ポインタで、名前ごとの所有権・認可は持たない。書けるのは service token を持つサービスのみ。名前を消しても実体は GC まで残る。
+- alias 名は 256 バイトまで。`/` を含む階層名を許すが、`.` / `..` のようなパス解決は行わない（DB のキーであってパスではない）。
 - upload は `Bytes` extractor でリクエスト全量をメモリにバッファする（上限 64 MiB）。maitre-d proxy も同じ上限・同じバッファリングを行う。
 - service token は平文で設定・比較する。ローテーション機構はなく、変更するには `cellar` / `maitre-d` / 全 banquette の再起動と設定更新が必要。
 - service token は `--service-token` 引数でも渡せるため `ps` から読める。本番では環境変数か systemd の `EnvironmentFile` を使うのが望ましい。

@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use alhalte_banquette::{BanquetteServer, CellarSink, InMemoryCellarSink, Room, ServerConfig};
 use async_trait::async_trait;
-use tin::TinId;
 use tokio::sync::{Mutex, watch};
 
 use crate::error::{MaitreDError, Result};
@@ -17,18 +16,14 @@ use crate::error::{MaitreDError, Result};
 pub trait BanquetteSpawner: Send + Sync {
     /// Launches or prepares a `banquette` instance for `room_id` and initial administrator `admin_account`.
     ///
-    /// `room_head` is the persisted `RoomData` tin ID read from `room_heads`.
-    /// When it is `Some`, the room must be restored from that tin; a missing,
-    /// corrupt, or mismatched head is an error and the spawner must never fall
-    /// back to an empty room. `None` starts a brand-new room.
+    /// No room head is passed: banquette reads cellar's `room/<room_id>/head`
+    /// alias and restores the room itself (Issue #192). A head that exists but
+    /// cannot be downloaded, decoded, validated, or that belongs to another room
+    /// ID is an error, so a spawner must never fall back to an empty room. With
+    /// no alias, banquette starts a brand-new room.
     ///
     /// Returns the UNIX domain socket path where the `banquette` server is listening.
-    async fn spawn_banquette(
-        &self,
-        room_id: u64,
-        admin_account: u64,
-        room_head: Option<TinId>,
-    ) -> Result<PathBuf>;
+    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf>;
 }
 
 /// Spawns external `alhalte-banquette` executable binaries as OS child processes.
@@ -109,14 +104,14 @@ impl ProcessBanquetteSpawner {
 
     /// Builds the argument list passed to the spawned `alhalte-banquette` binary.
     ///
-    /// Exposed so tests can assert the `--room-tin` restore contract and the
-    /// "no secret in argv" property without launching a child process.
+    /// Exposed so tests can assert the "no secret in argv" property and that no
+    /// room head is passed: the room restores itself from cellar's
+    /// `room/<room_id>/head` alias (Issue #192).
     pub fn command_args(
         &self,
         room_id: u64,
         admin_account: u64,
         socket_path: &std::path::Path,
-        room_head: Option<&TinId>,
     ) -> Vec<String> {
         let mut args = vec![
             "--room-id".to_string(),
@@ -130,11 +125,6 @@ impl ProcessBanquetteSpawner {
             "--chunk-size-exponent".to_string(),
             self.chunk_size_exponent.to_string(),
         ];
-
-        if let Some(tin_id) = room_head {
-            args.push("--room-tin".to_string());
-            args.push(hex::encode(tin_id));
-        }
 
         if let Some(path) = self.service_token_file.as_deref() {
             args.push("--service-token-file".to_string());
@@ -198,12 +188,7 @@ pub fn resolve_banquette_bin(binary_path: &std::path::Path) -> PathBuf {
 
 #[async_trait]
 impl BanquetteSpawner for ProcessBanquetteSpawner {
-    async fn spawn_banquette(
-        &self,
-        room_id: u64,
-        admin_account: u64,
-        room_head: Option<TinId>,
-    ) -> Result<PathBuf> {
+    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.socket_dir)
             .await
             .map_err(MaitreDError::Io)?;
@@ -221,7 +206,7 @@ impl BanquetteSpawner for ProcessBanquetteSpawner {
         );
 
         let mut cmd = tokio::process::Command::new(&resolved_bin);
-        cmd.args(self.command_args(room_id, admin_account, &socket_path, room_head.as_ref()));
+        cmd.args(self.command_args(room_id, admin_account, &socket_path));
         // The token never goes on the command line. When only the value is known
         // (no forwarded file path) hand it to the child through the environment.
         if self.service_token_file.is_none()
@@ -329,12 +314,7 @@ impl InProcessBanquetteSpawner {
 
 #[async_trait]
 impl BanquetteSpawner for InProcessBanquetteSpawner {
-    async fn spawn_banquette(
-        &self,
-        room_id: u64,
-        admin_account: u64,
-        room_head: Option<TinId>,
-    ) -> Result<PathBuf> {
+    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.socket_dir)
             .await
             .map_err(MaitreDError::Io)?;
@@ -351,19 +331,17 @@ impl BanquetteSpawner for InProcessBanquetteSpawner {
         // socket path and head pointer, so stop it before starting the new one.
         self.shutdown_room(room_id).await;
 
-        let room = match room_head {
-            Some(tin_id) => Room::load_from_cellar(self.cellar.as_ref(), &tin_id, room_id)
-                .await
-                .map_err(|e| {
-                    MaitreDError::Banquette(format!(
-                        "failed to restore room {room_id} from persisted tin {}: {e}",
-                        hex::encode(tin_id)
-                    ))
-                })?,
-            None => Room::new(room_id, admin_account, self.chunk_size_exponent).map_err(|e| {
-                MaitreDError::Banquette(format!("Failed to create Room data: {e:?}"))
-            })?,
-        };
+        // The room restores itself from cellar's `room/<room_id>/head` alias, or
+        // starts new when the alias is unset. A broken alias is an error, never an
+        // empty room.
+        let room = Room::load_or_create(
+            self.cellar.as_ref(),
+            room_id,
+            admin_account,
+            self.chunk_size_exponent,
+        )
+        .await
+        .map_err(|e| MaitreDError::Banquette(format!("failed to start room {room_id}: {e}")))?;
 
         let config = ServerConfig {
             socket_path: socket_path.clone(),

@@ -16,7 +16,6 @@ use tokio::net::UnixStream;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::codec::Framed;
 
-use crate::db::Database;
 use crate::error::{MaitreDError, Result};
 use crate::spawner::BanquetteSpawner;
 
@@ -29,14 +28,6 @@ type ExportResponseSender =
 /// permission mutation produces exactly one `PermissionsUpdated` or `Error`.
 /// The timeout only guards against a wedged room process.
 const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Current UNIX timestamp in seconds, used for `room_heads.updated_at`.
-fn unix_timestamp() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_secs() as i64)
-        .unwrap_or(0)
-}
 
 /// Active bidirectional bridge connecting WebSocket clients in a room with a `banquette` process.
 pub struct RoomBridge {
@@ -67,9 +58,10 @@ impl RoomBridge {
     /// Spawns a banquette for `room_id`, connects to its UNIX socket, and returns the bridge.
     ///
     /// `admin_account` is the room creator, which banquette makes its initial
-    /// `Admin` when the room starts from scratch. `room_head` is the persisted
-    /// `RoomData` tin pointer. The spawner restores the room from it, so a
-    /// bridge is never silently created around an empty room when a head exists.
+    /// `Admin` when the room starts from scratch. No room head is passed: banquette
+    /// restores itself from cellar's `room/<room_id>/head` alias, and a head that
+    /// cannot be restored fails the spawn instead of yielding an empty room
+    /// (Issue #192).
     ///
     /// # Errors
     ///
@@ -79,9 +71,7 @@ impl RoomBridge {
     pub async fn new(
         room_id: u64,
         admin_account: u64,
-        room_head: Option<TinId>,
         spawner: Arc<dyn BanquetteSpawner>,
-        db: Database,
         on_terminated: impl Fn(u64) + Send + Sync + 'static,
     ) -> Result<Self> {
         let clients = Arc::new(RwLock::new(HashMap::new()));
@@ -100,9 +90,7 @@ impl RoomBridge {
         let bridge_permission_queries = Arc::clone(&pending_permission_queries);
 
         tracing::info!("Launching banquette for room {room_id}...");
-        let socket_path = spawner
-            .spawn_banquette(room_id, admin_account, room_head)
-            .await?;
+        let socket_path = spawner.spawn_banquette(room_id, admin_account).await?;
 
         // Connect to UNIX domain socket with retry loop
         let stream = Self::connect_with_retry(&socket_path, 60, Duration::from_millis(50)).await?;
@@ -134,7 +122,6 @@ impl RoomBridge {
                         Self::dispatch_banquette_frame(
                             frame,
                             room_id,
-                            &db,
                             &bridge_clients,
                             &bridge_scenes,
                             &bridge_exports,
@@ -201,7 +188,6 @@ impl RoomBridge {
     async fn dispatch_banquette_frame(
         frame: BanquetteToMaitreD,
         room_id: u64,
-        db: &Database,
         clients: &Arc<RwLock<HashMap<u64, mpsc::Sender<ServerFrame>>>>,
         client_scenes: &Arc<RwLock<HashMap<u64, String>>>,
         pending_exports: &Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
@@ -254,35 +240,6 @@ impl RoomBridge {
                 let mut pending = pending_exports.write().await;
                 if let Some(tx) = pending.remove(&request_id) {
                     let _ = tx.send(result);
-                }
-            }
-            // spec: alhalte-maitre-d/room-head 0001 persist RoomData head pointer
-            //
-            // `RoomPersisted.default_permission` is not stored: the room's
-            // permission table lives in the persisted `RoomData` and `maitre-d`
-            // keeps no copy of it (Issue #200). Only the head pointer is
-            // recorded, and only after banquette reports a successful store.
-            BanquetteToMaitreD::RoomPersisted { tin_id, .. } => {
-                let room_id_hex = format!("{room_id:016x}");
-                match db.set_room_head(&room_id_hex, &tin_id, unix_timestamp()) {
-                    Ok(previous) => {
-                        if let Some(previous) = previous
-                            && previous != tin_id
-                        {
-                            // banquette unregisters its own superseded head; this
-                            // only happens when another instance persisted in the
-                            // meantime, so retention is left to the owner of that
-                            // head and only recorded here.
-                            tracing::debug!(
-                                "room {room_id_hex} head replaced {} -> {}",
-                                hex::encode(previous),
-                                hex::encode(tin_id)
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        tracing::error!("Failed to record room head for {room_id_hex}: {e}");
-                    }
                 }
             }
             // answer to `RoomBridge::query_account_permission`.
@@ -634,33 +591,32 @@ impl RoomBridge {
 pub struct RoomBridgeManager {
     rooms: Arc<RwLock<HashMap<u64, Arc<RoomBridge>>>>,
     spawner: Arc<dyn BanquetteSpawner>,
-    db: Database,
 }
 
 impl RoomBridgeManager {
     /// Creates a new [`RoomBridgeManager`].
     ///
-    /// The database is used to read the persisted room head before spawning
-    /// banquette and to record the head reported by `RoomPersisted`.
-    pub fn new(spawner: Arc<dyn BanquetteSpawner>, db: Database) -> Self {
+    /// The manager holds no room state: the head pointer is cellar's
+    /// `room/<room_id>/head` alias, read by banquette itself (Issue #192).
+    pub fn new(spawner: Arc<dyn BanquetteSpawner>) -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
             spawner,
-            db,
         }
     }
 
-    /// Obtains an existing [`RoomBridge`] or launches a new one from the persisted head.
+    /// Obtains an existing [`RoomBridge`] or spawns a banquette and connects to it.
     ///
     /// `admin_account` is the room's `rooms.creator_account`. It is the only
     /// source of the initial administrator: neither the connecting account nor a
-    /// database role decides it (Issue #200).
+    /// database role decides it (Issue #200). It is used only when banquette
+    /// starts a brand-new room; a room with a head is restored from cellar.
     ///
     /// # Errors
     ///
-    /// Returns an error when the room head cannot be read from the database or
-    /// when banquette cannot be spawned / connected. A head that exists but
-    /// cannot be restored surfaces here instead of yielding an empty room.
+    /// Returns an error when banquette cannot be spawned or connected. A head
+    /// that exists but cannot be restored surfaces here instead of yielding an
+    /// empty room, because banquette fails its own startup in that case.
     pub async fn get_or_create_room(
         &self,
         room_id: u64,
@@ -673,9 +629,6 @@ impl RoomBridgeManager {
             return Ok(Arc::clone(bridge));
         }
 
-        let room_id_hex = format!("{room_id:016x}");
-        let room_head = self.db.get_room_head(&room_id_hex)?;
-
         let rooms_ref = Arc::clone(&self.rooms);
         let on_term = move |rid: u64| {
             let rooms_inner = Arc::clone(&rooms_ref);
@@ -685,15 +638,7 @@ impl RoomBridgeManager {
         };
 
         let bridge = Arc::new(
-            RoomBridge::new(
-                room_id,
-                admin_account,
-                room_head,
-                Arc::clone(&self.spawner),
-                self.db.clone(),
-                on_term,
-            )
-            .await?,
+            RoomBridge::new(room_id, admin_account, Arc::clone(&self.spawner), on_term).await?,
         );
 
         rooms.insert(room_id, Arc::clone(&bridge));

@@ -128,7 +128,7 @@ enabled = true
 - `generate_maitre_d_args`: host、port、db-path、client-id、salt、socket-dir、cellar-url、chunk-size-exponent、`--client-secret-file <data-dir>/secrets/maitre-d-client-secret`。`banquette-bin` があれば追加。`cellar.service-token` があれば `--service-token-file <data-dir>/secrets/cellar-service-token` を追加する（maitre-d が各 banquette へ path を伝播する）。
 - `generate_cellar_args`: host、port、storage-path、db-path、session verifier（`cellar.maitre-d-socket` があれば `--maitre-d-socket <path>`、なければ `--maitre-d-url <url>`）、`allow-all-sessions` が true のとき `--allow-all-sessions`、`anti-oracle` が true のとき `--anti-oracle`、`cellar.service-token` があれば `--service-token-file <path>`。既定の URL は `http://{restaurant.host}:{maitre-d.port}`。
 
-`alhalte-banquette` は `alhalte-maitre-d` が部屋ごとに起動し、`--room-id` / `--admin` / `--socket` / `--chunk-size-exponent` / `--room-tin` / `--service-token-file` を spawner が組み立てるため、bistrot は静的な banquette 引数を生成しない。`[banquette] chunk-size-exponent` と `[cellar] service-token` は `generate_maitre_d_args` 経由で maitre-d に渡り、spawner が各 banquette に伝播する。
+`alhalte-banquette` は `alhalte-maitre-d` が部屋ごとに起動し、`--room-id` / `--admin` / `--socket` / `--chunk-size-exponent` / `--service-token-file` を spawner が組み立てるため、bistrot は静的な banquette 引数を生成しない（部屋 head は banquette が cellar の alias から自分で読む。#192）。`[banquette] chunk-size-exponent` と `[cellar] service-token` は `generate_maitre_d_args` 経由で maitre-d に渡り、spawner が各 banquette に伝播する。
 
 すべて副作用なし。`generate_module_args` はモジュール名を正規化して振り分ける。秘密 file の書き出しは `write_secret_files`（`args` / `systemd` サブコマンドが実行時に行う）だけが担う。
 
