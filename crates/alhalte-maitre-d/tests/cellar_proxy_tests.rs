@@ -252,7 +252,7 @@ fn test_identity() -> (Database, u64, u64) {
 fn base_app_state(db: Database) -> AppState {
     let spawner =
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
-    let room_manager = RoomBridgeManager::new(spawner, db.clone());
+    let room_manager = RoomBridgeManager::new(spawner);
     let oauth = Arc::new(MockOAuthProvider::new());
     AppState::new(db, "salt", oauth, room_manager)
 }
@@ -278,9 +278,9 @@ fn cookie_header(session_id: u64) -> String {
     format!("session_id={session_id}")
 }
 
-// spec: alhalte-maitre-d/cellar-proxy store check 200 + result (owner/session rewritten)
+// spec: alhalte-maitre-d/cellar-proxy store check 200 + result (headers only, Issue #191)
 #[tokio::test]
-async fn test_cellar_proxy_store_check_rewrites_owner_and_session() {
+async fn test_cellar_proxy_store_check_injects_identity_headers() {
     let mock = MockCellar::new();
     mock.set_store_result("upload_required");
     let cellar_addr = spawn_mock_cellar(mock.clone()).await;
@@ -289,9 +289,8 @@ async fn test_cellar_proxy_store_check_rewrites_owner_and_session() {
     let proxy = CellarProxy::new(format!("http://{cellar_addr}")).unwrap();
     let addr = spawn_maitre_d(db, Some(proxy)).await;
 
+    // The body carries metadata only; ownership comes from the session.
     let body = serde_json::json!({
-        "owner": 999u64,
-        "session_id": 888u64,
         "tin_id": TIN_ID,
         "size": 1234u64,
         "wrapped_key": null,
@@ -323,13 +322,61 @@ async fn test_cellar_proxy_store_check_rewrites_owner_and_session() {
         Some(session_id.to_string().as_str())
     );
 
-    // The spoofed owner/session in the body must have been replaced.
+    // The body is forwarded verbatim: cellar sees metadata only, no ownership.
     let forwarded: serde_json::Value = serde_json::from_slice(&call.body).unwrap();
-    assert_eq!(forwarded["owner"], account_id);
-    assert_eq!(forwarded["session_id"], session_id);
-    // Other fields are preserved verbatim.
     assert_eq!(forwarded["tin_id"], TIN_ID);
     assert_eq!(forwarded["size"], 1234);
+    assert!(forwarded.get("owner").is_none());
+    assert!(forwarded.get("session_id").is_none());
+}
+
+// spec: alhalte-maitre-d/cellar-proxy rejects a body that claims owner / session_id (Issue #191)
+#[tokio::test]
+async fn test_cellar_proxy_rejects_owner_claims_in_the_store_body() {
+    let mock = MockCellar::new();
+    let cellar_addr = spawn_mock_cellar(mock.clone()).await;
+
+    let (db, account_id, session_id) = test_identity();
+    let proxy = CellarProxy::new(format!("http://{cellar_addr}")).unwrap();
+    let addr = spawn_maitre_d(db, Some(proxy)).await;
+    let client = reqwest::Client::new();
+
+    // The pre-#191 contract (owner / session_id in the body) fails loudly
+    // instead of having the claim silently rewritten or ignored.
+    for body in [
+        serde_json::json!({
+            "owner": account_id,
+            "session_id": session_id,
+            "tin_id": TIN_ID,
+            "size": 1u64,
+        }),
+        serde_json::json!({
+            "owner": account_id + 1,
+            "tin_id": TIN_ID,
+            "size": 1u64,
+        }),
+        serde_json::json!({
+            "session_id": session_id,
+            "tin_id": TIN_ID,
+            "size": 1u64,
+        }),
+    ] {
+        let response = client
+            .post(format!("http://{addr}/api/cellar/store"))
+            .header("Cookie", cookie_header(session_id))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "body {body} must be rejected"
+        );
+    }
+
+    // Nothing reached cellar.
+    assert!(mock.calls().is_empty());
 }
 
 // spec: alhalte-maitre-d/cellar-proxy deduplicated/already_owned pass through without a PUT
@@ -349,8 +396,6 @@ async fn test_cellar_proxy_store_check_passes_results_through() {
             .post(format!("http://{addr}/api/cellar/store"))
             .header("Cookie", cookie_header(session_id))
             .json(&serde_json::json!({
-                "owner": 0u64,
-                "session_id": 0u64,
                 "tin_id": TIN_ID,
                 "size": 1u64,
             }))
@@ -398,8 +443,9 @@ async fn test_cellar_proxy_rejects_spoofed_owner() {
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
 
-    // 3. Spoofed owner in the store handshake body is rewritten, not honoured
-    //    (verified in the previous test); a spoofed account claim is refused.
+    // 3. A spoofed owner claim is refused. Ownership is never part of the body
+    //    (a body claim is 400, see the dedicated test) and a query claim that
+    //    contradicts the session is 403.
     let response = client
         .post(format!(
             "http://{addr}/api/cellar/store?account_id={other_account}"
@@ -758,9 +804,24 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
     let wrapped_key = "aabbccdd";
 
     // 1. First handshake: the cellar has never seen this tin -> upload_required.
-    //    owner / session_id in the body are wrong on purpose; the proxy must
-    //    replace them with the authenticated identity or the cellar would
-    //    reject the session.
+    //    The body carries metadata only; the proxy supplies the identity from
+    //    the session headers (Issue #191).
+    let response = client
+        .post(format!("{base}/store"))
+        .header("Cookie", cookie_header(session_id))
+        .json(&serde_json::json!({
+            "tin_id": TIN_ID,
+            "size": wire_bytes.len(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload, serde_json::json!({ "result": "upload_required" }));
+
+    // 1b. An ownership claim in the body is refused by the proxy before it can
+    //     reach the cellar.
     let response = client
         .post(format!("{base}/store"))
         .header("Cookie", cookie_header(session_id))
@@ -773,9 +834,7 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let payload: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(payload, serde_json::json!({ "result": "upload_required" }));
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
 
     // 2. Upload the body.
     let response = client
@@ -787,14 +846,17 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        payload["owner"], account_id,
+        "the stored reference belongs to the session owner"
+    );
 
     // 3. A second handshake now reports deduplicated or already_owned.
     let response = client
         .post(format!("{base}/store"))
         .header("Cookie", cookie_header(session_id))
         .json(&serde_json::json!({
-            "owner": 0u64,
-            "session_id": 0u64,
             "tin_id": TIN_ID,
             "size": wire_bytes.len(),
         }))

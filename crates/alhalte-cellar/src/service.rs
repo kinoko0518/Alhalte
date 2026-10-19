@@ -13,7 +13,10 @@ use crate::db::Database;
 use crate::error::{CellarError, Result};
 use crate::gc::run_garbage_collection;
 use crate::handlers::create_router;
-use crate::model::{GcStats, SYSTEM_OWNER, StoreRequest, StoreResult, StoreStatus};
+use crate::model::{
+    GcStats, SYSTEM_OWNER, StoreRequest, StoreResult, StoreStatus, WriteCredentials,
+    validate_alias_name,
+};
 use crate::storage::StorageManager;
 use crate::verifier::SessionVerifier;
 
@@ -62,25 +65,44 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     diff == 0
 }
 
+/// Current UNIX timestamp in seconds, stored in `aliases.updated_at`.
+fn unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Builds the 401 error for incomplete or rejected header credentials.
+///
+/// The reported pair is the claim (or the [`SYSTEM_OWNER`] / `0` placeholder
+/// when a header was absent) so the response shape stays stable.
+fn unauthorized(credentials: WriteCredentials) -> CellarError {
+    CellarError::Unauthorized {
+        owner: credentials.owner.unwrap_or(SYSTEM_OWNER),
+        session_id: credentials.session_id.unwrap_or(0),
+    }
+}
+
 /// Credential that authorized a cellar write.
 ///
 /// The credential, not the requested `owner`, decides the reference label:
 /// user sessions keep their account ID, while the internal service token always
-/// uses [`SYSTEM_OWNER`] so no request body can pick the label of an internal
-/// write. `owner` is never an authorization boundary.
+/// uses [`SYSTEM_OWNER`] so no request can pick the label of an internal write.
+/// `owner` is never an authorization boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WriteAuthorization {
-    /// Write authorized by a user session.
-    Session,
+    /// Write authorized by a user session, labelled with this account ID.
+    Session(u64),
     /// Write authorized by the internal service token.
     ServiceToken,
 }
 
 impl WriteAuthorization {
-    /// Returns the reference label to persist for a request that claimed `owner`.
-    fn reference_owner(self, owner: u64) -> u64 {
+    /// Returns the reference label to persist for the authorized request.
+    fn reference_owner(self) -> u64 {
         match self {
-            Self::Session => owner,
+            Self::Session(owner) => owner,
             Self::ServiceToken => SYSTEM_OWNER,
         }
     }
@@ -177,29 +199,37 @@ impl CellarService {
     ///
     /// A request that carries a `service_token` is authorized only by that token:
     /// it never falls back to session verification, so a wrong token is rejected
-    /// rather than silently accepted through a user session.
+    /// rather than silently accepted through a user session, and any claimed
+    /// `owner` is replaced by [`SYSTEM_OWNER`].
+    ///
+    /// Without a token both header credentials are required, because
+    /// [`SessionVerifier`] binds the reference label to the session; a missing or
+    /// mismatching pair is rejected with 401.
     async fn authorize(
         &self,
-        owner: u64,
-        session_id: u64,
+        credentials: WriteCredentials,
         service_token: Option<&str>,
     ) -> Result<WriteAuthorization> {
-        let Some(presented) = service_token else {
-            let is_valid = self.verifier.verify_session(owner, session_id).await?;
-            return if is_valid {
-                Ok(WriteAuthorization::Session)
-            } else {
-                Err(CellarError::Unauthorized { owner, session_id })
+        if let Some(presented) = service_token {
+            return match self.service_token.as_deref() {
+                Some(expected) if constant_time_eq(presented.as_bytes(), expected.as_bytes()) => {
+                    Ok(WriteAuthorization::ServiceToken)
+                }
+                // No token configured, or a mismatch: fail closed with the same
+                // error as an invalid session so callers cannot probe the token.
+                _ => Err(unauthorized(credentials)),
             };
+        }
+
+        let (Some(owner), Some(session_id)) = (credentials.owner, credentials.session_id) else {
+            return Err(unauthorized(credentials));
         };
 
-        match self.service_token.as_deref() {
-            Some(expected) if constant_time_eq(presented.as_bytes(), expected.as_bytes()) => {
-                Ok(WriteAuthorization::ServiceToken)
-            }
-            // No token configured, or a mismatch: fail closed with the same error
-            // as an invalid session so callers cannot probe the token.
-            _ => Err(CellarError::Unauthorized { owner, session_id }),
+        let is_valid = self.verifier.verify_session(owner, session_id).await?;
+        if is_valid {
+            Ok(WriteAuthorization::Session(owner))
+        } else {
+            Err(CellarError::Unauthorized { owner, session_id })
         }
     }
 
@@ -211,13 +241,20 @@ impl CellarService {
     /// - Returns [`StoreStatus::Deduplicated`] if already stored by another owner
     ///   (adding a DB reference row).
     /// - Returns [`StoreStatus::AlreadyOwned`] if already owned by this owner.
-    pub async fn store_check(&self, req: &StoreRequest) -> Result<StoreStatus> {
-        self.store_check_with_token(req, None).await
+    ///
+    /// `credentials` comes from the request headers (see [`WriteCredentials`]);
+    /// the body never carries an ownership claim.
+    pub async fn store_check(
+        &self,
+        req: &StoreRequest,
+        credentials: WriteCredentials,
+    ) -> Result<StoreStatus> {
+        self.store_check_with_token(req, credentials, None).await
     }
 
     /// Performs the store metadata handshake with an optional internal service token.
     ///
-    /// The reference label is the requested `owner` for a user session, and
+    /// The reference label is the claimed `owner` for a user session, and
     /// [`SYSTEM_OWNER`] when the internal service token authorized the request.
     /// `owner` never grants access by itself.
     ///
@@ -225,12 +262,11 @@ impl CellarService {
     pub async fn store_check_with_token(
         &self,
         req: &StoreRequest,
+        credentials: WriteCredentials,
         service_token: Option<&str>,
     ) -> Result<StoreStatus> {
-        let authorization = self
-            .authorize(req.owner, req.session_id, service_token)
-            .await?;
-        let owner = authorization.reference_owner(req.owner);
+        let authorization = self.authorize(credentials, service_token).await?;
+        let owner = authorization.reference_owner();
 
         let conn = self.db.lock().await;
         let already_owned = Database::has_owner_reference(&conn, &req.tin_id, owner)?;
@@ -258,34 +294,32 @@ impl CellarService {
     /// and the entity already exists), and records the ownership row in the SQLite database.
     pub async fn store_payload(
         &self,
-        owner: u64,
-        session_id: u64,
         tin_id: TinId,
         data: &[u8],
         wrapped_key: Option<Vec<u8>>,
+        credentials: WriteCredentials,
     ) -> Result<StoreResult> {
-        self.store_payload_with_token(owner, session_id, tin_id, data, wrapped_key, None)
+        self.store_payload_with_token(tin_id, data, wrapped_key, credentials, None)
             .await
     }
 
     /// Stores an uploaded tin payload with an optional internal service token.
     ///
-    /// The stored reference label is `owner` for a user session and
+    /// The stored reference label is the claimed `owner` for a user session and
     /// [`SYSTEM_OWNER`] for a service-token write; [`StoreResult::owner`] reports
     /// the label that was actually written.
     ///
     /// See [`Self::store_payload`] and [`Self::with_service_token`].
     pub async fn store_payload_with_token(
         &self,
-        owner: u64,
-        session_id: u64,
         tin_id: TinId,
         data: &[u8],
         wrapped_key: Option<Vec<u8>>,
+        credentials: WriteCredentials,
         service_token: Option<&str>,
     ) -> Result<StoreResult> {
-        let authorization = self.authorize(owner, session_id, service_token).await?;
-        let owner = authorization.reference_owner(owner);
+        let authorization = self.authorize(credentials, service_token).await?;
+        let owner = authorization.reference_owner();
 
         let file_exists = self.storage.has_tin_file(&tin_id);
         let written_to_disk = if self.anti_oracle && file_exists {
@@ -336,29 +370,93 @@ impl CellarService {
     /// Removes an ownership reference for `(tin_id, owner)` after verifying the session.
     ///
     /// Returns `true` if a row was deleted, `false` if not found.
-    pub async fn unregister(&self, owner: u64, session_id: u64, tin_id: &TinId) -> Result<bool> {
-        self.unregister_with_token(owner, session_id, tin_id, None)
-            .await
+    pub async fn unregister(&self, tin_id: &TinId, credentials: WriteCredentials) -> Result<bool> {
+        self.unregister_with_token(tin_id, credentials, None).await
     }
 
     /// Removes a reference with an optional internal service token.
     ///
     /// A service-token unregister removes the [`SYSTEM_OWNER`] reference
-    /// regardless of the requested `owner`, mirroring service-token stores.
+    /// regardless of the claimed owner, mirroring service-token stores.
     ///
     /// See [`Self::unregister`] and [`Self::with_service_token`].
     pub async fn unregister_with_token(
         &self,
-        owner: u64,
-        session_id: u64,
         tin_id: &TinId,
+        credentials: WriteCredentials,
         service_token: Option<&str>,
     ) -> Result<bool> {
-        let authorization = self.authorize(owner, session_id, service_token).await?;
-        let owner = authorization.reference_owner(owner);
+        let authorization = self.authorize(credentials, service_token).await?;
+        let owner = authorization.reference_owner();
 
         let conn = self.db.lock().await;
         Database::delete_reference(&conn, tin_id, owner)
+    }
+
+    /// Rejects a write unless the internal service token authorized it.
+    ///
+    /// Alias writes are infrastructure state (a room head pointer), not a
+    /// user-owned reference, so a valid user session must not be able to move
+    /// them. A missing token, a wrong token, or a cellar without a configured
+    /// token all fail closed with the same 401 as an invalid session.
+    fn require_service_token(&self, presented: Option<&str>) -> Result<()> {
+        let authorized = match (presented, self.service_token.as_deref()) {
+            (Some(presented), Some(expected)) => {
+                constant_time_eq(presented.as_bytes(), expected.as_bytes())
+            }
+            _ => false,
+        };
+        if authorized {
+            Ok(())
+        } else {
+            Err(CellarError::Unauthorized {
+                owner: SYSTEM_OWNER,
+                session_id: 0,
+            })
+        }
+    }
+
+    /// Reads the generic alias `name`, e.g. `room/<room_id>/head`.
+    ///
+    /// Reads are unauthenticated, like [`Self::download`]: the alias only names
+    /// a tin, and the tin body is fetched through the same unauthenticated
+    /// download envelope. `Ok(None)` means the name was never set.
+    pub async fn get_alias(&self, name: &str) -> Result<Option<TinId>> {
+        let name = validate_alias_name(name)?;
+        let conn = self.db.lock().await;
+        Database::get_alias(&conn, name)
+    }
+
+    /// Points the generic alias `name` at `tin_id` and reports the previous target.
+    ///
+    /// Only the internal service token may write an alias (see
+    /// [`Self::require_service_token`]). The tin does not have to be stored
+    /// yet; callers normally store the `RoomData` tin first and then move the
+    /// head alias, so a failed alias write leaves the previous head intact.
+    pub async fn set_alias_with_token(
+        &self,
+        name: &str,
+        tin_id: &TinId,
+        service_token: Option<&str>,
+    ) -> Result<Option<TinId>> {
+        let name = validate_alias_name(name)?;
+        self.require_service_token(service_token)?;
+        let conn = self.db.lock().await;
+        Database::set_alias(&conn, name, tin_id, unix_timestamp())
+    }
+
+    /// Deletes the generic alias `name`, returning whether a row was removed.
+    ///
+    /// Only the internal service token may delete an alias.
+    pub async fn delete_alias_with_token(
+        &self,
+        name: &str,
+        service_token: Option<&str>,
+    ) -> Result<bool> {
+        let name = validate_alias_name(name)?;
+        self.require_service_token(service_token)?;
+        let conn = self.db.lock().await;
+        Database::delete_alias(&conn, name)
     }
 
     /// Runs garbage collection over the storage directory.

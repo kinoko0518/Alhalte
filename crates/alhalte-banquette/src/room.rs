@@ -153,6 +153,16 @@ fn scene_name_or_id(scene: &Scene) -> String {
         })
 }
 
+/// Cellar alias name holding `room_id`'s persisted `RoomData` head.
+///
+/// The room head lives in cellar, not in `alhalte-maitre-d`: the alias
+/// `room/<room_id>/head` points at the tin of the last stored [`RoomData`], so a
+/// freshly started banquette can restore itself without `--room-tin` and without
+/// asking maitre-d (Issue #192). The room ID is written in canonical 16-hex form.
+pub fn room_head_alias(room_id: u64) -> String {
+    format!("room/{room_id:016x}/head")
+}
+
 /// The core session room process managing scenes, characters, and client presence.
 #[derive(Debug)]
 pub struct Room {
@@ -1086,7 +1096,8 @@ impl Room {
         self.client_activity_in_cycle = true;
     }
 
-    /// Persists the whole room state to cellar and advances the in-memory head pointer.
+    /// Persists the whole room state to cellar, moves the room head alias, and
+    /// advances the in-memory head pointer.
     ///
     /// The store is authorized by the cellar service token carried by the
     /// [`CellarSink`] (or by a real user session when no token is configured);
@@ -1095,9 +1106,15 @@ impl Room {
     /// [`alhalte_cellar::SYSTEM_OWNER`]: the room administrator is not the owner
     /// of internal room writes, and `owner` is not an authorization boundary.
     ///
-    /// After a successful store the previous head tin is unregistered on a
-    /// best-effort basis so cellar GC can reclaim it. The current head is never
-    /// unregistered, and retention failures are logged but do not fail the store.
+    /// The `room/<room_id>/head` alias is moved to the new tin **before** the
+    /// previous head is unregistered. The alias is the durable restore point, so
+    /// a failed alias write returns an error, keeps the previous alias and head
+    /// valid, and lets the heartbeat retry next cycle.
+    ///
+    /// Retention of the superseded head is best effort: the previous head is
+    /// unregistered after the alias moved so cellar GC can reclaim it, and a
+    /// retention failure is logged without failing the store. The current head
+    /// is never unregistered.
     ///
     /// Returns the tin ID of the stored `RoomData`.
     pub async fn persist(&mut self, cellar: &dyn CellarSink) -> Result<TinId> {
@@ -1114,6 +1131,11 @@ impl Room {
                 &tin_id,
                 None,
             )
+            .await?;
+
+        // The alias is the authoritative head pointer, so it moves first.
+        cellar
+            .set_alias(&room_head_alias(self.room_id), &tin_id)
             .await?;
 
         let previous = self.head_tin.replace(tin_id);
@@ -1330,6 +1352,43 @@ impl Room {
         }
 
         Ok(room)
+    }
+
+    /// Restores the room from its `room/<room_id>/head` alias, or starts a new room.
+    ///
+    /// This is the startup path shared by the standalone binary and maitre-d's
+    /// in-process spawner. An unset alias means the room was never persisted, so
+    /// a new room is created with `admin_account` as its initial `Admin`.
+    ///
+    /// A set alias is authoritative: a failed alias read, a missing or corrupt
+    /// tin, a content hash that does not match the alias, a room ID mismatch, or
+    /// a failed [`Room::validate`] all return an error. Startup fails instead of
+    /// silently opening an empty room over a persisted one.
+    pub async fn load_or_create(
+        cellar: &dyn CellarSink,
+        room_id: u64,
+        admin_account: u64,
+        chunk_exponent: u8,
+    ) -> Result<Self> {
+        let alias = room_head_alias(room_id);
+        let head = cellar.get_alias(&alias).await.map_err(|e| {
+            BanquetteError::Cellar(format!(
+                "failed to read room head alias {alias} for room {room_id:016x}: {e}"
+            ))
+        })?;
+
+        let Some(tin_id) = head else {
+            return Self::new(room_id, admin_account, chunk_exponent);
+        };
+
+        Self::load_from_cellar(cellar, &tin_id, room_id)
+            .await
+            .map_err(|e| {
+                BanquetteError::Cellar(format!(
+                    "failed to restore room {room_id:016x} from alias {alias} (tin {}): {e}",
+                    alhalte_cellar::format_tin_id(&tin_id)
+                ))
+            })
     }
 
     // -----------------------------------------------------------------------

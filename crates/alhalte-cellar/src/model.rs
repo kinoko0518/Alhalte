@@ -24,6 +24,63 @@ pub fn format_tin_id(tin_id: &TinId) -> String {
     hex::encode(tin_id)
 }
 
+/// Maximum accepted length of a generic alias name, in bytes.
+///
+/// The longest name the ecosystem uses is `room/<16 hex>/head`, so the limit is
+/// generous while still bounding what a client can store in the primary key.
+pub const MAX_ALIAS_NAME_BYTES: usize = 256;
+
+/// Validates a generic alias name such as `room/<room_id>/head`.
+///
+/// An alias name is an opaque key, not a filesystem path, so `/` is allowed and
+/// hierarchical names are the intended use. Names must be 1..=
+/// [`MAX_ALIAS_NAME_BYTES`] bytes and consist only of ASCII letters, digits and
+/// `-`, `_`, `.`, `:`, `/`. Control characters, whitespace and non-ASCII bytes
+/// are rejected so a name can always be embedded in a URL path and a log line.
+///
+/// # Errors
+///
+/// Returns [`CellarError::InvalidAlias`] for an empty, over-long, or
+/// out-of-charset name. The message never echoes a rejected name.
+pub fn validate_alias_name(name: &str) -> Result<&str, CellarError> {
+    let allowed =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/');
+    if name.is_empty() {
+        return Err(CellarError::InvalidAlias(
+            "alias names must not be empty".to_string(),
+        ));
+    }
+    if name.len() > MAX_ALIAS_NAME_BYTES {
+        return Err(CellarError::InvalidAlias(format!(
+            "alias names must be at most {MAX_ALIAS_NAME_BYTES} bytes"
+        )));
+    }
+    if let Some(offset) = name.bytes().position(|byte| !allowed(byte)) {
+        return Err(CellarError::InvalidAlias(format!(
+            "alias names allow only ASCII alphanumerics and -_.:/ (offset {offset})"
+        )));
+    }
+    Ok(name)
+}
+
+/// Request body of `PUT /alias/{name}`.
+///
+/// The name travels in the URL path, so the body only carries the target tin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasRequest {
+    /// 256-bit tin ID the alias must point at.
+    #[serde(with = "hex_tin_id")]
+    pub tin_id: TinId,
+}
+
+/// Response body of `GET /alias/{name}` / `PUT /alias/{name}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasResponse {
+    /// 256-bit tin ID the alias points at.
+    #[serde(with = "hex_tin_id")]
+    pub tin_id: TinId,
+}
+
 /// Serde module to serialize/deserialize `TinId` as a hex string.
 pub mod hex_tin_id {
     use super::*;
@@ -141,17 +198,60 @@ pub struct TinReference {
     pub wrapped_key: Option<Vec<u8>>,
 }
 
+/// Credentials that authorize a cellar write, taken from request headers.
+///
+/// The caller's identity is **never** part of a request body (Issue #191):
+/// `alhalte-cellar` reads `X-Alhalte-Owner` / `X-Alhalte-Session-Id` (see
+/// [`crate::handlers::OWNER_HEADER`] and [`crate::handlers::SESSION_ID_HEADER`])
+/// or the internal service token instead. A body that still carries a legacy
+/// `owner` / `session_id` is rejected with 400.
+///
+/// `owner` is a reference label, not an authorization boundary: a user session
+/// must own it (otherwise 401), and the service token always overrides it with
+/// [`SYSTEM_OWNER`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteCredentials {
+    /// Account ID claimed by the `X-Alhalte-Owner` header.
+    pub owner: Option<u64>,
+    /// Session ID claimed by the `X-Alhalte-Session-Id` header.
+    pub session_id: Option<u64>,
+}
+
+impl WriteCredentials {
+    /// Builds the credentials of a user-session write.
+    ///
+    /// The pair must satisfy [`crate::SessionVerifier`]; a claim that does not
+    /// match the session is rejected with 401.
+    #[must_use]
+    pub const fn session(owner: u64, session_id: u64) -> Self {
+        Self {
+            owner: Some(owner),
+            session_id: Some(session_id),
+        }
+    }
+
+    /// Builds owner-less credentials for a service-token write.
+    ///
+    /// The token is the credential and the reference label is always
+    /// [`SYSTEM_OWNER`], so no owner / session is claimed.
+    #[must_use]
+    pub const fn service() -> Self {
+        Self {
+            owner: None,
+            session_id: None,
+        }
+    }
+}
+
 /// Store metadata request received from a client.
 ///
-/// `owner` and `session_id` authenticate user writes. For service-token writes
-/// they are ignored: the reference label is always [`SYSTEM_OWNER`]. The fields
-/// stay in the type until the separate cleanup that removes them (#191).
+/// The body carries metadata only: `tin_id`, `size`, and `wrapped_key`. The
+/// writer's identity comes from the request headers (see [`WriteCredentials`]);
+/// `#[serde(deny_unknown_fields)]` rejects a legacy `owner` / `session_id` (or
+/// any other stray field) with 400 instead of silently ignoring it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StoreRequest {
-    /// Owner account ID (reference label for user writes; ignored with a service token).
-    pub owner: u64,
-    /// Active session ID issued by `maitre-d` (ignored with a service token).
-    pub session_id: u64,
     /// 256-bit tin ID.
     #[serde(with = "hex_tin_id")]
     pub tin_id: TinId,
@@ -205,14 +305,12 @@ pub struct StoreResult {
 
 /// Unregister request to remove ownership of a tin.
 ///
-/// `owner` and `session_id` authenticate user writes. For service-token writes
-/// they are ignored and the [`SYSTEM_OWNER`] reference is removed.
+/// Like [`StoreRequest`], the body carries only `tin_id`: the writer's identity
+/// comes from the request headers (see [`WriteCredentials`]), and a legacy
+/// `owner` / `session_id` in the body is rejected with 400.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UnregisterRequest {
-    /// Owner account ID (reference label for user writes; ignored with a service token).
-    pub owner: u64,
-    /// Active session ID (ignored with a service token).
-    pub session_id: u64,
     /// 256-bit tin ID.
     #[serde(with = "hex_tin_id")]
     pub tin_id: TinId,

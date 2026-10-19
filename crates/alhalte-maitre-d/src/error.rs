@@ -109,6 +109,17 @@ pub enum MaitreDError {
     )]
     LegacyRoomDone(usize),
 
+    /// The database still holds rows of the retired `room_heads` table.
+    ///
+    /// Issue #192 moved the `room_id -> RoomData tin` pointer to cellar's
+    /// generic alias `room/<room_id>/head`, which banquette reads on startup.
+    /// There is no migration of old rows, so the operator must reset the
+    /// database (delete the SQLite file) and let a fresh one be created.
+    #[error(
+        "database still holds {0} row(s) of the retired room_heads table; the room head is the cellar alias room/<room_id>/head now. Delete the SQLite database and restart"
+    )]
+    LegacyRoomHeads(usize),
+
     /// Invalid request parameters.
     #[error("Bad request: {0}")]
     BadRequest(String),

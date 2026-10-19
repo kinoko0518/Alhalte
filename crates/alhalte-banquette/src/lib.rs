@@ -20,9 +20,12 @@
 //!   administrator moved it into plus `"/"`, `Admin` writes everything).
 //! - **Lifecycle**: Unloading idle scenes when active client counts drop to zero, and periodic 4-minute heartbeats
 //!   with room state persistence, shutting down when idle for 3 consecutive intervals.
-//! - **Persistence**: [`Room::persist`] stores the whole room in cellar and reports the tin ID so
-//!   [`Room::load_from_cellar`] can restore it on the next process start. Internal writes are authorized
-//!   by the cellar service token carried by the [`CellarSink`], never by a synthetic user session.
+//! - **Persistence**: [`Room::persist`] stores the whole room in cellar and moves the
+//!   `room/<room_id>/head` alias ([`room_head_alias`]); [`Room::load_or_create`] restores the room
+//!   from that alias on the next process start, so no head is passed on the command line. Internal
+//!   writes are authorized by the cellar service token carried by the [`CellarSink`], never by a
+//!   synthetic user session. A set alias that cannot be restored fails startup instead of opening
+//!   an empty room (Issue #192).
 //!
 //! ## Example
 //!
@@ -79,6 +82,7 @@ pub use protocol::{
 };
 pub use room::{
     HeartbeatOutcome, HeartbeatResult, Room, RoomData, RoomPermissionLevel, SceneSummary,
+    room_head_alias,
 };
 pub use scene::{Scene, SceneData};
 pub use server::{BanquetteServer, ConnectedClient, ServerConfig};

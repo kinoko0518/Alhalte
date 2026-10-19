@@ -1,4 +1,4 @@
-//! SQLite database management for storing tin references.
+//! SQLite database management for storing tin references and aliases.
 //!
 //! According to ARCHITECTURE.md:
 //! References are stored as the Cartesian product of:
@@ -6,6 +6,11 @@
 //!
 //! The entity file name is not stored: it is always `hex(tin_id)` (see
 //! [`crate::storage::StorageManager::relative_name`]).
+//!
+//! [`Database::get_alias`] / [`Database::set_alias`] / [`Database::delete_alias`]
+//! back the generic `name -> tin_id` pointer table used for room heads
+//! (`room/<room_id>/head`). An alias is a reference too: GC keeps a tin that an
+//! alias points at even when no `tin_references` row remains.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -13,7 +18,7 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 use tin::TinId;
 
-use crate::error::Result;
+use crate::error::{CellarError, Result};
 use crate::model::TinReference;
 
 /// Table holding ownership references to stored tin entities.
@@ -64,7 +69,12 @@ impl Database {
                 wrapped_key BLOB,
                 PRIMARY KEY (tin_id, owner)
             );
-            CREATE INDEX IF NOT EXISTS idx_tin_references_tin_id ON tin_references(tin_id);",
+            CREATE INDEX IF NOT EXISTS idx_tin_references_tin_id ON tin_references(tin_id);
+            CREATE TABLE IF NOT EXISTS aliases (
+                name TEXT PRIMARY KEY,
+                tin_id BLOB NOT NULL,
+                updated_at INTEGER NOT NULL
+            );",
         )?;
         Self::migrate_drop_path_column(conn)?;
         Ok(())
@@ -214,6 +224,10 @@ impl Database {
     /// The corresponding entity file name is `hex(tin_id)` (see
     /// [`crate::storage::StorageManager::relative_name`]); GC derives it from
     /// this set because no path is persisted.
+    ///
+    /// Only `tin_references` rows are returned. Alias pointers are a second
+    /// kind of reference and are returned by [`Self::get_all_alias_tin_ids`];
+    /// GC unions both sets before deleting files.
     pub fn get_all_referenced_tin_ids(conn: &Connection) -> Result<HashSet<TinId>> {
         let mut stmt = conn.prepare_cached("SELECT DISTINCT tin_id FROM tin_references")?;
         let rows = stmt.query_map([], |r| {
@@ -230,5 +244,80 @@ impl Database {
             }
         }
         Ok(ids)
+    }
+
+    /// Reads the tin ID stored under the generic alias `name`.
+    ///
+    /// Returns `None` when the name was never set (or was deleted). The stored
+    /// column is a plain 32-byte blob; a row of another length is a corrupt
+    /// database and reported as an error instead of being ignored.
+    pub fn get_alias(conn: &Connection, name: &str) -> Result<Option<TinId>> {
+        let mut stmt = conn.prepare_cached("SELECT tin_id FROM aliases WHERE name = ?1")?;
+        let blob: Option<Vec<u8>> = stmt.query_row(params![name], |row| row.get(0)).optional()?;
+
+        blob.map(|bytes| Self::tin_id_from_alias_blob(name, bytes))
+            .transpose()
+    }
+
+    /// Points the generic alias `name` at `tin_id`.
+    ///
+    /// Returns the tin ID the alias pointed at before the write, if any.
+    pub fn set_alias(
+        conn: &Connection,
+        name: &str,
+        tin_id: &TinId,
+        updated_at: i64,
+    ) -> Result<Option<TinId>> {
+        let previous = Self::get_alias(conn, name)?;
+        let mut stmt = conn.prepare_cached(
+            "INSERT INTO aliases (name, tin_id, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT (name) DO UPDATE SET
+                 tin_id = excluded.tin_id,
+                 updated_at = excluded.updated_at",
+        )?;
+        stmt.execute(params![name, tin_id.as_slice(), updated_at])?;
+        Ok(previous)
+    }
+
+    /// Deletes the generic alias `name`.
+    ///
+    /// Returns `true` when a row was removed and `false` when the name was
+    /// already unused.
+    pub fn delete_alias(conn: &Connection, name: &str) -> Result<bool> {
+        let mut stmt = conn.prepare_cached("DELETE FROM aliases WHERE name = ?1")?;
+        let rows = stmt.execute(params![name])?;
+        Ok(rows > 0)
+    }
+
+    /// Returns the set of every tin ID an alias currently points at.
+    ///
+    /// GC treats these as references exactly like `tin_references` rows, so a
+    /// tin that only a room-head alias points at is never collected.
+    pub fn get_all_alias_tin_ids(conn: &Connection) -> Result<HashSet<TinId>> {
+        let mut stmt = conn.prepare_cached("SELECT name, tin_id FROM aliases")?;
+        let rows = stmt.query_map([], |r| {
+            let name: String = r.get(0)?;
+            let blob: Vec<u8> = r.get(1)?;
+            Ok((name, blob))
+        })?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            let (name, blob) = row?;
+            // A malformed row would otherwise make GC delete the tin it points
+            // at, so it is surfaced instead of skipped.
+            ids.insert(Self::tin_id_from_alias_blob(&name, blob)?);
+        }
+        Ok(ids)
+    }
+
+    /// Parses an `aliases.tin_id` blob, naming the alias in the error message.
+    fn tin_id_from_alias_blob(name: &str, blob: Vec<u8>) -> Result<TinId> {
+        let len = blob.len();
+        blob.try_into().map_err(|_| {
+            CellarError::Internal(format!(
+                "aliases.tin_id for {name} must be 32 bytes, got {len}"
+            ))
+        })
     }
 }

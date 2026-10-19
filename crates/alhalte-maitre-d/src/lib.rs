@@ -22,11 +22,11 @@
 //!   and, in debug builds, creates throwaway accounts keyed by an unguessable synthetic subject.
 //! - **WebSocket Demultiplexer & Banquette Spawner**: Inspects incoming WebSocket headers (`X-Alhalte-Room`),
 //!   query parameters (`room`), and URL paths (`/room/{room_id}`) to demultiplex messages to `alhalte-banquette`
-//!   daemons via UNIX domain sockets. Spawning, room restore, and the socket connection are awaited before a
-//!   client is registered, so a failed restore is reported to the caller instead of silently starting empty.
-//! - **Room state head**: `room_heads` stores the tin ID of the last persisted `RoomData` per room. It is
-//!   read before spawning banquette (so the room is restored instead of starting empty) and updated from
-//!   `RoomPersisted` control frames.
+//!   daemons via UNIX domain sockets. Spawning and the socket connection are awaited before a client is
+//!   registered, so a failed room restore is reported to the caller instead of silently starting empty.
+//! - **Room state head**: owned by cellar, not by maitre-d. Banquette keeps the last persisted `RoomData`
+//!   under the alias `room/<room_id>/head` and restores itself from it on startup, so `maitre-d` passes no
+//!   head to the spawner and stores none (Issue #192).
 //!
 //! ## Example
 //!

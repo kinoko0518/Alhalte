@@ -31,6 +31,10 @@ pub struct CliArgs {
     pub socket: PathBuf,
 
     /// Base HTTP URL of the `alhalte-cellar` content storage service.
+    ///
+    /// Cellar is also the source of the room head: startup reads the
+    /// `room/<room-id>/head` alias and restores the room when it is set
+    /// (Issue #192), so no restore flag exists.
     #[arg(
         long,
         default_value = "http://127.0.0.1:8080",
@@ -51,18 +55,11 @@ pub struct CliArgs {
     #[arg(long, default_value = "240", env = "ALHALTE_HEARTBEAT_INTERVAL_SECS")]
     pub heartbeat_interval_secs: u64,
 
-    /// Persisted `RoomData` tin ID to restore instead of starting an empty room.
-    ///
-    /// `maitre-d` reads the room head before spawning and passes it here. When
-    /// present, startup fails loudly if the tin cannot be downloaded, decoded,
-    /// or validated against `--room-id`.
-    #[arg(long, env = "ALHALTE_ROOM_TIN", value_parser = parse_tin_id_arg)]
-    pub room_tin: Option<tin::TinId>,
-
     /// Internal cellar service token used for room state persistence.
     ///
     /// Sent as `X-Alhalte-Service-Token` so internal writes do not impersonate a
-    /// user session. The value is never logged.
+    /// user session. Room head alias updates require the same token. The value
+    /// is never logged.
     ///
     /// Prefer `--service-token-file`: an inline value is visible in `ps`.
     #[arg(long, env = "ALHALTE_SERVICE_TOKEN", hide_env_values = true)]
@@ -81,10 +78,10 @@ pub struct CliArgs {
     /// `alhalte-maitre-d --debug-login` passes this so a debug instance never
     /// writes to the shared `alhalte-cellar`: nothing is persisted, superseded
     /// heads are not released, and the room disappears when the process exits.
-    /// It conflicts with `--room-tin`, because there is no persisted room to
-    /// restore (Issue #150). `ALHALTE_NO_PERSIST` is a value switch: set it to
-    /// `true` (or `false`).
-    #[arg(long, env = "ALHALTE_NO_PERSIST", conflicts_with = "room_tin")]
+    /// The head normally comes from the cellar alias, so `--no-persist` starts
+    /// an empty in-memory room (Issue #150). `ALHALTE_NO_PERSIST` is a value
+    /// switch: set it to `true` (or `false`).
+    #[arg(long, env = "ALHALTE_NO_PERSIST")]
     pub no_persist: bool,
 }
 
@@ -101,18 +98,6 @@ impl CliArgs {
             self.service_token.as_deref(),
         )
     }
-}
-
-/// Parses a 64-hex-character tin ID argument into a [`tin::TinId`].
-fn parse_tin_id_arg(value: &str) -> Result<tin::TinId, String> {
-    let value = value.trim();
-    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return Err("room tin ID must be 64 hexadecimal characters".to_string());
-    }
-    let mut out = [0u8; 32];
-    hex::decode_to_slice(value, &mut out)
-        .map_err(|_| "room tin ID must be 64 hexadecimal characters".to_string())?;
-    Ok(out)
 }
 
 /// Parses a room ID argument in canonical 16-hex or legacy decimal form.
@@ -192,7 +177,7 @@ mod tests {
 
     // spec: alhalte-banquette/persistence 0008 --no-persist disables cellar writes
     #[test]
-    fn parses_no_persist_and_rejects_it_with_room_tin() {
+    fn parses_no_persist() {
         let args = CliArgs::try_parse_from([
             "alhalte-banquette",
             "--room-id",
@@ -209,9 +194,13 @@ mod tests {
             CliArgs::try_parse_from(["alhalte-banquette", "--room-id", "777", "--admin", "1"])
                 .unwrap();
         assert!(!args.no_persist);
+    }
 
-        // Nothing persisted means nothing to restore.
-        let tin_hex = "ab".repeat(32);
+    // spec: alhalte-banquette/persistence 0007 the room head comes from cellar, not argv
+    #[test]
+    fn rejects_the_removed_room_tin_flag() {
+        // The head is read from the `room/<room-id>/head` cellar alias, so the
+        // former restore argument is gone instead of being silently ignored.
         assert!(
             CliArgs::try_parse_from([
                 "alhalte-banquette",
@@ -219,53 +208,30 @@ mod tests {
                 "777",
                 "--admin",
                 "1",
-                "--no-persist",
                 "--room-tin",
-                &tin_hex,
+                &"ab".repeat(32),
             ])
             .is_err()
         );
-    }
 
-    // spec: alhalte-banquette/persistence 0007 --room-tin restore argument
-    #[test]
-    fn parses_room_tin_and_service_token() {
-        let tin_hex = "ab".repeat(32);
+        // No restore flag and no service token by default.
+        let args =
+            CliArgs::try_parse_from(["alhalte-banquette", "--room-id", "777", "--admin", "1"])
+                .unwrap();
+        assert_eq!(args.service_token, None);
+
+        // The inline token is still parsed (the 0600 file wins when both exist).
         let args = CliArgs::try_parse_from([
             "alhalte-banquette",
             "--room-id",
-            "abcdef0123456789",
+            "777",
             "--admin",
             "1",
-            "--room-tin",
-            &tin_hex,
             "--service-token",
             "internal-secret",
         ])
         .unwrap();
-        assert_eq!(args.room_tin, Some([0xabu8; 32]));
         assert_eq!(args.service_token.as_deref(), Some("internal-secret"));
-
-        // No head means a new room.
-        let args =
-            CliArgs::try_parse_from(["alhalte-banquette", "--room-id", "777", "--admin", "1"])
-                .unwrap();
-        assert_eq!(args.room_tin, None);
-        assert_eq!(args.service_token, None);
-
-        // Tin IDs must be exactly 64 hex characters.
-        assert!(
-            CliArgs::try_parse_from([
-                "alhalte-banquette",
-                "--room-id",
-                "777",
-                "--admin",
-                "1",
-                "--room-tin",
-                "abcd",
-            ])
-            .is_err()
-        );
     }
 }
 

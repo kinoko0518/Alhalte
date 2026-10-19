@@ -8,6 +8,12 @@
 //! as rows in an SQLite database: `(tin_id: [u8; 32], owner: u64, wrapped_key: Option<Vec<u8>>)`.
 //! The entity file name on disk is always `hex(tin_id)`; no path is persisted.
 //!
+//! A generic `aliases(name TEXT PRIMARY KEY, tin_id BLOB NOT NULL, updated_at INTEGER NOT NULL)`
+//! table points a name at a tin, and `GET` / `PUT` / `DELETE /alias/{name}` expose it. Alias
+//! writes require the internal service token, while reads are unauthenticated like downloads.
+//! `alhalte-banquette` keeps its room head at `room/<room_id>/head`; GC keeps alias targets, so
+//! the current head survives even when no `tin_references` row points at it (Issue #192).
+//!
 //! When receiving a store request:
 //! - Validates the owner's session rights via [`SessionVerifier`].
 //! - Answers `POST /store` with `200 OK` and a [`StoreResponse`] body whose
@@ -24,7 +30,10 @@
 //!
 //! ```no_run
 //! use std::sync::Arc;
-//! use alhalte_cellar::{CellarConfig, CellarService, InMemorySessionVerifier, StoreRequest, StoreStatus};
+//! use alhalte_cellar::{
+//!     CellarConfig, CellarService, InMemorySessionVerifier, StoreRequest, StoreStatus,
+//!     WriteCredentials,
+//! };
 //! use tempfile::tempdir;
 //!
 //! # #[tokio::main]
@@ -34,15 +43,16 @@
 //! verifier.allow(42, 100);
 //!
 //! let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false)?;
+//! // The body carries metadata only; the caller is identified by the headers.
 //! let req = StoreRequest {
-//!     owner: 42,
-//!     session_id: 100,
 //!     tin_id: [1u8; 32],
 //!     size: 10,
 //!     wrapped_key: None,
 //! };
 //!
-//! let status = service.store_check(&req).await?;
+//! let status = service
+//!     .store_check(&req, WriteCredentials::session(42, 100))
+//!     .await?;
 //! assert_eq!(status, StoreStatus::UploadRequired);
 //! # Ok(())
 //! # }
@@ -69,8 +79,9 @@ pub use error::{CellarError, Result};
 pub use gc::run_garbage_collection;
 pub use handlers::create_router;
 pub use model::{
-    GcStats, SYSTEM_OWNER, StoreRequest, StoreResponse, StoreResult, StoreStatus, TinReference,
-    UnregisterRequest, format_tin_id, parse_tin_id,
+    AliasRequest, AliasResponse, GcStats, MAX_ALIAS_NAME_BYTES, SYSTEM_OWNER, StoreRequest,
+    StoreResponse, StoreResult, StoreStatus, TinReference, UnregisterRequest, WriteCredentials,
+    format_tin_id, parse_tin_id, validate_alias_name,
 };
 pub use secret_file::{SecretFileError, read_secret_file, resolve_secret};
 pub use service::{CellarConfig, CellarService};

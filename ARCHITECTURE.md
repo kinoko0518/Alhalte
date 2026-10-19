@@ -92,24 +92,24 @@ client 総体 = cutlery
 ### 部屋作成
 
 1. クライアントは `maitre-d` の `POST /api/rooms` に `{ room_id?, name }` を送る（要 session）。`room_id` を省略するとサーバーが 16 hex を生成する。
-2. `maitre-d` は SQLite の `rooms` に部屋を登録し、同じ transaction で作成者を `room_permissions` の `gm` にする。banquette はまだ起動しない。
-3. `GET /api/rooms/{room_id}` が名前・caller の role・done を返す（`done` は `RoomData.default_permission != Denied` の射影）。部屋は WS / export で参照されるまでプロセスを持たない。
+2. `maitre-d` は SQLite の `rooms` に部屋を登録する。権限は持たず、作成者は banquette spawn 時の初期 Admin にだけ使う。banquette はまだ起動しない。
+3. `GET /api/rooms/{room_id}` は名前と caller の権限を返す。権限は banquette へ `QueryAccountPermission` で問い合わせる。部屋は WS / export で参照されるまでプロセスを持たない。
 
 ### 入室
 
 1. ブラウザは部屋 URL `/rooms/<roomId>#<roomKey>` を開く。`roomKey` はフラグメントにだけ存在し、サーバーへ送らない。
 2. `argenterie` は `maitre-d` の `/ws/room/<roomId>?account_id=...&session_id=...` へ WebSocket 接続する。
-3. `maitre-d` はセッションを検証し、`rooms` に登録済みか確認する。未登録は 404、権限がなく `done=false` なら 403 で拒否する。
-4. 許可された接続は `banquette` の UNIX ソケットへ `ClientConnected` として流し込む。bridge の `admin_account` は部屋の作成者 / DB の GM で、接続順には依存しない。banquette が未起動なら `room_heads` の head を渡して起動する。head があり復元できない場合は 500 で失敗し、空部屋は作らない。head がなければ新しい部屋を起動する。
+3. `maitre-d` はセッションを検証し、`rooms` に登録済みか確認する。未登録は 404、権限が `Denied` なら 403 で拒否する。
+4. 許可された接続は `banquette` の UNIX ソケットへ `ClientConnected` として流し込む。bridge の `admin_account` は部屋の作成者（`rooms.creator_account`）で、接続順には依存しない。banquette が未起動なら起動する。復元点は cellar の alias `room/<room_id>/head` にあり、banquette 自身が起動時に読む（maitre-d は head を渡さない）。alias があり復元できない場合は 500 で失敗し、空部屋は作らない。alias がなければ新しい部屋を起動する。
 5. banquette はクライアントをルートシーン `/` に入室させる。
 
 ### 部屋の永続化
 
-1. banquette は heartbeat（既定 4 分）ごとに部屋全体を `alhalte/banquette` Tin として cellar に保存し、成功した tin id と `default_permission` を `RoomPersisted { tin_id, default_permission }` で `maitre-d` へ返す。
-2. `maitre-d` は `room_heads(room_id, tin_id, updated_at)` に head を記録し、`default_permission != Denied` を `rooms.done` に射影する。`rooms.done` は pre-spawn の入場判定が `maitre-d` 再起動後も機能するための暫定フラグで、権限の正は `RoomData.default_permission` / `RoomData.permissions` にある（#200 で判定ごと置き換える）。
-3. 新 head の保存後、banquette は旧 head の参照を best-effort で unregister し、cellar GC が実体を回収できるようにする。現在の head は削除しない。
+1. banquette は heartbeat（既定 4 分）ごとに部屋全体を `alhalte/banquette` Tin として cellar に保存する。
+2. 保存に成功したら、まず cellar の alias `room/<room_id>/head` を新しい tin へ移す。この alias が唯一の head ポインタで、`maitre-d` は head を記録しない（`room_heads` と `RoomPersisted` は #192 で撤去した）。
+3. alias の更新後、banquette は旧 head の参照を best-effort で unregister し、cellar GC が実体を回収できるようにする。現在の head は alias が指しているので削除しない。cellar の GC は `tin_references` と `aliases` の両方を参照として扱う。
 4. idle 終了などの graceful shutdown、および standalone banquette の SIGTERM / SIGINT では、終了直前にもう一度 persist してから終了する。シグナルは `run_until_shutdown` の shutdown channel に配線する。
-5. 次回 spawn 時は head から scenes / state / characters / log biblio / 権限（`default_permission` / `permissions` / `accessible_scenes`）を復元する。復元された `default_permission` は次回の `RoomPersisted` で `rooms.done` に書き戻す。
+5. 次回 spawn 時は alias の head から scenes / state / characters / log biblio / 権限（`default_permission` / `permissions` / `accessible_scenes`）を復元する。壊れた tin・hash 不一致・room_id 不一致は起動失敗で、空部屋にフォールバックしない。
 
 ### 発言
 
@@ -128,8 +128,8 @@ client 総体 = cutlery
 
 ### エクスポート
 
-1. `maitre-d` の `GET /api/room/<roomId>/export/zip?type=full|logs` は `rooms` を引き、未登録は 404、非メンバーかつ `done=false` は 403 で拒否する。空の部屋を暗黙作成しない。
-2. 許可された場合、`banquette` に `ExportRoom` を送る。bridge が未起動なら作成者 / DB GM を admin として起動し、`room_heads` の head から部屋を復元する。復元できない場合は 5xx を返し、空の ZIP を返さない。
+1. `maitre-d` の `GET /api/room/<roomId>/export/zip?type=full|logs` は `rooms` を引き、未登録は 404、呼び出し元の権限が `Denied` なら 403 で拒否する。空の部屋を暗黙作成しない。
+2. 許可された場合、`banquette` に `ExportRoom` を送る。bridge が未起動なら作成者を admin として起動する。banquette は cellar の alias `room/<room_id>/head` から部屋を復元してから応答する（#193 で ZIP 化）。復元できない場合は 5xx を返し、空の ZIP を返さない。
 3. banquette は権限のある scene と log chunk を `RoomData` にまとめて返す。
 4. `maitre-d` は `alhalte-kitchen` で ZIP を組み立てて返す。
 5. `alhalte-kitchen` CLI は ZIP / tar.gz を読み、`RoomGraph` を作り、HTML5 または EPUB に変換する。
@@ -166,8 +166,8 @@ client 総体 = cutlery
 
 - `Denied`: 読み書き不可。`Viewer`: 全 scene を読めるが書けない。`Participant`: 管理者に移動させられた scene と `/` を読み書きできる。`Admin`: 全 scene の読み書きと権限変更。
 - 全 mutate frame（log / state / scene 構造 / character CRUD / 移動）は `banquette` 自身が権限表で拒否する。`maitre-d` の viewer 遮断に依存しない。
-- `maitre-d` は SQLite の `rooms(room_id, name, creator_account, created_at, done)` と `room_permissions(room_id, account_id, role)` をまだ持ち、WS 接続時の入場可否と viewer の mutate 遮断を行う。ただし #199 以降、DB の role は実行中の `banquette` へ push されない（`SetAdmins` は撤去）。`banquette` は `SetMemberPermission` / `SetDefaultPermission` / `QueryPermissions` で自身の権限表を更新し、`QueryAccountPermission` で `maitre-d` が問い合わせる。DB role と部屋権限表の接続は Issue #200 で行う。
-- 部屋状態の永続 head は `room_heads` が持ち、`rooms.done` は `default_permission` の射影（pre-spawn gate 用の暫定値）、内部書き込みの認可は `cellar.service-token` が担う。
+- `maitre-d` は SQLite の `rooms(room_id, name, creator_account, created_at)` だけを持ち、権限も head も持たない。WS / `GET /api/rooms/{id}` / export の入場可否は `banquette` へ `QueryAccountPermission` で問い合わせる。`banquette` は `SetMemberPermission` / `SetDefaultPermission` / `QueryPermissions` で自身の権限表を更新する。
+- 部屋状態の永続 head は cellar の alias `room/<room_id>/head` が持つ（#192）。`maitre-d` の `room_heads` と `RoomPersisted` は撤去し、旧 `room_heads` 行がある DB は起動時に拒否する。内部書き込みの認可は `cellar.service-token` が担う。
 
 ### エラー・安全規約
 
@@ -208,7 +208,7 @@ client 総体 = cutlery
 | 領域 | 設計時の記述 | 現在の実装 |
 | --- | --- | --- |
 | 権限 | 部屋の `done` フラグと `std::admins` | `banquette` の `RoomData.permissions` / `default_permission` が正（4 段階）。`maitre-d` は権限テーブルを持たず、WS / `GET /api/rooms/{id}` / export / HTTP 権限 API で banquette に問い合わせる。旧 `gm/pl/viewer` / `rooms.done` は起動時に拒否する。 |
-| 部屋状態 | 部屋プロセスは揮発 | `maitre-d` の `room_heads` と cellar の `alhalte/banquette` Tin で永続化し、spawn 時に復元する。復元失敗は空部屋にフォールバックしない。 |
+| 部屋状態 | 部屋プロセスは揮発 | cellar の `alhalte/banquette` Tin と head alias `room/<room_id>/head` で永続化し、banquette が起動時に自分で復元する（#192）。復元失敗は空部屋にフォールバックしない。 |
 | 内部書き込み | ユーザー session で認可 | `cellar.service-token` による内部認証。合成 session（旧 `system_session_id = 1`）は廃止。 |
 | 拡張 ABI | `process-generast(Generast) -> Generast` | `process_generast(ptr, len) -> i64`。`(Generast, speaker_id)` の Tin を入出力し、`alhalte_abi_version` / `alloc` / `dealloc` / `self_introduction` を持つ。 |
 | canner | クライアント側 wasm の `encode-*` / `encrypt-*` | Rust ライブラリとして実装済み。WASM ABI は未エクスポート。ブラウザでは `pantry` の TS 実装が暗号・展開を担う。 |
@@ -217,7 +217,7 @@ client 総体 = cutlery
 | saignant の WASM 実行 | キャラクター名を解決 | ABI v2 の `render_generast_abi_v2(ptr, len, names_ptr, names_len)` が名前 JSON を受け取り、mention / `fluct` / `assign` を解決する。v1 は互換のため残し、名前なしでは `Anonymous` になる。 |
 | Markdown | 打ち消し線 `~~` を含む | パーサは `~~` を実装していない（自己紹介文には記載がある）。 |
 
-- `rooms.done` は `RoomPersisted.default_permission` と `ServerFrame::PermissionsUpdated` から射影した暫定フラグで、WS / `GET /api/rooms/{id}` / export の pre-spawn 判定に使う。権限の正は `RoomData` 側にあり、#200 でゲートごと置き換える（`RoomData.done` という field は #199 で消滅した）。
+- `rooms.done` と `RoomPersisted` は撤去した。`maitre-d` は権限を `QueryAccountPermission` で、head を cellar の alias で扱う（#200 / #192）。`RoomData.done` という field は #199 で消滅した。
 - standalone の `alhalte-banquette` は SIGTERM / SIGINT を捕捉し、`run_until_shutdown` と同じ graceful shutdown 経路で最終 persist を行う（`crates/alhalte-banquette/tests/spec_tests.rs` の SIGTERM 統合テストで確認）。
 | ディレクトリ名 | `generast-rs` | package 名は `generast`。文書内ではディレクトリ名と package 名を併記する。 |
 

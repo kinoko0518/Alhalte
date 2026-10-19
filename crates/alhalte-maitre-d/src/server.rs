@@ -2382,7 +2382,9 @@ pub enum CellarProxyError {
 /// The browser never talks to `alhalte-cellar` directly: it calls maitre-d,
 /// which resolves the caller from the session and injects the
 /// `X-Alhalte-Owner` / `X-Alhalte-Session-Id` headers itself. Client-supplied
-/// ownership is therefore never trusted.
+/// ownership is therefore never trusted: it is never read from the body, and a
+/// body that still claims `owner` / `session_id` is rejected with `400`
+/// (Issue #191).
 #[derive(Clone, Debug)]
 pub struct CellarProxy {
     /// Base URL of the cellar service, without a trailing slash.
@@ -2598,6 +2600,20 @@ fn owner_headers(caller: &CallerCredentials) -> Vec<(&'static str, String)> {
     ]
 }
 
+/// Returns the first legacy ownership field found in a cellar body, if any.
+///
+/// Since Issue #191 the store handshake body is `{ tin_id, size, wrapped_key }`
+/// only. `owner` / `session_id` used to be client-supplied and rewritten by the
+/// proxy; both are now rejected with `400` so an old client fails loudly instead
+/// of having its claim silently ignored.
+fn claimed_owner_fields(payload: &serde_json::Value) -> Option<&'static str> {
+    const LEGACY_FIELDS: [&str; 2] = ["owner", "session_id"];
+    let map = payload.as_object()?;
+    LEGACY_FIELDS
+        .into_iter()
+        .find(|field| map.contains_key(*field))
+}
+
 /// Validates a 64-character hex tin ID taken from the request path.
 ///
 /// Rejecting anything else keeps path traversal (`..`) and other upstream path
@@ -2659,10 +2675,12 @@ async fn forward_cellar_request(
 
 /// Handles `POST /api/cellar/store` (cellar `POST /store`).
 ///
-/// The JSON body is forwarded with `owner` / `session_id` overwritten by the
-/// authenticated values, so the store check always runs against the caller's
-/// own account. The upstream `200 OK` + `{"result": ...}` answer is passed
-/// through verbatim.
+/// The caller's identity is injected as `X-Alhalte-Owner` / `X-Alhalte-Session-Id`;
+/// the JSON body is forwarded unchanged and must not carry an ownership claim.
+/// Since Issue #191 the body is `{ tin_id, size, wrapped_key }` only: a client
+/// that still sends `owner` / `session_id` (the pre-#191 contract) is answered
+/// with `400` instead of having its claim silently ignored. The upstream
+/// `200 OK` + `{"result": ...}` answer is passed through verbatim.
 async fn cellar_store_check_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2678,7 +2696,7 @@ async fn cellar_store_check_handler(
         Err(err) => return auth_error_response(err),
     };
 
-    let mut payload: serde_json::Value = match serde_json::from_slice(&body) {
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
         Ok(payload @ serde_json::Value::Object(_)) => payload,
         _ => {
             return (
@@ -2689,28 +2707,17 @@ async fn cellar_store_check_handler(
         }
     };
 
-    if let Some(map) = payload.as_object_mut() {
-        map.insert(
-            "owner".to_string(),
-            serde_json::Value::from(caller.account_id),
-        );
-        map.insert(
-            "session_id".to_string(),
-            serde_json::Value::from(caller.session_id),
-        );
+    if let Some(claim) = claimed_owner_fields(&payload) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "`{claim}` must not be sent in the body; ownership is derived from the session"
+                ),
+            })),
+        )
+            .into_response();
     }
-
-    let body = match serde_json::to_vec(&payload) {
-        Ok(body) => body,
-        Err(err) => {
-            tracing::error!("failed to re-serialize cellar store request: {err}");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid store request" })),
-            )
-                .into_response();
-        }
-    };
 
     let mut upstream_headers = owner_headers(&caller);
     upstream_headers.push(("Content-Type", "application/json".to_string()));
@@ -2720,7 +2727,7 @@ async fn cellar_store_check_handler(
         reqwest::Method::POST,
         "/store",
         upstream_headers,
-        Some(Bytes::from(body)),
+        Some(body),
     )
     .await
 }
