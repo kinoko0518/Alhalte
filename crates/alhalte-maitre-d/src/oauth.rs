@@ -7,6 +7,7 @@ use std::sync::RwLock;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::percent_encode;
 use crate::error::{MaitreDError, Result};
 
 /// User info obtained from Google OAuth, containing strictly only the `sub` identifier.
@@ -77,9 +78,9 @@ impl OAuthProvider for GoogleOAuthProvider {
     fn authorization_url(&self, redirect_uri: &str, state: &str) -> String {
         format!(
             "https://accounts.google.com/o/oauth2/v2/auth?client_id={}&redirect_uri={}&response_type=code&scope=openid&state={}",
-            urlencoding::encode(&self.client_id),
-            urlencoding::encode(redirect_uri),
-            urlencoding::encode(state),
+            percent_encode(&self.client_id),
+            percent_encode(redirect_uri),
+            percent_encode(state),
         )
     }
 
@@ -241,22 +242,5 @@ impl OAuthProvider for MockOAuthProvider {
         Err(MaitreDError::OAuth(format!(
             "MockOAuthProvider: unrecognized id_token '{id_token}'"
         )))
-    }
-}
-
-mod urlencoding {
-    pub fn encode(s: &str) -> String {
-        let mut out = String::with_capacity(s.len());
-        for b in s.bytes() {
-            match b {
-                b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    out.push(b as char)
-                }
-                _ => {
-                    out.push_str(&format!("%{:02X}", b));
-                }
-            }
-        }
-        out
     }
 }

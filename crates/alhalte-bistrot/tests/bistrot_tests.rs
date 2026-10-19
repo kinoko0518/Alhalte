@@ -347,6 +347,7 @@ fn test_generate_maitre_d_args() {
             banquette_bin: None,
             cellar_url: None,
             public_url: None,
+            debug_login: false,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -452,6 +453,7 @@ fn test_maitre_d_public_url_derivation() {
             banquette_bin: None,
             cellar_url: None,
             public_url: Some("https://auth.example.com/".to_string()),
+            debug_login: false,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -507,6 +509,7 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             banquette_bin: None,
             cellar_url: None,
             public_url: None,
+            debug_login: false,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -678,6 +681,7 @@ fn test_generate_all_args_and_module_args() {
             banquette_bin: None,
             cellar_url: None,
             public_url: None,
+            debug_login: false,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -732,6 +736,7 @@ fn test_systemd_generator() {
             banquette_bin: None,
             cellar_url: None,
             public_url: None,
+            debug_login: false,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -1795,6 +1800,7 @@ fn test_write_secret_files_permissions() {
             banquette_bin: None,
             cellar_url: None,
             public_url: None,
+            debug_login: false,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -1921,4 +1927,62 @@ fn test_example_configuration_is_fail_closed() {
             "expected AgeKeyMissing for the template, got {err:?}"
         );
     }
+}
+
+// spec: alhalte-maitre-d/debug-login 0004 Bistrot passes --debug-login only when
+// [maitre-d] debug-login is enabled
+#[test]
+fn test_generate_maitre_d_args_passes_debug_login() {
+    // Off by default: no flag, and the setting is not in the TOML at all.
+    let plain = dev_parse(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+"#,
+    )
+    .unwrap();
+    assert!(!plain.maitre_d.debug_login);
+    assert!(
+        !generate_maitre_d_args(&plain)
+            .iter()
+            .any(|arg| arg == "--debug-login"),
+        "the debug login must stay off unless it is configured"
+    );
+
+    // Enabled through the TOML key (kebab-case and snake_case alias).
+    let enabled = dev_parse(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+debug-login = true
+"#,
+    )
+    .unwrap();
+    assert!(enabled.maitre_d.debug_login);
+    assert!(
+        generate_maitre_d_args(&enabled)
+            .iter()
+            .any(|arg| arg == "--debug-login")
+    );
+
+    let snake = dev_parse(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+debug_login = true
+"#,
+    )
+    .unwrap();
+    assert!(snake.maitre_d.debug_login);
+
+    // The flag does not change any other argument.
+    let mut with_flag = generate_maitre_d_args(&enabled);
+    with_flag.retain(|arg| arg != "--debug-login");
+    assert_eq!(with_flag, generate_maitre_d_args(&plain));
 }

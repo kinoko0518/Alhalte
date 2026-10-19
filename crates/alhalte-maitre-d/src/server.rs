@@ -7,8 +7,10 @@ use std::time::Duration;
 
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION, SET_COOKIE};
+use axum::extract::{DefaultBodyLimit, Form, Path as AxumPath, Query, State};
+use axum::http::header::{
+    ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONTENT_TYPE, HeaderValue, LOCATION, SET_COOKIE,
+};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -19,6 +21,9 @@ use tower_http::cors::CorsLayer;
 
 use alhalte_banquette::{ClientFrame, RoomPermissionLevel};
 
+use crate::auth::{
+    AuthIdentity, AuthProvider, DebugAuthProvider, GoogleAuthProvider, MAX_DEBUG_ACCOUNT_NAME_LEN,
+};
 use crate::crypto;
 use crate::db::{Account, Database, Room};
 use crate::error::MaitreDError;
@@ -53,8 +58,8 @@ pub struct AppState {
     pub db: Database,
     /// Instance salt for Google `sub` encryption.
     pub salt: String,
-    /// OAuth provider (production or mock).
-    pub oauth: Arc<dyn OAuthProvider>,
+    /// Authentication provider (Google OAuth or the isolated debug login).
+    pub auth: Arc<dyn AuthProvider>,
     /// WebSocket room demuxer manager.
     pub room_manager: RoomBridgeManager,
     /// Optional authenticated reverse proxy to `alhalte-cellar` (`/api/cellar/*`).
@@ -79,7 +84,10 @@ pub struct AppState {
 impl AppState {
     /// Creates a new [`AppState`] without a cellar proxy.
     ///
-    /// Use [`AppState::with_cellar_proxy`] (or [`AppState::with_cellar_url`]) to
+    /// `oauth` is wrapped as the normal Google login flow
+    /// ([`GoogleAuthProvider`]). Use [`AppState::with_debug_login`] to replace the
+    /// whole authentication path with the isolated debug login,
+    /// [`AppState::with_cellar_proxy`] (or [`AppState::with_cellar_url`]) to
     /// enable the `/api/cellar/*` routes,
     /// [`AppState::with_allowed_origins`] to replace the local-development CORS
     /// allow-list, and [`AppState::with_public_url`] to replace the OAuth
@@ -93,7 +101,7 @@ impl AppState {
         Self {
             db,
             salt: salt.into(),
-            oauth,
+            auth: Arc::new(GoogleAuthProvider::new(oauth)),
             room_manager,
             cellar: None,
             allowed_origins: DEFAULT_ALLOWED_ORIGINS
@@ -103,6 +111,29 @@ impl AppState {
             public_url: DEFAULT_PUBLIC_URL.to_string(),
             client_counter: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Switches the authentication path to the isolated debug login (Issue #150).
+    ///
+    /// [`create_router`] then registers `GET` / `POST /auth/debug/login`, drops
+    /// the Google callback / token routes, `GET /auth/login` redirects to the
+    /// debug form, and `GET /api/server-info` reports `debug_login: true`.
+    #[must_use]
+    pub fn with_debug_login(mut self) -> Self {
+        self.auth = Arc::new(DebugAuthProvider::new());
+        self
+    }
+
+    /// Replaces the authentication provider (tests / embedders).
+    #[must_use]
+    pub fn with_auth_provider(mut self, auth: Arc<dyn AuthProvider>) -> Self {
+        self.auth = auth;
+        self
+    }
+
+    /// Returns true when the debug login flow is active.
+    pub fn is_debug_login(&self) -> bool {
+        self.auth.kind().is_debug()
     }
 
     /// Replaces the CORS origin allow-list.
@@ -465,6 +496,35 @@ pub struct CreateDebugAccountRequest {
     pub icon_tin_id: Option<String>,
 }
 
+/// Response payload of `GET /api/server-info`.
+///
+/// Public on purpose: argenterie reads it before sign-in and shows the
+/// full-screen debug-login warning when `debug_login` is true (Issue #150).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerInfoResponse {
+    /// True when this `maitre-d` runs with `--debug-login`.
+    pub debug_login: bool,
+}
+
+/// Query parameters of `GET /auth/debug/login`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DebugLoginQuery {
+    /// Absolute URL to return to after the debug login.
+    ///
+    /// Only origins in the CORS allow-list are accepted, exactly like
+    /// `GET /auth/login`.
+    pub return_to: Option<String>,
+}
+
+/// Form payload of `POST /auth/debug/login`.
+#[derive(Debug, Deserialize)]
+pub struct DebugLoginForm {
+    /// Absolute URL to return to after the debug login.
+    pub return_to: Option<String>,
+    /// Account name. A name that does not exist yet creates an account.
+    pub account_name: String,
+}
+
 /// Query parameters for WebSocket connection.
 #[derive(Debug, Deserialize, Default)]
 pub struct WsQuery {
@@ -532,15 +592,21 @@ const MAX_ROOM_ID_GENERATION_ATTEMPTS: usize = 16;
 pub const MAX_CELLAR_TRANSFER_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Creates the Axum router for `alhalte-maitre-d`.
+///
+/// With the debug login active (`AppState::with_debug_login`) the Google
+/// callback / token routes are not registered at all and `/auth/debug/login` is;
+/// without it `/auth/debug/login` answers `404 Not Found` (Issue #150).
 pub fn create_router(state: AppState) -> Router {
+    let debug_login = state.is_debug_login();
     let mut router = Router::new()
         .route("/api/verify-session", get(verify_session_handler))
         .route("/api/session", get(session_handler))
         .route("/api/heartbeat", post(heartbeat_handler))
-        // OAuth entry point: maitre-d owns the state and the fixed redirect URI.
+        // Public server metadata: argenterie reads `debug_login` before sign-in.
+        .route("/api/server-info", get(server_info_handler))
+        // OAuth / debug login entry point: maitre-d owns the state and the fixed
+        // redirect URI, or hands the browser to the debug form.
         .route("/auth/login", get(oauth_login_handler))
-        .route("/auth/google/callback", get(oauth_callback_handler))
-        .route("/auth/google/token", post(oauth_token_handler))
         .route(
             "/api/account/{account_id}",
             get(get_account_handler).patch(update_account_handler),
@@ -597,6 +663,19 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/cellar/tin/{tin_id}", get(cellar_download_handler));
 
+    if debug_login {
+        // Issue #150: the debug login is a separate path, not a branch inside
+        // the Google flow. The Google routes do not exist while it is active.
+        router = router.route(
+            "/auth/debug/login",
+            get(debug_login_form_handler).post(debug_login_submit_handler),
+        );
+    } else {
+        router = router
+            .route("/auth/google/callback", get(oauth_callback_handler))
+            .route("/auth/google/token", post(oauth_token_handler));
+    }
+
     #[cfg(debug_assertions)]
     {
         router = router.route("/api/debug/account", post(create_debug_account_handler));
@@ -648,6 +727,16 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
     } else {
         layer.allow_origin(parsed)
     }
+}
+
+/// Handles `GET /api/server-info`.
+///
+/// Public and unauthenticated: argenterie asks for it at startup and shows the
+/// full-screen warning when `debug_login` is true (Issue #150).
+async fn server_info_handler(State(state): State<AppState>) -> Json<ServerInfoResponse> {
+    Json(ServerInfoResponse {
+        debug_login: state.is_debug_login(),
+    })
 }
 
 /// Handles `GET /api/verify-session`.
@@ -842,10 +931,13 @@ fn generate_oauth_state() -> String {
 
 /// Handles `GET /auth/login`.
 ///
-/// The browser navigates here with an absolute `return_to`. maitre-d issues a
-/// single-use state, binds it to `return_to`, and redirects to Google with the
-/// fixed `{public_url}/auth/google/callback` redirect URI. The argenterie
-/// origin / port is never sent to Google.
+/// The browser navigates here with an absolute `return_to`, which is validated
+/// against the CORS origin allow-list first (open-redirect guard). The
+/// [`AuthProvider`] then decides the next step: the debug login redirects to
+/// `/auth/debug/login`, while Google issues a single-use state, binds it to
+/// `return_to`, and redirects to Google with the fixed
+/// `{public_url}/auth/google/callback` redirect URI (the argenterie origin /
+/// port is never sent to Google).
 async fn oauth_login_handler(
     State(state): State<AppState>,
     Query(q): Query<OAuthLoginQuery>,
@@ -863,6 +955,11 @@ async fn oauth_login_handler(
         return error_response(StatusCode::BAD_REQUEST, "return_to origin is not allowed");
     }
 
+    // Debug login: the provider owns the next step (a local form).
+    if let Some(target) = state.auth.login_redirect(return_to) {
+        return redirect_response(&target);
+    }
+
     let now = chrono::Utc::now().timestamp();
     let oauth_state = generate_oauth_state();
     if let Err(error) = state.db.create_oauth_state(
@@ -875,7 +972,12 @@ async fn oauth_login_handler(
     }
 
     let redirect_uri = state.oauth_redirect_uri();
-    let mut url = state.oauth.authorization_url(&redirect_uri, &oauth_state);
+    let Some(mut url) = state.auth.authorization_url(&redirect_uri, &oauth_state) else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Authentication provider cannot start a Google login",
+        );
+    };
     if let Some(prompt) = q.prompt.as_deref().filter(|p| is_allowed_prompt(Some(p))) {
         url.push(if url.contains('?') { '&' } else { '?' });
         url.push_str("prompt=");
@@ -933,53 +1035,57 @@ async fn oauth_callback_handler(
     }
 
     let redirect_uri = state.oauth_redirect_uri();
-    let mut user_info = match state.oauth.exchange_code(code, &redirect_uri).await {
-        Ok(info) => info,
+    let identity = match state.auth.exchange_code(code, &redirect_uri).await {
+        Ok(identity) => identity,
         Err(error) => return error_response(StatusCode::UNAUTHORIZED, error.to_string()),
     };
 
-    let (_account, session) =
-        match issue_account_session(&state, &mut user_info.sub, "Anonymous", now) {
-            Ok(values) => values,
-            Err((status, message)) => return error_response(status, message),
-        };
+    let (_account, session) = match issue_account_session(&state, identity, now) {
+        Ok(values) => values,
+        Err((status, message)) => return error_response(status, message),
+    };
 
     let secure = state.public_url.trim().starts_with("https://");
-    let cookie = session_cookie_header(session.session_id, secure, SESSION_COOKIE_MAX_AGE_SECS);
-
-    let mut response = redirect_response(&return_to);
-    match HeaderValue::from_str(&cookie) {
-        Ok(value) => {
-            response.headers_mut().append(SET_COOKIE, value);
-            response
-        }
-        Err(_) => error_response(
+    match with_session_cookie(redirect_response(&return_to), session.session_id, secure) {
+        Some(response) => response,
+        None => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to build session cookie",
         ),
     }
 }
 
-/// Looks up or creates the account for `sub` and issues a fresh session.
+/// Looks up or creates the account for a provider identity and issues a session.
 ///
-/// `sub` is hashed and zeroized in place; the raw Google identifier is never
-/// written to the database.
+/// The identity's subject (a Google `sub`, or the synthetic debug key) is hashed
+/// and zeroized in place, so the raw identifier is never written to the
+/// database, a log line, or a response.
 fn issue_account_session(
     state: &AppState,
-    sub: &mut String,
-    default_name: &str,
+    identity: AuthIdentity,
     now: i64,
 ) -> std::result::Result<(Account, crate::db::Session), (StatusCode, String)> {
-    let sub_hash = crypto::hash_sub(&state.salt, sub);
+    let (sub_hash, handle_name) = identity.into_sub_hash(&state.salt);
     let account = state
         .db
-        .get_or_create_account(&sub_hash, default_name, None, now)
+        .get_or_create_account(&sub_hash, &handle_name, None, now)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let session = state
         .db
         .create_session(account.account_id, now)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     Ok((account, session))
+}
+
+/// Appends the `session_id` `Set-Cookie` header to `response`.
+///
+/// Returns `None` when the header value cannot be built, so the caller answers
+/// with a 500 instead of silently dropping the cookie.
+fn with_session_cookie(mut response: Response, session_id: u64, secure: bool) -> Option<Response> {
+    let cookie = session_cookie_header(session_id, secure, SESSION_COOKIE_MAX_AGE_SECS);
+    let value = HeaderValue::from_str(&cookie).ok()?;
+    response.headers_mut().append(SET_COOKIE, value);
+    Some(response)
 }
 
 /// Handles `GET /api/session`.
@@ -1035,8 +1141,8 @@ async fn oauth_token_handler(
     State(state): State<AppState>,
     Json(req): Json<OAuthTokenRequest>,
 ) -> Response {
-    let mut user_info = match state.oauth.verify_id_token(&req.id_token).await {
-        Ok(info) => info,
+    let identity = match state.auth.verify_id_token(&req.id_token).await {
+        Ok(identity) => identity,
         Err(e) => {
             return (
                 StatusCode::UNAUTHORIZED,
@@ -1046,34 +1152,16 @@ async fn oauth_token_handler(
         }
     };
 
-    let sub_hash = crypto::hash_sub(&state.salt, &mut user_info.sub);
-
-    let now = chrono::Utc::now().timestamp();
-    let default_name = req.handle_name.as_deref().unwrap_or("Anonymous");
-
-    let account = match state
-        .db
-        .get_or_create_account(&sub_hash, default_name, None, now)
-    {
-        Ok(acc) => acc,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+    // The caller may suggest the default handle name for a new account.
+    let identity = match req.handle_name.as_deref() {
+        Some(name) => identity.with_handle_name(name),
+        None => identity,
     };
 
-    let session = match state.db.create_session(account.account_id, now) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+    let now = chrono::Utc::now().timestamp();
+    let (account, session) = match issue_account_session(&state, identity, now) {
+        Ok(values) => values,
+        Err((status, message)) => return error_response(status, message),
     };
 
     Json(AuthResponse {
@@ -1081,6 +1169,143 @@ async fn oauth_token_handler(
         session_id: session.session_id,
     })
     .into_response()
+}
+
+/// Validates the `return_to` of a debug login request.
+///
+/// The same rules as `GET /auth/login` apply: an absolute URL on a CORS-allowed
+/// origin, never a protocol-relative or foreign URL.
+fn debug_return_to<'a>(
+    state: &AppState,
+    raw: Option<&'a str>,
+) -> std::result::Result<&'a str, Response> {
+    let Some(return_to) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(error_response(StatusCode::BAD_REQUEST, "Missing return_to"));
+    };
+    if !is_allowed_return_to(return_to, &state.allowed_origins) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "return_to origin is not allowed",
+        ));
+    }
+    Ok(return_to)
+}
+
+/// Escapes a value for inclusion in HTML text / a double-quoted attribute.
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Handles `GET /auth/debug/login` (debug login only).
+///
+/// Answers a minimal HTML form asking for an account name; the only other input
+/// is the `return_to` the browser is sent back to. The route exists only when the
+/// debug login is active, so it is `404 Not Found` otherwise.
+async fn debug_login_form_handler(
+    State(state): State<AppState>,
+    Query(q): Query<DebugLoginQuery>,
+) -> Response {
+    let Ok(return_to) = debug_return_to(&state, q.return_to.as_deref()) else {
+        return error_response(StatusCode::BAD_REQUEST, "Missing or disallowed return_to");
+    };
+
+    let return_to_value = html_escape(return_to);
+    let max_len = MAX_DEBUG_ACCOUNT_NAME_LEN;
+    let body = format!(
+        "<!doctype html>
+<html lang=\"ja\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+<title>デバッグログイン</title>
+<style>
+body {{ font-family: system-ui, sans-serif; margin: 0; padding: 2rem; background: #1c1b1f; color: #e6e1e5; }}
+main {{ max-width: 24rem; margin: 4rem auto; display: flex; flex-direction: column; gap: 1rem; }}
+h1 {{ font-size: 1.5rem; margin: 0; }}
+p {{ margin: 0; line-height: 1.6; }}
+input {{ font: inherit; padding: 0.75rem; border-radius: 0.5rem; border: 1px solid #938f99; background: #2b2930; color: inherit; }}
+button {{ font: inherit; padding: 0.75rem; border-radius: 0.5rem; border: 0; background: #d0bcff; color: #381e72; cursor: pointer; }}
+</style>
+</head>
+<body>
+<main>
+<h1>デバッグログイン</h1>
+<p>アカウント名を入力してください。存在しない名前は、その名前で新しいアカウントとして作成されます。</p>
+<form method=\"post\" action=\"/auth/debug/login\">
+<input type=\"hidden\" name=\"return_to\" value=\"{return_to_value}\">
+<label for=\"account-name\">アカウント名</label>
+<input id=\"account-name\" name=\"account_name\" type=\"text\" required maxlength=\"{max_len}\" autocomplete=\"off\" autofocus>
+<button type=\"submit\">ログイン</button>
+</form>
+</main>
+</body>
+</html>"
+    );
+
+    (
+        [
+            (CONTENT_TYPE, "text/html; charset=utf-8"),
+            (CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Handles `POST /auth/debug/login` (debug login only).
+///
+/// The trimmed account name is the whole credential: an unknown name creates an
+/// account, a known name reuses it. The subject is derived from the name and
+/// hashed with the instance salt, then a session is issued and the browser is
+/// sent back to `return_to` with the `session_id` cookie.
+async fn debug_login_submit_handler(
+    State(state): State<AppState>,
+    Form(form): Form<DebugLoginForm>,
+) -> Response {
+    if !state.is_debug_login() {
+        return error_response(StatusCode::NOT_FOUND, "Debug login is not enabled");
+    }
+
+    let return_to = match debug_return_to(&state, form.return_to.as_deref()) {
+        Ok(value) => value.to_string(),
+        Err(response) => return response,
+    };
+
+    let Some(identity) = state.auth.debug_identity(&form.account_name) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "account_name must be 1..={MAX_DEBUG_ACCOUNT_NAME_LEN} characters without control \
+                 characters"
+            ),
+        );
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let (_account, session) = match issue_account_session(&state, identity, now) {
+        Ok(values) => values,
+        Err((status, message)) => return error_response(status, message),
+    };
+
+    let secure = state.public_url.trim().starts_with("https://");
+    match with_session_cookie(redirect_response(&return_to), session.session_id, secure) {
+        Some(response) => response,
+        None => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to build session cookie",
+        ),
+    }
 }
 
 /// Handles `GET /api/account/{account_id}`.

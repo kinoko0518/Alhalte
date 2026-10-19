@@ -28,6 +28,7 @@ CLI（`CliArgs`）:
 - `--room-tin` / `ALHALTE_ROOM_TIN`: 復元する `RoomData` の 64 hex tin id。指定時は必ず cellar から復元し、失敗したら起動しない。
 - `--service-token` / `ALHALTE_SERVICE_TOKEN`: 内部書き込み用トークン（後方互換。argv に出るので非推奨）。値はログに出さない。
 - `--service-token-file` / `ALHALTE_SERVICE_TOKEN_FILE`: 内部書き込み用トークンを 0600 file から読む。maitre-d が Bistrot から受け取った path をそのまま転送する。
+- `--no-persist` / `ALHALTE_NO_PERSIST`: cellar への永続化を切る。`CellarSink` が `InMemoryCellarSink` になり、`RoomData` / log chunk / scene はプロセスのメモリにだけ存在する。`--room-tin` とは併用できない（復元する永続物がない）。`maitre-d --debug-login` が常に付ける（Issue #150）。
 - 秘密 file は `alhalte_banquette::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
 
 ### 主な公開型
@@ -110,6 +111,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 - 保存に成功すると、直前の head tin を `CellarSink::unregister_tin` で best-effort に解放する。現在の head は解放しない。解放失敗は警告ログのみで、保存自体は成功扱い。
 - graceful shutdown（idle による `ShouldExit`、`run_until_shutdown`、または standalone バイナリの SIGTERM / SIGINT）では終了直前に `persist` をもう一度行い、`RoomPersisted` を送ってからソケットを閉じる。SIGTERM / SIGINT は `main.rs` で `watch` channel に配線し、`run_until_shutdown` へ渡す。
 - `room_id → head tin` のポインタは `alhalte-maitre-d` の `room_heads` が持つ。banquette 自身は head を永続化しない。
+- `--no-persist` では `CellarSink` が `InMemoryCellarSink` になる。heartbeat の定期 persist も graceful shutdown の最終 persist も成功し `RoomPersisted` を報告するが、tin はプロセスのメモリにしか無い。`maitre-d --debug-login` は head を記録しないので、報告された tin が復元に使われることはなく、プロセス終了とともに部屋は消える。`alhalte-cellar` への書き込み・`unregister` は一切発生しない。
 
 ### クライアント接続
 
@@ -198,4 +200,4 @@ load 後と権限変更後に呼び、次を検証する。違反は `InvalidRoo
 - graceful shutdown の経路は idle 終了と `run_until_shutdown`（および standalone バイナリの SIGTERM / SIGINT）。SIGTERM / SIGINT は `main.rs` で捕捉し、最終 persist を含む同じ graceful path に入る。シグナル配線そのものはプロセス起動を伴う統合テスト（`tests/spec_tests.rs` の `test_sigterm_runs_graceful_final_persist`）で確認する。
 - `Room::load_from_cellar` の download は cellar 側で認証されない（現行 cellar の download は session 検証を行わない）。service token は書き込みだけを守る。
 - `maitre-d` が記録した head が別インスタンスの persist で置き換わった場合、`maitre-d` はその旧 head を unregister しない（banquette が自分の直前 head だけを解放する）。
-
+- `--no-persist` では `CellarSink::download_tin` もプロセスのメモリだけを見る。別プロセスの tin（別インスタンスが保存した部屋、通常 cellar のアセット）は取得できないので、`--room-tin` を併用できない。

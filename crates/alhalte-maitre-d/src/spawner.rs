@@ -45,6 +45,7 @@ pub struct ProcessBanquetteSpawner {
     chunk_size_exponent: u8,
     service_token: Option<String>,
     service_token_file: Option<PathBuf>,
+    no_persist: bool,
 }
 
 impl std::fmt::Debug for ProcessBanquetteSpawner {
@@ -59,6 +60,7 @@ impl std::fmt::Debug for ProcessBanquetteSpawner {
                 &self.service_token.as_ref().map(|_| "<redacted>"),
             )
             .field("service_token_file", &self.service_token_file)
+            .field("no_persist", &self.no_persist)
             .finish()
     }
 }
@@ -78,7 +80,26 @@ impl ProcessBanquetteSpawner {
             chunk_size_exponent,
             service_token: None,
             service_token_file: None,
+            no_persist: false,
         }
+    }
+
+    /// Disables room state persistence in every spawned banquette.
+    ///
+    /// `maitre-d --debug-login` sets this: banquette keeps room state and log
+    /// chunks in process memory (`--no-persist`) instead of writing them to the
+    /// shared `alhalte-cellar`, so a debug instance never touches the normal
+    /// cellar (Issue #150).
+    #[must_use]
+    pub fn with_no_persist(mut self) -> Self {
+        self.no_persist = true;
+        self
+    }
+
+    /// Returns whether spawned banquette processes run with `--no-persist`.
+    #[must_use]
+    pub fn is_no_persist(&self) -> bool {
+        self.no_persist
     }
 
     /// Configures the internal cellar service token passed to spawned banquette processes.
@@ -139,6 +160,11 @@ impl ProcessBanquetteSpawner {
         if let Some(path) = self.service_token_file.as_deref() {
             args.push("--service-token-file".to_string());
             args.push(path.display().to_string());
+        }
+
+        // Debug login: no room state or log chunk may reach the shared cellar.
+        if self.no_persist {
+            args.push("--no-persist".to_string());
         }
 
         args

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alhalte_banquette::cellar_sink::HttpCellarSink;
+use alhalte_banquette::cellar_sink::{CellarSink, HttpCellarSink, InMemoryCellarSink};
 use alhalte_banquette::cli::parse_cli_args;
 use alhalte_banquette::room::Room;
 use alhalte_banquette::server::{BanquetteServer, ServerConfig};
@@ -20,18 +20,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.socket
     );
 
-    // The token comes from a 0600 file when maitre-d forwards one; argv and the
-    // environment stay backward compatible (Issue #194).
-    let service_token = args.resolve_service_token()?;
-    let mut cellar = HttpCellarSink::new(args.cellar_url);
-    match service_token {
-        Some(token) => cellar = cellar.with_service_token(token),
-        None => tracing::warn!(
-            "No --service-token-file configured: room state persistence will fail unless cellar \
-             accepts the write through a user session"
-        ),
-    }
-    let cellar = Arc::new(cellar);
+    // `--no-persist` (maitre-d --debug-login) keeps everything in process memory:
+    // no write, unregister, or download ever reaches the shared cellar, so a
+    // debug instance cannot disturb a real one (Issue #150).
+    let cellar: Arc<dyn CellarSink> = if args.no_persist {
+        tracing::warn!(
+            "No-persist mode: room {:016x} state and log chunks stay in process memory and are \
+             never written to cellar",
+            args.room_id
+        );
+        Arc::new(InMemoryCellarSink::new())
+    } else {
+        // The token comes from a 0600 file when maitre-d forwards one; argv and
+        // the environment stay backward compatible (Issue #194).
+        let service_token = args.resolve_service_token()?;
+        let mut cellar = HttpCellarSink::new(args.cellar_url);
+        match service_token {
+            Some(token) => cellar = cellar.with_service_token(token),
+            None => tracing::warn!(
+                "No --service-token-file configured: room state persistence will fail unless \
+                 cellar accepts the write through a user session"
+            ),
+        }
+        Arc::new(cellar)
+    };
 
     // A persisted head must be restored; a failure here aborts startup instead of
     // silently starting an empty room.

@@ -91,6 +91,13 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         args.push(origin);
     }
 
+    // Issue #150: debug login is opt-in. maitre-d then picks the isolated
+    // `<data-dir>/maitre-d-debug.sqlite3` database itself, so no extra path is
+    // passed here.
+    if config.maitre_d.debug_login {
+        args.push("--debug-login".to_string());
+    }
+
     args
 }
 

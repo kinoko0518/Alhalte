@@ -50,6 +50,10 @@ client-secret = """
 salt = "REPLACE_WITH_RANDOM_INSTANCE_SALT"
 # public-url は OAuth の redirect_uri の基点。省略時は restaurant.domain から導出。
 # public-url = "https://vtt.example.com"
+# 開発専用: アカウント名だけでサインインできるデバッグログインを有効にする。
+# 有効時は別 DB（<data-dir>/maitre-d-debug.sqlite3）が使われ、banquette は
+# cellar へ永続化しない。公開インスタンスでは絶対に有効にしない（Issue #150）。
+# debug-login = false
 
 [cellar]
 port = 8081

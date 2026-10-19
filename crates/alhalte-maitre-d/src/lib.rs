@@ -13,6 +13,11 @@
 //! - **Session Expiration at 4:00 AM**: Issues 64-bit session IDs (`alhalte/maitre-d/session-id`) with heartbeat
 //!   tracking. Every day at 4:00 AM local time, all sessions without a heartbeat since the previous 4:00 AM
 //!   are purged.
+//! - **Session Verification & Debug Login**: Exposes verification endpoints compatible with `alhalte-cellar`
+//!   and, with `--debug-login`, an isolated debug login. [`AuthProvider`] switches between the Google
+//!   OAuth flow and [`DebugAuthProvider`]; the debug flow accepts an account name alone, creates the
+//!   account on first use, and stores everything in a separate SQLite file
+//!   ([`CliArgs::active_db_path`]) so the normal database is never opened.
 //! - **Session Verification & Debug Accounts**: Exposes verification endpoints compatible with `alhalte-cellar`
 //!   and, in debug builds, creates throwaway accounts keyed by an unguessable synthetic subject.
 //! - **WebSocket Demultiplexer & Banquette Spawner**: Inspects incoming WebSocket headers (`X-Alhalte-Room`),
@@ -44,6 +49,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod auth;
 pub mod cli;
 pub mod crypto;
 pub mod db;
@@ -57,7 +63,12 @@ pub mod server;
 pub mod session;
 pub mod spawner;
 
-pub use cli::{CliArgs, parse_cli_args, parse_cli_args_from};
+pub use auth::{
+    AuthIdentity, AuthKind, AuthProvider, DEBUG_SUBJECT_PREFIX, DEFAULT_HANDLE_NAME,
+    DebugAuthProvider, GoogleAuthProvider, MAX_DEBUG_ACCOUNT_NAME_LEN, parse_debug_account_name,
+    percent_encode,
+};
+pub use cli::{CliArgs, DEBUG_DB_FILE_NAME, parse_cli_args, parse_cli_args_from};
 pub use crypto::{SUB_HASH_BYTES, SUB_HASH_HEX_LEN, SubHash, hash_sub};
 pub use db::{Account, Database, OAUTH_STATE_TTL_SECS, Room, Session};
 pub use error::{MaitreDError, Result};
@@ -71,10 +82,11 @@ pub use oauth::{GoogleOAuthProvider, GoogleUserInfo, MockOAuthProvider, OAuthPro
 pub use room_id::{RoomId, RoomIdParseError, parse_room_id};
 pub use server::{
     AccountResponse, AccountSearchItem, AppState, AuthResponse, CreateRoomRequest,
-    DEFAULT_ALLOWED_ORIGINS, DEFAULT_PUBLIC_URL, MAX_ROOM_NAME_LEN, OAuthLoginQuery,
-    RoomInfoResponse, RoomPermissionItem, RoomRole, RoomSessionQuery, SESSION_COOKIE_MAX_AGE_SECS,
-    SearchAccountsQuery, SessionResponse, SetRoomPermissionRequest, VerifySessionQuery,
-    VerifySessionResponse, create_router, extract_session_id_from_cookie, is_allowed_return_to,
+    DEFAULT_ALLOWED_ORIGINS, DEFAULT_PUBLIC_URL, DebugLoginForm, DebugLoginQuery,
+    MAX_ROOM_NAME_LEN, OAuthLoginQuery, RoomInfoResponse, RoomPermissionItem, RoomRole,
+    RoomSessionQuery, SESSION_COOKIE_MAX_AGE_SECS, SearchAccountsQuery, ServerInfoResponse,
+    SessionResponse, SetRoomPermissionRequest, VerifySessionQuery, VerifySessionResponse,
+    create_router, extract_session_id_from_cookie, is_allowed_return_to,
     parse_session_id_from_cookie_str, session_cookie_header,
 };
 pub use session::{

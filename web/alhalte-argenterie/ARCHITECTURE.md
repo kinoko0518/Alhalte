@@ -107,6 +107,16 @@
 3. 成功時だけ、返却された `room_id` とクライアント生成の部屋鍵から招待 URL を作り、最近の部屋へ保存して入室する。`role` はサーバーが返した値を localStorage 互換の `isAdmin` に反映するだけ。
 4. 401 はサインイン導線、403 / 通信失敗 / その他の HTTP 失敗はダイアログ内のエラーとして表示し、ローカル部屋の作成や入室は行わない。ダイアログは開いたまま再試行できる。
 
+### デバッグログインの警告（Issue #150）
+
+ホーム画面は mount 時に `fetchServerInfo`（`GET /api/server-info`）を呼び、`debug_login === true` なら全画面警告を出す。`alhalte-maitre-d --debug-login` は account 名だけでサインインできるため、公開インスタンスで有効にしてはならない。
+
+- 警告は `role="alert"` の fixed 全画面レイヤ（`data-testid="debug-login-warning"`）。ホーム画面の内容の上に重ねる。
+- 中央大文字の見出し「管理者向けの警告」と、本文「現在デバッグログインが有効になっています。公開されるインスタンスでこの機能を利用するのは推奨されません。」
+- 閉じるボタンは置かない（警告を消して通常運用に見せかけられないようにする）。
+- `fetchServerInfo` は 404 / 通信失敗 / 不正な body をすべて `{ debug_login: false }` に落とす。警告の取得失敗でホーム画面を壊さない。
+- サインイン導線は従来どおり `GET /auth/login` のままで、debug 時は maitre-d が `/auth/debug/login` へ 302 する。argenterie 側に分岐は無い。
+
 ### 門前払い画面
 
 `GateScreen` はフィールドやコントロールパネルの代わりに全画面で表示する。4 段階 role では `denied` がこれに当たる（preflight の 403、role が `denied` の応答、WebSocket の `1008` / `4403` / `4404`）。

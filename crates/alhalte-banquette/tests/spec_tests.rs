@@ -1335,3 +1335,91 @@ async fn test_sigterm_runs_graceful_final_persist() {
         "banquette must exit cleanly, got {status:?}"
     );
 }
+
+// spec: alhalte-maitre-d/debug-login 0002 --no-persist keeps the room out of cellar
+#[tokio::test]
+async fn test_no_persist_never_writes_cellar() {
+    use alhalte_cellar::{CellarService, InMemorySessionVerifier};
+
+    // A real cellar HTTP service: anything uploaded would be visible here.
+    let storage = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    let service =
+        Arc::new(CellarService::new_with_in_memory_db(storage.path(), verifier, false).unwrap());
+    let app = Arc::clone(&service).into_router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cellar_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = tempdir().unwrap();
+    let sock_path = dir.path().join("banquette.sock");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_alhalte-banquette"))
+        .args(["--room-id", "6161616161616161", "--admin", "10"])
+        .arg("--socket")
+        .arg(&sock_path)
+        .arg("--cellar-url")
+        .arg(format!("http://{cellar_addr}"))
+        .args(["--heartbeat-interval-secs", "3600", "--no-persist"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the banquette binary");
+
+    for _ in 0..100 {
+        if sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sock_path.exists(), "banquette did not bind its UNIX socket");
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+    let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+    // The room works without any cellar round trip.
+    writer.send(MaitreDToBanquette::Ping).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
+            Ok(Some(Ok(BanquetteToMaitreD::Pong))) => break,
+            Ok(Some(Ok(_))) => continue,
+            other => panic!("expected Pong from the no-persist binary: {other:?}"),
+        }
+    }
+    // Give the spawned signal task a chance to install its handlers.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let pid = child.id().expect("child pid");
+    // SAFETY: `kill(2)` is an FFI call to the OS and `pid` is a live child of
+    // this test; no pointer or Rust memory is involved.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(sent, 0, "failed to send SIGTERM to banquette");
+
+    // The final persist still succeeds against the in-memory sink and reports a
+    // head, but that tin must not exist in the real cellar.
+    let mut persisted = None;
+    for _ in 0..40 {
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, .. }))) =
+            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
+        {
+            persisted = Some(tin_id);
+            break;
+        }
+    }
+    let tin_id = persisted.expect("the final in-memory persist must report a tin");
+    assert!(
+        service.download(&tin_id, None).await.is_err(),
+        "no-persist must keep the room out of the shared cellar"
+    );
+
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("banquette must exit after SIGTERM")
+        .unwrap();
+    assert!(
+        status.success(),
+        "banquette must exit cleanly, got {status:?}"
+    );
+}

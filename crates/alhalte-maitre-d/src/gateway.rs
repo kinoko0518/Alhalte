@@ -71,6 +71,10 @@ impl RoomBridge {
     /// `RoomData` tin pointer. The spawner restores the room from it, so a
     /// bridge is never silently created around an empty room when a head exists.
     ///
+    /// `persist_head` controls `room_heads`: when false (debug login) a reported
+    /// `RoomPersisted` is not recorded, because the room process keeps its state
+    /// in memory and the tin would be gone after a restart.
+    ///
     /// # Errors
     ///
     /// Returns an error when the spawner fails (including a persisted head that
@@ -82,6 +86,7 @@ impl RoomBridge {
         room_head: Option<TinId>,
         spawner: Arc<dyn BanquetteSpawner>,
         db: Database,
+        persist_head: bool,
         on_terminated: impl Fn(u64) + Send + Sync + 'static,
     ) -> Result<Self> {
         let clients = Arc::new(RwLock::new(HashMap::new()));
@@ -134,6 +139,7 @@ impl RoomBridge {
                         Self::dispatch_banquette_frame(
                             frame,
                             room_id,
+                            persist_head,
                             &db,
                             &bridge_clients,
                             &bridge_scenes,
@@ -198,9 +204,14 @@ impl RoomBridge {
     }
 
     /// Dispatches frames received from `banquette` to connected WebSocket clients and pending queries.
+    ///
+    /// `persist_head` is forwarded to the `RoomPersisted` arm: a debug-login
+    /// instance runs banquette with `--no-persist`, so the reported tin does not
+    /// survive the process and must not become a `room_heads` row.
     async fn dispatch_banquette_frame(
         frame: BanquetteToMaitreD,
         room_id: u64,
+        persist_head: bool,
         db: &Database,
         clients: &Arc<RwLock<HashMap<u64, mpsc::Sender<ServerFrame>>>>,
         client_scenes: &Arc<RwLock<HashMap<u64, String>>>,
@@ -263,6 +274,16 @@ impl RoomBridge {
             // keeps no copy of it (Issue #200). Only the head pointer is
             // recorded, and only after banquette reports a successful store.
             BanquetteToMaitreD::RoomPersisted { tin_id, .. } => {
+                if !persist_head {
+                    // Debug login: banquette runs with `--no-persist`, so the
+                    // reported tin only lives in that process. Recording it would
+                    // make the next spawn fail to restore an in-memory room.
+                    tracing::debug!(
+                        "room {room_id:016x} persisted tin {} in memory only (no-persist)",
+                        hex::encode(tin_id)
+                    );
+                    return;
+                }
                 let room_id_hex = format!("{room_id:016x}");
                 match db.set_room_head(&room_id_hex, &tin_id, unix_timestamp()) {
                     Ok(previous) => {
@@ -635,19 +656,41 @@ pub struct RoomBridgeManager {
     rooms: Arc<RwLock<HashMap<u64, Arc<RoomBridge>>>>,
     spawner: Arc<dyn BanquetteSpawner>,
     db: Database,
+    persist_head: bool,
 }
 
 impl RoomBridgeManager {
     /// Creates a new [`RoomBridgeManager`].
     ///
     /// The database is used to read the persisted room head before spawning
-    /// banquette and to record the head reported by `RoomPersisted`.
+    /// banquette and to record the head reported by `RoomPersisted`. Use
+    /// [`RoomBridgeManager::without_persistence`] to disable both, as
+    /// `maitre-d --debug-login` does.
     pub fn new(spawner: Arc<dyn BanquetteSpawner>, db: Database) -> Self {
         Self {
             rooms: Arc::new(RwLock::new(HashMap::new())),
             spawner,
             db,
+            persist_head: true,
         }
+    }
+
+    /// Stops reading and recording `room_heads` (Issue #150).
+    ///
+    /// With `--debug-login` the spawned banquette runs with `--no-persist`: room
+    /// state lives in that process and disappears with it. Restoring from a
+    /// recorded head would fail, so the debug instance starts every room fresh
+    /// and leaves the (debug) `room_heads` table untouched.
+    #[must_use]
+    pub fn without_persistence(mut self) -> Self {
+        self.persist_head = false;
+        self
+    }
+
+    /// Returns whether `room_heads` is read and written.
+    #[must_use]
+    pub fn persists_room_heads(&self) -> bool {
+        self.persist_head
     }
 
     /// Obtains an existing [`RoomBridge`] or launches a new one from the persisted head.
@@ -674,7 +717,11 @@ impl RoomBridgeManager {
         }
 
         let room_id_hex = format!("{room_id:016x}");
-        let room_head = self.db.get_room_head(&room_id_hex)?;
+        let room_head = if self.persist_head {
+            self.db.get_room_head(&room_id_hex)?
+        } else {
+            None
+        };
 
         let rooms_ref = Arc::clone(&self.rooms);
         let on_term = move |rid: u64| {
@@ -691,6 +738,7 @@ impl RoomBridgeManager {
                 room_head,
                 Arc::clone(&self.spawner),
                 self.db.clone(),
+                self.persist_head,
                 on_term,
             )
             .await?,

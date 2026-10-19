@@ -56,7 +56,8 @@ client-secret = """
 -----END AGE ENCRYPTED FILE-----
 """
 salt = "..."
-# db-path, socket-dir, banquette-bin, cellar-url は任意
+# db-path, socket-dir, banquette-bin, cellar-url, public-url は任意
+# debug-login = false   # 開発専用。true で maitre-d --debug-login を有効にする（Issue #150）
 
 [cellar]
 port = 8081
@@ -85,7 +86,7 @@ path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
 enabled = true
 ```
 
-`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。`cellar.service-token` は設定する場合のみ非空でなければならない。
+`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。`cellar.service-token` は設定する場合のみ非空でなければならない。`maitre-d.debug-login` は既定 `false` で、真偽値のみ。true はローカル開発専用で、起動する maitre-d は account 名だけでサインインできる状態になる（検証では禁止しないが、ドキュメントで明示する）。
 
 ### 秘密値の扱い（Issue #194）
 
@@ -108,6 +109,7 @@ enabled = true
 | `cellar.maitre-d-url` | `http://{restaurant.host}:{maitre-d.port}`（`0.0.0.0` / `::` は `127.0.0.1`） |
 | `cellar.maitre-d-socket` | なし（指定時は `maitre-d-url` より優先） |
 | `cellar.allow-all-sessions` | `false` |
+| `maitre-d.debug-login` | `false`（debug 時の DB は `{data_dir}/maitre-d-debug.sqlite3` を maitre-d が選ぶ） |
 | `banquette.socket-dir` | `{socket_dir}` |
 | 秘密 file | `{data_dir}/secrets/` |
 
@@ -125,7 +127,7 @@ enabled = true
 
 ### 引数生成
 
-- `generate_maitre_d_args`: host、port、db-path、client-id、salt、socket-dir、cellar-url、chunk-size-exponent、`--client-secret-file <data-dir>/secrets/maitre-d-client-secret`。`banquette-bin` があれば追加。`cellar.service-token` があれば `--service-token-file <data-dir>/secrets/cellar-service-token` を追加する（maitre-d が各 banquette へ path を伝播する）。
+- `generate_maitre_d_args`: host、port、db-path、client-id、salt、socket-dir、cellar-url、chunk-size-exponent、`--client-secret-file <data-dir>/secrets/maitre-d-client-secret`。`banquette-bin` があれば追加。`cellar.service-token` があれば `--service-token-file <data-dir>/secrets/cellar-service-token` を追加する（maitre-d が各 banquette へ path を伝播する）。`maitre-d.debug-login` が true なら `--debug-login` を追加する。debug 用 DB path は渡さない（maitre-d が `--db-path` の隣の `maitre-d-debug.sqlite3` を自分で選ぶ）。
 - `generate_cellar_args`: host、port、storage-path、db-path、session verifier（`cellar.maitre-d-socket` があれば `--maitre-d-socket <path>`、なければ `--maitre-d-url <url>`）、`allow-all-sessions` が true のとき `--allow-all-sessions`、`anti-oracle` が true のとき `--anti-oracle`、`cellar.service-token` があれば `--service-token-file <path>`。既定の URL は `http://{restaurant.host}:{maitre-d.port}`。
 
 `alhalte-banquette` は `alhalte-maitre-d` が部屋ごとに起動し、`--room-id` / `--admin` / `--socket` / `--chunk-size-exponent` / `--room-tin` / `--service-token-file` を spawner が組み立てるため、bistrot は静的な banquette 引数を生成しない。`[banquette] chunk-size-exponent` と `[cellar] service-token` は `generate_maitre_d_args` 経由で maitre-d に渡り、spawner が各 banquette に伝播する。
@@ -165,6 +167,7 @@ enabled = true
 - `nix run .#bistrot` は systemd が使えない環境ではバックグラウンドプロセスへフォールバックする。この処理は `flake.nix` の `bistrot-runner` 側にある。
 - argenterie は開発サーバー（Vite）として起動する。本番配信の unit は未定義。
 - `Bistrot.toml` の `maitre-d` と `cellar` は必須。`restaurant`、`banquette`、`argenterie`、`extensions` は既定値を持つ。
+- `maitre-d.debug-login` は開発専用のスイッチで、Bistrot は検証で止めない（`--debug-login` を渡すだけ）。debug 時の DB は `{data_dir}/maitre-d-debug.sqlite3` を maitre-d が選び、banquette は `--no-persist` で起動するため、通常 DB / 通常 cellar は変更されない。本番の `Bistrot.toml` では false のままにする。
 - `cellar.allow-all-sessions` はローカル開発専用。有効時は `alhalte-cellar` が警告を出し、session 検証をすべて許可する。verifier が未設定でこのフラグも false の場合、`alhalte-cellar` は全拒否の verifier に落ちず起動エラーになる。
 - `cellar.service-token` は age armor で暗号化して保持する前提。リポジトリ同梱の `Bistrot.toml` はローカル開発専用の平文既定値 `alhalte-local-service-token` を設定し、`ALHALTE_ALLOW_PLAINTEXT_SECRETS=1`（flake.nix の bistrot-runner が設定）でのみ読み込める。実 credential は `Bistrot.local.toml`（gitignore）に armored 値で置く（未設定・空文字は不可、未設定のままでは persistence が cellar に拒否される）。
 - 生成される systemd unit の `ExecStart` に秘密値は含まれない（`--client-secret-file` / `--service-token-file` の path のみ）。unit ファイルと `ps` から秘密を読めない代わりに、`<data-dir>/secrets/` の 0600 file を読む権限モデルに依存する。`--service-token` / `--client-secret` の argv 指定は後方互換のため受理するが、Bistrot は生成しない。
