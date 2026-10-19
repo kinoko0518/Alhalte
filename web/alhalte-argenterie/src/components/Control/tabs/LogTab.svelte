@@ -20,6 +20,7 @@
   import { ChunkLogManager, logRecordContentTin, readLogBiblioHead } from '../../../utils/log.js';
   import { tinToLogRecord, type RoomSocket } from '../../../utils/roomSocket.js';
   import {
+    characterNamesSignature,
     clearSaignantCache,
     initSaignant,
     renderGenerast,
@@ -277,9 +278,9 @@
           if (renderVersion !== currentVersion) {
             return;
           }
-          nextMap[r.id] = await renderGenerast(ast);
+          nextMap[r.id] = await renderGenerast(ast, characters);
         } catch {
-          nextMap[r.id] = renderGenerastSync(r.content);
+          nextMap[r.id] = renderGenerastSync(r.content, characters);
         }
         changed = true;
       }
@@ -320,6 +321,24 @@
         void updateRenderedHtml(messages);
       });
     }
+  });
+
+  // Saignant ABI v2 resolves mentions / fluct / assign names from the current
+  // character list (Issue #163). A CharacterList or CharacterInfo update changes
+  // the signature; drop both the component-level HTML map and the WASM render
+  // cache so no message keeps a name that no longer exists.
+  let characterSignature = $derived(characterNamesSignature(characters));
+  let lastCharacterSignature = characterNamesSignature(characters);
+
+  $effect(() => {
+    const currentSignature = characterSignature;
+    if (currentSignature === lastCharacterSignature) return;
+    lastCharacterSignature = currentSignature;
+    untrack(() => {
+      clearSaignantCache();
+      renderedContentMap = {};
+      void updateRenderedHtml(messages);
+    });
   });
 
   function refreshLogs() {
@@ -641,7 +660,7 @@
 
                 <!-- 2nd Row: Generast rendered HTML via Saignant WASM -->
                 <div class="msg-content saignant-content" data-testid="msg-content-{record.id}">
-                  {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content)}
+                  {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content, characters)}
                 </div>
               </div>
             </div>

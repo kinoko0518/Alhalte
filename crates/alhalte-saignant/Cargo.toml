@@ -13,10 +13,14 @@ tin = { path = "../tin-rs" }
 generast = { path = "../generast-rs" }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive", "alloc"] }
+serde_json = "1.0"
 postcard = { version = "1.0", features = ["alloc"] }
 
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { version = "0.2", features = ["custom"] }
 
 [dev-dependencies]
+# Reads the committed `public/wasm/alhalte_saignant.wasm` artifact so the ABI
+# version / exports cannot drift from the Rust source (Issue #163).
+wasmparser = "0.244"
 

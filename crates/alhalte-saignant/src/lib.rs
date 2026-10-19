@@ -47,6 +47,7 @@ pub mod log;
 pub mod render;
 pub mod resolver;
 
+pub use abi::ABI_VERSION;
 pub use css::{CssCategory, CssLayer, category_css, expressive_css, full_css, structural_css};
 pub use datetime::{
     TimestampFormat, format_iso8601, format_japanese, format_standard, format_timestamp,

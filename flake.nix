@@ -163,12 +163,35 @@
             fi
           '';
         };
+
+        # Reproducible Saignant wasm build/stage (Issue #163).
+        saignantWasmRunner = pkgs.writeShellApplication {
+          name = "saignant-wasm";
+          runtimeInputs = [
+            pkgs.bash
+            toolchain
+            llvm.clang-unwrapped
+            llvm.lld
+            llvm.llvm
+            pkgs.coreutils
+          ];
+          text = ''
+            export CC_wasm32_unknown_unknown="${llvm.clang-unwrapped}/bin/clang"
+            export AR_wasm32_unknown_unknown="${llvm.llvm}/bin/llvm-ar"
+            export CFLAGS_wasm32_unknown_unknown="--target=wasm32-unknown-unknown"
+            exec bash "$PWD/scripts/build-saignant-wasm.sh"
+          '';
+        };
       in
       {
         apps = {
           bistrot = {
             type = "app";
             program = "${bistrotRunner}/bin/bistrot-runner";
+          };
+          saignant-wasm = {
+            type = "app";
+            program = "${saignantWasmRunner}/bin/saignant-wasm";
           };
           default = {
             type = "app";
@@ -178,6 +201,7 @@
 
         packages = {
           bistrot = bistrotRunner;
+          saignant-wasm = saignantWasmRunner;
           default = bistrotRunner;
         };
 

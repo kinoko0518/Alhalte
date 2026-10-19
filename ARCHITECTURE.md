@@ -115,7 +115,7 @@ client 総体 = cutlery
 
 1. `argenterie` は入力テキストを `Generast::String` として保持する。
 2. 表示時に有効な拡張機能を優先度昇順で適用し、`(Generast, speaker_id)` の Tin を左畳み込みする。
-3. 最終 Tin を `saignant` の `render_generast_abi` に渡し、HTML を得る。
+3. 最終 Tin と現在のキャラクター名マップを `saignant` の `render_generast_abi_v2` に渡し、HTML を得る。
 4. 送信時は `AppendLog` を `banquette` へ送る。banquette は scene log に追記し、同一シーンのクライアントへ `LogEventAppended` を配信する。
 5. chunk が満杯になると `alhalte/banquette/log/chunk` Tin に封入し、`cellar` へ保存する。
 
@@ -211,7 +211,7 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 | canner | クライアント側 wasm の `encode-*` / `encrypt-*` | Rust ライブラリとして実装済み。WASM ABI は未エクスポート。ブラウザでは `pantry` の TS 実装が暗号・展開を担う。 |
 | アセット | `pantry` が cellar から取得・復号・キャッシュ | `argenterie` は `pantry` の `encodeTin` で RoomKey 暗号化した Tin を maitre-d の `/api/cellar/*` proxy 経由で cellar へ保存し、進捗・失敗・再試行をカードに出す。room アセットのメタデータは `/` の state、personal は localStorage のみ。拡張 wasm も同じ経路で `tinId` だけを state に持つ。 |
 | kitchen の room key | ランダム 96bit nonce | `export_room_to_zip` / `export_room_to_tar_gz` は Zero Nonce で room-key 暗号化する。 |
-| saignant の WASM 実行 | キャラクター名を解決 | `render_generast_abi` は `NoopCharacterResolver` を使うため、メンションは `Anonymous` になる。 |
+| saignant の WASM 実行 | キャラクター名を解決 | ABI v2 の `render_generast_abi_v2(ptr, len, names_ptr, names_len)` が名前 JSON を受け取り、mention / `fluct` / `assign` を解決する。v1 は互換のため残し、名前なしでは `Anonymous` になる。 |
 | Markdown | 打ち消し線 `~~` を含む | パーサは `~~` を実装していない（自己紹介文には記載がある）。 |
 
 - 部屋の `done` は `rooms.done` に永続化済み。WS / `GET /api/rooms/{id}` / export の pre-spawn 判定は DB を参照するため、`maitre-d` 再起動後も公開部屋に非メンバーが入れる。`RoomPersisted.done` で復元された `RoomData.done` も書き戻す。

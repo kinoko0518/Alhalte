@@ -2,7 +2,7 @@
 
 > 上位文書: [../../ARCHITECTURE.md](../../ARCHITECTURE.md)  
 > 実装: `crates/alhalte-saignant`  
-> テスト: `crates/alhalte-saignant/tests/{log_test,render_test,css_test,escape_test,abi_test}.rs`
+> テスト: `crates/alhalte-saignant/tests/{log_test,render_test,css_test,escape_test,abi_test,artifact_test}.rs`
 
 ## 責務
 
@@ -40,12 +40,25 @@ duck-typed なキー:
 
 ### WASM ABI
 
-`wasm32` 向けに以下をエクスポートする。
+`wasm32` 向けに以下をエクスポートする。現行バージョンは `2`。
 
-- `alhalte_abi_version() -> i32`（1）
+- `alhalte_abi_version() -> i32`（2）。Rust 定数 `abi::ABI_VERSION` と一致する。
 - `alloc(len) -> *mut u8`、`dealloc(ptr, len)`
-- `render_generast_abi(ptr, len) -> u64`: Generast Tin を受け取り、HTML を `(ptr << 32) | len` で返す。
-- `get_full_css_abi() -> u64`: `full_css()` を同じ形式で返す。
+- `render_generast_abi(ptr, len) -> u64`（v1、互換のため残す）: Generast Tin を受け取り、`NoopCharacterResolver` で HTML を `(ptr << 32) | len` で返す。mention は `Anonymous` のまま。
+- `render_generast_abi_v2(ptr, len, names_ptr, names_len) -> u64`（v2）: 入力は v1 と同じ。加えて UTF-8 JSON `{ "<character id>": "<display name>" }` を受け取り、`HashMap<u64, String>` を `CharacterResolver` として使う。`names_ptr = null, names_len = 0` は名前なしとして扱う。JSON が不正、またはキーが decimal `u64` でない場合はそのキーを無視し、該当 mention は `Anonymous` にフォールバックする。
+- `get_full_css_abi() -> u64`: `full_css()` を同じ形式で返す。v1 / v2 で変更しない。
+
+v2 は `character-id` の mention と、`fluct` / `assign` のキャラクター名部分に名前を適用する。名前は HTML エスケープして出力する。
+
+ビルドと配置は再現可能にするため、以下を使う。
+
+```bash
+nix run .#saignant-wasm
+# または
+nix develop -c ./scripts/build-saignant-wasm.sh
+```
+
+`scripts/build-saignant-wasm.sh` は `cargo build -p alhalte-saignant --target wasm32-unknown-unknown --release` の後、成果物を `web/alhalte-argenterie/public/wasm/alhalte_saignant.wasm` へコピーする。checkout / Cargo / sysroot のパスは `--remap-path-prefix` で固定し、`CARGO_INCREMENTAL=0` でビルドする。commit 済み wasm の `alhalte_abi_version` とエクスポートは `tests/artifact_test.rs` が Rust 定数・クライアント定数と突き合わせる。
 
 ## 内部フロー
 
@@ -80,16 +93,19 @@ duck-typed なキー:
 
 ### WASM
 
-`render_generast_abi` は以下を順に試す。
+`render_generast_abi` / `render_generast_abi_v2` は以下を順に試す。
 
 1. 入力を `Tin::from_plaintext` として読み、ラベルが `alhalte/generast` なら `Generast::from_tin`。
 2. 失敗したら `decode_ext_io`（`(Generast, u64)`）を試す。
 3. それも失敗したら生の postcard `Generast`、次に `(Generast, u64)` を試す。
 4. それでも失敗したら `syntax-error` の HTML を返す。
 
+v2 は名前 JSON を先に復号し、`HashMap<u64, String>` を resolver として同じ描画経路へ渡す。v1 は `NoopCharacterResolver` を渡す。
+
 ## 既知の差分・制約
 
-- `render_generast_abi` は `NoopCharacterResolver` を使う。WASM 経由の mention は常に `Anonymous` になる。ホスト側で名前を差し込むには ABI の拡張が必要。
+- v1 `render_generast_abi` は互換のため `NoopCharacterResolver` のまま残す。WASM 経由で名前を解決するホストは v2 を使う必要がある。
+- v2 の名前 JSON は表示名だけを受け取る。avatar URL は解決しない（ログ行の avatar はクライアントが別途 `characters` から引く）。
 - `render_generast_abi` は入力の Tin が wire 形式（opener 付き）か平文かを厳密に区別しない。`Tin::from_plaintext` を先に試すフォールバック順で吸収している。
 - HTML エスケープと CSS 色の sanitize は必須。`{@html}` に渡す前に saignant 側で処理する。
 - `LogEntry` の `extra` は未知キーを保持するが、描画には使わない。
