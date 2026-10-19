@@ -453,7 +453,8 @@ export function tinMapToCharacter(
     return isTinJson(value) ? tinToJson(value) : value;
   };
 
-  const name = read('std::name');
+  const stdName = read('std::name');
+  const name = typeof stdName === 'string' && stdName.length > 0 ? stdName : read('name');
   const initiative = read('initiative');
   const iconUrl = read('iconUrl');
   const color = read('color');
@@ -583,6 +584,13 @@ export interface SceneSummary {
   active_client_count?: number;
   /** Whether the scene is currently loaded in memory. */
   is_loaded?: boolean;
+  /**
+   * Character IDs present in the scene, as reported by `SceneSummary`.
+   *
+   * Clients rebuild `scene.members` from this list on reload / reconnect.
+   * Older servers omit the field; in that case the previous membership is kept.
+   */
+  present_characters?: number[];
 }
 
 /**
@@ -619,6 +627,13 @@ export function sceneListEntrySummary(entry: unknown): SceneSummary | null {
         ? { active_client_count: record.active_client_count }
         : {}),
       ...(typeof record.is_loaded === 'boolean' ? { is_loaded: record.is_loaded } : {}),
+      ...(Array.isArray(record.present_characters)
+        ? {
+            present_characters: record.present_characters
+              .map((id) => Number(id))
+              .filter((id) => Number.isFinite(id)),
+          }
+        : {}),
     };
   }
   return null;
@@ -925,54 +940,6 @@ export function entryToLogRecord(
   }
 
   return null;
-}
-
-/**
- * Parses raw server character data into a Character model.
- */
-export function parseCharacter(id: string | number, raw: any): Character {
-  let name = `Character ${id}`;
-  if (typeof raw?.name === 'string' && raw.name.length > 0) {
-    name = raw.name;
-  } else if (raw?.['std::name']) {
-    const val = raw['std::name'];
-    if (typeof val === 'string') {
-      name = val;
-    } else if (val && typeof val === 'object' && val.payload) {
-      try {
-        const bytes = Array.isArray(val.payload)
-          ? new Uint8Array(val.payload)
-          : val.payload instanceof Uint8Array
-            ? val.payload
-            : new Uint8Array(Object.values(val.payload));
-        name = new TextDecoder().decode(bytes);
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  return {
-    id: String(id),
-    name,
-    initiative: typeof raw?.initiative === 'number' ? raw.initiative : 0,
-    iconUrl: typeof raw?.iconUrl === 'string' ? raw.iconUrl : undefined,
-    color: typeof raw?.color === 'string' ? raw.color : undefined,
-    description: typeof raw?.description === 'string' ? raw.description : '',
-    reference: typeof raw?.reference === 'string' ? raw.reference : undefined,
-    statuses: Array.isArray(raw?.statuses) ? raw.statuses : [],
-    parameters: Array.isArray(raw?.parameters) ? raw.parameters : [],
-    chatPalette: typeof raw?.chatPalette === 'string' ? raw.chatPalette : '',
-    hideStatus: Boolean(raw?.hideStatus),
-    isNarrative: Boolean(raw?.isNarrative),
-    placedAsPiece: Boolean(raw?.placedAsPiece),
-    piecePosition:
-      raw?.piecePosition &&
-      typeof raw.piecePosition.x === 'number' &&
-      typeof raw.piecePosition.y === 'number'
-        ? { x: raw.piecePosition.x, y: raw.piecePosition.y }
-        : undefined,
-  };
 }
 
 /**
@@ -2312,7 +2279,10 @@ export class RoomSocket {
       const charList: Character[] = [];
       if (frame.CharacterList?.characters) {
         for (const [id, raw] of Object.entries(frame.CharacterList.characters)) {
-          charList.push(parseCharacter(id, raw));
+          // Decode the full Tin attribute map: statuses, parameters, chat
+          // palette, icon, color and piece placement must match the character
+          // tab instead of falling back to defaults (Issue #160).
+          charList.push(tinMapToCharacter(id, raw as Record<string, any>));
         }
       }
       this.characters = charList;
@@ -2322,7 +2292,7 @@ export class RoomSocket {
     // 7b. CharacterInfo updates a single character in the local cache.
     if ('CharacterInfo' in frame) {
       const { character_id, data } = frame.CharacterInfo;
-      const parsed = parseCharacter(character_id, data);
+      const parsed = tinMapToCharacter(character_id, data);
       const index = this.characters.findIndex((c) => c.id === String(character_id));
       if (index >= 0) {
         const next = [...this.characters];

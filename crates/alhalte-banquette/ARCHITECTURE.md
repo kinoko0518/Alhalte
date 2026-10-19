@@ -58,11 +58,12 @@ CLI（`CliArgs`）:
 
 `ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答、BGM 変更を持つ。`ServerFrame` はその結果と broadcast を返す。
 
-- `ListScenes` / `CreateScene` / `DeleteScene` / `MoveCharacter` の scene 一覧は `SceneSummary`（`id`、`name`、`present_character_count`、`active_client_count`、`is_loaded`）の列 `SceneList` として返す。`name` は scene state `std::name` の UTF-8 文字列で、未設定なら scene id、`/` は作成時に `メインシーン` が入る。
+- `ListScenes` / `CreateScene` / `DeleteScene` / `MoveCharacter` の scene 一覧は `SceneSummary`（`id`、`name`、`present_character_count`、`present_characters`、`active_client_count`、`is_loaded`）の列 `SceneList` として返す。`present_characters` は scene に在籍する character id の昇順リストで、クライアントはこれで `scene.members` を再構築する。`name` は scene state `std::name` の UTF-8 文字列で、未設定なら scene id、`/` は作成時に `メインシーン` が入る。`SceneSummary` は protocol 上の summary であり、`RoomData` / `SceneData` の wire schema は変えず、永続化は従来どおり `SceneData.present_characters` が持つ。
 - `CreateScene { scene_id, inherit_juices, name }` は `name` を `std::name` へ作成と同時に書き、`SceneCreated` を要求元へ返し、`SceneList` と新 scene の `SceneInfo` を room 全体へ broadcast する。`std::name` は juice 継承の対象外。
 - `UpdateState` で `key == "std::name"` が成功したときは `StateUpdated` の ack / scene broadcast に加えて `SceneInfo` を room 全体へ broadcast する。これにより他クライアントは再読み込みなしで rename を反映できる。
 - `EnterScene` 成功時、caller が `can_access_scene` を満たす場合はその scene の `StateSnapshot` を直接返す。クライアントは入室ごとの `QueryState` を必要としない（`QueryState` は従来どおり明示問い合わせ用に残る）。
-- `CreateScene` / `DeleteScene` の成功時は要求元へ `SceneCreated` / `SceneDeleted` を返し、更新後の scene 一覧を `SceneList` として room 全体へ broadcast する。`MoveCharacter` の成功時は `CharacterMoved` を返し、移動先 scene が暗黙に作られた場合は `SceneList` も broadcast する。
+- `CreateScene` / `DeleteScene` の成功時は要求元へ `SceneCreated` / `SceneDeleted` を返し、更新後の scene 一覧を `SceneList` として room 全体へ broadcast する。`MoveCharacter` の成功時は要求元への `CharacterMoved` ack に加えて room 全体へも `CharacterMoved` を broadcast し、移動元・移動先の `SceneInfo` を broadcast する。移動先 scene が暗黙に作られた場合は `SceneList` も broadcast する。ack と broadcast が重複してもクライアント側は冪等に適用する。
+- character の CRUD は room 全体へ同期する（#160）。`CreateCharacter` 成功時は要求元へ `CharacterCreated`（採番 id）を返し、room 全体へ `CharacterInfo { character_id, data }` と、新しい character が入った scene の `SceneInfo` を broadcast する。新規 character は要求元が現在入室している scene（不明なら `/`）に所属する。`UpdateCharacter` 成功時は `CharacterUpdated` ack と room 全体への `CharacterInfo`（保存後の属性）を送る。`DeleteCharacter` 成功時は `CharacterDeleted` を room 全体へ broadcast し、全 scene の `present_characters` から除去したうえで `SceneInfo` を、残っている `piece::<id>::placed` / `piece::<id>::pos` を削除して `StateDeleted` を broadcast する。scene membership は `Scene.present_characters` が正で、`character::<id>::scene` mirror は書かない。
 - state の `UpdateState` / `DeleteState` 成功時は、要求元への直接 ack と対象 scene への broadcast の両方を行う。ルート scene `/` の state は他 scene から編集される（アセット・拡張機能）ため、要求元が対象 scene に居なくても ack が届く。両方を受け取ったクライアントは同じ frame を 2 回適用するが、state 更新・削除は冪等。
 - `ClientFrame::ChangeBgm { scene_id, slot, tin_id }` は `tin_id` の 64 hex 文字列を `TinId` に復元し、`ChangeBgmEvent` を log に append する。成功は既存の `LogEventAppended` broadcast で観測できる。BGM の現在値は `std::bgm` / `std::bgm<N>` の state が持つ（slot 番号は任意）。
 
@@ -143,7 +144,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 
 ### character
 
-`CharacterBiblio` は `next_id` を単調増加させて ID を払い出す。作成時に `std::owner_account` がなければ作成者を設定する。更新・削除は所有者または管理者のみ。`MoveCharacter` は移動元 scene に `character-gone`、移動先に `character-came` の log を追記する。
+`CharacterBiblio` は `next_id` を単調増加させて ID を払い出す。作成時に `std::owner_account` がなければ作成者を設定する。更新・削除は所有者または管理者のみ。`MoveCharacter` は移動元 scene に `character-gone`、移動先に `character-came` の log を追記する。scene membership は各 `Scene.present_characters` が保持し、`RoomData` の `SceneData.present_characters` として永続化されるため、reload / reconnect 後も復元される。`character::<id>::scene` は write-only の mirror だったため廃止し、`SceneInfo` / `SceneList` の `present_characters` を正とする。
 
 ### export
 
