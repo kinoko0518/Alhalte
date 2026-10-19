@@ -24,6 +24,63 @@ pub fn format_tin_id(tin_id: &TinId) -> String {
     hex::encode(tin_id)
 }
 
+/// Maximum accepted length of a generic alias name, in bytes.
+///
+/// The longest name the ecosystem uses is `room/<16 hex>/head`, so the limit is
+/// generous while still bounding what a client can store in the primary key.
+pub const MAX_ALIAS_NAME_BYTES: usize = 256;
+
+/// Validates a generic alias name such as `room/<room_id>/head`.
+///
+/// An alias name is an opaque key, not a filesystem path, so `/` is allowed and
+/// hierarchical names are the intended use. Names must be 1..=
+/// [`MAX_ALIAS_NAME_BYTES`] bytes and consist only of ASCII letters, digits and
+/// `-`, `_`, `.`, `:`, `/`. Control characters, whitespace and non-ASCII bytes
+/// are rejected so a name can always be embedded in a URL path and a log line.
+///
+/// # Errors
+///
+/// Returns [`CellarError::InvalidAlias`] for an empty, over-long, or
+/// out-of-charset name. The message never echoes a rejected name.
+pub fn validate_alias_name(name: &str) -> Result<&str, CellarError> {
+    let allowed =
+        |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/');
+    if name.is_empty() {
+        return Err(CellarError::InvalidAlias(
+            "alias names must not be empty".to_string(),
+        ));
+    }
+    if name.len() > MAX_ALIAS_NAME_BYTES {
+        return Err(CellarError::InvalidAlias(format!(
+            "alias names must be at most {MAX_ALIAS_NAME_BYTES} bytes"
+        )));
+    }
+    if let Some(offset) = name.bytes().position(|byte| !allowed(byte)) {
+        return Err(CellarError::InvalidAlias(format!(
+            "alias names allow only ASCII alphanumerics and -_.:/ (offset {offset})"
+        )));
+    }
+    Ok(name)
+}
+
+/// Request body of `PUT /alias/{name}`.
+///
+/// The name travels in the URL path, so the body only carries the target tin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasRequest {
+    /// 256-bit tin ID the alias must point at.
+    #[serde(with = "hex_tin_id")]
+    pub tin_id: TinId,
+}
+
+/// Response body of `GET /alias/{name}` / `PUT /alias/{name}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AliasResponse {
+    /// 256-bit tin ID the alias points at.
+    #[serde(with = "hex_tin_id")]
+    pub tin_id: TinId,
+}
+
 /// Serde module to serialize/deserialize `TinId` as a hex string.
 pub mod hex_tin_id {
     use super::*;

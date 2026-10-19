@@ -101,19 +101,12 @@ fn test_new_frames_are_appended_and_roundtrip() {
         postcard::from_bytes::<BanquetteToMaitreD>(&bytes).unwrap(),
         permission_response
     );
-    let persisted = BanquetteToMaitreD::RoomPersisted {
-        tin_id: [7u8; 32],
-        default_permission: RoomPermissionLevel::Denied,
-    };
-    let bytes = postcard::to_allocvec(&persisted).unwrap();
-    assert_eq!(
-        postcard::from_bytes::<BanquetteToMaitreD>(&bytes).unwrap(),
-        persisted
-    );
 
     // The postcard variant index is a positional varint. Issue #199 removed
     // `SetDone` / `DoneUpdated` / `SetAdmins` / `AdminsUpdated`, so the indices
     // after the removed variant shifted; these values pin the new layout.
+    // Issue #192 removed `RoomPersisted` from `BanquetteToMaitreD` (the head is
+    // a cellar alias now), which shifts the control-channel indices below.
     assert_eq!(
         postcard::to_allocvec(&ClientFrame::HeartbeatResponse)
             .unwrap()
@@ -204,7 +197,7 @@ fn test_new_frames_are_appended_and_roundtrip() {
         })
         .unwrap()
         .first(),
-        Some(&7u8)
+        Some(&6u8)
     );
 }
 

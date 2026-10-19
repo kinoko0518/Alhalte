@@ -1331,3 +1331,314 @@ async fn test_user_session_owner_label_is_bound_to_the_session() {
         }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Issue #192: generic aliases (`room/<room_id>/head`) and GC reference union
+// ---------------------------------------------------------------------------
+
+// spec: alhalte-cellar/alias 0001 alias name validation
+#[test]
+fn test_alias_name_validation() {
+    // The room-head convention and other hierarchical names are accepted.
+    for name in [
+        "room/9f3a7c1e5b2d8046/head",
+        "room/777/head",
+        "a",
+        "A-Z_0.9:x",
+    ] {
+        assert_eq!(alhalte_cellar::validate_alias_name(name).unwrap(), name);
+    }
+
+    // Empty, over-long, whitespace, non-ASCII and URL-unsafe names are refused.
+    assert!(alhalte_cellar::validate_alias_name("").is_err());
+    assert!(alhalte_cellar::validate_alias_name("room head").is_err());
+    assert!(alhalte_cellar::validate_alias_name("room/ヘッド").is_err());
+    assert!(alhalte_cellar::validate_alias_name("room/*/head").is_err());
+    let too_long = "a".repeat(alhalte_cellar::MAX_ALIAS_NAME_BYTES + 1);
+    assert!(alhalte_cellar::validate_alias_name(&too_long).is_err());
+}
+
+// spec: alhalte-cellar/alias 0002 alias pointers round-trip through the database
+#[test]
+fn test_alias_database_round_trip() {
+    let conn = Database::open_in_memory().unwrap();
+    let name = "room/00000000000000aa/head";
+    let first = [0x01u8; 32];
+    let second = [0x02u8; 32];
+
+    // An unset alias has no target.
+    assert_eq!(Database::get_alias(&conn, name).unwrap(), None);
+
+    // The first write has no previous target; the second reports the old one.
+    assert_eq!(
+        Database::set_alias(&conn, name, &first, 1000).unwrap(),
+        None
+    );
+    assert_eq!(Database::get_alias(&conn, name).unwrap(), Some(first));
+    assert_eq!(
+        Database::set_alias(&conn, name, &second, 2000).unwrap(),
+        Some(first),
+        "the superseded alias target must be reported"
+    );
+    assert_eq!(Database::get_alias(&conn, name).unwrap(), Some(second));
+
+    // GC reads every alias target, not just tin_references rows.
+    assert_eq!(
+        Database::get_all_alias_tin_ids(&conn).unwrap(),
+        HashSet::from([second])
+    );
+    assert_eq!(
+        Database::get_all_referenced_tin_ids(&conn).unwrap(),
+        HashSet::new(),
+        "alias pointers are not tin_references rows"
+    );
+
+    // Aliases are independent per name and deletion is idempotent.
+    assert_eq!(Database::get_alias(&conn, "room/other/head").unwrap(), None);
+    assert!(Database::delete_alias(&conn, name).unwrap());
+    assert!(!Database::delete_alias(&conn, name).unwrap());
+    assert_eq!(Database::get_alias(&conn, name).unwrap(), None);
+}
+
+// spec: alhalte-cellar/alias 0003 HTTP alias API is service-token only
+#[tokio::test]
+async fn test_alias_http_api_requires_the_service_token() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    // Owner 7 holds a valid session: it must still not be allowed to write an alias.
+    verifier.allow(7, 70);
+    let service = Arc::new(
+        CellarService::new_with_in_memory_db(dir.path(), verifier, false)
+            .unwrap()
+            .with_service_token("service-secret"),
+    );
+    let app = Arc::clone(&service).into_router();
+
+    let (_, first) = create_test_tin("first room head");
+    let (_, second) = create_test_tin("second room head");
+    let name = "room/9f3a7c1e5b2d8046/head";
+    let uri = format!("/alias/{name}");
+    let json_body = serde_json::json!({ "tin_id": format_tin_id(&first) });
+
+    // Reads of an unset alias are 404.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // A user session is not an alias credential.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header("Content-Type", "application/json")
+                .header("X-Alhalte-Owner", "7")
+                .header("X-Alhalte-Session-Id", "70")
+                .body(Body::from(serde_json::to_vec(&json_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // No token and a wrong token both fail closed.
+    for token in [None, Some("wrong-secret")] {
+        let mut builder = Request::builder()
+            .method("PUT")
+            .uri(&uri)
+            .header("Content-Type", "application/json");
+        if let Some(token) = token {
+            builder = builder.header("X-Alhalte-Service-Token", token);
+        }
+        let resp = app
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(serde_json::to_vec(&json_body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // The service token writes the alias, and the response echoes the target.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header("Content-Type", "application/json")
+                .header("X-Alhalte-Service-Token", "service-secret")
+                .body(Body::from(serde_json::to_vec(&json_body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["tin_id"], format_tin_id(&first));
+
+    // The wildcard route keeps the slashes of a hierarchical name.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["tin_id"], format_tin_id(&first));
+
+    // Moving the alias replaces the target.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(&uri)
+                .header("Content-Type", "application/json")
+                .header("X-Alhalte-Service-Token", "service-secret")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "tin_id": format_tin_id(&second) }))
+                        .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Deleting releases the alias and is reported; a repeated delete is not an error.
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&uri)
+                .header("X-Alhalte-Service-Token", "service-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["deleted"].as_bool(), Some(true));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(&uri)
+                .header("X-Alhalte-Service-Token", "service-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload["deleted"].as_bool(), Some(false));
+
+    // A deleted alias reads as 404 again.
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(&uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// spec: alhalte-cellar/gc 0002 GC keeps alias targets and releases moved ones
+#[tokio::test]
+async fn test_gc_keeps_the_tin_an_alias_points_at() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    verifier.allow(1, 10);
+    let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false)
+        .unwrap()
+        .with_service_token("service-secret");
+    let alias = "room/0000000000000001/head";
+
+    let (first_bytes, first_tin) = create_test_tin("first aliased head");
+    let (second_bytes, second_tin) = create_test_tin("second aliased head");
+    for (bytes, tin_id) in [(&first_bytes, first_tin), (&second_bytes, second_tin)] {
+        service
+            .store_payload(1, 10, tin_id, bytes, None)
+            .await
+            .unwrap();
+        // The alias (not the reference row) is what keeps the head alive below.
+        service.unregister(1, 10, &tin_id).await.unwrap();
+    }
+
+    // Point the alias at the first head, then move it to the second before GC.
+    // The move is what makes the first head collectable; the current target is
+    // never collected.
+    assert_eq!(
+        service
+            .set_alias_with_token(alias, &first_tin, Some("service-secret"))
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        service
+            .set_alias_with_token(alias, &second_tin, Some("service-secret"))
+            .await
+            .unwrap(),
+        Some(first_tin),
+        "the superseded alias target must be reported"
+    );
+
+    let stats = service.run_gc().await.unwrap();
+    assert_eq!(stats.scanned_files, 2);
+    assert_eq!(
+        stats.deleted_files, 1,
+        "only the moved-away head may be collected: {stats:?}"
+    );
+    assert!(
+        !service.storage().has_tin_file(&first_tin),
+        "a head the alias no longer points at is collectable"
+    );
+    assert!(
+        service.storage().has_tin_file(&second_tin),
+        "the alias target must survive GC"
+    );
+
+    // Deleting the alias releases the current head too.
+    assert!(
+        service
+            .delete_alias_with_token(alias, Some("service-secret"))
+            .await
+            .unwrap()
+    );
+    let stats = service.run_gc().await.unwrap();
+    assert_eq!(stats.deleted_files, 1);
+    assert!(!service.storage().has_tin_file(&second_tin));
+}

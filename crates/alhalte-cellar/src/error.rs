@@ -41,6 +41,15 @@ pub enum CellarError {
     #[error("Tin with ID {0} was not found")]
     NotFound(String),
 
+    /// Requested alias name was not registered.
+    #[error("Alias {0} was not found")]
+    AliasNotFound(String),
+
+    /// Alias name is empty, too long, or holds a character outside the
+    /// allowed set.
+    #[error("Invalid alias name: {0}")]
+    InvalidAlias(String),
+
     /// Tin is already owned by the specified owner.
     #[error("Tin with ID {tin_id} is already owned by owner {owner}")]
     AlreadyOwned {

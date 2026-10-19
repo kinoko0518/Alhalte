@@ -14,20 +14,20 @@
 
 | 接続先 | 方向 | 内容 |
 | --- | --- | --- |
-| `alhalte-maitre-d` | 双方向 | UNIX ドメインソケット。4 バイト big-endian 長 + postcard のフレーム。部屋 head の報告もここで行う。 |
-| `alhalte-cellar` | 送信・取得 | `POST /store`、`POST /store/{tin_id}`、`GET /tin/{tin_id}`、`POST /unregister`。封入した chunk、scene、room の永続化と旧 head の解放。内部書き込みは `X-Alhalte-Service-Token` で認可する。 |
+| `alhalte-maitre-d` | 双方向 | UNIX ドメインソケット。4 バイト big-endian 長 + postcard のフレーム。部屋 head はここでは報告しない（Issue #192）。 |
+| `alhalte-cellar` | 送信・取得 | `POST /store`、`POST /store/{tin_id}`、`GET /tin/{tin_id}`、`POST /unregister`、`GET` / `PUT /alias/{name}`。封入した chunk、scene、room の永続化、head alias の読み書き、旧 head の解放。内部書き込みは `X-Alhalte-Service-Token` で認可する。 |
 
 CLI（`CliArgs`）:
 
 - `--room-id` / `ALHALTE_ROOM_ID`: 16 hex（正）または移行用 decimal の `u64`。内部の `RoomData.room_id` は `u64` のまま。
 - `--admin`（別名 `--owner`）/ `ALHALTE_ADMIN_ACCOUNT`
 - `--socket` / `ALHALTE_SOCKET_PATH`（既定 `/tmp/alhalte-banquette.sock`）
-- `--cellar-url` / `ALHALTE_CELLAR_URL`（既定 `http://127.0.0.1:8080`）
+- `--cellar-url` / `ALHALTE_CELLAR_URL`（既定 `http://127.0.0.1:8080`）。起動時の head 読み込みもここへ行う。
 - `--chunk-size-exponent` / `ALHALTE_CHUNK_SIZE_EXPONENT`（既定 8）
 - `--heartbeat-interval-secs` / `ALHALTE_HEARTBEAT_INTERVAL_SECS`（既定 240）
-- `--room-tin` / `ALHALTE_ROOM_TIN`: 復元する `RoomData` の 64 hex tin id。指定時は必ず cellar から復元し、失敗したら起動しない。
-- `--service-token` / `ALHALTE_SERVICE_TOKEN`: 内部書き込み用トークン（後方互換。argv に出るので非推奨）。値はログに出さない。
+- `--service-token` / `ALHALTE_SERVICE_TOKEN`: 内部書き込みと alias 更新用トークン（後方互換。argv に出るので非推奨）。値はログに出さない。
 - `--service-token-file` / `ALHALTE_SERVICE_TOKEN_FILE`: 内部書き込み用トークンを 0600 file から読む。maitre-d が Bistrot から受け取った path をそのまま転送する。
+- 復元用の引数は無い。head は cellar の `room/<room_id>/head` alias から読む（Issue #192）。旧 `--room-tin` / `ALHALTE_ROOM_TIN` は廃止し、指定すると clap が unknown argument で起動を拒否する。
 - 秘密 file は `alhalte_banquette::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
 
 ### 主な公開型
@@ -35,24 +35,25 @@ CLI（`CliArgs`）:
 | API | 内容 |
 | --- | --- |
 | `Room` / `RoomData` / `RoomPermissionLevel` | 部屋全体。scene biblio、character biblio、権限（`default_permission` / `permissions` / `accessible_scenes`）、chunk exponent。`room_id` は `u64`。 |
-| `Room::persist` / `Room::load_from_cellar` / `Room::from_tin_with_head` / `Room::validate` | 部屋全体の保存・復元・不変条件検証。復元は room_id、root scene、権限表を検証する。 |
+| `Room::persist` / `Room::load_or_create` / `Room::load_from_cellar` / `Room::from_tin_with_head` / `Room::validate` | 部屋全体の保存・復元・不変条件検証。`persist` は store 後に head alias を移し、`load_or_create` は起動時に alias を読んで復元する（未設定なら新規部屋）。復元は room_id、root scene、権限表を検証する。 |
+| `room_head_alias(room_id)` | 部屋 head を置く cellar alias 名（`room/<room_id 16 hex>/head`）。 |
 | `HeartbeatOutcome` / `HeartbeatResult` | heartbeat の継続判定と、保存に成功した `RoomData` tin id。 |
 | `Scene` / `SceneData` | 独立した log と state を持つ scene。 |
 | `SceneLog` / `LogBiblio` / `LogChunk` | chunk 化された log と head。 |
 | `SceneState` | `BTreeMap<String, Tin>`。4KiB 制限と `::` 名前空間検証。 |
 | `Character` / `CharacterBiblio` | `HashMap<String, Tin>` と所有権。 |
 | `ClientFrame` / `ServerFrame` | クライアントと banquette の論理フレーム。 |
-| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`BanquetteToMaitreD::RoomPersisted` で head と `default_permission` を報告し、`QueryAccountPermission` / `AccountPermissionResponse` で account の実効権限を返す。 |
+| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`QueryAccountPermission` / `AccountPermissionResponse` で account の実効権限を返す。head を報告する frame は持たない（Issue #192）。 |
 | `ProtocolCodec<T>` | 長さ前置 postcard コーデック。 |
 | `BanquetteServer` / `ServerConfig` | UNIX ソケットサーバー。`run_until_shutdown` で明示的に停止できる。 |
-| `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。`unregister_tin` を含む。 |
+| `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。`store_tin` / `download_tin` / `unregister_tin` / `get_alias` / `set_alias` を持つ。 |
 | `INTERNAL_WRITE_SESSION_ID` | 内部書き込みが送る session id（`0`）。合成 session は使わない。 |
 
 ### プロトコル
 
 `MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom`、`QueryAccountPermission { request_id, account_id }` を持つ。
 
-`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`RoomPersisted`、`AccountPermissionResponse` を持つ。`RoomPersisted { tin_id, default_permission }` は `RoomData` の store が成功したときだけ送られ、`maitre-d` が `room_heads` を更新し、`default_permission != Denied` を `rooms.done` へ射影する。射影は pre-spawn gate の暫定措置で、権限の正は `RoomData` 側にある（#200 で置き換える）。
+`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`AccountPermissionResponse` を持つ。head を報告する `RoomPersisted` は Issue #192 で削除した（head は cellar の alias が持つ）。
 
 `QueryAccountPermission` は `maitre-d` が「この部屋でのこの account の実効権限」を尋ねる制御フレームで、`Room::get_account_permission` の結果を `AccountPermissionResponse { request_id, account_id, permission }` で返す。DB の role と部屋の権限表を突き合わせるのは `maitre-d` 側の責務（#200）で、banquette は自分の権限表だけを答える。旧 `SetAdmins` / `AdminsUpdated`（DB の GM 集合を実行中の部屋へ push する経路）は #199 で撤去した。
 
@@ -93,23 +94,25 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 
 ### 起動
 
-1. `--room-tin` が指定された場合、`Room::load_from_cellar` が cellar から tin を取得する。
-   - `Tin::decode` で復号し、tin id（内容ハッシュ）が head と一致することを確認する。
-   - `Room::from_tin` が `RoomData` を復元し、root scene `/` の存在と `Room::validate`（Admin が 1 人以上、`accessible_scenes` の整合）を検証する。
-   - `RoomData.room_id` が `--room-id` と一致することを検証する。
-   - 取得・復号・検証のいずれかが失敗したら**空部屋で起動せず**、明確なエラーで終了する。旧 schema（`done` フラグを持つ #199 以前の `RoomData`）は decode 失敗として扱い、変換しない。
-2. `--room-tin` がない場合は `Room::new(room_id, creator_account, chunk_exponent)` が `/` を作り、作成者を `Admin`、`default_permission` を `Denied`、作成者の `accessible_scenes` を `["/"]` にして `RoomData` に持たせる。
-3. `BanquetteServer::run` が既存ソケットを削除し、UNIX ソケットを bind する。
-4. heartbeat タスクを起動する。初回 tick は捨てる。
-5. maitre-d からの接続ごとに `handle_connection` を spawn する。
+1. `Room::load_or_create(cellar, room_id, admin_account, chunk_exponent)` が cellar の `room/<room_id>/head` alias を読む（`room_head_alias`）。
+   - alias が未設定なら、部屋は一度も永続化されていない。`Room::new` が `/` を作り、作成者を `Admin`、`default_permission` を `Denied`、作成者の `accessible_scenes` を `["/"]` にして `RoomData` に持たせる。
+   - alias があれば、`Room::load_from_cellar` が cellar から tin を取得して復元する。
+     - `Tin::decode` で復号し、tin id（内容ハッシュ）が alias の指す head と一致することを確認する。
+     - `Room::from_tin` が `RoomData` を復元し、root scene `/` の存在と `Room::validate`（Admin が 1 人以上、`accessible_scenes` の整合）を検証する。
+     - `RoomData.room_id` が `--room-id` と一致することを検証する。
+     - alias の読み込み・取得・復号・検証のいずれかが失敗したら**空部屋で起動せず**、明確なエラーで終了する。旧 schema（`done` フラグを持つ #199 以前の `RoomData`）は decode 失敗として扱い、変換しない。
+2. `BanquetteServer::run` が既存ソケットを削除し、UNIX ソケットを bind する。
+3. heartbeat タスクを起動する。初回 tick は捨てる。
+4. maitre-d からの接続ごとに `handle_connection` を spawn する。
 
 ### 部屋状態の永続化と復元
 
 - heartbeat ごとに `Room::persist` が部屋全体を `alhalte/banquette` Tin（Zstd）として cellar に保存する。内部書き込みは `INTERNAL_WRITE_SESSION_ID = 0` と `X-Alhalte-Service-Token` を使い、合成 session は使わない。
-- 保存に成功した tin id と `RoomData.default_permission` を `HeartbeatResult::persisted_tin` と `RoomPersisted { tin_id, default_permission }` で通知する。保存失敗時は通知せず、ログに残して次周期に再試行する。
-- 保存に成功すると、直前の head tin を `CellarSink::unregister_tin` で best-effort に解放する。現在の head は解放しない。解放失敗は警告ログのみで、保存自体は成功扱い。
-- graceful shutdown（idle による `ShouldExit`、`run_until_shutdown`、または standalone バイナリの SIGTERM / SIGINT）では終了直前に `persist` をもう一度行い、`RoomPersisted` を送ってからソケットを閉じる。SIGTERM / SIGINT は `main.rs` で `watch` channel に配線し、`run_until_shutdown` へ渡す。
-- `room_id → head tin` のポインタは `alhalte-maitre-d` の `room_heads` が持つ。banquette 自身は head を永続化しない。
+- 保存に成功したら、まず `PUT /alias/room/<room_id>/head` で head alias を新しい tin へ移す。alias が唯一の復元点なので、この書き込みの失敗は `persist` の失敗として返す（旧 alias と旧 head は有効なまま残り、次周期に再試行する）。
+- alias の更新後に、直前の head tin を `CellarSink::unregister_tin` で best-effort に解放する。現在の head は alias が指しているので解放しない。解放失敗は警告ログのみで、保存自体は成功扱い。
+- 保存に成功した tin id は `HeartbeatResult::persisted_tin` に入る。保存失敗時は `None` で、ログに残して次周期に再試行する。maitre-d へ報告する frame は無い。
+- graceful shutdown（idle による `ShouldExit`、`run_until_shutdown`、または standalone バイナリの SIGTERM / SIGINT）では終了直前に `persist` をもう一度行い、alias を最終状態へ移してからソケットを閉じる。SIGTERM / SIGINT は `main.rs` で `watch` channel に配線し、`run_until_shutdown` へ渡す。
+- `room_id → head tin` のポインタは cellar の alias だけが持つ。maitre-d も banquette も DB / 専用ファイルに head を保存しない。
 
 ### クライアント接続
 
@@ -186,7 +189,7 @@ load 後と権限変更後に呼び、次を検証する。違反は `InvalidRoo
 - Issue #199 で `done` / `SetDone` / `std::admins` を撤去し、`RoomData` の wire schema を切った。旧 schema の部屋は decode 失敗として起動しない（変換しない）。`RoomData` の JSON / postcard 互換性は保証しない。
 - `maitre-d` の DB role（`room_permissions`）と部屋の権限表はまだ接続していない。`SetAdmins` を撤去したため、実行中の部屋の権限は `SetMemberPermission` / `SetDefaultPermission` でしか変わらず、DB の role 変更は次回 spawn でも反映されない。接続は #200。
 - その帰結として、`maitre-d` の DB で `pl` / `viewer` の account も banquette からは `Denied`（`default_permission`）に見える。`Viewer` の mutate 遮断は当面 `maitre-d` の WS ゲートが担い、banquette 側の拒否と二重になる。#200 で DB role を部屋権限表へ移すと解消する。
-- `maitre-d` の `rooms.done` は `default_permission != Denied` の射影で、pre-spawn gate（WS / `GET /api/rooms/{id}` / export）にだけ使う。`RoomPersisted.default_permission` と `ServerFrame::PermissionsUpdated` で更新する。#200 でゲートごと置き換える。
+- `maitre-d` の pre-spawn gate（`rooms.done`）は #200 で部屋権限表に置き換えた。banquette は `QueryAccountPermission` で実効権限を答えるだけで、head や `default_permission` を報告しない（head 報告の `RoomPersisted` は #192 で削除）。
 - `alhalte-kitchen` の `RoomArchive.done` は `RoomData.default_permission != Denied` の射影で残している。アーカイブ形式は #184 で凍結するため、権限表そのものは運ばない。
 - `SetMemberPermission` / `SetDefaultPermission` の ack は要求元にだけ返し、部屋全体へは broadcast しない。降格された account は次回 `QueryPermissions` まで自分の権限変化を知らない（UI 追従は #201）。
 - `EnterScene` は権限が無い場合に無言で何もしない。`maitre-d` は自前の `client_scenes` で broadcast 先を決めるため、接続時の入場可否は当面 `maitre-d` のゲートが正で、banquette 側の判定は defense in depth。#200 で一本化する。
@@ -194,8 +197,9 @@ load 後と権限変更後に呼び、次を検証する。違反は `InvalidRoo
 - WebRTC の DataChannel は signaling の中継までを実装し、state の DataChannel 経路そのものは未実装。
 - `RoomData` は `HashMap` を含むため、内容が同じでも postcard の map 順序が変わり tin id が変わることがある。heartbeat ごとに head が作り直されるが、旧 head の unregister と GC で回収される。
 - `persist` の失敗はログのみで、次周期までの再試行はない。メトリクスや専用の再試行キューは持たない。
-- 合成 session（旧 `system_session_id = 1`）は廃止した。`--service-token` が未設定の場合、内部書き込みは cellar の session 検証に失敗する。
+- 合成 session（旧 `system_session_id = 1`）は廃止した。`--service-token` が未設定の場合、内部書き込みは cellar の session 検証に失敗し、alias 書き込みも service token 必須なので 401 になる（persist は失敗し、次周期に再試行する）。
 - graceful shutdown の経路は idle 終了と `run_until_shutdown`（および standalone バイナリの SIGTERM / SIGINT）。SIGTERM / SIGINT は `main.rs` で捕捉し、最終 persist を含む同じ graceful path に入る。シグナル配線そのものはプロセス起動を伴う統合テスト（`tests/spec_tests.rs` の `test_sigterm_runs_graceful_final_persist`）で確認する。
 - `Room::load_from_cellar` の download は cellar 側で認証されない（現行 cellar の download は session 検証を行わない）。service token は書き込みだけを守る。
-- `maitre-d` が記録した head が別インスタンスの persist で置き換わった場合、`maitre-d` はその旧 head を unregister しない（banquette が自分の直前 head だけを解放する）。
+- `Room::load_or_create` は alias を読んでから復元する。alias が壊れた tin を指す・hash が一致しない・`RoomData.room_id` が違う場合は起動失敗で、空部屋にフォールバックしない。壊れた alias は自動修復しない（運用者が cellar 側で直す）。
+- `maitre-d` は head を一切持たない（`room_heads` は撤去）。別インスタンスが persist して alias を置き換えた場合、旧 head の解放はそれを行った banquette が担う。
 

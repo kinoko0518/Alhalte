@@ -252,7 +252,7 @@ fn test_identity() -> (Database, u64, u64) {
 fn base_app_state(db: Database) -> AppState {
     let spawner =
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
-    let room_manager = RoomBridgeManager::new(spawner, db.clone());
+    let room_manager = RoomBridgeManager::new(spawner);
     let oauth = Arc::new(MockOAuthProvider::new());
     AppState::new(db, "salt", oauth, room_manager)
 }

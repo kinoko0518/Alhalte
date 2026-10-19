@@ -9,7 +9,8 @@ use reqwest::StatusCode;
 use tokio::sync::RwLock;
 
 use alhalte_cellar::{
-    StoreRequest, StoreResponse, StoreResult, StoreStatus, UnregisterRequest, format_tin_id,
+    AliasRequest, AliasResponse, StoreRequest, StoreResponse, StoreResult, StoreStatus,
+    UnregisterRequest, format_tin_id,
 };
 use tin::TinId;
 
@@ -48,6 +49,21 @@ pub trait CellarSink: Send + Sync {
     /// reference did not exist (already reclaimed). Retention of superseded room
     /// heads is best effort: callers log and continue on errors.
     async fn unregister_tin(&self, owner: u64, session_id: u64, tin_id: &TinId) -> Result<bool>;
+
+    /// Reads the tin ID stored under a generic cellar alias such as
+    /// `room/<room_id>/head`.
+    ///
+    /// `Ok(None)` means the alias is unset, which for a room head means "this
+    /// room has never been persisted". A transport or authorization failure is
+    /// an error: it must never be mistaken for "unset", or startup would
+    /// silently open an empty room over a persisted one.
+    async fn get_alias(&self, name: &str) -> Result<Option<TinId>>;
+
+    /// Points a generic cellar alias at `tin_id`.
+    ///
+    /// Alias writes are authorized by the cellar service token, which the sink
+    /// carries when configured ([`HttpCellarSink::with_service_token`]).
+    async fn set_alias(&self, name: &str, tin_id: &TinId) -> Result<()>;
 }
 
 #[derive(Debug, Clone)]
@@ -60,6 +76,7 @@ struct StoredTin {
 #[derive(Debug, Default, Clone)]
 pub struct InMemoryCellarSink {
     storage: Arc<RwLock<HashMap<TinId, StoredTin>>>,
+    aliases: Arc<RwLock<HashMap<String, TinId>>>,
 }
 
 impl InMemoryCellarSink {
@@ -67,6 +84,7 @@ impl InMemoryCellarSink {
     pub fn new() -> Self {
         Self {
             storage: Arc::new(RwLock::new(HashMap::new())),
+            aliases: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -133,6 +151,17 @@ impl CellarSink for InMemoryCellarSink {
         // stored entry is equivalent to removing the last reference row.
         let mut write = self.storage.write().await;
         Ok(write.remove(tin_id).is_some())
+    }
+
+    async fn get_alias(&self, name: &str) -> Result<Option<TinId>> {
+        let read = self.aliases.read().await;
+        Ok(read.get(name).copied())
+    }
+
+    async fn set_alias(&self, name: &str, tin_id: &TinId) -> Result<()> {
+        let mut write = self.aliases.write().await;
+        write.insert(name.to_string(), *tin_id);
+        Ok(())
     }
 }
 
@@ -350,5 +379,53 @@ impl CellarSink for HttpCellarSink {
         }
 
         Ok(true)
+    }
+
+    async fn get_alias(&self, name: &str) -> Result<Option<TinId>> {
+        let url = format!("{}/alias/{}", self.base_url, name);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
+
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if !resp.status().is_success() {
+            return Err(BanquetteError::Cellar(format!(
+                "Cellar alias read failed with status {}",
+                resp.status()
+            )));
+        }
+
+        let alias: AliasResponse = resp
+            .json()
+            .await
+            .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
+
+        Ok(Some(alias.tin_id))
+    }
+
+    async fn set_alias(&self, name: &str, tin_id: &TinId) -> Result<()> {
+        let url = format!("{}/alias/{}", self.base_url, name);
+        let request = AliasRequest { tin_id: *tin_id };
+
+        let resp = self
+            .authorize(self.client.put(&url).json(&request))
+            .send()
+            .await
+            .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
+
+        if !resp.status().is_success() {
+            return Err(BanquetteError::Cellar(format!(
+                "Cellar alias write failed with status {}",
+                resp.status()
+            )));
+        }
+
+        Ok(())
     }
 }

@@ -8,6 +8,12 @@
 //! as rows in an SQLite database: `(tin_id: [u8; 32], owner: u64, wrapped_key: Option<Vec<u8>>)`.
 //! The entity file name on disk is always `hex(tin_id)`; no path is persisted.
 //!
+//! A generic `aliases(name TEXT PRIMARY KEY, tin_id BLOB NOT NULL, updated_at INTEGER NOT NULL)`
+//! table points a name at a tin, and `GET` / `PUT` / `DELETE /alias/{name}` expose it. Alias
+//! writes require the internal service token, while reads are unauthenticated like downloads.
+//! `alhalte-banquette` keeps its room head at `room/<room_id>/head`; GC keeps alias targets, so
+//! the current head survives even when no `tin_references` row points at it (Issue #192).
+//!
 //! When receiving a store request:
 //! - Validates the owner's session rights via [`SessionVerifier`].
 //! - Answers `POST /store` with `200 OK` and a [`StoreResponse`] body whose
@@ -69,8 +75,9 @@ pub use error::{CellarError, Result};
 pub use gc::run_garbage_collection;
 pub use handlers::create_router;
 pub use model::{
-    GcStats, SYSTEM_OWNER, StoreRequest, StoreResponse, StoreResult, StoreStatus, TinReference,
-    UnregisterRequest, format_tin_id, parse_tin_id,
+    AliasRequest, AliasResponse, GcStats, MAX_ALIAS_NAME_BYTES, SYSTEM_OWNER, StoreRequest,
+    StoreResponse, StoreResult, StoreStatus, TinReference, UnregisterRequest, format_tin_id,
+    parse_tin_id, validate_alias_name,
 };
 pub use secret_file::{SecretFileError, read_secret_file, resolve_secret};
 pub use service::{CellarConfig, CellarService};

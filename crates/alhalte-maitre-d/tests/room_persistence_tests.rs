@@ -2,6 +2,10 @@
 //!
 //! These tests exercise the real manager / spawner / banquette server stack with
 //! an in-memory or loopback cellar. No external network is used.
+//!
+//! Issue #192 moved the room head from `maitre-d`'s `room_heads` table to
+//! cellar's generic alias `room/<room_id>/head`, so every test that used to read
+//! the head from SQLite reads the alias from the [`CellarSink`] instead.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,7 +13,7 @@ use std::time::Duration;
 
 use alhalte_banquette::{
     CellarSink, ClientFrame, HttpCellarSink, InMemoryCellarSink, Room, RoomPermissionLevel,
-    ServerFrame,
+    ServerFrame, room_head_alias,
 };
 use alhalte_cellar::{CellarService, InMemorySessionVerifier};
 use alhalte_maitre_d::{
@@ -81,15 +85,16 @@ async fn wait_for_frame(
     panic!("expected server frame was not received");
 }
 
-/// Polls the database until the room head is recorded, returning it.
-async fn wait_for_room_head(db: &Database) -> [u8; 32] {
+/// Polls cellar until the room's head alias is set, returning the head tin.
+async fn wait_for_alias_head(cellar: &dyn CellarSink, room_id: u64) -> tin::TinId {
+    let alias = room_head_alias(room_id);
     for _ in 0..100 {
-        if let Some(head) = db.get_room_head(ROOM_ID_HEX).unwrap() {
+        if let Some(head) = cellar.get_alias(&alias).await.unwrap() {
             return head;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("maitre-d did not record a room head");
+    panic!("the room head alias {alias} was never set");
 }
 
 /// Returns the value following `flag` in an argument vector.
@@ -124,11 +129,14 @@ async fn test_room_state_restored_after_banquette_restart() {
     let db = Database::new_in_memory().unwrap();
     let (account_id, session_id) = registered_room(&db);
 
-    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+    // The test owns the sink so it can read the head alias after shutdown.
+    let cellar = Arc::new(InMemoryCellarSink::new());
+    let spawner = Arc::new(InProcessBanquetteSpawner::new(
         temp_dir.path().to_path_buf(),
+        cellar.clone(),
         8,
     ));
-    let manager = RoomBridgeManager::new(spawner.clone(), db.clone());
+    let manager = RoomBridgeManager::new(spawner.clone());
 
     let bridge = manager
         .get_or_create_room(ROOM_ID, account_id)
@@ -136,7 +144,7 @@ async fn test_room_state_restored_after_banquette_restart() {
         .expect("new room starts");
     let mut rx = bridge.register_client(1, account_id, session_id).await;
 
-    // Populate scenes, state, characters, logs, admins, and done.
+    // Populate scenes, state, characters, logs, admins, and permissions.
     bridge.send_client_frame(
         1,
         ClientFrame::CreateScene {
@@ -219,19 +227,22 @@ async fn test_room_state_restored_after_banquette_restart() {
     })
     .await;
 
-    // Graceful shutdown persists the final state and reports the head.
+    // Graceful shutdown persists the final state and moves the head alias.
     assert!(
         spawner.shutdown_room(ROOM_ID).await,
         "the in-process room must be tracked"
     );
-    let head = wait_for_room_head(&db).await;
+    let head = wait_for_alias_head(cellar.as_ref(), ROOM_ID).await;
     manager.remove_room(ROOM_ID).await;
 
-    // A new bridge must restore the room from the head, not start empty.
+    // A new bridge must restore the room from the alias, not start empty.
     let restored = manager
         .get_or_create_room(ROOM_ID, account_id)
         .await
-        .expect("the persisted head must restore the room");
+        .expect("the aliased head must restore the room");
+
+    // Export after a restore is a required #192 path: the snapshot comes from
+    // the restored room and must not be empty.
     let (room_data, _chunks) = restored
         .export_room(Some(account_id))
         .await
@@ -321,26 +332,30 @@ async fn test_room_state_restored_after_banquette_restart() {
         _ => unreachable!(),
     }
 
-    assert_eq!(db.get_room_head(ROOM_ID_HEX).unwrap(), Some(head));
+    // The head is still the alias target, and maitre-d stores no copy of it.
+    assert_eq!(
+        cellar.get_alias(&room_head_alias(ROOM_ID)).await.unwrap(),
+        Some(head)
+    );
 
     spawner.shutdown_room(ROOM_ID).await;
 }
 
-// spec: alhalte-maitre-d/room-head 0003 heartbeat reports the head to maitre-d
+// spec: alhalte-maitre-d/room-head 0003 the heartbeat moves the head alias
 #[tokio::test]
-async fn test_heartbeat_updates_room_head() {
+async fn test_heartbeat_moves_the_room_head_alias() {
     let temp_dir = tempdir().unwrap();
     let db = Database::new_in_memory().unwrap();
     let (account_id, _session_id) = registered_room(&db);
 
     let cellar = Arc::new(InMemoryCellarSink::new());
-    // A 500 ms heartbeat leaves a comfortable window to load the reported head
-    // (a subsequent persist supersedes and unregisters the previous one).
+    // A 500 ms heartbeat leaves a comfortable window to read the alias (a
+    // subsequent persist moves it and unregisters the previous head).
     let spawner = Arc::new(
         InProcessBanquetteSpawner::new(temp_dir.path().to_path_buf(), cellar.clone(), 8)
             .with_heartbeat_interval(Duration::from_millis(500)),
     );
-    let manager = RoomBridgeManager::new(spawner.clone(), db.clone());
+    let manager = RoomBridgeManager::new(spawner.clone());
 
     let bridge = manager
         .get_or_create_room(ROOM_ID, account_id)
@@ -360,26 +375,30 @@ async fn test_heartbeat_updates_room_head() {
     })
     .await;
 
-    // The reported head is the RoomData tin of the current state and can be restored.
+    // The aliased head is the RoomData tin of the current state and restores.
+    let alias = room_head_alias(ROOM_ID);
     let mut restored = None;
     for _ in 0..10 {
-        let head = wait_for_room_head(&db).await;
+        let Some(head) = cellar.get_alias(&alias).await.unwrap() else {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
         match Room::load_from_cellar(cellar.as_ref(), &head, ROOM_ID).await {
             Ok(room) => {
                 restored = Some(room);
                 break;
             }
-            // A heartbeat may have superseded the head between the read and the load.
+            // A heartbeat may have superseded the head between read and load.
             Err(_) => continue,
         }
     }
-    let restored = restored.expect("a reported head must be loadable");
+    let restored = restored.expect("the aliased head must be loadable");
     assert!(restored.scene_biblio.contains_key("garden"));
 
     spawner.shutdown_room(ROOM_ID).await;
 }
 
-// spec: alhalte-maitre-d/room-head 0004 a head that cannot be loaded fails loudly
+// spec: alhalte-maitre-d/room-head 0004 a head that cannot be restored fails the spawn
 #[tokio::test]
 async fn test_missing_or_corrupt_head_is_not_replaced_by_an_empty_room() {
     let temp_dir = tempdir().unwrap();
@@ -387,12 +406,13 @@ async fn test_missing_or_corrupt_head_is_not_replaced_by_an_empty_room() {
     let (account_id, session_id) = registered_room(&db);
 
     let cellar = Arc::new(InMemoryCellarSink::new());
+    let alias = room_head_alias(ROOM_ID);
     let spawner = Arc::new(InProcessBanquetteSpawner::new(
         temp_dir.path().to_path_buf(),
         cellar.clone(),
         8,
     ));
-    let manager = RoomBridgeManager::new(spawner, db.clone());
+    let manager = RoomBridgeManager::new(spawner.clone());
     let state = AppState::new(
         db.clone(),
         "salt",
@@ -406,19 +426,19 @@ async fn test_missing_or_corrupt_head_is_not_replaced_by_an_empty_room() {
         let _ = axum::serve(listener, app).await;
     });
 
-    // 1. A head that points at a missing tin.
+    // 1. The alias points at a tin that is not stored.
     let missing = [0xABu8; 32];
-    db.set_room_head(ROOM_ID_HEX, &missing, 1000).unwrap();
+    cellar.set_alias(&alias, &missing).await.unwrap();
     let err = manager
         .get_or_create_room(ROOM_ID, account_id)
         .await
         .err()
-        .expect("missing head must fail the spawn");
+        .expect("a missing head must fail the spawn");
     assert!(
         err.to_string().contains("failed to restore room"),
         "clear restore error expected, got: {err}"
     );
-    assert_eq!(db.get_room_head(ROOM_ID_HEX).unwrap(), Some(missing));
+    assert_eq!(cellar.get_alias(&alias).await.unwrap(), Some(missing));
 
     // The export route reports a 5xx instead of an empty ZIP.
     let response = reqwest::Client::new()
@@ -434,25 +454,25 @@ async fn test_missing_or_corrupt_head_is_not_replaced_by_an_empty_room() {
     );
     let body = response.text().await.unwrap();
     assert!(body.contains("error"), "error body expected, got {body}");
-    assert_eq!(db.get_room_head(ROOM_ID_HEX).unwrap(), Some(missing));
+    assert_eq!(cellar.get_alias(&alias).await.unwrap(), Some(missing));
 
-    // 2. A head whose tin exists but does not decode into a RoomData tin.
+    // 2. The aliased tin exists but does not decode into a RoomData tin.
     let garbage = [0xCDu8; 32];
     cellar
         .store_tin(ADMIN, 0, b"garbled room head", &garbage, None)
         .await
         .unwrap();
-    db.set_room_head(ROOM_ID_HEX, &garbage, 1001).unwrap();
+    cellar.set_alias(&alias, &garbage).await.unwrap();
     let err = manager
         .get_or_create_room(ROOM_ID, account_id)
         .await
         .err()
-        .expect("garbled head must fail the spawn");
+        .expect("a garbled head must fail the spawn");
     assert!(
         err.to_string().contains("failed to restore room"),
         "clear restore error expected, got: {err}"
     );
-    assert_eq!(db.get_room_head(ROOM_ID_HEX).unwrap(), Some(garbage));
+    assert_eq!(cellar.get_alias(&alias).await.unwrap(), Some(garbage));
 }
 
 // spec: alhalte-maitre-d/room-head 0005 internal credential + retention end to end
@@ -461,6 +481,7 @@ async fn test_internal_service_token_store_and_old_head_retention() {
     let (addr, service, _dir) = spawn_cellar(Some("test-service-token")).await;
     let sink =
         HttpCellarSink::new(format!("http://{addr}")).with_service_token("test-service-token");
+    let alias = room_head_alias(ROOM_ID);
 
     let mut room = Room::new(ROOM_ID, ADMIN, 8).unwrap();
     room.create_scene(ADMIN, "tavern", None).unwrap();
@@ -472,12 +493,15 @@ async fn test_internal_service_token_store_and_old_head_retention() {
     )
     .unwrap();
 
-    // The store succeeds without any user session; only the service token authorizes it.
+    // The store succeeds without any user session; only the service token
+    // authorizes it, and the same token moves the head alias.
     let first_head = room.persist(&sink).await.expect("token store");
     assert_eq!(room.head_tin, Some(first_head));
+    assert_eq!(sink.get_alias(&alias).await.unwrap(), Some(first_head));
     assert!(service.download(&first_head, None).await.is_ok());
 
-    // A second persist unregisters the superseded head so GC can reclaim it.
+    // A second persist moves the alias and unregisters the superseded head so GC
+    // can reclaim it.
     room.update_scene_state(
         ADMIN,
         "tavern",
@@ -487,6 +511,11 @@ async fn test_internal_service_token_store_and_old_head_retention() {
     .unwrap();
     let second_head = room.persist(&sink).await.expect("token store");
     assert_ne!(first_head, second_head);
+    assert_eq!(
+        sink.get_alias(&alias).await.unwrap(),
+        Some(second_head),
+        "the alias is the only head pointer"
+    );
     assert!(
         service.download(&first_head, None).await.is_err(),
         "the old head reference must be unregistered"
@@ -496,11 +525,11 @@ async fn test_internal_service_token_store_and_old_head_retention() {
         stats.deleted_files >= 1,
         "GC should reclaim the old head file, got {stats:?}"
     );
-    // The current head survives GC and restores the latest state.
+    // The aliased head survives GC and restores the latest state.
     assert!(service.download(&second_head, None).await.is_ok());
-    let restored = Room::load_from_cellar(&sink, &second_head, ROOM_ID)
+    let restored = Room::load_or_create(&sink, ROOM_ID, ADMIN, 8)
         .await
-        .expect("restore through the internal credential");
+        .expect("the alias must restore through the internal credential");
     assert_eq!(
         restored
             .scene_biblio
@@ -524,15 +553,16 @@ async fn test_internal_service_token_store_and_old_head_retention() {
         format!("{err}").contains("401") || format!("{err}").contains("Unexpected response status"),
         "expected an authorization failure, got: {err}"
     );
-    // The failed store did not advance or unregister the head.
+    // The failed store did not advance the head or move the alias.
     assert_eq!(room.head_tin, Some(second_head));
+    assert_eq!(sink.get_alias(&alias).await.unwrap(), Some(second_head));
     assert!(service.download(&second_head, None).await.is_ok());
 }
 
-// spec: alhalte-maitre-d/room-head 0006 process spawner forwards --room-tin
+// spec: alhalte-maitre-d/room-head 0006 the process spawner passes no --room-tin
 // spec: alhalte-bistrot/secrets 0003 secrets are forwarded as file paths, never argv
 #[test]
-fn test_process_spawner_passes_room_tin_and_service_token() {
+fn test_process_spawner_forwards_no_room_tin_and_a_token_file() {
     let token_path = std::path::Path::new("/run/alhalte/secrets/cellar-service-token");
     let spawner = ProcessBanquetteSpawner::new(
         "/usr/local/bin/alhalte-banquette",
@@ -541,13 +571,16 @@ fn test_process_spawner_passes_room_tin_and_service_token() {
         8,
     )
     .with_service_token_file(token_path);
-    let head = [0x11u8; 32];
     let socket = std::path::Path::new("/run/alhalte/banquette-1.sock");
 
-    let args = spawner.command_args(1, 42, socket, Some(&head));
+    let args = spawner.command_args(1, 42, socket);
+    assert!(
+        !args.iter().any(|arg| arg == "--room-tin"),
+        "banquette restores itself from cellar, so no restore flag may be passed"
+    );
     assert!(
         args.windows(2)
-            .any(|w| w[0] == "--room-tin" && w[1] == hex::encode(head))
+            .any(|w| w[0] == "--room-id" && w[1] == "0000000000000001")
     );
     assert!(
         args.windows(2)
@@ -558,10 +591,6 @@ fn test_process_spawner_passes_room_tin_and_service_token() {
         "the token value must never be passed as an argument"
     );
 
-    // Without a persisted head no restore flag is passed.
-    let args = spawner.command_args(1, 42, socket, None);
-    assert!(!args.iter().any(|arg| arg == "--room-tin"));
-
     // A value-only token is forwarded through the environment, not argv.
     let value_only = ProcessBanquetteSpawner::new(
         "/usr/local/bin/alhalte-banquette",
@@ -570,7 +599,7 @@ fn test_process_spawner_passes_room_tin_and_service_token() {
         8,
     )
     .with_service_token("secret-token");
-    let args = value_only.command_args(1, 42, socket, None);
+    let args = value_only.command_args(1, 42, socket);
     assert!(
         !args.iter().any(|arg| arg == "secret-token"),
         "the token value must never be passed as an argument"
@@ -634,26 +663,31 @@ async fn test_default_bistrot_config_authorizes_room_persistence() {
         ROOM_ID,
         ADMIN,
         std::path::Path::new("/run/alhalte/banquette.sock"),
-        None,
     );
     assert_eq!(
         arg_after(&banquette_args, "--service-token-file"),
         Some(token_path.as_str())
     );
     assert!(!banquette_args.contains(&token));
+    assert!(
+        !banquette_args.iter().any(|arg| arg == "--room-tin"),
+        "the head is read from cellar, not passed by maitre-d"
+    );
 
     // With the real session verifier and the default token, the internal
-    // RoomData store is accepted (no 401) and restores.
+    // RoomData store is accepted (no 401), moves the head alias, and restores.
     let (addr, service, _dir) = spawn_cellar(Some(token.as_str())).await;
     let sink = HttpCellarSink::new(format!("http://{addr}")).with_service_token(token.as_str());
+    let alias = room_head_alias(ROOM_ID);
     let mut room = Room::new(ROOM_ID, ADMIN, config.banquette.chunk_size_exponent).unwrap();
     room.create_scene(ADMIN, "tavern", None).unwrap();
     let head = room
         .persist(&sink)
         .await
         .expect("the default local configuration must authorize persistence");
+    assert_eq!(sink.get_alias(&alias).await.unwrap(), Some(head));
     assert!(service.download(&head, None).await.is_ok());
-    let restored = Room::load_from_cellar(&sink, &head, ROOM_ID)
+    let restored = Room::load_or_create(&sink, ROOM_ID, ADMIN, 8)
         .await
         .expect("the persisted room must restore through the same token");
     assert!(restored.scene_biblio.contains_key("tavern"));

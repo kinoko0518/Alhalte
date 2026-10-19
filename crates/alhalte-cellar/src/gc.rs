@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 
 use rusqlite::Connection;
+use tin::TinId;
 
 use crate::db::Database;
 use crate::error::Result;
@@ -14,10 +15,17 @@ use crate::storage::StorageManager;
 /// An entity file is named `hex(tin_id)` on disk (see
 /// [`StorageManager::relative_name`]), so the referenced set is built by
 /// hashing the distinct `tin_id` rows instead of reading a stored path column.
-/// Any file that no row references is permanently removed.
+///
+/// Both reference kinds count: `tin_references` rows **and** `aliases`
+/// pointers. A room head that only the `room/<room_id>/head` alias points at
+/// is therefore never collected (Issue #192).
+///
+/// Any file that neither kind references is permanently removed.
 pub fn run_garbage_collection(storage: &StorageManager, conn: &Connection) -> Result<GcStats> {
     let files = storage.list_tin_files()?;
-    let referenced_names: HashSet<String> = Database::get_all_referenced_tin_ids(conn)?
+    let mut referenced: HashSet<TinId> = Database::get_all_referenced_tin_ids(conn)?;
+    referenced.extend(Database::get_all_alias_tin_ids(conn)?);
+    let referenced_names: HashSet<String> = referenced
         .iter()
         .map(StorageManager::relative_name)
         .collect();

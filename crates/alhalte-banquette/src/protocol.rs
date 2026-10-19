@@ -471,28 +471,11 @@ pub enum BanquetteToMaitreD {
         /// Exported room snapshot and log chunks, or an error description.
         result: std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>,
     },
-    /// The whole `RoomData` was successfully stored to cellar under `tin_id`.
-    ///
-    /// `maitre-d` records this tin ID as the room's persisted head pointer so a
-    /// later spawn can restore the room. Sent only after a successful store and
-    /// also after the final persist on graceful shutdown.
-    ///
-    /// `default_permission` mirrors [`crate::room::RoomData::default_permission`]
-    /// at store time. `maitre-d` uses it for the pre-spawn membership gate until
-    /// Issue #200 replaces that gate with the room permission table.
-    ///
-    /// Declared last so that the postcard variant indices of pre-existing
-    /// frames stay stable (backward compatibility).
-    RoomPersisted {
-        /// Tin ID of the stored `RoomData`.
-        tin_id: TinId,
-        /// Permission applied to accounts without an explicit entry.
-        default_permission: RoomPermissionLevel,
-    },
     /// Answer to [`MaitreDToBanquette::QueryAccountPermission`].
     ///
     /// Declared last so that the postcard variant indices of pre-existing
-    /// frames stay stable; `AdminsUpdated` was removed by Issue #199.
+    /// frames stay stable; `AdminsUpdated` was removed by Issue #199 and
+    /// `RoomPersisted` by Issue #192.
     AccountPermissionResponse {
         /// Request correlation ID echoed from the query.
         request_id: u64,

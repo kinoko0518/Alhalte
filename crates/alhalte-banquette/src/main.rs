@@ -26,34 +26,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut cellar = HttpCellarSink::new(args.cellar_url);
     match service_token {
         Some(token) => cellar = cellar.with_service_token(token),
+        // Head alias writes are service-token only, so a token is now required
+        // for persistence even when a user session could authorize the store.
         None => tracing::warn!(
-            "No --service-token-file configured: room state persistence will fail unless cellar \
-             accepts the write through a user session"
+            "No --service-token-file configured: room state persistence will fail because the \
+             room head alias is written with the cellar service token"
         ),
     }
     let cellar = Arc::new(cellar);
 
-    // A persisted head must be restored; a failure here aborts startup instead of
-    // silently starting an empty room.
-    let room = match args.room_tin {
-        Some(tin_id) => {
-            tracing::info!(
-                "Restoring room {:016x} from persisted tin {}",
-                args.room_id,
-                alhalte_cellar::format_tin_id(&tin_id)
-            );
-            Room::load_from_cellar(cellar.as_ref(), &tin_id, args.room_id)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "failed to restore persisted room {:016x} from tin {}: {e}",
-                        args.room_id,
-                        alhalte_cellar::format_tin_id(&tin_id)
-                    )
-                })?
-        }
-        None => Room::new(args.room_id, args.admin, args.chunk_size_exponent)?,
-    };
+    // The room restores itself from cellar: the `room/<room_id>/head` alias is
+    // the only source of a persisted head, so nothing is passed on the command
+    // line. A set alias that cannot be restored aborts startup instead of
+    // silently starting an empty room; no alias starts a brand-new room.
+    let room = Room::load_or_create(
+        cellar.as_ref(),
+        args.room_id,
+        args.admin,
+        args.chunk_size_exponent,
+    )
+    .await?;
 
     let config = ServerConfig {
         socket_path: args.socket,
@@ -62,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Flush the final `RoomData` to cellar when the service manager or an
     // operator stops the room with SIGTERM / SIGINT. The graceful path
-    // (`run_until_shutdown`) persists once more and reports `RoomPersisted`.
+    // (`run_until_shutdown`) persists once more and moves the head alias.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
         match wait_for_termination_signal().await {
