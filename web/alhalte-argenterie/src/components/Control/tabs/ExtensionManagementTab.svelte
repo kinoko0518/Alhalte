@@ -32,10 +32,12 @@
    *                                        └──timeout/error──▶ offline (list unchanged)
    * ```
    *
-   * A failed operation flips the tab into the offline state. While offline the
-   * whole tab is dimmed and inert (`aria-disabled` + `pointer-events: none`),
-   * **even for admins**, until the connection returns; the reconnect effect then
-   * re-runs the query and restores the tab.
+   * A failed operation flips the tab into the offline state. Failures never
+   * disable the shell: the list stays readable and scrollable and the offline
+   * banner keeps full contrast. Only the mutation controls (toggle / delete /
+   * reorder / upload) become `disabled` + `aria-disabled`, even for admins,
+   * until the connection returns; the reconnect effect then re-runs the query
+   * and restores the actions (Issue #149).
    */
   import { SvelteSet } from 'svelte/reactivity';
   import {
@@ -162,13 +164,21 @@
 
   /**
    * Offline: the socket is gone / disconnected, the tab-open query failed, or a
-   * write timed out. While true the tab is inert even for admins.
+   * write timed out. While true the mutation controls are disabled even for
+   * admins, but the list and the banner stay readable (Issue #149).
    */
   let offline = $derived(!socketConnected || loadState === 'offline' || writeFailed);
 
   let isLoading = $derived(loadState === 'loading');
   let isUploading = $derived(uploadPhase !== 'idle');
   let isBusy = $derived(pendingIds.size > 0 || isUploading);
+
+  /**
+   * Guards **only the mutation controls**, never the shell (Issue #149): the
+   * list and the offline banner stay readable and scrollable while a viewer
+   * cannot manage extensions, the tab is offline, or an operation is pending.
+   */
+  let mutationsDisabled = $derived(offline || !canAdmin || isBusy);
 
   let sortedExtensions = $derived.by(() => {
     return [...extensions].sort((a, b) => a.priority - b.priority);
@@ -541,12 +551,12 @@
   class="extension-tab-shell"
   class:extensions-offline={offline}
   class:non-admin-locked={!canAdmin}
-  aria-disabled={offline ? 'true' : undefined}
   data-testid="extension-management-tab"
 >
   {#if offline}
-    <!-- Offline: communication with the server failed. The whole tab is dimmed
-         and non-interactive below, admins included. -->
+    <!-- Offline: communication with the server failed. The banner stays at full
+         contrast and the list below stays readable / scrollable; only the
+         mutation controls are disabled (Issue #149). -->
     <div
       class="extension-offline-notice"
       data-testid="extension-offline-notice"
@@ -575,6 +585,7 @@
         <Button
           variant="filled"
           disabled={offline || isBusy}
+          aria-disabled={offline || isBusy ? 'true' : undefined}
           onclick={handleUploadClick}
           data-testid="upload-extension-btn"
         >
@@ -662,7 +673,8 @@
                       <button
                         type="button"
                         class="reorder-btn"
-                        disabled={!canAdmin || offline || isBusy || idx === 0}
+                        disabled={mutationsDisabled || idx === 0}
+                        aria-disabled={mutationsDisabled || idx === 0 ? 'true' : undefined}
                         onclick={() => handleMoveUp(idx)}
                         data-testid="move-up-btn-{ext.id}"
                         title="優先度を上げる"
@@ -672,7 +684,10 @@
                       <button
                         type="button"
                         class="reorder-btn"
-                        disabled={!canAdmin || offline || isBusy || idx === sortedExtensions.length - 1}
+                        disabled={mutationsDisabled || idx === sortedExtensions.length - 1}
+                        aria-disabled={mutationsDisabled || idx === sortedExtensions.length - 1
+                          ? 'true'
+                          : undefined}
                         onclick={() => handleMoveDown(idx)}
                         data-testid="move-down-btn-{ext.id}"
                         title="優先度を下げる"
@@ -731,7 +746,8 @@
                   <span class="priority-badge">#{ext.priority + 1}</span>
                   <Switch
                     selected={ext.enabled}
-                    disabled={!canAdmin || offline || isBusy || wasmMissing}
+                    disabled={mutationsDisabled || wasmMissing}
+                    aria-disabled={mutationsDisabled || wasmMissing ? 'true' : undefined}
                     onchange={() => handleToggle(ext.id)}
                     data-testid="ext-toggle-{ext.id}"
                     aria-label="{ext.name}の有効/無効化"
@@ -741,7 +757,8 @@
                   <div class="more-menu-wrapper">
                     <IconButton
                       variant="text"
-                      disabled={!canAdmin || offline || isBusy}
+                      disabled={mutationsDisabled}
+                      aria-disabled={mutationsDisabled ? 'true' : undefined}
                       onclick={(e) => {
                         e.stopPropagation();
                         activeMenuExtId = activeMenuExtId === ext.id ? null : ext.id;
@@ -769,7 +786,8 @@
                       }}
                     >
                       <MenuItem
-                        disabled={!canAdmin || offline || isBusy}
+                        disabled={mutationsDisabled}
+                        aria-disabled={mutationsDisabled ? 'true' : undefined}
                         onclick={() => {
                           activeMenuExtId = null;
                           handleDelete(ext.id);
@@ -815,16 +833,11 @@
     box-sizing: border-box;
   }
   /*
-   * ARCHITECTURE.md & Issue #59/#145:
-   * オフライン時はタブ全体（管理者を含む）を暗転し、操作を受け付けない。
-   * `aria-disabled` (root) と `pointer-events` の両方で担保する。
+   * Issue #149: neither the offline state nor the non-admin lock may dim or
+   * freeze the shell. The list and the offline banner must stay readable and
+   * scrollable; only the mutation controls are `disabled` + `aria-disabled`.
+   * Do not reintroduce `opacity` / `pointer-events` / `filter` here.
    */
-  .extension-tab-shell.extensions-offline {
-    opacity: 0.5;
-    pointer-events: none;
-    user-select: none;
-    filter: grayscale(80%);
-  }
   .extension-offline-notice {
     display: flex;
     align-items: flex-start;
@@ -847,8 +860,8 @@
   }
   .offline-hint {
     font-size: 0.8rem;
+    /* Issue #149: full contrast; no dimmed text on the error container. */
     color: var(--np-color-on-error-container);
-    opacity: 0.85;
   }
   .extension-tab-container {
     display: flex;
@@ -863,16 +876,11 @@
     gap: 16px;
   }
   /*
-   * ARCHITECTURE.md & Issue #59:
-   * 管理者（admin）以外のユーザーが開いた場合、タブ全体が暗くなりアクションを受け付けない制御（opacity: 0.5, pointer-events: none）を確実に適用。
-   * Issue #145: オフライン時も管理者を含めて同じ制御を行う。
+   * Issue #59 / #145 / #149:
+   * 管理者（admin）以外のユーザーが開いた場合もタブは読めるままにし、操作だけを無効化する。
+   * オフライン時も同じ方針（オフライン通知は通常のコントラストで表示）。
+   * 暗転・クリック透過は行わない（再導入しない）。
    */
-  .extension-tab-shell.non-admin-locked {
-    opacity: 0.5;
-    pointer-events: none;
-    user-select: none;
-    filter: grayscale(80%);
-  }
   .tab-header {
     display: flex;
     justify-content: space-between;

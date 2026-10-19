@@ -128,8 +128,8 @@ function buildWasmWithSelfIntro(introBytes: Uint8Array): Uint8Array {
 }
 
 describe('Extensions Tab & WASM ABI Host Runner', () => {
-  // spec: alhalte-argenterie/extensions-abi 管理者権限ロック（非管理者グレーアウト）
-  it('locks extension management for non-admins (grayed out & disabled) and permits admin edits', async () => {
+  // spec: alhalte-argenterie/extensions-abi 管理者権限ロック（非管理者は読み取り専用・操作のみ無効）
+  it('locks the extension management actions for non-admins and permits admin edits', async () => {
     const extensions: ExtensionItem[] = [
       { id: 'ext-1', name: 'alhalte-dsl', enabled: true, priority: 0 },
       { id: 'ext-2', name: 'markdown', enabled: false, priority: 1 },
@@ -168,16 +168,24 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
 
     const rootEl = target.querySelector('[data-testid="extension-management-tab"]');
     expect(rootEl?.classList.contains('non-admin-locked')).toBe(true);
+    // Issue #149: the non-admin shell stays readable; only actions are disabled.
+    expect(rootEl?.getAttribute('aria-disabled')).toBeNull();
+    expect(target.querySelector('[data-testid="extension-list"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="ext-name-ext-1"]')?.textContent?.trim()).toBe(
+      'alhalte-dsl',
+    );
     expect(target.querySelector('[data-testid="lock-indicator"]')).toBeTruthy();
 
     const checkbox = target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-ext-1"]');
     expect(checkbox?.disabled).toBe(true);
+    expect(checkbox?.getAttribute('aria-disabled')).toBe('true');
 
     const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="ext-more-btn-ext-1"]');
     expect(moreBtn?.disabled).toBe(true);
+    expect(moreBtn?.getAttribute('aria-disabled')).toBe('true');
 
     const delBtn = target.querySelector('[data-testid="ext-delete-btn-ext-1"]');
-    expect(delBtn?.getAttribute('aria-disabled') === 'true' || delBtn?.classList.contains('disabled')).toBe(true);
+    expect(delBtn?.getAttribute('aria-disabled')).toBe('true');
 
     unmount(instanceNonAdmin);
     target.remove();
