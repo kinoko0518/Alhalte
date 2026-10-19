@@ -30,6 +30,7 @@
   import OfflineQueueNotice from '../../OfflineQueueNotice.svelte';
   import CommonHeader from '../CommonHeader.svelte';
   import IconImagePicker from '../IconImagePicker.svelte';
+  import type { RoomRole } from '../../../utils/session.js';
 
   let {
     scene,
@@ -38,7 +39,8 @@
     extensions = [],
     extensionPipeline = new ExtensionPipeline(),
     roomId,
-    isAdmin = false,
+    role = 'participant',
+    defaultPermission = null,
     chunkManager = new ChunkLogManager(),
     onCollapse,
     onSelectScene,
@@ -47,7 +49,7 @@
     onDeleteScene,
     onManageMembers,
     onManagePermissions,
-    onSetDone,
+    onSetDefaultPermission,
     onRequestAssetPicker,
     hideHeader = false,
     roomSocket = null,
@@ -60,7 +62,10 @@
     extensions?: ExtensionItem[];
     extensionPipeline?: ExtensionPipeline;
     roomId?: string;
-    isAdmin?: boolean;
+    /** Role of the caller, forwarded to the inline `CommonHeader` (Issue #201). */
+    role?: RoomRole;
+    /** Default permission shown by the header selector (`null` = unknown). */
+    defaultPermission?: RoomRole | null;
     chunkManager?: ChunkLogManager;
     onCollapse?: () => void;
     onSelectScene?: (sceneId: string) => void;
@@ -69,7 +74,7 @@
     onDeleteScene?: () => void;
     onManageMembers?: () => void;
     onManagePermissions?: () => void;
-    onSetDone?: (done: boolean) => void;
+    onSetDefaultPermission?: (permission: RoomRole) => void | Promise<unknown>;
     onRequestAssetPicker?: (options: {
       mediaType: AssetMediaType;
       initialScope?: AssetScope;
@@ -651,7 +656,8 @@
       {allScenes}
       {characters}
       {roomId}
-      {isAdmin}
+      {role}
+      {defaultPermission}
       {onCollapse}
       {onSelectScene}
       {onExportZip}
@@ -659,7 +665,7 @@
       {onDeleteScene}
       {onManageMembers}
       {onManagePermissions}
-      {onSetDone}
+      {onSetDefaultPermission}
     />
   {/if}
 

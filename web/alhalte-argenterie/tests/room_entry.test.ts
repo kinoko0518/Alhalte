@@ -13,6 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
 import App from '../src/components/App.svelte';
 import type { VisitedRoom } from '../src/types/index.js';
+import type { RoomRole } from '../src/utils/session.js';
 
 const ROOM_KEY_HEX =
   'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
@@ -26,7 +27,7 @@ function jsonResponse(payload: unknown, status = 200): Response {
   } as Response;
 }
 
-function roomInfo(role: 'gm' | 'pl' | 'viewer', name = 'サーバー部屋') {
+function roomInfo(role: RoomRole, name = 'サーバー部屋') {
   return {
     room_id: '1122334455667788',
     name,
@@ -85,7 +86,7 @@ describe('App room entry preflight & roles (Issue #156)', () => {
   };
 
   it('derives isAdmin from the server role and shows the GM-only menu section', async () => {
-    mountApp({ initialRoom: baseRoom, userRole: 'gm' });
+    mountApp({ initialRoom: baseRoom, userRole: 'admin' });
     gearMenu();
     await new Promise((r) => setTimeout(r, 30));
 
@@ -99,7 +100,7 @@ describe('App room entry preflight & roles (Issue #156)', () => {
       JSON.stringify([{ ...baseRoom, isAdmin: true }]),
     );
 
-    mountApp({ initialRoom: { ...baseRoom, isAdmin: true }, userRole: 'pl' });
+    mountApp({ initialRoom: { ...baseRoom, isAdmin: true }, userRole: 'participant' });
     gearMenu();
     await new Promise((r) => setTimeout(r, 30));
 
@@ -165,6 +166,43 @@ describe('App room entry preflight & roles (Issue #156)', () => {
     );
     // 403 is final: the client must not retry it forever.
     expect(fetchFn).toHaveBeenCalledTimes(1);
+  });
+
+  // spec: alhalte-argenterie/入室 4 段階 role の denied も GateScreen (#201)
+  it('renders the gate screen when the preflight body reports the denied role', async () => {
+    window.history.replaceState(
+      null,
+      '',
+      `/rooms/1122334455667788#${ROOM_KEY_HEX}`,
+    );
+    const fetchFn = vi.fn(async () => jsonResponse(roomInfo('denied')));
+
+    mountApp({ fetchFn });
+
+    await vi.waitFor(() =>
+      expect(target.querySelector('[data-testid="forbidden-room-screen"]')).toBeTruthy(),
+    );
+    expect(target.querySelector('[data-testid="room-layout"]')).toBeNull();
+    expect(target.querySelector('[data-testid="chat-input-field"]')).toBeNull();
+  });
+
+  // spec: alhalte-argenterie/入室 done フラグは必須ではない (#200 / #201)
+  it('accepts a preflight response without the legacy done flag', async () => {
+    window.history.replaceState(
+      null,
+      '',
+      `/rooms/1122334455667788#${ROOM_KEY_HEX}`,
+    );
+    const fetchFn = vi.fn(async () =>
+      jsonResponse({ room_id: '1122334455667788', name: 'サーバー部屋', role: 'participant' }),
+    );
+
+    mountApp({ fetchFn });
+
+    await vi.waitFor(() =>
+      expect(target.querySelector('[data-testid="room-layout"]')).toBeTruthy(),
+    );
+    expect(target.textContent).toContain('サーバー部屋');
   });
 
   it('renders a clear not-found state on a 404 and does not enter', async () => {
@@ -234,7 +272,7 @@ describe('App room entry preflight & roles (Issue #156)', () => {
       '',
       `/rooms/1122334455667788#${ROOM_KEY_HEX}`,
     );
-    const fetchFn = vi.fn(async () => jsonResponse(roomInfo('gm', 'サーバー側の部屋名')));
+    const fetchFn = vi.fn(async () => jsonResponse(roomInfo('admin', 'サーバー側の部屋名')));
 
     mountApp({ fetchFn });
 

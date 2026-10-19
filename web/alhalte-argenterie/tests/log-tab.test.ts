@@ -147,7 +147,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       target,
       props: {
         scene: testScene,
-        isAdmin: false,
+        role: 'participant',
         onCollapse: () => {
           collapsed = true;
         },
@@ -184,7 +184,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       target,
       props: {
         scene: testScene,
-        isAdmin: true,
+        role: 'admin',
       },
     });
 
@@ -382,7 +382,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       target,
       props: {
         scene: testScene,
-        isAdmin: true,
+        role: 'admin',
       },
     });
 

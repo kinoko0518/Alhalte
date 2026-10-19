@@ -7,18 +7,20 @@
    */
   import { Button, Card } from 'noph-ui';
   import type { Scene } from '../../../types/index.js';
+  import { roomRoleCapabilities, type RoomRole } from '../../../utils/session.js';
 
   let {
     scenes = [],
     currentSceneId,
-    isAdmin = false,
+    role = 'participant',
     onSelectScene,
     onCreateScene,
     onDeleteScene,
   }: {
     scenes?: Scene[];
     currentSceneId?: string;
-    isAdmin?: boolean;
+    /** Role of the caller; scene creation is admin-only (Issue #201). */
+    role?: RoomRole;
     onSelectScene?: (sceneId: string) => void;
     onCreateScene?: () => void;
     onDeleteScene?: (sceneId: string) => void;
@@ -28,7 +30,7 @@
 <div class="scene-management-container" data-testid="scene-management-tab">
   <div class="scene-management-header">
     <h3 class="tab-title">シーン一覧</h3>
-    {#if isAdmin}
+    {#if roomRoleCapabilities(role).isAdmin}
       <Button variant="filled" onclick={onCreateScene} data-testid="create-scene-btn-mgmt">
         新規シーン
       </Button>
@@ -52,7 +54,7 @@
               >
                 {sc.id === currentSceneId ? '現在地' : '移動'}
               </Button>
-              {#if isAdmin && sc.id !== '/'}
+              {#if roomRoleCapabilities(role).isAdmin && sc.id !== '/'}
                 <Button
                   variant="text"
                   onclick={() => onDeleteScene?.(sc.id)}

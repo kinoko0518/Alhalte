@@ -362,7 +362,7 @@ describe('Scene Graph Algorithm & View', () => {
         movements,
         sceneNames,
         accessibleSceneIds: accessibleScenes,
-        isAdmin: true,
+        role: 'admin',
         onDeleteScene: (id) => {
           deletedSceneId = id;
         },
@@ -422,7 +422,7 @@ describe('Scene Graph Algorithm & View', () => {
         movements,
         sceneNames,
         accessibleSceneIds: accessibleScenes,
-        isAdmin: true,
+        role: 'admin',
         onDeleteScene: (id) => {
           deletedSceneId = id;
         },

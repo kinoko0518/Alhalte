@@ -14,9 +14,8 @@
 
 | 接続先 | 内容 |
 | --- | --- |
-| `maitre-d` `POST /api/rooms` | 認証必須。`{ name, room_id? }` で部屋を登録し、作成者を `gm` にする（`utils/home.ts` の `createRoom`）。`room_id` はクライアント生成の 16 hex を送ってもよいが、返却値が正。 |
-| `maitre-d` `GET /api/rooms/{room_id}` | 入室 preflight。部屋名・caller の `role`・`done` を返す（`utils/home.ts` の `fetchRoomInfo`）。403 / 404 は事前に判別する。 |
-| `maitre-d` `/api/room/{room_id}/permissions` | 部屋権限の取得・設定・削除（`utils/session.ts`）。`room_id` は 16 hex。 |
+| `maitre-d` `POST /api/rooms` | 認証必須。`{ name, room_id? }` で部屋を登録し、作成者を `admin` にする（`utils/home.ts` の `createRoom`）。`room_id` はクライアント生成の 16 hex を送ってもよいが、返却値が正。 |
+| `maitre-d` `GET /api/rooms/{room_id}` | 入室 preflight。部屋名と呼び出し元の `role`（`admin` / `participant` / `viewer` / `denied`）を返す（`utils/home.ts` の `fetchRoomInfo`）。`denied` は 403 で返るため、403 は `GateScreen`、404 は not-found として事前に判別する。旧 `done` フラグは #200 で廃止され、返ってきても UI は使わない。 |
 | `maitre-d` `/api/accounts/search` | account 検索。 |
 | `maitre-d` `/api/account/{account_id}` | account 取得・更新。アカウントメニューの表示名・アイコン取得に使う（`utils/account.ts`）。 |
 | `maitre-d` `GET /auth/login?return_to=...&prompt=...` | Google サインインの入口。絶対 URL の `return_to`（fragment を除く）へ遷移する（`utils/account.ts`）。state と `redirect_uri` は maitre-d が持つ。 |
@@ -32,7 +31,8 @@
 
 - **URL 構築**: `buildRoomWebSocketUrl` は招待ページ URL（`https://host/rooms/<id>#<key>`）からは **origin だけ** を使い、`ws(s)://host/ws/room/<id>` を組み立てる。`/rooms/<id>` などのパスを WebSocket URL に引き継がない。明示的な `ws(s)://.../ws/room/...` だけをそのまま使い、それ以外の `ws(s)` URL も origin から作り直す。
 - **room ID 検証**: `utils/home.ts` の `parseRoomUrl` は 16 hex（または移行用 decimal）だけを受理し、`room-1` のような任意文字列は `null` で拒否する。`generateRoomUrl` は 16 hex を作る。
-- **close 通知と再接続**: `RoomSocket` は `onclose(event)` を `onClose` callback と `getLastCloseEvent()` で公開する。`1008` / `4403` / `4404` は再試行不能として自動再接続を止め、`App` はこれらを `isForbidden`（`GateScreen`）に反映する。入室前の HTTP 403 / 404 は `GET /api/rooms/{id}` の preflight で判別する。
+- **close 通知と再接続**: `RoomSocket` は `onclose(event)` を `onClose` callback と `getLastCloseEvent()` で公開する。`1008` / `4403` / `4404` は再試行不能として自動再接続を止め、`App` はこれらを `denied`（`GateScreen`）に反映する。入室前の HTTP 403（`denied`） / 404 は `GET /api/rooms/{id}` の preflight で判別する。
+- **権限 frame (Issue #201)**: 権限表は HTTP ではなく WS で扱う。`ClientFrame::QueryPermissions`（`PermissionsSnapshot` が返る）、`SetMemberPermission { account_id, permission }` と `SetDefaultPermission { permission }`（成功で `PermissionsUpdated`、失敗で `SetMemberPermissionFailed` / `SetDefaultPermissionFailed` の `Error`）を `requestQueryPermissions` / `requestSetMemberPermission` / `requestSetDefaultPermission` で送る。level は banquette の Serde 表記（`Admin` / `Participant` / `Viewer` / `Denied`）で送受信し、UI の role（小文字）とは `roleToPermissionLevel` / `permissionLevelToRole` で変換する。ack は要求元にしか届かず、部屋全体へは broadcast されない。
 
 - **Tin エンコード**: banquette が `Tin` を期待する frame（`AppendLog.entry`、character の `data`）は、`jsonToTin` / `logRecordToTin` / `characterToTinMap` で Tin JSON `{ label, payload }` に変換してから送る。label は pantry の `labelHash` で用途別定数（`LABEL_LOG_RECORD`、`LABEL_JSON` など）を使う。受信側は `tinToJson` / `tinToLogRecord` / `tinMapToCharacter` で戻す。`CharacterList` / `CharacterInfo` も `tinMapToCharacter` で全属性（statuses / parameters / chatPalette / icon / color / piecePosition など）を decode する。
 - **Promise API と ack**: mutate 用の `request*` と query 用の `query*` が Promise を返す。既存の void API（`appendLog`、`updateState`、`createCharacter` など）は残している。
@@ -93,12 +93,12 @@
 
 1. `main.ts` が `App` を mount する。管理者は `isAdmin` ではなくサーバーの `role` から決める。
 2. `App.svelte` は `resolveRoomFromLocation` で URL から部屋を解決する。
-3. 入室前に `GET /api/rooms/{room_id}` を preflight する。成功時は返却された `name` を `currentRoom.name` に、`role` を `userRole` に反映してから `RoomSocket` を作る。403 / 401 は `GateScreen`、404 は not-found 画面、ネットワーク / 5xx は 2 秒間隔・最大 5 回の再試行後に再試行 UI を出す。403 / 404 は再試行しない。
+3. 入室前に `GET /api/rooms/{room_id}` を preflight する。成功時は返却された `name` を `currentRoom.name` に、`role`（4 段階）を `userRole` に反映してから `RoomSocket` を作る。403（`denied`） / 401 は `GateScreen`、404 は not-found 画面、ネットワーク / 5xx は 2 秒間隔・最大 5 回の再試行後に再試行 UI を出す。403 / 404 は再試行しない。
 4. `RoomSocket` を作り、account / session をクエリに付けて接続する。preflight が `ok` になるまで WebSocket は開かない。`initialRoom` prop はテスト / プレビュー用の明示 override で、preflight と `userRole` の上書きをスキップする。
 5. `ServerFrame` の `SceneList`（`SceneSummary` の列）、`SceneInfo`、`CharacterList`、`CharacterInfo`、`StateSnapshot`、`StateUpdated`、`StateDeleted`、`LogEventAppended`、`SceneCreated` / `SceneDeleted` / `CharacterMoved` / `CharacterDeleted` などを Svelte の state に反映する。`SceneList` / `StateSnapshot` がシーン名・BGM・背景・view・駒の権威で、`SceneList` / `SceneInfo` の `present_characters` が `scene.members` の権威、`CharacterInfo` / `CharacterDeleted` / `CharacterMoved` が character 一覧の権威。`SceneInfo` は create / rename / membership を他クライアントへ即時反映する。
-6. ログタブは入室時と scene 切り替え時に最新 chunk を読む（後述）。WebSocket の `Error` frame や close code（`1008` / `4403` / `4404`）も `isForbidden` のフォールバックとして `GateScreen` を出す。
+6. ログタブは入室時と scene 切り替え時に最新 chunk を読む（後述）。WebSocket の `Error` frame や close code（`1008` / `4403` / `4404`）も `denied`（`isForbidden`）のフォールバックとして `GateScreen` を出す。
 
-`isAdmin` は `userRole === 'gm'`（viewer は常に false）で導出し、`isAdmin` prop はテスト / プレビュー用の明示 override に限定する。`VisitedRoom.isAdmin` は localStorage 互換のために保存するだけで、権限判定には使わない。
+`RoomRole` は `admin` / `participant` / `viewer` / `denied` の 4 段階で、`utils/session.ts` の `roomRoleCapabilities` が `isAdmin` / `isParticipant` / `isViewer` / `isDenied` と `canSend` / `canManageScenes` / `canManageCharacters` / `canManageExtensions` / `canManageRoom` を導出する。`isAdmin` は `effectiveRole === "admin"`、`isViewer` は `viewer` のみで、participant を viewer 扱いしない。`isAdmin` prop はテスト / プレビュー用の明示 override に限定し、role が未確定（preflight 前）のときだけ participant 相当として扱う。`VisitedRoom.isAdmin` は localStorage 互換のために保存するだけで、権限判定には使わない。
 
 ### 部屋作成
 
@@ -109,7 +109,7 @@
 
 ### 門前払い画面
 
-`GateScreen` はフィールドやコントロールパネルの代わりに全画面で表示する。
+`GateScreen` はフィールドやコントロールパネルの代わりに全画面で表示する。4 段階 role では `denied` がこれに当たる（preflight の 403、role が `denied` の応答、WebSocket の `1008` / `4403` / `4404`）。
 
 - 中央大文字: 「アカウントに入室権限がありません」
 - 説明: 「部屋の管理者に権限をリクエストしてください。正しいアカウントを使っていますか？」
@@ -211,7 +211,19 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 
 ### 権限 UI
 
-`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。ロール変更・追加・削除は API の成功を待ってからローカル一覧へ反映し、失敗時は元の一覧へ戻してエラーバナーを表示する（楽観的に確定しない）。`CommonHeader` の「部屋の全てをPLに公開」は `RoomSocket.requestSetDone` の `DoneUpdated` ack 後にのみダイアログを閉じ、`SetDoneFailed` / `PermissionDenied` / timeout ではエラーを表示して開いたままにする。`App` は `isViewer` を `SceneSettingsTab`（シーン作成・削除・メンバー移動）、`SceneGraphTab`（シーン削除）、`CharacterManagementTab`（作成・編集・削除・駒配置）、`ExtensionManagementTab`（追加・並べ替え・削除・toggle）へ渡し、viewer では該当操作を無効化する。viewer の場合はフッターの送信・ダイス・scene 変更も無効化する。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
+
+`utils/session.ts` の `searchAccounts` だけが HTTP を使い、権限表そのものは `RoomSocket` の権限 frame で読み書きする（Issue #201）。`RoomPermissionModal` は開くたびに `requestQueryPermissions` で `PermissionsSnapshot` を取り、M3 Search、Divider、Connected Button Group（拒否 / 閲覧者 / 参加者 / 管理者）で行を描画する。一覧は account ID しか持たないため、表示名は `/api/accounts/search?q=<account_id>` で解決し、解決できない行は `#<account_id>` を出す。ロール変更・追加・既定へのリセットは `requestSetMemberPermission` の ack（`PermissionsUpdated`）が返ってから一覧を差し替える（楽観更新しない）。失敗時は一覧を変えずに `permission-error` を出す。「削除」は明示エントリを既定の権限へ戻す操作で、`SetMemberPermission(default_permission)` を送る（banquette にエントリ削除 frame は無い）。既定の権限 selector はモーダルと `CommonHeader` の gear menu にあり、`requestSetDefaultPermission` の ack 後にのみ表示が変わる。`CommonHeader` の旧「部屋の全てをPLに公開」（`SetDone` / `DoneUpdated`）は削除した。
+
+`App` は `role` を `ControlPanel` 経由で各タブへ渡し、viewer 判定ではなく `roomRoleCapabilities` で操作を出し分ける。
+
+| role | 送信（log / state） | character CRUD | scene 作成・削除・メンバー移動 | 拡張機能 | 権限表 / 既定の権限 |
+| --- | --- | --- | --- | --- | --- |
+| `admin` | 全 scene | 可 | 可 | 可 | 可 |
+| `participant` | アクセス可能 scene（UI は現在の scene のみ送信可とし、最終認可はサーバー） | 可 | 不可 | 不可 | 不可 |
+| `viewer` | 不可（入力欄・送信・ダイスを無効化） | 不可 | 不可 | 不可 | 不可 |
+| `denied` | 不可（`GateScreen` を表示） | 不可 | 不可 | 不可 | 不可 |
+
+`PermissionsSnapshot` は `accessible_scenes` を持たないため、participant の「アクセス可能 scene」は UI では現在の scene（と banquette が writer に常時許可する `/`）だけを送信可能として扱う。`accessibleSceneIds`（シーングラフの可視判定）は全 scene のままで、書込の可否とは独立している。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
 
 ## 既知の差分・制約
 
@@ -223,10 +235,10 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 - 公式既定拡張の削除の永続性は `extension::__seeded` マーカーに依存する。マーカーは GM が拡張機能タブを最初に開いたときに書かれるため、それ以前に別クライアントが削除した公式既定は seed で復活し得る（seed は「サーバーに無い公式既定を書く」ため）。サーバー正のマージも拡張機能タブを開いた時点で適用され、タブを開く前の送信 pipeline は App のローカル既定を使う。
 - タイムアウトは 8 秒で、権限問い合わせのようにサーバーが黙って破棄する操作では唯一の失敗シグナルになる。`PermissionDenied` が返らない経路はタイムアウトとして扱う。
 - Saignant WASM は v2 で character 名を受け取る。v2 をエクスポートしない古い wasm を読み込んだ場合だけ mention が `Anonymous` になる。committed artifact は `scripts/build-saignant-wasm.sh` で更新する。
-- 開発エントリ（`main.ts`）は `isAdmin` を渡さない。管理者は `GET /api/rooms/{id}` の `role === 'gm'` から決まる。`isAdmin` prop はテスト / プレビュー用の明示 override で、既定は false。`initialRoom` prop も同じくテスト / プレビュー用で preflight をスキップする。
+- 開発エントリ（`main.ts`）は `isAdmin` も `userRole` も渡さない。管理者は `GET /api/rooms/{id}` の `role === "admin"` から決まる。`isAdmin` prop はテスト / プレビュー用の明示 override で、既定は false。`initialRoom` prop も同じくテスト / プレビュー用で preflight をスキップし、そのとき role 未指定なら participant 相当（送信可・管理不可）として扱う。
 - 入室 preflight のネットワーク / 5xx 失敗は 2 秒間隔・最大 5 回で打ち切り、`OfflineIndicator` の再試行導線に合流する。403 / 401 / 404 は再試行しない。401 は `GateScreen`（サインイン導線）として扱う。
 - 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。`App` は `roomKey` prop → `currentRoom.url` のフラグメント → `window.location.hash` の順に解決し、64 hex を検証する。鍵が無い場合、アセット・拡張 wasm の cellar upload は試行せずエラーを表示する。
 - ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
 - Google OAuth の `redirect_uri` は maitre-d の固定 URL（`{public_url}/auth/google/callback`）だけを Google Cloud Console に登録する。argenterie の origin / port は登録しない。`return_to` は maitre-d が CORS allow-list と照合する。`/api/session` を Cookie 付きで呼ぶため、開発では `public_url` を argenterie の dev origin（Vite の `/auth` proxy）に合わせる必要がある。
 - `AccountMenu` は account ごとに `GET /api/account/{id}` を呼ぶ。プロフィール取得に失敗してもサインイン状態は維持し、イニシャル表示にフォールバックする。
-- 入室可否は `GET /api/rooms/{id}` の preflight を正とする。`isForbidden` は WebSocket の `Error` frame / close code でもフォールバックとして立つが、権限一覧 API の結果からは導出しない（権限一覧は `RoomPermissionModal` の表示にだけ使う）。`room_permissions` に行があり `done` が true の部屋でも、preflight が `viewer` を返せば入室できる。
+- 入室可否は `GET /api/rooms/{id}` の preflight を正とする。`isForbidden`（= `denied`）は WebSocket の `Error` frame / close code でもフォールバックとして立つが、権限表 (`PermissionsSnapshot`) からは導出しない。`PermissionsSnapshot` は要求元にしか返らず、`SetMemberPermission` / `SetDefaultPermission` の ack も broadcast されないため、他クライアントによる降格は再接続時の `QueryPermissions`（`App` は接続のたびに問い合わせる）まで見えない。participant のアクセス可能 scene は `PermissionsSnapshot` に含まれないので、UI は現在の scene だけを送信可能として扱い、最終認可は banquette に委ねる。

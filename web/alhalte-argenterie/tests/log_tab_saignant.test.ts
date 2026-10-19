@@ -178,7 +178,7 @@ describe('Saignant WASM & LogTab M3 Expressive Integration (Issue #55)', () => {
       props: {
         scene: sceneMain,
         allScenes: [sceneMain, sceneSub],
-        isAdmin: true,
+        role: 'admin',
         onCollapse: () => {
           collapsed = true;
         },
@@ -232,7 +232,7 @@ describe('Saignant WASM & LogTab M3 Expressive Integration (Issue #55)', () => {
     expect(target.querySelector('[data-testid="zip-export-item"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="export-zip-logs-item"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="manage-permissions-item"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="set-done-item"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="default-permission-selector"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="theme-section-header"]')).toBeTruthy();
 
     unmount(instance);
@@ -253,19 +253,19 @@ describe('Saignant WASM & LogTab M3 Expressive Integration (Issue #55)', () => {
     };
 
     let exportedType: string | null = null;
-    let doneState = false;
+    let doneDefaultPermission: string | null = null;
 
     const instance = mount(LogTab, {
       target,
       props: {
         scene: testScene,
         roomId: 'room-xyz-123',
-        isAdmin: true,
+        role: 'admin',
         onExportZip: (type) => {
           exportedType = type;
         },
-        onSetDone: (done) => {
-          doneState = done;
+        onSetDefaultPermission: async (permission) => {
+          doneDefaultPermission = permission;
         },
       },
     });
@@ -293,45 +293,34 @@ describe('Saignant WASM & LogTab M3 Expressive Integration (Issue #55)', () => {
     logsZipItem?.click();
     expect(exportedType).toBe('logs');
 
-    // Test 3: Set Done warning dialog
+    // Test 3: default permission selector (Issue #201, replaces the old
+    // 「部屋の全てをPLに公開」 toggle)
     gearBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    const setDoneItem = target.querySelector<HTMLElement>('[data-testid="set-done-item"]');
-    expect(setDoneItem).toBeTruthy();
-    setDoneItem?.click();
-    await new Promise((r) => setTimeout(r, 20));
+    const selector = target.querySelector('[data-testid="default-permission-selector"]');
+    expect(selector).toBeTruthy();
+    expect(target.querySelector('[data-testid="set-done-item"]')).toBeNull();
 
-    // Viewport-level full-screen warning overlay with scrim
-    const warningDialog = target.querySelector('[data-testid="set-done-warning-dialog"]');
-    expect(warningDialog).toBeTruthy();
-    expect(target.querySelector('[data-testid="done-dialog-title"]')?.textContent).toContain(
-      '部屋の全てをPLに公開しますか？',
+    const adminBtn = target.querySelector<HTMLButtonElement>(
+      '[data-testid="default-permission-btn-admin"]',
     );
-    expect(target.querySelector('[data-testid="done-dialog-warning"]')?.textContent).toContain(
-      '部屋を「公開（done）」状態にします',
-    );
+    expect(adminBtn).toBeTruthy();
+    adminBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(doneDefaultPermission).toBe('admin');
 
-    // Cancel does not trigger setDone
-    target.querySelector<HTMLButtonElement>('[data-testid="cancel-done-btn"]')?.click();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeNull();
-    expect(doneState).toBe(false);
+    // The component never commits on its own: the App applies the ack.
+    expect(
+      target.querySelector('[data-testid="default-permission-btn-admin"]')?.className,
+    ).not.toContain('filled');
 
-    // Reopen and confirm
-    gearBtn?.click();
-    await new Promise((r) => setTimeout(r, 20));
-    target.querySelector<HTMLElement>('[data-testid="set-done-item"]')?.click();
-    await new Promise((r) => setTimeout(r, 20));
-
-    target.querySelector<HTMLButtonElement>('[data-testid="confirm-done-button"]')?.click();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(doneState).toBe(true);
-    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeNull();
-
-    // Test 4: Theme Palette selection (Azure, Violet, Emerald, Rose, Amber)
-    gearBtn?.click();
-    await new Promise((r) => setTimeout(r, 20));
+    // Test 4: Theme Palette selection (Azure, Violet, Emerald, Rose, Amber).
+    // The default permission selector keeps the gear menu open.
+    if (!target.querySelector('[data-testid="gear-dropdown-menu"]')) {
+      gearBtn?.click();
+      await new Promise((r) => setTimeout(r, 20));
+    }
 
     const emeraldItem = target.querySelector<HTMLElement>('[data-testid="theme-item-emerald"]');
     expect(emeraldItem).toBeTruthy();

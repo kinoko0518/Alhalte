@@ -180,7 +180,7 @@ describe('Home Screen & Room URL', () => {
       return jsonResponse({
         room_id: posted.room_id,
         name: posted.name,
-        role: 'gm',
+        role: 'admin',
         done: false,
       });
     });
@@ -442,7 +442,7 @@ describe('Home Screen & Room URL', () => {
       return jsonResponse({
         room_id: SERVER_ROOM_ID,
         name: 'サーバー命名の部屋',
-        role: 'gm',
+        role: 'admin',
         done: false,
       });
     });
@@ -498,7 +498,7 @@ describe('Home Screen & Room URL', () => {
       return jsonResponse({
         room_id: '1122334455667788',
         name: 'サーバー部屋',
-        role: 'pl',
+        role: 'participant',
         done: false,
       });
     });

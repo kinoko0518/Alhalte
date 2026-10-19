@@ -87,7 +87,7 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
         json: async () => ({
           room_id: posted.room_id,
           name: posted.name,
-          role: 'gm',
+          role: 'admin',
           done: false,
         }),
       } as Response;
@@ -257,6 +257,7 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
       target,
       props: {
         currentScene: testScene,
+        role: 'admin',
         allScenes: [testScene],
         characters: testCharacters,
         onUpdateScene: (sc) => {

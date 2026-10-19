@@ -55,14 +55,14 @@
     type AssetItem,
     type AssetMediaType,
   } from '../../../utils/assets.js';
+  import { roomRoleCapabilities, type RoomRole } from '../../../utils/session.js';
   import AssetPickerModal from '../AssetPickerModal.svelte';
 
   let {
     currentScene,
     allScenes = [],
     characters = [],
-    isAdmin = false,
-    isViewer = false,
+    role = 'participant',
     onUpdateScene,
     onCreateScene,
     onDeleteScene,
@@ -80,9 +80,11 @@
     currentScene: Scene;
     allScenes?: Scene[];
     characters?: Character[];
-    isAdmin?: boolean;
-    /** Viewers cannot create/delete scenes or move members (Issue #156). */
-    isViewer?: boolean;
+    /**
+     * Role of the caller (Issue #201). Scene creation/deletion, log deletion and
+     * member moves are admin-only; `viewer` and `denied` get the read-only tab.
+     */
+    role?: RoomRole;
     onUpdateScene?: (scene: Scene) => void;
     onSelectScene?: (sceneId: string) => void;
     onCreateScene?: (
@@ -161,12 +163,14 @@
     return unsubscribe;
   });
 
-  /** Viewers get a read-only scene settings tab (Issue #156). */
-  let canManageScenes = $derived(!isViewer);
+  let capabilities = $derived(roomRoleCapabilities(role));
+
+  /** Scene creation / deletion / log deletion / member moves are admin-only (Issue #201). */
+  let canManageScenes = $derived(capabilities.canManageScenes);
 
   let imageAssets = $derived(
     allAssets.filter(
-      (a) => a.mediaType === 'image' && ((isAdmin && canManageScenes) || a.scope === 'personal'),
+      (a) => a.mediaType === 'image' && (capabilities.isAdmin || a.scope === 'personal'),
     ),
   );
 
@@ -1175,7 +1179,7 @@
         label="背景画像アセット"
         aspectRatio={16 / 9}
         showNone={true}
-        isAdmin={isAdmin && canManageScenes}
+        isAdmin={capabilities.isAdmin}
         imageAssets={imageAssets}
         onSelect={handleQuickSelectBgImage}
         onOpenPicker={handleBgImageSelect}
@@ -1750,7 +1754,7 @@
     <AssetPickerModal
       open={isAssetPickerOpen}
       initialMediaType={assetPickerMediaType}
-      isAdmin={isAdmin && canManageScenes}
+      isAdmin={capabilities.isAdmin}
       onSelect={handleAssetPicked}
       onClose={() => (isAssetPickerOpen = false)}
     />

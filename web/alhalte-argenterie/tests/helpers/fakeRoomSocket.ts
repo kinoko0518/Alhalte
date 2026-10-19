@@ -44,15 +44,24 @@
  *   {@link FakeRoomSocket.resolveCharacterRequest} /
  *   {@link FakeRoomSocket.rejectCharacterRequest}. Creates allocate ids from
  *   {@link FakeRoomSocket.nextCharacterId}, mirroring `CharacterCreated`.
+ * - `requestQueryPermissions` / `requestSetMemberPermission` /
+ *   `requestSetDefaultPermission` — the room permission table (Issue #201).
+ *   They answer immediately with {@link FakeRoomSocket.permissionsSnapshot}
+ *   (mutated by the two writes) unless
+ *   {@link FakeRoomSocket.permissionsError} is set, in which case they reject
+ *   like a `SetMemberPermissionFailed` / timeout. `emitFrame` can push a
+ *   `PermissionsUpdated` to subscribers to simulate a pushed role change.
  * - `emitFrame` — pushes an arbitrary `ServerFrame` to the subscribers so an
  *   App-level test can drive `StateUpdated` / `StateDeleted`.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`, `### アセット`
  * - GitHub Issue #109 / sub-issue #139, #140, #141, #142, #143, #144, #145
+ * - GitHub Issue #201: 4 段階権限を WebSocket で変更する
  */
 import type { ChunkLogManager } from '../../src/utils/log.js';
-import type { RoomSocket } from '../../src/utils/roomSocket.js';
+import type { PermissionsAck, RoomSocket } from '../../src/utils/roomSocket.js';
+import type { RoomPermissionLevel } from '../../src/utils/session.js';
 import type { Character, LogRecord } from '../../src/types/index.js';
 
 type FrameListener = (frame: unknown) => void;
@@ -227,6 +236,21 @@ export class FakeRoomSocket {
   autoAnswerCharacterRequests = true;
   /** Id allocated by the next successful `requestCreateCharacter` ack. */
   nextCharacterId = 1000;
+  /**
+   * Wire permission table answered by `requestQueryPermissions` (Issue #201).
+   * The two set requests mutate it and answer with the new table, exactly like
+   * banquette's `PermissionsSnapshot` / `PermissionsUpdated`.
+   */
+  permissionsSnapshot: PermissionsAck = {
+    default_permission: 'Viewer',
+    permissions: {},
+  };
+  /**
+   * When set, every permission request rejects with this error (simulates a
+   * non-admin `SetMemberPermissionFailed` / `SetDefaultPermissionFailed` or a
+   * timeout, Issue #201).
+   */
+  permissionsError: unknown = null;
 
   readonly requestAppendLogCalls: AppendCall[] = [];
   readonly appendLogCalls: AppendCall[] = [];
@@ -244,6 +268,15 @@ export class FakeRoomSocket {
   readonly requestCreateCharacterCalls: CreateCharacterCall[] = [];
   readonly requestUpdateCharacterCalls: UpdateCharacterCall[] = [];
   readonly requestDeleteCharacterCalls: DeleteCharacterCall[] = [];
+  /** Count of `QueryPermissions` requests (Issue #201). */
+  requestQueryPermissionsCalls = 0;
+  /** Recorded `SetMemberPermission` frames (Issue #201). */
+  readonly requestSetMemberPermissionCalls: Array<{
+    accountId: number;
+    permission: RoomPermissionLevel;
+  }> = [];
+  /** Recorded `SetDefaultPermission` frames (Issue #201). */
+  readonly requestSetDefaultPermissionCalls: RoomPermissionLevel[] = [];
 
   private readonly listeners = new Set<FrameListener>();
   private readonly pending: Array<{
@@ -550,6 +583,62 @@ export class FakeRoomSocket {
   /** Number of character create/update/delete requests still waiting for a manual answer. */
   get pendingCharacterRequestCount(): number {
     return this.pendingCharacterRequests.length;
+  }
+
+  // -------------------------------------------------------------------------
+  // Room permission table (Issue #201)
+  // -------------------------------------------------------------------------
+
+  /** Answers `QueryPermissions` with {@link FakeRoomSocket.permissionsSnapshot}. */
+  requestQueryPermissions(_timeoutMs?: number): Promise<PermissionsAck> {
+    this.requestQueryPermissionsCalls += 1;
+    return this.answerPermissions();
+  }
+
+  /**
+   * Records a `SetMemberPermission` frame and answers with the updated table
+   * (the same shape as banquette's `PermissionsUpdated`).
+   */
+  requestSetMemberPermission(
+    accountId: number,
+    permission: RoomPermissionLevel,
+    _timeoutMs?: number,
+  ): Promise<PermissionsAck> {
+    this.requestSetMemberPermissionCalls.push({ accountId, permission });
+    if (this.permissionsError) return Promise.reject(this.permissionsError);
+    this.permissionsSnapshot = {
+      ...this.permissionsSnapshot,
+      permissions: { ...this.permissionsSnapshot.permissions, [String(accountId)]: permission },
+    };
+    return this.answerPermissions();
+  }
+
+  /** Records a `SetDefaultPermission` frame and answers with the updated table. */
+  requestSetDefaultPermission(
+    permission: RoomPermissionLevel,
+    _timeoutMs?: number,
+  ): Promise<PermissionsAck> {
+    this.requestSetDefaultPermissionCalls.push(permission);
+    if (this.permissionsError) return Promise.reject(this.permissionsError);
+    this.permissionsSnapshot = { ...this.permissionsSnapshot, default_permission: permission };
+    return this.answerPermissions();
+  }
+
+  private answerPermissions(): Promise<PermissionsAck> {
+    if (this.permissionsError) return Promise.reject(this.permissionsError);
+    return Promise.resolve({
+      default_permission: this.permissionsSnapshot.default_permission,
+      permissions: { ...this.permissionsSnapshot.permissions },
+    });
+  }
+
+  /** Pushes a `PermissionsUpdated` frame to every subscriber (pushed role change). */
+  deliverPermissionsUpdated(snapshot: PermissionsAck = this.permissionsSnapshot): void {
+    this.permissionsSnapshot = {
+      default_permission: snapshot.default_permission,
+      permissions: { ...snapshot.permissions },
+    };
+    this.emitFrame({ PermissionsUpdated: snapshot });
   }
 
   /**

@@ -24,6 +24,7 @@ import {
   labelHash,
 } from '@alhalte/pantry';
 import type { Character, LogRecord, LogSystemEvent } from '../types/index.js';
+import type { RoomPermissionLevel } from './session.js';
 import {
   connectionManager as defaultConnectionManager,
   ConnectionManager,
@@ -164,9 +165,12 @@ export interface LogRewoundAck {
   position: number;
 }
 
-/** Acknowledgement payload of `DoneUpdated`. */
-export interface DoneUpdatedAck {
-  done: boolean;
+/** Acknowledgement payload of `PermissionsSnapshot` / `PermissionsUpdated`. */
+export interface PermissionsAck {
+  /** Level applied to accounts without an explicit entry (wire PascalCase). */
+  default_permission: RoomPermissionLevel;
+  /** Explicit per-account levels, keyed by account ID (wire PascalCase). */
+  permissions: Record<string, RoomPermissionLevel>;
 }
 
 // =========================================================================
@@ -728,7 +732,6 @@ export type ClientFrame =
   | { DeleteScene: { scene_id: string } }
   | { EnterScene: { scene_id: string } }
   | { LeaveScene: { scene_id: string } }
-  | { SetDone: { done: boolean } }
   | { QueryState: { scene_id: string } }
   | { UpdateState: { scene_id: string; key: string; value: TinJson | any } }
   | { DeleteState: { scene_id: string; key: string } }
@@ -746,6 +749,13 @@ export type ClientFrame =
   | { DeleteCharacter: { character_id: number } }
   | { MoveCharacter: { character_id: number; to_scene_id: string } }
   | { WebRtcSignal: { to_client_id: number; payload: any } }
+  /** Requests the whole permission table (`ServerFrame::PermissionsSnapshot`). */
+  | 'QueryPermissions'
+  | { QueryPermissions?: Record<string, never> }
+  /** Sets one account's level (admin only); answered with `PermissionsUpdated`. */
+  | { SetMemberPermission: { account_id: number; permission: RoomPermissionLevel } }
+  /** Sets the level for accounts without an entry (admin only). */
+  | { SetDefaultPermission: { permission: RoomPermissionLevel } }
   | 'HeartbeatResponse';
 
 /**
@@ -775,7 +785,10 @@ export type ServerFrame =
   | { SceneCreated: { scene_id: string } }
   | { SceneDeleted: { scene_id: string } }
   | { CharacterMoved: { character_id: number; to_scene_id: string } }
-  | { DoneUpdated: { done: boolean } }
+  /** Answer to `QueryPermissions`: the whole permission table. */
+  | { PermissionsSnapshot: PermissionsAck }
+  /** Success ack of `SetMemberPermission` / `SetDefaultPermission`. */
+  | { PermissionsUpdated: PermissionsAck }
   | { Error: { code: string; message: string } };
 
 /**
@@ -834,6 +847,8 @@ export interface RoomSocketOptions {
   onLogEventDeleted?: (sceneId: string, chunkIndex: number, position: number) => void;
   onLogEventRewound?: (sceneId: string, chunkIndex: number, position: number) => void;
   onWebRtcSignal?: (fromClientId: number, payload: any) => void;
+  /** Called with the table carried by `PermissionsSnapshot` / `PermissionsUpdated`. */
+  onPermissions?: (permissions: PermissionsAck) => void;
   onServerFrame?: (frame: ServerFrame) => void;
   onError?: (error: { code: string; message: string }) => void;
 }
@@ -1043,7 +1058,9 @@ type OperationKind =
   | 'updateCharacter'
   | 'deleteCharacter'
   | 'rewindLog'
-  | 'setDone'
+  | 'queryPermissions'
+  | 'setMemberPermission'
+  | 'setDefaultPermission'
   | 'querySceneList'
   | 'queryState'
   | 'queryLogBiblio'
@@ -1556,41 +1573,93 @@ export class RoomSocket {
   }
 
   /**
-   * Sets the room's done flag (admin only), fire-and-forget.
+   * Requests the whole room permission table.
    *
-   * Use {@link RoomSocket.requestSetDone} when the caller must only report
-   * success after banquette acknowledged the change.
+   * Resolves with `ServerFrame::PermissionsSnapshot`. banquette answers only
+   * accounts that may access the room, so a `denied` caller never gets a
+   * response and the Promise times out (the preflight already shows
+   * `GateScreen` for it).
    */
-  public setDone(done: boolean): void {
-    this.send({ SetDone: { done } });
-  }
-
-  /**
-   * Sets the room's done flag and resolves only when banquette acknowledges it
-   * with `DoneUpdated`.
-   *
-   * banquette sends `SetDoneFailed` for a non-admin request and maitre-d never
-   * persists `rooms.done` before the success frame, so a rejected call leaves
-   * both the DB and the UI unchanged. `PermissionDenied` rejects the pending
-   * operation as well.
-   */
-  public requestSetDone(done: boolean, timeoutMs?: number): Promise<DoneUpdatedAck> {
-    const promise = this.registerOperation<DoneUpdatedAck>(
-      'setDone',
-      ['SetDoneFailed'],
+  public requestQueryPermissions(timeoutMs?: number): Promise<PermissionsAck> {
+    const promise = this.registerOperation<PermissionsAck>(
+      'queryPermissions',
+      [],
       (frame) => {
-        if (typeof frame !== 'object' || frame === null || !('DoneUpdated' in frame)) {
+        if (typeof frame !== 'object' || frame === null || !('PermissionsSnapshot' in frame)) {
           return { matched: false };
         }
-        if (Boolean(frame.DoneUpdated.done) !== Boolean(done)) {
-          return { matched: false };
-        }
-        return { matched: true, value: frame.DoneUpdated };
+        return { matched: true, value: frame.PermissionsSnapshot };
       },
       timeoutMs,
     );
 
-    this.send({ SetDone: { done } });
+    this.send('QueryPermissions');
+    return promise;
+  }
+
+  /**
+   * Sets one account's permission level and resolves only when banquette
+   * acknowledges it with `PermissionsUpdated`.
+   *
+   * banquette rejects non-admin requests with `SetMemberPermissionFailed` and
+   * demoting the last administrator with the same code, so a failed call leaves
+   * both the server table and the UI unchanged. `PermissionDenied` rejects the
+   * pending operation as well.
+   */
+  public requestSetMemberPermission(
+    accountId: number,
+    permission: RoomPermissionLevel,
+    timeoutMs?: number,
+  ): Promise<PermissionsAck> {
+    const target = Number(accountId);
+    const promise = this.registerOperation<PermissionsAck>(
+      'setMemberPermission',
+      ['SetMemberPermissionFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('PermissionsUpdated' in frame)) {
+          return { matched: false };
+        }
+        // Another pending write may be waiting for the same frame; only claim
+        // an ack whose table already reflects this account's level.
+        const levels = frame.PermissionsUpdated.permissions ?? {};
+        if (levels[String(target)] !== permission) {
+          return { matched: false };
+        }
+        return { matched: true, value: frame.PermissionsUpdated };
+      },
+      timeoutMs,
+    );
+
+    this.send({ SetMemberPermission: { account_id: target, permission } });
+    return promise;
+  }
+
+  /**
+   * Sets the permission level applied to accounts without an explicit entry.
+   *
+   * Resolves with the `PermissionsUpdated` ack and rejects with
+   * `SetDefaultPermissionFailed` / `PermissionDenied` / timeout.
+   */
+  public requestSetDefaultPermission(
+    permission: RoomPermissionLevel,
+    timeoutMs?: number,
+  ): Promise<PermissionsAck> {
+    const promise = this.registerOperation<PermissionsAck>(
+      'setDefaultPermission',
+      ['SetDefaultPermissionFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('PermissionsUpdated' in frame)) {
+          return { matched: false };
+        }
+        if (frame.PermissionsUpdated.default_permission !== permission) {
+          return { matched: false };
+        }
+        return { matched: true, value: frame.PermissionsUpdated };
+      },
+      timeoutMs,
+    );
+
+    this.send({ SetDefaultPermission: { permission } });
     return promise;
   }
 
@@ -2390,6 +2459,17 @@ export class RoomSocket {
     if ('WebRtcSignal' in frame) {
       const { from_client_id, payload } = frame.WebRtcSignal;
       this.options.onWebRtcSignal?.(from_client_id, payload);
+    }
+
+    // 10d. Permission table (Issue #201): banquette answers `QueryPermissions`
+    // with `PermissionsSnapshot` and the set frames with `PermissionsUpdated`.
+    // Both are only delivered to the requester (never broadcast), so listeners
+    // use them to refresh their own role / the modal's list.
+    if ('PermissionsSnapshot' in frame) {
+      this.options.onPermissions?.(frame.PermissionsSnapshot);
+    }
+    if ('PermissionsUpdated' in frame) {
+      this.options.onPermissions?.(frame.PermissionsUpdated);
     }
 
     // 11. Error

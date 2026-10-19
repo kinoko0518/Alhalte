@@ -49,7 +49,7 @@ describe('CommonHeader Component & Gear Menu Positioning (Issue #124)', () => {
       props: {
         scene: sampleScene,
         allScenes: sampleScenes,
-        isAdmin: true,
+        role: 'admin',
         onExportZip,
       },
     });
@@ -145,8 +145,8 @@ describe('CommonHeader Component & Gear Menu Positioning (Issue #124)', () => {
   });
 });
 
-// spec: alhalte-argenterie/common-header SetDone 完了ダイアログは ack 後にのみ閉じる
-describe('CommonHeader SetDone acknowledgement', () => {
+// spec: alhalte-argenterie/permissions 0200 既定の権限 selector は ack 後にのみ確定する
+describe('CommonHeader default permission selector (Issue #201)', () => {
   const scene: Scene = {
     id: '/',
     name: 'メインシーン',
@@ -160,15 +160,60 @@ describe('CommonHeader SetDone acknowledgement', () => {
     window.innerHeight = 800;
   });
 
-  async function openDoneDialog(target: HTMLDivElement) {
+  async function openGearMenu(target: HTMLDivElement) {
     target.querySelector<HTMLButtonElement>('[data-testid="gear-menu-button"]')?.click();
     await new Promise((r) => setTimeout(r, 20));
-    target.querySelector<HTMLElement>('[data-testid="set-done-item"]')?.click();
-    await new Promise((r) => setTimeout(r, 20));
-    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeTruthy();
   }
 
-  it('keeps the dialog open until onSetDone resolves', async () => {
+  it('renders the four default permission levels for an admin instead of the old PL toggle', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(CommonHeader, {
+      target,
+      props: { scene, role: 'admin', defaultPermission: 'participant' },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await openGearMenu(target);
+
+    // The old 「部屋の全てをPLに公開」 entry is gone.
+    expect(target.querySelector('[data-testid="set-done-item"]')).toBeNull();
+
+    expect(target.querySelector('[data-testid="default-permission-selector"]')).toBeTruthy();
+    for (const role of ['denied', 'viewer', 'participant', 'admin']) {
+      const button = target.querySelector<HTMLButtonElement>(
+        `[data-testid="default-permission-btn-${role}"]`,
+      );
+      expect(button).toBeTruthy();
+      expect(button?.disabled).toBe(false);
+    }
+    // The current level is the filled one.
+    expect(
+      target.querySelector('[data-testid="default-permission-btn-participant"]')?.className,
+    ).toContain('filled');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  it('hides the admin-only default permission selector from a participant and a viewer', async () => {
+    for (const role of ['participant', 'viewer'] as const) {
+      const target = document.createElement('div');
+      document.body.appendChild(target);
+
+      const instance = mount(CommonHeader, { target, props: { scene, role } });
+      await new Promise((r) => setTimeout(r, 20));
+      await openGearMenu(target);
+
+      expect(target.querySelector('[data-testid="admin-section-label"]')).toBeNull();
+      expect(target.querySelector('[data-testid="default-permission-selector"]')).toBeNull();
+
+      unmount(instance);
+      target.remove();
+    }
+  });
+
+  it('keeps the current level until onSetDefaultPermission resolves, then shows the new one', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -176,52 +221,61 @@ describe('CommonHeader SetDone acknowledgement', () => {
     const request = new Promise<void>((resolve) => {
       resolveRequest = resolve;
     });
-    const onSetDone = vi.fn(() => request);
+    const onSetDefaultPermission = vi.fn(() => request);
 
     const instance = mount(CommonHeader, {
       target,
-      props: { scene, isAdmin: true, onSetDone },
+      props: { scene, role: 'admin', defaultPermission: 'participant', onSetDefaultPermission },
     });
     await new Promise((r) => setTimeout(r, 20));
-    await openDoneDialog(target);
+    await openGearMenu(target);
 
-    target.querySelector<HTMLButtonElement>('[data-testid="confirm-done-button"]')?.click();
+    target.querySelector<HTMLButtonElement>('[data-testid="default-permission-btn-viewer"]')?.click();
     await new Promise((r) => setTimeout(r, 20));
 
-    expect(onSetDone).toHaveBeenCalledWith(true);
-    // Still waiting for the banquette acknowledgement.
-    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeTruthy();
+    expect(onSetDefaultPermission).toHaveBeenCalledWith('viewer');
+    // Still waiting for the banquette ack: the selector reflects the old level.
+    expect(
+      target.querySelector('[data-testid="default-permission-btn-participant"]')?.className,
+    ).toContain('filled');
+    expect(
+      target.querySelector('[data-testid="default-permission-pending"]')?.textContent,
+    ).toContain('閲覧者');
 
     resolveRequest();
     await new Promise((r) => setTimeout(r, 30));
-    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeNull();
+    // The App owns `defaultPermission`; the component only reports progress.
+    expect(target.querySelector('[data-testid="default-permission-pending"]')).toBeNull();
 
     unmount(instance);
     target.remove();
   });
 
-  it('stays open and shows the error when the acknowledgement fails', async () => {
+  it('shows the error and does not report success when the acknowledgement fails', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
-    const onSetDone = vi.fn(async () => {
-      throw new Error('SetDoneFailed');
+    const onSetDefaultPermission = vi.fn(async () => {
+      throw new Error('SetDefaultPermissionFailed');
     });
 
     const instance = mount(CommonHeader, {
       target,
-      props: { scene, isAdmin: true, onSetDone },
+      props: { scene, role: 'admin', defaultPermission: 'participant', onSetDefaultPermission },
     });
     await new Promise((r) => setTimeout(r, 20));
-    await openDoneDialog(target);
+    await openGearMenu(target);
 
-    target.querySelector<HTMLButtonElement>('[data-testid="confirm-done-button"]')?.click();
+    target.querySelector<HTMLButtonElement>('[data-testid="default-permission-btn-admin"]')?.click();
     await new Promise((r) => setTimeout(r, 30));
 
-    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeTruthy();
-    const error = target.querySelector('[data-testid="done-error-message"]');
+    const error = target.querySelector('[data-testid="default-permission-error"]');
     expect(error).toBeTruthy();
-    expect(error?.textContent).toContain('SetDoneFailed');
+    expect(error?.textContent).toContain('SetDefaultPermissionFailed');
+    // Nothing was committed.
+    expect(
+      target.querySelector('[data-testid="default-permission-btn-admin"]')?.className,
+    ).not.toContain('filled');
 
     unmount(instance);
     target.remove();

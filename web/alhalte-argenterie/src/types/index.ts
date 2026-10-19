@@ -291,6 +291,9 @@ export type {
 
 export type {
   RoomRole,
+  RoomPermissionLevel,
+  RoomRoleCapabilities,
+  RoomPermissionsSnapshot,
   AccountSearchItem,
   RoomPermissionItem,
 } from '../utils/session.js';

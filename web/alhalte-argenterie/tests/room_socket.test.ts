@@ -392,12 +392,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       });
     });
 
-    it('sends SetDone, ListScenes, and ListCharacters frames', () => {
-      socket.setDone(true);
-      expect(JSON.parse(mockWs.sentMessages.pop()!)).toEqual({
-        SetDone: { done: true },
-      });
-
+    it('sends ListScenes and ListCharacters frames', () => {
       socket.listScenes();
       expect(JSON.parse(mockWs.sentMessages.pop()!)).toBe('ListScenes');
 
@@ -818,6 +813,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
         props: {
           initialRoom: dummyRoom,
           roomSocket: socket,
+          isAdmin: true,
         },
       });
 
@@ -868,13 +864,13 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
   });
 });
 
-// spec: alhalte-argenterie/roomSocket SetDone resolves only after the banquette ack
-describe('RoomSocket - SetDone acknowledgement', () => {
+// spec: alhalte-argenterie/roomSocket 権限 frame は ack 後にのみ解決する (Issue #201)
+describe('RoomSocket - permission frames (Issue #201)', () => {
   beforeEach(() => {
     MockWebSocket.instances = [];
   });
 
-  it('resolves requestSetDone on DoneUpdated and rejects on SetDoneFailed', async () => {
+  function connectedSocket(): { socket: RoomSocket; ws: MockWebSocket } {
     const socket = new RoomSocket({
       roomId: 'aabbccddeeff0011',
       webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
@@ -883,32 +879,89 @@ describe('RoomSocket - SetDone acknowledgement', () => {
     const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
     ws.open();
     ws.sentMessages = [];
+    return { socket, ws };
+  }
 
-    const pending = socket.requestSetDone(true, 500);
+  it('sends QueryPermissions and resolves on PermissionsSnapshot', async () => {
+    const { socket, ws } = connectedSocket();
+
+    const pending = socket.requestQueryPermissions(500);
     expect(socket.getPendingOperationCount()).toBe(1);
-    expect(JSON.parse(ws.sentMessages[0])).toEqual({ SetDone: { done: true } });
+    expect(JSON.parse(ws.sentMessages[0])).toBe('QueryPermissions');
 
-    ws.receive({ DoneUpdated: { done: true } });
-    await expect(pending).resolves.toEqual({ done: true });
-    expect(socket.getPendingOperationCount()).toBe(0);
-
-    const denied = socket.requestSetDone(true, 500);
-    ws.receive({ Error: { code: 'SetDoneFailed', message: 'not an admin' } });
-    await expect(denied).rejects.toMatchObject({ code: 'SetDoneFailed' });
+    ws.receive({
+      PermissionsSnapshot: {
+        default_permission: 'Viewer',
+        permissions: { '1001': 'Admin' },
+      },
+    });
+    await expect(pending).resolves.toEqual({
+      default_permission: 'Viewer',
+      permissions: { '1001': 'Admin' },
+    });
     expect(socket.getPendingOperationCount()).toBe(0);
   });
 
-  it('rejects requestSetDone when the server reports PermissionDenied', async () => {
-    const socket = new RoomSocket({
-      roomId: 'aabbccddeeff0011',
-      webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
-    });
-    socket.connect();
-    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
-    ws.open();
-    ws.sentMessages = [];
+  it('sends SetMemberPermission and resolves only on the matching PermissionsUpdated', async () => {
+    const { socket, ws } = connectedSocket();
 
-    const pending = socket.requestSetDone(true, 500);
+    const pending = socket.requestSetMemberPermission(1001, 'Participant', 500);
+    expect(JSON.parse(ws.sentMessages[0])).toEqual({
+      SetMemberPermission: { account_id: 1001, permission: 'Participant' },
+    });
+
+    // An ack for another account must not settle this operation.
+    ws.receive({
+      PermissionsUpdated: { default_permission: 'Viewer', permissions: { '2002': 'Admin' } },
+    });
+    expect(socket.getPendingOperationCount()).toBe(1);
+
+    ws.receive({
+      PermissionsUpdated: {
+        default_permission: 'Viewer',
+        permissions: { '1001': 'Participant' },
+      },
+    });
+    await expect(pending).resolves.toMatchObject({
+      permissions: { '1001': 'Participant' },
+    });
+    expect(socket.getPendingOperationCount()).toBe(0);
+  });
+
+  it('rejects SetMemberPermission on SetMemberPermissionFailed', async () => {
+    const { socket, ws } = connectedSocket();
+
+    const denied = socket.requestSetMemberPermission(1001, 'Admin', 500);
+    ws.receive({ Error: { code: 'SetMemberPermissionFailed', message: 'not an admin' } });
+    await expect(denied).rejects.toMatchObject({ code: 'SetMemberPermissionFailed' });
+    expect(socket.getPendingOperationCount()).toBe(0);
+  });
+
+  it('sends SetDefaultPermission and rejects on SetDefaultPermissionFailed', async () => {
+    const { socket, ws } = connectedSocket();
+
+    const pending = socket.requestSetDefaultPermission('Participant', 500);
+    expect(JSON.parse(ws.sentMessages[0])).toEqual({
+      SetDefaultPermission: { permission: 'Participant' },
+    });
+
+    ws.receive({
+      PermissionsUpdated: {
+        default_permission: 'Participant',
+        permissions: {},
+      },
+    });
+    await expect(pending).resolves.toMatchObject({ default_permission: 'Participant' });
+
+    const rejected = socket.requestSetDefaultPermission('Admin', 500);
+    ws.receive({ Error: { code: 'SetDefaultPermissionFailed', message: 'last admin' } });
+    await expect(rejected).rejects.toMatchObject({ code: 'SetDefaultPermissionFailed' });
+  });
+
+  it('rejects pending permission operations on PermissionDenied', async () => {
+    const { socket, ws } = connectedSocket();
+
+    const pending = socket.requestQueryPermissions(500);
     ws.receive({ Error: { code: 'PermissionDenied', message: 'viewer' } });
     await expect(pending).rejects.toMatchObject({ code: 'PermissionDenied' });
   });
