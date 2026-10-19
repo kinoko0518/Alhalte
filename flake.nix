@@ -88,6 +88,14 @@
               exit 1
             fi
 
+            # 同梱の Bistrot.toml はローカル開発専用の平文 secret を持つ。
+            # 平文 secret は fail-closed なので、開発時だけ明示的に許可する
+            # （本番は age armor の値 + Bistrot.local.toml を使う）。
+            if [ -z "''${ALHALTE_ALLOW_PLAINTEXT_SECRETS:-}" ]; then
+              echo "Notice: allowing plaintext secrets for local development (ALHALTE_ALLOW_PLAINTEXT_SECRETS=1)." >&2
+              export ALHALTE_ALLOW_PLAINTEXT_SECRETS=1
+            fi
+
             # 2. 必要なデータ・ソケットディレクトリを作成
             mkdir -p .alhalte/data/cellar/tin .alhalte/sockets
 

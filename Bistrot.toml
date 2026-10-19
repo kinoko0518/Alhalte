@@ -1,3 +1,14 @@
+# ローカル開発用の既定構成（nix run .#bistrot が使う）。
+#
+# 秘密値（maitre-d.client-secret / cellar.service-token）はここでは平文。
+# Bistrot は平文 secret を fail-closed で拒否するため、この設定で動かすには
+# `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` が必要（flake.nix の bistrot-runner が
+# ローカル開発時だけ設定する）。
+#
+# 本番・実 OAuth 資格情報は age armor で暗号化した値を Bistrot.local.toml
+# （gitignore 済み）に置く。手順は Bistrot.example.toml を参照。
+#   printf '%s' 'SECRET' | alhalte-bistrot encrypt-value --recipient age1...
+
 [restaurant]
 domain = "localhost"
 host = "127.0.0.1"
@@ -7,6 +18,7 @@ socket-dir = ".alhalte/sockets"
 [maitre-d]
 port = 8080
 client-id = "alhalte-local-client"
+# ローカル開発専用の平文 secret。本番は age armor にする。
 client-secret = "alhalte-local-secret"
 salt = "alhalte-local-instance-salt-0001"
 
@@ -19,10 +31,11 @@ anti-oracle = false
 # maitre-d-socket = ".alhalte/sockets/maitre-d.sock"
 # ローカル開発専用。true にするとすべての session を許可する（既定 false）。
 allow-all-sessions = false
-# 内部書き込み用のサービス間トークン（rops で暗号化する秘密値）。
+# 内部書き込み用のサービス間トークン（age armor で暗号化する秘密値）。
 # maitre-d / banquette / cellar が同じ値を使う。未設定の場合、banquette の
 # 部屋状態 persistence は cellar に拒否される（本番では必ず設定する）。
-# 下記はローカル開発専用の既定値。本番では rops で暗号化した値に必ず差し替えること。
+# 下記はローカル開発専用の既定値。本番では
+# `alhalte-bistrot encrypt-value` で作った armored 値に必ず差し替えること。
 service-token = "alhalte-local-service-token"
 
 [banquette]

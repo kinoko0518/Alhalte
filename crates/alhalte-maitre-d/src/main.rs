@@ -33,10 +33,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Spawn periodic 4:00 AM session cleanup task
     spawn_session_cleanup_task(db.clone());
 
-    let oauth = Arc::new(GoogleOAuthProvider::new(
-        &args.client_id,
-        &args.client_secret,
-    ));
+    // Secrets are read from 0600 files (or the environment) so they never appear
+    // in `ps` or in a systemd unit (Issue #194).
+    let client_secret = args.resolve_client_secret()?;
+    let service_token = args.resolve_service_token()?;
+
+    let oauth = Arc::new(GoogleOAuthProvider::new(&args.client_id, &client_secret));
 
     let mut spawner = ProcessBanquetteSpawner::new(
         &args.banquette_bin,
@@ -44,10 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.cellar_url,
         args.chunk_size_exponent,
     );
-    match args.service_token.as_deref() {
-        Some(token) => spawner = spawner.with_service_token(token),
-        None => tracing::warn!(
-            "No --service-token configured: spawned banquette processes cannot persist room \
+    match (service_token.as_deref(), args.service_token_file.as_deref()) {
+        // Forward the injected file path so the child never holds the value in
+        // its argument list.
+        (Some(_), Some(path)) => {
+            spawner = spawner.with_service_token_file(path);
+        }
+        (Some(token), None) => {
+            spawner = spawner.with_service_token(token);
+        }
+        (None, _) => tracing::warn!(
+            "No --service-token-file configured: spawned banquette processes cannot persist room \
              state unless cellar accepts the write through a user session"
         ),
     }
