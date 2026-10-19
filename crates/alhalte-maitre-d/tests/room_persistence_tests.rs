@@ -14,12 +14,18 @@ use alhalte_banquette::{
 use alhalte_cellar::{CellarService, InMemorySessionVerifier};
 use alhalte_maitre_d::{
     AppState, Database, InProcessBanquetteSpawner, MockOAuthProvider, ProcessBanquetteSpawner,
-    RoomBridgeManager, create_router,
+    RoomBridgeManager, SubHash, create_router, hash_sub,
 };
 use tempfile::tempdir;
 use tin::Tin;
 
 /// Room ID used by the persistence tests (canonical 16-hex form).
+/// Hashes a test `sub` the way the OAuth path does (Issue #190).
+fn test_sub_hash(sub: &str) -> SubHash {
+    let mut sub = sub.to_string();
+    hash_sub("test-salt", &mut sub)
+}
+
 const ROOM_ID_HEX: &str = "9f3a7c1e5b2d8046";
 const ROOM_ID: u64 = 0x9f3a7c1e5b2d8046;
 const ADMIN: u64 = 1;
@@ -48,7 +54,7 @@ async fn spawn_cellar(
 /// Creates a registered room whose creator becomes banquette's initial Admin.
 fn registered_room(db: &Database) -> (u64, u64) {
     let account = db
-        .get_or_create_account("sub-persist-admin", "Admin", None, 1000)
+        .get_or_create_account(&test_sub_hash("sub-persist-admin"), "Admin", None, 1000)
         .unwrap();
     db.create_room(ROOM_ID_HEX, "Persistence room", account.account_id, 1000)
         .unwrap();

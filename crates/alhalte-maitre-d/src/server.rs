@@ -300,8 +300,8 @@ pub struct AccountSearchItem {
 
 /// Public account profile returned by `GET /api/account/{account_id}`.
 ///
-/// This is a response DTO: the stored [`Account::encrypted_sub`] (the encrypted
-/// Google identifier) is never serialized to clients.
+/// This is a response DTO: the stored [`Account::sub_hash`] (the salted 128-bit
+/// hash of the Google identifier) is never serialized to clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountResponse {
     /// 64-bit account ID.
@@ -420,10 +420,13 @@ pub struct OAuthTokenRequest {
 }
 
 /// Authentication response containing account and session ID.
+///
+/// The account is served as [`AccountResponse`]: neither the raw Google `sub`
+/// nor its stored hash is exposed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AuthResponse {
-    /// Account entity.
-    pub account: Account,
+    /// Public account profile.
+    pub account: AccountResponse,
     /// Issued 64-bit session ID.
     pub session_id: u64,
 }
@@ -432,7 +435,7 @@ pub struct AuthResponse {
 ///
 /// The callback sets the `session_id` cookie; argenterie calls this endpoint
 /// after the redirect to learn the account ID and persist the session in the
-/// same places the room socket reads. `encrypted_sub` is never exposed.
+/// same places the room socket reads. `sub_hash` is never exposed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SessionResponse {
     /// Public account profile for the session owner.
@@ -930,16 +933,16 @@ async fn oauth_callback_handler(
     }
 
     let redirect_uri = state.oauth_redirect_uri();
-    let user_info = match state.oauth.exchange_code(code, &redirect_uri).await {
+    let mut user_info = match state.oauth.exchange_code(code, &redirect_uri).await {
         Ok(info) => info,
         Err(error) => return error_response(StatusCode::UNAUTHORIZED, error.to_string()),
     };
 
-    let (_account, session) = match issue_account_session(&state, &user_info.sub, "Anonymous", now)
-    {
-        Ok(values) => values,
-        Err((status, message)) => return error_response(status, message),
-    };
+    let (_account, session) =
+        match issue_account_session(&state, &mut user_info.sub, "Anonymous", now) {
+            Ok(values) => values,
+            Err((status, message)) => return error_response(status, message),
+        };
 
     let secure = state.public_url.trim().starts_with("https://");
     let cookie = session_cookie_header(session.session_id, secure, SESSION_COOKIE_MAX_AGE_SECS);
@@ -958,17 +961,19 @@ async fn oauth_callback_handler(
 }
 
 /// Looks up or creates the account for `sub` and issues a fresh session.
+///
+/// `sub` is hashed and zeroized in place; the raw Google identifier is never
+/// written to the database.
 fn issue_account_session(
     state: &AppState,
-    sub: &str,
+    sub: &mut String,
     default_name: &str,
     now: i64,
 ) -> std::result::Result<(Account, crate::db::Session), (StatusCode, String)> {
-    let encrypted_sub = crypto::encrypt_sub(&state.salt, sub)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let sub_hash = crypto::hash_sub(&state.salt, sub);
     let account = state
         .db
-        .get_or_create_account(&encrypted_sub, default_name, None, now)
+        .get_or_create_account(&sub_hash, default_name, None, now)
         .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
     let session = state
         .db
@@ -1030,7 +1035,7 @@ async fn oauth_token_handler(
     State(state): State<AppState>,
     Json(req): Json<OAuthTokenRequest>,
 ) -> Response {
-    let user_info = match state.oauth.verify_id_token(&req.id_token).await {
+    let mut user_info = match state.oauth.verify_id_token(&req.id_token).await {
         Ok(info) => info,
         Err(e) => {
             return (
@@ -1041,23 +1046,14 @@ async fn oauth_token_handler(
         }
     };
 
-    let encrypted_sub = match crypto::encrypt_sub(&state.salt, &user_info.sub) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
+    let sub_hash = crypto::hash_sub(&state.salt, &mut user_info.sub);
 
     let now = chrono::Utc::now().timestamp();
     let default_name = req.handle_name.as_deref().unwrap_or("Anonymous");
 
     let account = match state
         .db
-        .get_or_create_account(&encrypted_sub, default_name, None, now)
+        .get_or_create_account(&sub_hash, default_name, None, now)
     {
         Ok(acc) => acc,
         Err(e) => {
@@ -1081,7 +1077,7 @@ async fn oauth_token_handler(
     };
 
     Json(AuthResponse {
-        account,
+        account: AccountResponse::from(account),
         session_id: session.session_id,
     })
     .into_response()
@@ -1090,7 +1086,7 @@ async fn oauth_token_handler(
 /// Handles `GET /api/account/{account_id}`.
 ///
 /// Requires a valid session. The response is [`AccountResponse`], which omits
-/// the stored `encrypted_sub`.
+/// the stored `sub_hash`.
 async fn get_account_handler(
     State(state): State<AppState>,
     AxumPath(account_id): AxumPath<u64>,
@@ -1197,6 +1193,10 @@ async fn update_account_handler(
 }
 
 /// Handles `POST /api/debug/account` (debug builds only).
+///
+/// Creates a throwaway account keyed by an unguessable synthetic subject and
+/// issues a session for it. The response is an [`AuthResponse`], so the stored
+/// hash never leaves the server.
 #[cfg(debug_assertions)]
 async fn create_debug_account_handler(
     State(state): State<AppState>,
@@ -1215,9 +1215,17 @@ async fn create_debug_account_handler(
         })
     });
 
+    // A debug account used to be the literal `sub = "0"`. With the ciphertext
+    // column gone (#190), each debug account is keyed by an unguessable
+    // synthetic subject instead, so the unique `sub_hash` constraint holds and
+    // a debug account is indistinguishable from a real one in the database.
+    // Issue #150 moves debug accounts to a dedicated database.
+    let mut debug_sub = format!("alhalte/debug/{}", hex::encode(rand::random::<[u8; 32]>()));
+    let sub_hash = crypto::hash_sub(&state.salt, &mut debug_sub);
+
     let account = match state
         .db
-        .create_debug_account(&req.handle_name, icon_bytes, now)
+        .get_or_create_account(&sub_hash, &req.handle_name, icon_bytes, now)
     {
         Ok(acc) => acc,
         Err(e) => {
@@ -1241,7 +1249,7 @@ async fn create_debug_account_handler(
     };
 
     Json(AuthResponse {
-        account,
+        account: AccountResponse::from(account),
         session_id: session.session_id,
     })
     .into_response()

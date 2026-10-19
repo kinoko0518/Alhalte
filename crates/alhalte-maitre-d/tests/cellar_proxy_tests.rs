@@ -16,7 +16,15 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 
 use alhalte_maitre_d::server::CellarProxy;
-use alhalte_maitre_d::{AppState, Database, MockOAuthProvider, RoomBridgeManager, create_router};
+use alhalte_maitre_d::{
+    AppState, Database, MockOAuthProvider, RoomBridgeManager, SubHash, create_router, hash_sub,
+};
+
+/// Hashes a test `sub` the way the OAuth path does (Issue #190).
+fn test_sub_hash(sub: &str) -> SubHash {
+    let mut sub = sub.to_string();
+    hash_sub("test-salt", &mut sub)
+}
 
 const TIN_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const WRAPPED_KEY: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -229,7 +237,12 @@ async fn spawn_mock_cellar(cellar: MockCellar) -> SocketAddr {
 fn test_identity() -> (Database, u64, u64) {
     let db = Database::new_in_memory().unwrap();
     let account = db
-        .get_or_create_account("sub-cellar-proxy", "Proxy Tester", None, 1000)
+        .get_or_create_account(
+            &test_sub_hash("sub-cellar-proxy"),
+            "Proxy Tester",
+            None,
+            1000,
+        )
         .unwrap();
     let session = db.create_session(account.account_id, 1000).unwrap();
     (db, account.account_id, session.session_id)

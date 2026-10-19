@@ -73,6 +73,24 @@ pub enum MaitreDError {
     )]
     LegacyRoomPermissions(usize),
 
+    /// The database still uses the retired `accounts.encrypted_sub` column.
+    ///
+    /// Issue #190 replaced the reversible ciphertext with a one-way 128-bit
+    /// hash ([`crate::crypto::SubHash`]). There is no migration: existing
+    /// accounts were never supported, so the operator must reset the database
+    /// (delete the SQLite file) and let a fresh one be created.
+    #[error(
+        "database still uses the retired accounts.encrypted_sub column; Google sub identifiers are stored as a salted 128-bit hash now. Delete the SQLite database and restart"
+    )]
+    LegacySubSchema,
+
+    /// A stored `sub` hash is not the expected 32-character hex form.
+    ///
+    /// The message never includes the offending value: it is a pseudonymous
+    /// account correlator and must not reach logs.
+    #[error("stored sub hash is malformed: expected 32 lowercase hex characters")]
+    InvalidSubHash,
+
     /// The database still holds rooms with the retired `rooms.done` flag set.
     ///
     /// Like [`MaitreDError::LegacyRoomPermissions`], there is no migration: the
