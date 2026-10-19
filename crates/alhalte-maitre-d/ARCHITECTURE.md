@@ -137,16 +137,16 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 1. `POST /api/rooms` は session を検証する（401）。
 2. `room_id` があれば `RoomId` として parse し、canonical 16 hex に正規化する。不正なら 400。なければ非ゼロのランダム u64 を生成する。
 3. 名前を trim し、空・制御文字を含む・`MAX_ROOM_NAME_LEN`（100 文字）超を 400 で拒否する。
-4. `rooms` に insert し、同じ transaction で作成者を `gm` として `room_permissions` に insert する。既存 ID は 409 Conflict。
+4. `rooms` に insert する。作成者は `creator_account` として記録し、banquette spawn 時の初期 Admin にだけ使う。既存 ID は 409 Conflict。
 5. banquette は起動しない。最初の WS / export までプロセスは作られない。
 
 ### 権限管理
 
-`rooms(room_id, name, creator_account, created_at, done)` が部屋の registry で、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保存する。`room_id` は `RoomId` の正規形（16 hex 小文字）で、permissions API・export・WebSocket の権限判定で共通に使う。`RoomRole` は serde で snake_case。WebSocket 接続時の入場可否と viewer の mutate 遮断に使う。
+`rooms(room_id, name, creator_account, created_at)` が部屋の registry で、`room_id` は `RoomId` の正規形（16 hex 小文字）。権限は `banquette` の `RoomData.default_permission` / `permissions` が正で、`maitre-d` は権限テーブルを持たない。`RoomRole` は `admin` / `participant` / `viewer` / `denied` の transport DTO にすぎない。
 
-権限 API は session を必須とし、GET はメンバー（role 行あり）、POST / DELETE は GM だけが呼べる。Issue #199 以降、DB の role は実行中の banquette へ push しない（`SetAdmins` / `sync_room_admins` は撤去）。変更は DB に保存されるだけで、部屋の権限表は `banquette` の `SetMemberPermission` / `SetDefaultPermission` が管理する。したがって実行中の部屋には反映されず、次回 spawn でも反映されない。DB role と部屋権限表を接続するのは #200 の仕事で、そのとき `QueryAccountPermission` で `banquette` に問い合わせる。
+`GET /api/rooms/{id}` / WebSocket / export は、bridge を spawn した後に `QueryAccountPermission` で banquette に問い合わせ、`Denied` を 403 / 4403 で拒否する。`creator_account` は spawn 時の初期 Admin にだけ使う。接続順や DB role から admin を決めない。
 
-`done` は `rooms.done` に永続化し、WS / `GET /api/rooms/{id}` / export の pre-spawn 判定はこの DB 値を参照する。`rooms.done` は `banquette` の `default_permission != Denied` を射影した暫定フラグで、`RoomPersisted.default_permission` と `ServerFrame::PermissionsUpdated` で更新する（更新は成功 frame を観測した後だけ）。`SetDefaultPermission` は banquette に転送するだけで、非管理者の要求は banquette が `SetDefaultPermissionFailed` を返し DB / UI は変わらない。`RoomBridgeManager::is_room_done` も DB を優先し、行がない場合だけ bridge にフォールバックする。#200 でこの gate ごと部屋権限表へ置き換える。
+HTTP 権限 API は banquette への薄い proxy で、`QueryPermissions` / `SetMemberPermission` / `SetDefaultPermission` を転送する。DB は読まない/書かない。`rooms.done` と `room_permissions` は撤去済みで、旧行が残っている DB は起動時に `LegacyRoomPermissions` / `LegacyRoomDone` で拒否する（移行なし）。pre-spawn の `done` gate は存在しない。
 
 ### ZIP export
 
@@ -180,36 +180,31 @@ accounts(account_id INTEGER PRIMARY KEY, encrypted_sub TEXT, handle_name TEXT,
 sessions(session_id INTEGER PRIMARY KEY, account_id INTEGER, last_heartbeat INTEGER,
          created_at INTEGER)
 rooms(room_id TEXT PRIMARY KEY, name TEXT NOT NULL, creator_account INTEGER NOT NULL,
-      created_at INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0)
-room_permissions(room_id TEXT, account_id INTEGER, role TEXT, created_at INTEGER,
-                 PRIMARY KEY (room_id, account_id))
+      created_at INTEGER NOT NULL)
 room_heads(room_id TEXT PRIMARY KEY, tin_id BLOB NOT NULL, updated_at INTEGER NOT NULL)
 oauth_states(state TEXT PRIMARY KEY, return_to TEXT NOT NULL, created_at INTEGER NOT NULL)
 ```
 
-`encrypted_sub` には索引がある。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列（`RoomId` の 16 hex 正規形）。`rooms` が部屋の第一級エンティティで、`room_permissions` はその認可だけを持つ。`rooms.done` は `RoomData.default_permission != Denied` を射影した pre-spawn gate 用のフラグで、`maitre-d` の再起動をまたぐ（権限の正は #199 以降 `banquette` の `RoomData` 側）。`room_heads.tin_id` は 32 バイトで、banquette が最後に保存した `RoomData` tin を指す。部屋が一度も保存されていなければ行がない。
+`encrypted_sub` には索引がある。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列（`RoomId` の 16 hex 正規形）。`rooms` が部屋の第一級エンティティで、権限は持たない（権限の正は `banquette` の `RoomData`）。`room_heads.tin_id` は 32 バイトで、banquette が最後に保存した `RoomData` tin を指す。部屋が一度も保存されていなければ行がない。
 
 `oauth_states` はログイン中の OAuth state を `return_to` と結びつけて保持する。`consume_oauth_state` は同じ transaction で SELECT と DELETE を行い、単回使用を保証する。`created_at` が 10 分（`OAUTH_STATE_TTL_SECS`）より古い state は削除して `None` を返す。`create_oauth_state` は期限切れ行を opportunistic に削除する。
 
-起動時の migration は次の 3 つを行う。
+起動時の schema 処理は、旧権限スキーマの退役だけを行う。
 
-1. `rooms` に `done` 列がなければ `done INTEGER NOT NULL DEFAULT 0` を追加する（既存部屋は private 扱い）。
-2. `room_permissions.room_id` のうち、16 文字でない decimal 文字列を canonical 16 hex に書き換える（16 文字の all-digit は #154 の契約どおり hex として扱う）。
-3. `rooms` 行を持たない permission 行から部屋を復元する。creator は最も古い GM（いなければ最も古い permission）、名前は `"Unnamed room"` を使う。
+1. `room_permissions` テーブルに行が残っていれば `LegacyRoomPermissions` で起動を拒否する。空ならテーブルを drop する。
+2. `rooms.done` 列があり、`done <> 0` の行があれば `LegacyRoomDone` で起動を拒否する。空なら列を drop する。
 
 ## 既知の差分・制約
 
-- 部屋の権限の正は Issue #199 以降 `banquette` の `RoomData.permissions` / `default_permission`（4 段階）にある。`maitre-d` の `room_permissions`（`gm` / `pl` / `viewer`）は DB に残っているが、実行中の部屋へは push しない（`SetAdmins` / `AdminsUpdated` / `sync_room_admins` は撤去）。`pl` / `viewer` の account は banquette からは `Denied`（`default_permission`）に見えるため、viewer の mutate 遮断は当面 `maitre-d` の WS ゲートだけが担う。DB role を部屋権限表へ移すのは #200。
-- `rooms.done` は `default_permission != Denied` の射影で、pre-spawn gate（WS / `GET /api/rooms/{id}` / export）専用の暫定値。`ServerFrame::PermissionsUpdated` と `RoomPersisted.default_permission` を受けた時点で更新する。権限の正ではないので、成功 frame を観測しない限り DB は変わらない。#200 で gate ごと置き換える。
-- `RoomBridgeManager` の `is_room_done` は `rooms.done` を正とする（bridge の in-memory `done` は DB 行がない場合のフォールバック）。`maitre-d` を再起動しても公開部屋の非メンバーは pre-spawn gate を通れる。
-- `QueryAccountPermission` / `AccountPermissionResponse` は実装済みだが、`maitre-d` 側に送信経路がなく、受信はデバッグログに留める。`GET /api/rooms/{id}` と WS ゲートへの接続は #200。
+- 部屋の権限の正は `banquette` の `RoomData.permissions` / `default_permission`（4 段階）にある。`maitre-d` は権限テーブルを持たず、`RoomRole` は transport DTO にすぎない。旧 `room_permissions` / `rooms.done` の行が残っている DB は起動時に拒否する（移行なし）。
+- `GET /api/rooms/{id}` / WS / export は spawn 後に `QueryAccountPermission` を問い合わせ、`Denied` を 403 / 4403 で拒否する。pre-spawn の `done` gate はない。匿名は account_id `0` として default permission を問い合わせる。
+- 旧 `gm` / `pl` の serde alias は削除した。role は `admin` / `participant` / `viewer` / `denied` のみ。
 - head の記録は `RoomPersisted` を受けたときだけ行う。banquette が保存前に落ちた場合、`room_heads` は最後に成功した head のままになる。
 - `maitre-d` は旧 head の unregister を行わない。別インスタンスが persist して head が置き換わった場合、その旧 tin は参照が残る（banquette は自分の直前 head だけを解放する）。
-- `--service-token` は `--client-secret` と同様に引数で渡すため、`ps` や systemd unit から読める。リポジトリ同梱の `Bistrot.toml` はローカル開発用の既定値を設定し、本番では rops / `EnvironmentFile` で差し替える。`EnvironmentFile` 化は今後の課題。
+- 内部資格情報は Bistrot が `Bistrot.toml` の age armor 値を復号し、0600 の file に書いて `--client-secret-file` / `--service-token-file` で渡す。argv / `ps` / systemd unit に秘密値は出ない。詳細は [alhalte-bistrot](../alhalte-bistrot/ARCHITECTURE.md)。
 - `get_or_create_room` は接続待ちの間（最大約 3 秒）manager の write lock を保持する。部屋数の多い同時接続ではボトルネックになり得る。
 - `ProcessBanquetteSpawner` が起動した子プロセスは maitre-d 側で reap しない。maitre-d が再起動すると、古い banquette が残っていれば同じ socket path / head を奪い合う。systemd の cgroup（既定 `KillMode=control-group`）で一緒に停止する運用を前提とする。
-- `POST /api/rooms` は `rooms` と初期 GM を書くだけで banquette を起動しない。最初の WS / export で起動する。
-- migration で復元した部屋の名前は `"Unnamed room"` になる（元の名前はクライアントの localStorage にしかないため）。
+- `POST /api/rooms` は `rooms` に行を書くだけで、権限行も banquette も作らない。最初の WS / export で起動し、creator が初期 Admin になる。
 - `GET /api/rooms`（自分の role を持つ部屋一覧）は未実装。
 - debug account は `encrypted_sub = "0"` で作られ、`decrypt_sub` も `"0"` を特別扱いする。debug ビルド限定。
 - CORS は明示的な origin allow-list。`--cors-origin` 未指定時はローカル開発 origin のみで、本番では Bistrot が argenterie URL / domain から生成した値を渡す。reverse proxy 側での制限も併用できる。

@@ -331,21 +331,12 @@ impl From<Account> for AccountResponse {
 /// transport DTO only: `maitre-d` stores no permission of its own and answers
 /// every access question by asking the room's banquette
 /// (`QueryAccountPermission` / `QueryPermissions`).
-///
-/// The legacy three-level names (`gm` / `pl`) are accepted as deserialization
-/// aliases so the pre-#201 argenterie build keeps working; they always serialize
-/// back as `admin` / `participant`.
-///
-/// TODO(#201): remove the `gm` / `pl` aliases once the room UI speaks the
-/// four-level model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoomRole {
     /// Full access, including the room permission table.
-    #[serde(alias = "gm")]
     Admin,
     /// Read/write the scenes an administrator moved the account into.
-    #[serde(alias = "pl")]
     Participant,
     /// Read-only access to every scene.
     Viewer,
