@@ -29,9 +29,32 @@ fn register_room(db: &Database, room_id: u64, creator: u64, name: &str) {
         .unwrap();
 }
 
-type SpawnCalls = Arc<std::sync::Mutex<Vec<(u64, u64)>>>;
+// spec: alhalte-maitre-d/room-head 0001 room_heads tin pointer round trip
+#[test]
+fn test_room_head_round_trip_and_overwrite() {
+    let db = Database::new_in_memory().unwrap();
+    let room_id = "00000000000000aa";
+    assert_eq!(db.get_room_head(room_id).unwrap(), None);
 
-/// Wraps an in-process spawner and records every `(room_id, admin_account)`.
+    let first = [0x01u8; 32];
+    assert_eq!(db.set_room_head(room_id, &first, 1000).unwrap(), None);
+    assert_eq!(db.get_room_head(room_id).unwrap(), Some(first));
+
+    let second = [0x02u8; 32];
+    assert_eq!(
+        db.set_room_head(room_id, &second, 2000).unwrap(),
+        Some(first),
+        "the superseded head is reported for retention"
+    );
+    assert_eq!(db.get_room_head(room_id).unwrap(), Some(second));
+
+    // Heads are per room.
+    assert_eq!(db.get_room_head("00000000000000ab").unwrap(), None);
+}
+
+type SpawnCalls = Arc<std::sync::Mutex<Vec<(u64, u64, Option<[u8; 32]>)>>>;
+
+/// Wraps an in-process spawner and records every `(room_id, admin_account, room_head)`.
 #[derive(Clone)]
 struct RecordingSpawner {
     inner: Arc<InProcessBanquetteSpawner>,
@@ -48,7 +71,7 @@ impl RecordingSpawner {
         }
     }
 
-    fn calls(&self) -> Vec<(u64, u64)> {
+    fn calls(&self) -> Vec<(u64, u64, Option<[u8; 32]>)> {
         self.calls.lock().unwrap().clone()
     }
 }
@@ -59,9 +82,15 @@ impl BanquetteSpawner for RecordingSpawner {
         &self,
         room_id: u64,
         admin_account: u64,
+        room_head: Option<[u8; 32]>,
     ) -> alhalte_maitre_d::Result<std::path::PathBuf> {
-        self.calls.lock().unwrap().push((room_id, admin_account));
-        self.inner.spawn_banquette(room_id, admin_account).await
+        self.calls
+            .lock()
+            .unwrap()
+            .push((room_id, admin_account, room_head));
+        self.inner
+            .spawn_banquette(room_id, admin_account, room_head)
+            .await
     }
 }
 
@@ -75,8 +104,8 @@ async fn spawn_recording_router() -> (
 ) {
     let temp_dir = tempdir().unwrap();
     let spawner = RecordingSpawner::new(temp_dir.path().to_path_buf());
-    let manager = RoomBridgeManager::new(Arc::new(spawner.clone()));
     let db = Database::new_in_memory().unwrap();
+    let manager = RoomBridgeManager::new(Arc::new(spawner.clone()), db.clone());
     let state = AppState::new(
         db.clone(),
         "salt",
@@ -391,7 +420,7 @@ async fn test_debug_account_creation() {
     // HTTP endpoint test
     let spawner =
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
@@ -435,7 +464,7 @@ async fn test_session_verification_http_endpoint() {
 
     let spawner =
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db, "salt", oauth, room_manager);
     let app = create_router(state);
@@ -484,7 +513,7 @@ async fn test_interoperability_with_cellar_maitre_d_verifier() {
 
     let spawner =
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db, "salt", oauth, room_manager);
     let app = create_router(state);
@@ -523,7 +552,7 @@ async fn test_oauth_flow_and_account_linkage() {
 
     let spawner =
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let salt = "my-test-salt";
     let state = AppState::new(db.clone(), salt, mock_oauth, room_manager);
     let app = create_router(state);
@@ -639,7 +668,7 @@ async fn test_websocket_demux_and_banquette_spawner() {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         socket_dir, 8,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
@@ -750,7 +779,7 @@ async fn test_room_zip_export_endpoints() {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         socket_dir, 5,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
@@ -1101,7 +1130,7 @@ async fn test_accounts_search_endpoint() {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         "/tmp", 8,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db, "salt", oauth, room_manager);
     let app = create_router(state);
@@ -1171,7 +1200,7 @@ async fn test_room_permissions_rest_api() {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         "/tmp", 8,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db, "salt", oauth, room_manager);
     let app = create_router(state);
@@ -1650,7 +1679,7 @@ async fn test_bridge_admin_is_creator_not_first_connector() {
         }
     }
     assert!(received_scene_list);
-    assert_eq!(spawner.calls(), vec![(room_u64, creator)]);
+    assert_eq!(spawner.calls(), vec![(room_u64, creator, None)]);
     ws_stream.close(None).await.unwrap();
 }
 
@@ -1662,6 +1691,17 @@ fn test_chunk_size_exponent_cli_flag() {
 
     let custom = parse_cli_args_from(["alhalte-maitre-d", "--chunk-size-exponent", "12"]).unwrap();
     assert_eq!(custom.chunk_size_exponent, 12);
+}
+
+// spec: alhalte-maitre-d/cli-args internal cellar service token
+#[test]
+fn test_service_token_cli_flag() {
+    let default = parse_cli_args_from(["alhalte-maitre-d"]).unwrap();
+    assert_eq!(default.service_token, None);
+
+    let with_token =
+        parse_cli_args_from(["alhalte-maitre-d", "--service-token", "internal-secret"]).unwrap();
+    assert_eq!(with_token.service_token.as_deref(), Some("internal-secret"));
 }
 
 // spec: alhalte-maitre-d/websocket-auth-and-done-rejection
@@ -1684,7 +1724,7 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         socket_dir, 8,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db.clone(), "salt", oauth, room_manager.clone());
     let app = create_router(state);
@@ -1784,7 +1824,7 @@ async fn test_websocket_cookie_session_authentication() {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         socket_dir, 8,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);
@@ -1865,7 +1905,7 @@ async fn test_websocket_viewer_mutate_blocking() {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         socket_dir, 8,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db, "salt", oauth, room_manager);
     let app = create_router(state);
@@ -2056,7 +2096,7 @@ async fn test_initial_scene_demultiplexing_and_root_broadcasts() {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         socket_dir, 8,
     ));
-    let room_manager = RoomBridgeManager::new(spawner);
+    let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db.clone(), "salt", oauth, room_manager);
     let app = create_router(state);

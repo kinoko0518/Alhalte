@@ -793,3 +793,204 @@ fn test_cli_bistrot_argument_compatibility() {
     );
     assert!(!parsed6.allow_all_sessions);
 }
+
+// ---------------------------------------------------------------------------
+// Issue #157: internal service token for trusted room-state writes
+// ---------------------------------------------------------------------------
+
+// spec: alhalte-cellar/service-token 0001 internal store authorized without a user session
+#[tokio::test]
+async fn test_service_token_authorizes_internal_writes_without_a_session() {
+    let dir = tempdir().unwrap();
+    // The verifier denies every session, so success can only come from the token.
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false)
+        .unwrap()
+        .with_service_token("service-secret");
+    assert!(service.has_service_token());
+
+    let (tin_bytes, tin_id) = create_test_tin("internal room state");
+    let req = StoreRequest {
+        owner: 42,
+        session_id: 0,
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+
+    // Valid token: upload required, then payload accepted.
+    assert_eq!(
+        service
+            .store_check_with_token(&req, Some("service-secret"))
+            .await
+            .unwrap(),
+        StoreStatus::UploadRequired
+    );
+    let result = service
+        .store_payload_with_token(42, 0, tin_id, &tin_bytes, None, Some("service-secret"))
+        .await
+        .unwrap();
+    assert!(result.written_to_disk);
+
+    // Wrong token fails closed (401), never falling back to session verification.
+    let err = service
+        .store_check_with_token(&req, Some("wrong-secret"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CellarError::Unauthorized { .. }));
+
+    // No token and no session fails as before.
+    let err = service
+        .store_check_with_token(&req, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CellarError::Unauthorized { .. }));
+
+    // A token-bearing request is still rejected when none is configured.
+    let dir2 = tempdir().unwrap();
+    let tokenless = CellarService::new_with_in_memory_db(
+        dir2.path(),
+        Arc::new(InMemorySessionVerifier::allow_all_verifier()),
+        false,
+    )
+    .unwrap();
+    assert!(!tokenless.has_service_token());
+    let err = tokenless
+        .store_check_with_token(&req, Some("service-secret"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CellarError::Unauthorized { .. }));
+
+    // Invalid token without any session.
+    assert!(
+        service
+            .unregister_with_token(42, 0, &tin_id, Some("wrong"))
+            .await
+            .is_err(),
+        "a wrong service token must not unregister"
+    );
+    assert!(
+        service
+            .unregister_with_token(42, 0, &tin_id, Some("service-secret"))
+            .await
+            .unwrap(),
+        "the valid service token must unregister the reference"
+    );
+}
+
+// spec: alhalte-cellar/service-token 0002 user sessions still work for the public proxy
+#[tokio::test]
+async fn test_service_token_keeps_user_session_verification() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    verifier.allow(7, 70);
+    let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false)
+        .unwrap()
+        .with_service_token("service-secret");
+
+    let (tin_bytes, tin_id) = create_test_tin("user session content");
+    let user_req = StoreRequest {
+        owner: 7,
+        session_id: 70,
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+    // A normal user request without the service token is verified against the session.
+    assert_eq!(
+        service.store_check(&user_req).await.unwrap(),
+        StoreStatus::UploadRequired
+    );
+    service
+        .store_payload(7, 70, tin_id, &tin_bytes, None)
+        .await
+        .unwrap();
+
+    // Revoked sessions are still rejected even though a service token exists.
+    let unknown_req = StoreRequest {
+        owner: 7,
+        session_id: 71,
+        ..user_req
+    };
+    let err = service.store_check(&unknown_req).await.unwrap_err();
+    assert!(matches!(
+        err,
+        CellarError::Unauthorized {
+            owner: 7,
+            session_id: 71
+        }
+    ));
+}
+
+// spec: alhalte-cellar/service-token 0003 header plumbing through the HTTP router
+#[tokio::test]
+async fn test_service_token_header_is_accepted_by_the_router() {
+    let dir = tempdir().unwrap();
+    let service = Arc::new(
+        CellarService::new_with_in_memory_db(
+            dir.path(),
+            Arc::new(InMemorySessionVerifier::new()),
+            false,
+        )
+        .unwrap()
+        .with_service_token("service-secret"),
+    );
+    let (tin_bytes, tin_id) = create_test_tin("router internal store");
+    let app = Arc::clone(&service).into_router();
+
+    let req_body = StoreRequest {
+        owner: 42,
+        session_id: 0,
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/store")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status().as_u16(), 210);
+
+    let upload = Request::builder()
+        .method("POST")
+        .uri(format!("/store/{}", format_tin_id(&tin_id)))
+        .header("X-Alhalte-Owner", "42")
+        .header("X-Alhalte-Session-Id", "0")
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(tin_bytes.clone()))
+        .unwrap();
+    let resp = app.clone().oneshot(upload).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Wrong token -> 401.
+    let request = Request::builder()
+        .method("POST")
+        .uri("/store")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Service-Token", "nope")
+        .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Unregister with the token removes the reference.
+    let unregister_body = serde_json::json!({
+        "owner": 42,
+        "session_id": 0,
+        "tin_id": format_tin_id(&tin_id),
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/unregister")
+        .header("Content-Type", "application/json")
+        .header("X-Alhalte-Service-Token", "service-secret")
+        .body(Body::from(serde_json::to_vec(&unregister_body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(request).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

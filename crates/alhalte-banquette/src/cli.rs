@@ -48,6 +48,33 @@ pub struct CliArgs {
     /// Periodic heartbeat interval in seconds (default 240 seconds = 4 minutes).
     #[arg(long, default_value = "240", env = "ALHALTE_HEARTBEAT_INTERVAL_SECS")]
     pub heartbeat_interval_secs: u64,
+
+    /// Persisted `RoomData` tin ID to restore instead of starting an empty room.
+    ///
+    /// `maitre-d` reads the room head before spawning and passes it here. When
+    /// present, startup fails loudly if the tin cannot be downloaded, decoded,
+    /// or validated against `--room-id`.
+    #[arg(long, env = "ALHALTE_ROOM_TIN", value_parser = parse_tin_id_arg)]
+    pub room_tin: Option<tin::TinId>,
+
+    /// Internal cellar service token used for room state persistence.
+    ///
+    /// Sent as `X-Alhalte-Service-Token` so internal writes do not impersonate a
+    /// user session. The value is never logged.
+    #[arg(long, env = "ALHALTE_CELLAR_SERVICE_TOKEN", hide_env_values = true)]
+    pub service_token: Option<String>,
+}
+
+/// Parses a 64-hex-character tin ID argument into a [`tin::TinId`].
+fn parse_tin_id_arg(value: &str) -> Result<tin::TinId, String> {
+    let value = value.trim();
+    if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("room tin ID must be 64 hexadecimal characters".to_string());
+    }
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(value, &mut out)
+        .map_err(|_| "room tin ID must be 64 hexadecimal characters".to_string())?;
+    Ok(out)
 }
 
 /// Parses a room ID argument in canonical 16-hex or legacy decimal form.
@@ -123,5 +150,46 @@ mod tests {
         );
         assert!(parse_room_id_arg("0x1234").is_err());
         assert!(parse_room_id_arg("18446744073709551616").is_err());
+    }
+
+    // spec: alhalte-banquette/persistence 0007 --room-tin restore argument
+    #[test]
+    fn parses_room_tin_and_service_token() {
+        let tin_hex = "ab".repeat(32);
+        let args = CliArgs::try_parse_from([
+            "alhalte-banquette",
+            "--room-id",
+            "abcdef0123456789",
+            "--admin",
+            "1",
+            "--room-tin",
+            &tin_hex,
+            "--service-token",
+            "internal-secret",
+        ])
+        .unwrap();
+        assert_eq!(args.room_tin, Some([0xabu8; 32]));
+        assert_eq!(args.service_token.as_deref(), Some("internal-secret"));
+
+        // No head means a new room.
+        let args =
+            CliArgs::try_parse_from(["alhalte-banquette", "--room-id", "777", "--admin", "1"])
+                .unwrap();
+        assert_eq!(args.room_tin, None);
+        assert_eq!(args.service_token, None);
+
+        // Tin IDs must be exactly 64 hex characters.
+        assert!(
+            CliArgs::try_parse_from([
+                "alhalte-banquette",
+                "--room-id",
+                "777",
+                "--admin",
+                "1",
+                "--room-tin",
+                "abcd",
+            ])
+            .is_err()
+        );
     }
 }

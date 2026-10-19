@@ -6,7 +6,7 @@
 
 ## 責務
 
-restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、インスタンス固有の salt で暗号化して account を作る。64bit の session を発行・失効させる。HTTP API と WebSocket を提供し、部屋 ID ごとに通信を demultiplex して `alhalte-banquette` の UNIX ソケットへ流す。SQLite に部屋 registry（`rooms`）と権限を保持し、部屋作成 API と ZIP export も持つ。
+restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、インスタンス固有の salt で暗号化して account を作る。64bit の session を発行・失効させる。HTTP API と WebSocket を提供し、部屋 ID ごとに通信を demultiplex して `alhalte-banquette` の UNIX ソケットへ流す。SQLite に部屋 registry（`rooms`）と権限、部屋状態の head（`room_heads`）を保持し、部屋作成 API と ZIP export も持つ。
 
 ## 公開 API / 外部接続点
 
@@ -25,7 +25,7 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | `GET` | `/api/rooms/{room_id}` | 認証必須。部屋名・caller の role・done を返す。非メンバーかつ done=false は 403、未知は 404。 |
 | `GET` / `POST` | `/api/room/{room_id}/permissions` | 部屋の権限一覧取得・追加/更新。 |
 | `DELETE` | `/api/room/{room_id}/permissions/{account_id}` | 権限削除。 |
-| `GET` | `/api/room/{room_id}/export/zip?type=full|logs` | 部屋またはログの ZIP。 |
+| `GET` | `/api/room/{room_id}/export/zip?type=full|logs` | 部屋またはログの ZIP。persisted head から復元できなければ 5xx。 |
 | `POST` | `/api/cellar/store` | 認証付き cellar proxy。cellar の `POST /store`（210/211/212 の store check）へ転送する。 |
 | `POST` / `PUT` | `/api/cellar/store/{tin_id}` | 認証付き cellar proxy。Tin 本体を cellar の `POST` / `PUT /store/{tin_id}` へ転送する。 |
 | `GET` | `/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。本体と `X-Alhalte-Wrapped-Key` を返す。 |
@@ -66,18 +66,20 @@ room-scoped route の `{room_id}` は `RoomId`（`crates/alhalte-maitre-d/src/ro
 
 `/api/cellar/store`、`/api/cellar/store/{tin_id}` は Axum 既定の 2 MiB を超える Tin（アセット・拡張 wasm）を通すため、`DefaultBodyLimit::max(64 MiB)` を route 単位で設定する。他の route は既定のまま。
 
-CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`。
+CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`、`--service-token`（`ALHALTE_CELLAR_SERVICE_TOKEN`）。
 
 ### 主な公開型
 
 - `RoomId`、`RoomIdParseError`、`parse_room_id`
-- `Database`、`Account`、`Session`、`Room`、`RoomRole`、`RoomPermissionItem`
+- `Database`、`Account`、`Session`、`Room`、`RoomRole`、`RoomPermissionItem`（`Database::get_room_head` / `set_room_head` を含む）
 - `CreateRoomRequest`、`RoomInfoResponse`、`RoomSessionQuery`、`MAX_ROOM_NAME_LEN`
 - `OAuthProvider`、`GoogleOAuthProvider`、`MockOAuthProvider`、`GoogleUserInfo`
 - `RoomBridge`、`RoomBridgeManager`、`BanquetteSpawner`、`ProcessBanquetteSpawner`、`InProcessBanquetteSpawner`
 - `AppState`、`create_router`、`extract_session_id_from_cookie`
 - `encrypt_sub` / `decrypt_sub`、`DEBUG_SUB_CIPHERTEXT`
 - session cleanup: `previous_4am_local`、`cleanup_sessions_at`、`spawn_session_cleanup_task`
+
+`RoomBridgeManager::new(spawner, db)` は registry の DB を共有し、`get_or_create_room` は head の読み込み・banquette の起動・UNIX ソケット接続までを await して `Result` を返す。`BanquetteSpawner::spawn_banquette(room_id, admin_account, room_head)` の `room_head` は `room_heads` の tin id で、`Some` のときは復元が必須。
 
 ## 内部フロー
 
@@ -105,10 +107,11 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 3. `rooms` を引き、未登録なら **404**。`get_or_create_room` は呼ばない。
 4. 登録済みでも、account に role がなく `done=false` なら **403** と「全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください」を返す。`argenterie` はこの拒否を門前払い画面（`GateScreen`）として表示し、アカウントのサインイン・切り替えを促す。`done=true` の非メンバーは `viewer` として接続できる。
 5. bridge の `admin_account` は DB の GM（`room_permissions.role = 'gm'`）、なければ `rooms.creator_account` から決める。接続順や接続者を admin にしない。
-6. `RoomBridgeManager::get_or_create_room` で部屋の bridge を取得する。bridge は banquette を起動し、UNIX ソケットへ接続する。接続完了までは `mpsc::unbounded_channel` にフレームをキューする。
+6. `RoomBridgeManager::get_or_create_room` で部屋の bridge を取得する。bridge は `room_heads` の head を読み、banquette を起動して UNIX ソケットへ接続する。head がある場合は banquette が cellar から部屋を復元する。復元に失敗した場合、この時点で **500** を返し、空部屋を起動しない。
 7. bridge に client を登録し、`ClientConnected` を banquette へ送る。初期 scene は `/`。
 8. クライアントからの `ClientFrame` は JSON または postcard で受け取り、viewer の mutate を遮断してから bridge へ渡す。
 9. banquette からの `ServerFrame` は client_id 宛、scene 宛、room 全体宛に振り分ける。
+10. banquette からの `RoomPersisted { tin_id, done }` は `room_heads` と `rooms.done` に記録する。head が次回 spawn 時の復元点になり、`done` が pre-spawn の入場判定に使われる。
 
 `is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetDone`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter`、`ChangeBgm` を mutate とみなす。
 
@@ -130,7 +133,7 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 
 ### 権限管理
 
-`rooms(room_id, name, creator_account, created_at)` が部屋の registry で、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保存する。`room_id` は `RoomId` の正規形（16 hex 小文字）で、permissions API・export・WebSocket の権限判定で共通に使う。`RoomRole` は serde で snake_case。WebSocket 接続時の入場可否と viewer の mutate 遮断に使う。`SetDone` は bridge の in-memory `done` と `RoomBridgeManager` の room 状態にも反映する。
+`rooms(room_id, name, creator_account, created_at, done)` が部屋の registry で、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保存する。`room_id` は `RoomId` の正規形（16 hex 小文字）で、permissions API・export・WebSocket の権限判定で共通に使う。`RoomRole` は serde で snake_case。WebSocket 接続時の入場可否と viewer の mutate 遮断に使う。`done` は `rooms.done` に永続化し、WS / `GET /api/rooms/{id}` / export の pre-spawn 判定はこの DB 値を参照する。`SetDone` は `rooms.done` を更新し、bridge が生きていればその in-memory `done` も更新する。`RoomBridgeManager::is_room_done` も DB を優先し、行がない場合だけ bridge にフォールバックする。
 
 ### ZIP export
 
@@ -138,9 +141,21 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 2. account と session が片方だけなら 401。両方あれば session を検証する。
 3. `rooms` を引き、未登録なら **404**。登録済みでも caller に role がなく `done=false` なら **403**。どちらも banquette を起動しない。
 4. bridge の admin は WS と同じく DB の GM / `rooms.creator_account` から決める。
-5. bridge に `ExportRoom` を送り、banquette から `RoomData` と chunk を受け取る。
-6. `logs` の場合は各 scene の state を空にする。
-7. `alhalte_kitchen::export_room_to_zip` で ZIP を作り、`application/zip` と `Content-Disposition` を付けて返す。
+5. `get_or_create_room` で bridge を取得する。bridge は persisted head から部屋を復元してから `ExportRoom` に応答する。head が壊れている場合は **500** を返し、空の ZIP を返さない。
+6. bridge に `ExportRoom` を送り、banquette から `RoomData` と chunk を受け取る。
+7. `logs` の場合は各 scene の state を空にする。
+8. `alhalte_kitchen::export_room_to_zip` で ZIP を作り、`application/zip` と `Content-Disposition` を付けて返す。
+
+### 部屋 head と復元
+
+- `room_heads(room_id, tin_id, updated_at)` が `room_id → RoomData tin id` のポインタを持つ。`tin_id` は 32 バイトで、`RoomData` の wire schema には手を入れない外部メタデータ。
+- `get_or_create_room` は spawn 前に `Database::get_room_head` を読み、`spawn_banquette(room_id, admin, room_head)` に渡す。
+  - `ProcessBanquetteSpawner` は `--room-tin <64 hex>` として子プロセスへ渡す。
+  - `InProcessBanquetteSpawner` は spawn 前に `Room::load_from_cellar` で復元し、失敗したら `Err` を返す。
+- head がない場合だけ `Room::new` で新しい部屋を作る。
+- head がある場合の復元失敗（tin 不在・復号不能・room_id 不一致・root scene 不在）は spawn の失敗として扱い、WS は 500、export は 5xx を返す。
+- `set_room_head` は置き換え前の tin id を返すが、旧 head の unregister は原則 banquette が行う。`maitre-d` は報告された head を記録するだけ。
+- `rooms.done` は head とは独立に保存する。`SetDone` と `RoomPersisted.done` の両方で更新し、spawn 前の WS / export gate は `rooms.done` を読む。これにより `maitre-d` 再起動後、banquette が未起動でも公開部屋は非メンバーに開放され、private 部屋は 403 のままになる。
 
 ## データベース
 
@@ -152,23 +167,30 @@ accounts(account_id INTEGER PRIMARY KEY, encrypted_sub TEXT, handle_name TEXT,
 sessions(session_id INTEGER PRIMARY KEY, account_id INTEGER, last_heartbeat INTEGER,
          created_at INTEGER)
 rooms(room_id TEXT PRIMARY KEY, name TEXT NOT NULL, creator_account INTEGER NOT NULL,
-      created_at INTEGER NOT NULL)
+      created_at INTEGER NOT NULL, done INTEGER NOT NULL DEFAULT 0)
 room_permissions(room_id TEXT, account_id INTEGER, role TEXT, created_at INTEGER,
                  PRIMARY KEY (room_id, account_id))
+room_heads(room_id TEXT PRIMARY KEY, tin_id BLOB NOT NULL, updated_at INTEGER NOT NULL)
 ```
 
-`encrypted_sub` には索引がある。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列（`RoomId` の 16 hex 正規形）。`rooms` が部屋の第一級エンティティで、`room_permissions` はその認可だけを持つ。
+`encrypted_sub` には索引がある。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列（`RoomId` の 16 hex 正規形）。`rooms` が部屋の第一級エンティティで、`room_permissions` はその認可だけを持つ。`rooms.done` は部屋の公開フラグで、`RoomData` に依存せず `maitre-d` の再起動をまたぐ。`room_heads.tin_id` は 32 バイトで、banquette が最後に保存した `RoomData` tin を指す。部屋が一度も保存されていなければ行がない。
 
-起動時の migration は次の 2 つを行う。
+起動時の migration は次の 3 つを行う。
 
-1. `room_permissions.room_id` のうち、16 文字でない decimal 文字列を canonical 16 hex に書き換える（16 文字の all-digit は #154 の契約どおり hex として扱う）。
-2. `rooms` 行を持たない permission 行から部屋を復元する。creator は最も古い GM（いなければ最も古い permission）、名前は `"Unnamed room"` を使う。
+1. `rooms` に `done` 列がなければ `done INTEGER NOT NULL DEFAULT 0` を追加する（既存部屋は private 扱い）。
+2. `room_permissions.room_id` のうち、16 文字でない decimal 文字列を canonical 16 hex に書き換える（16 文字の all-digit は #154 の契約どおり hex として扱う）。
+3. `rooms` 行を持たない permission 行から部屋を復元する。creator は最も古い GM（いなければ最も古い permission）、名前は `"Unnamed room"` を使う。
 
 ## 既知の差分・制約
 
 - main 時点では権限の正が `maitre-d` の SQLite にあり、`banquette` は `done` と `std::admins` で判定する。Issue #114 では `maitre-d` が `banquette` に問い合わせる構成へ移行中。
 - `gateway.rs` は `AccountPermissionResponse` の受信処理が未接続で、`pending_perm_queries` を登録しても応答が届かない経路がある。
-- `RoomBridgeManager` の `room_done_status` は in-memory で、再起動すると失われる。永続化は `banquette` の room state 側に委ねる（#157）。
+- `RoomBridgeManager` の `is_room_done` は `rooms.done` を正とする。`SetDone` は DB に永続化され、`maitre-d` を再起動しても公開部屋の非メンバーは pre-spawn gate を通れる。bridge の in-memory `done` は DB 行がない場合のフォールバックにすぎない。
+- head の記録は `RoomPersisted` を受けたときだけ行う。banquette が保存前に落ちた場合、`room_heads` は最後に成功した head のままになる。
+- `maitre-d` は旧 head の unregister を行わない。別インスタンスが persist して head が置き換わった場合、その旧 tin は参照が残る（banquette は自分の直前 head だけを解放する）。
+- `--service-token` は `--client-secret` と同様に引数で渡すため、`ps` や systemd unit から読める。リポジトリ同梱の `Bistrot.toml` はローカル開発用の既定値を設定し、本番では rops / `EnvironmentFile` で差し替える。`EnvironmentFile` 化は今後の課題。
+- `get_or_create_room` は接続待ちの間（最大約 3 秒）manager の write lock を保持する。部屋数の多い同時接続ではボトルネックになり得る。
+- `ProcessBanquetteSpawner` が起動した子プロセスは maitre-d 側で reap しない。maitre-d が再起動すると、古い banquette が残っていれば同じ socket path / head を奪い合う。systemd の cgroup（既定 `KillMode=control-group`）で一緒に停止する運用を前提とする。
 - `POST /api/rooms` は `rooms` と初期 GM を書くだけで banquette を起動しない。最初の WS / export で起動する。
 - migration で復元した部屋の名前は `"Unnamed room"` になる（元の名前はクライアントの localStorage にしかないため）。
 - `GET /api/rooms`（自分の role を持つ部屋一覧）は未実装。

@@ -555,31 +555,31 @@ async fn test_heartbeat_and_idle_exit() {
 
     // 1st tick with client activity: reset missed to 0
     room.record_client_activity();
-    let outcome = room.step_heartbeat(&cellar, 42, 1).await.unwrap();
-    assert_eq!(outcome, HeartbeatOutcome::Continue);
+    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 0);
 
     // 1st idle tick
-    let outcome = room.step_heartbeat(&cellar, 42, 1).await.unwrap();
-    assert_eq!(outcome, HeartbeatOutcome::Continue);
+    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 1);
 
     // 2nd idle tick
-    let outcome = room.step_heartbeat(&cellar, 42, 1).await.unwrap();
-    assert_eq!(outcome, HeartbeatOutcome::Continue);
+    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 2);
 
     // Activity arrives! Resets counter
     room.record_client_activity();
-    let outcome = room.step_heartbeat(&cellar, 42, 1).await.unwrap();
-    assert_eq!(outcome, HeartbeatOutcome::Continue);
+    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    assert_eq!(result.outcome, HeartbeatOutcome::Continue);
     assert_eq!(room.missed_heartbeats, 0);
 
     // Now 3 consecutive idle ticks
-    let _ = room.step_heartbeat(&cellar, 42, 1).await.unwrap(); // tick 1
-    let _ = room.step_heartbeat(&cellar, 42, 1).await.unwrap(); // tick 2
-    let outcome = room.step_heartbeat(&cellar, 42, 1).await.unwrap(); // tick 3
-    assert_eq!(outcome, HeartbeatOutcome::ShouldExit);
+    let _ = room.step_heartbeat(&cellar, 42).await.unwrap(); // tick 1
+    let _ = room.step_heartbeat(&cellar, 42).await.unwrap(); // tick 2
+    let result = room.step_heartbeat(&cellar, 42).await.unwrap(); // tick 3
+    assert_eq!(result.outcome, HeartbeatOutcome::ShouldExit);
     assert_eq!(room.missed_heartbeats, 3);
 }
 
@@ -628,7 +628,6 @@ async fn test_unix_socket_server_integration() {
         socket_path: sock_path.clone(),
         heartbeat_interval: Duration::from_secs(3600), // large interval
         admin_account: 10,
-        system_session_id: 1,
     };
 
     let server = BanquetteServer::new(config, room, cellar);
@@ -719,4 +718,499 @@ async fn test_unix_socket_server_integration() {
     }
 
     server_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Issue #157: room persistence, restore, and internal cellar credentials
+// ---------------------------------------------------------------------------
+
+use alhalte_banquette::cellar_sink::CellarSink;
+use alhalte_banquette::error::BanquetteError as PersistenceError;
+use tin::TinId;
+
+/// Cellar sink that records the credentials of internal writes.
+///
+/// `fail_store` makes every store fail so heartbeat failure handling can be
+/// observed.
+#[derive(Default)]
+struct RecordingCellarSink {
+    inner: InMemoryCellarSink,
+    stores: std::sync::Mutex<Vec<(u64, u64, TinId)>>,
+    unregisters: std::sync::Mutex<Vec<TinId>>,
+    fail_store: bool,
+}
+
+impl RecordingCellarSink {
+    fn failing() -> Self {
+        Self {
+            fail_store: true,
+            ..Self::default()
+        }
+    }
+
+    fn stores(&self) -> Vec<(u64, u64, TinId)> {
+        self.stores.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl CellarSink for RecordingCellarSink {
+    async fn store_tin(
+        &self,
+        owner: u64,
+        session_id: u64,
+        tin_bytes: &[u8],
+        tin_id: &TinId,
+        wrapped_key: Option<Vec<u8>>,
+    ) -> Result<alhalte_cellar::StoreResult, PersistenceError> {
+        self.stores
+            .lock()
+            .unwrap()
+            .push((owner, session_id, *tin_id));
+        if self.fail_store {
+            return Err(PersistenceError::Cellar(
+                "simulated store failure".to_string(),
+            ));
+        }
+        self.inner
+            .store_tin(owner, session_id, tin_bytes, tin_id, wrapped_key)
+            .await
+    }
+
+    async fn download_tin(
+        &self,
+        tin_id: &TinId,
+        owner: Option<u64>,
+    ) -> Result<Vec<u8>, PersistenceError> {
+        self.inner.download_tin(tin_id, owner).await
+    }
+
+    async fn unregister_tin(
+        &self,
+        owner: u64,
+        session_id: u64,
+        tin_id: &TinId,
+    ) -> Result<bool, PersistenceError> {
+        self.unregisters.lock().unwrap().push(*tin_id);
+        self.inner.unregister_tin(owner, session_id, tin_id).await
+    }
+}
+
+/// Builds a room containing scenes, state, characters, log entries, admins, and `done`.
+async fn populated_room(cellar: &dyn CellarSink) -> Room {
+    let room_id = 0xabcd_ef01_2345_6789u64;
+    let mut room = Room::new(room_id, 42, 8).unwrap();
+    room.create_scene(42, "tavern", Some("/")).unwrap();
+    room.update_scene_state(
+        42,
+        "tavern",
+        "custom::weather".to_string(),
+        Tin::from_string("rain"),
+    )
+    .unwrap();
+    room.update_scene_state(42, "/", "std::b-img".to_string(), Tin::from_string("bg"))
+        .unwrap();
+    let character: alhalte_banquette::Character =
+        HashMap::from([("std::name".to_string(), Tin::from_string("Alice"))]);
+    let character_id = room.character_biblio.create_character(42, character);
+    room.move_character(42, character_id, "tavern").unwrap();
+    room.append_log(42, 100, "tavern", Some(Tin::from_string("hello")), cellar)
+        .await
+        .unwrap();
+    room.append_log(42, 100, "tavern", Some(Tin::from_string("world")), cellar)
+        .await
+        .unwrap();
+    room.set_done(42, true).unwrap();
+    room.set_admins(42, vec![42, 77]).unwrap();
+    room
+}
+
+// spec: alhalte-banquette/persistence 0001 persist and restore the whole room state
+#[tokio::test]
+async fn test_persist_and_restore_whole_room() {
+    let cellar = InMemoryCellarSink::new();
+    let mut room = populated_room(&cellar).await;
+    let room_id = room.room_id;
+
+    let head = room.persist(&cellar, 42).await.unwrap();
+    assert_eq!(room.head_tin, Some(head));
+    assert!(cellar.contains(&head).await);
+
+    let restored = Room::load_from_cellar(&cellar, &head, room_id)
+        .await
+        .unwrap();
+    assert_eq!(restored.room_id, room_id);
+    assert!(restored.done);
+    assert_eq!(restored.chunk_exponent, 8);
+    assert_eq!(restored.head_tin, Some(head));
+    // admins survive
+    assert!(restored.is_admin(42));
+    assert!(restored.is_admin(77));
+    assert!(!restored.is_admin(99));
+    // scenes and state survive
+    let tavern = restored
+        .scene_biblio
+        .get("tavern")
+        .expect("tavern restored");
+    assert_eq!(
+        tavern
+            .state
+            .get("custom::weather")
+            .unwrap()
+            .as_string()
+            .unwrap(),
+        "rain"
+    );
+    assert_eq!(
+        restored
+            .scene_biblio
+            .get("/")
+            .unwrap()
+            .state
+            .get("std::b-img")
+            .unwrap()
+            .as_string()
+            .unwrap(),
+        "bg"
+    );
+    // log biblio survives
+    assert_eq!(tavern.log.biblio.head, (0, 2));
+    // characters and ownership survive
+    let character = restored
+        .character_biblio
+        .get(1)
+        .expect("character restored");
+    assert_eq!(get_character_owner(character), Some(42));
+    assert_eq!(get_character_name(character).as_deref(), Some("Alice"));
+    assert!(tavern.present_characters.contains(&1));
+    // export of the restored room also exposes the data
+    let (data, _chunks) = restored.export_snapshot(&cellar, Some(42)).await.unwrap();
+    assert!(data.done);
+    assert!(data.scenes.contains_key("tavern"));
+    assert_eq!(data.character_biblio.len(), 1);
+}
+
+// spec: alhalte-banquette/persistence 0002 superseded head is unregistered (retention)
+#[tokio::test]
+async fn test_superseded_head_is_unregistered() {
+    let cellar = InMemoryCellarSink::new();
+    let mut room = populated_room(&cellar).await;
+
+    let first_head = room.persist(&cellar, 42).await.unwrap();
+    room.update_scene_state(
+        42,
+        "tavern",
+        "custom::weather".to_string(),
+        Tin::from_string("snow"),
+    )
+    .unwrap();
+    let second_head = room.persist(&cellar, 42).await.unwrap();
+
+    assert_ne!(first_head, second_head);
+    assert_eq!(room.head_tin, Some(second_head));
+    assert!(
+        !cellar.contains(&first_head).await,
+        "superseded head must be unregistered so cellar GC can reclaim it"
+    );
+    assert!(
+        cellar.contains(&second_head).await,
+        "the current head must never be unregistered"
+    );
+
+    // Re-persisting must never unregister the freshly stored head. `RoomData`
+    // contains `HashMap`s, so an unchanged room can serialize to a different
+    // content-addressed tin id (postcard map ordering); in that case the
+    // superseded head is the one that gets reclaimed.
+    let third_head = room.persist(&cellar, 42).await.unwrap();
+    assert_eq!(room.head_tin, Some(third_head));
+    assert!(cellar.contains(&third_head).await);
+    if third_head != second_head {
+        assert!(!cellar.contains(&second_head).await);
+    }
+}
+
+// spec: alhalte-banquette/persistence 0003 missing or corrupt head fails loudly
+#[tokio::test]
+async fn test_load_from_cellar_rejects_missing_or_corrupt_head() {
+    let cellar = InMemoryCellarSink::new();
+    let room_id = 1001u64;
+
+    // Missing tin.
+    let missing = [7u8; 32];
+    let err = Room::load_from_cellar(&cellar, &missing, room_id).await;
+    assert!(err.is_err(), "missing head must not produce an empty room");
+
+    // Garbled payload stored under the head tin id.
+    let garbage = [9u8; 32];
+    cellar
+        .store_tin(42, 0, b"not a tin at all", &garbage, None)
+        .await
+        .unwrap();
+    let err = Room::load_from_cellar(&cellar, &garbage, room_id).await;
+    assert!(err.is_err(), "garbled head must not produce an empty room");
+
+    // A valid room tin for a different room id.
+    let mut other = Room::new(999, 42, 8).unwrap();
+    let other_head = other.persist(&cellar, 42).await.unwrap();
+    let err = Room::load_from_cellar(&cellar, &other_head, room_id).await;
+    assert!(
+        matches!(err, Err(PersistenceError::RoomIdMismatch { .. })),
+        "room id mismatch must be reported, got {err:?}"
+    );
+
+    // Valid room id but the label is not a RoomData tin.
+    let wrong_label = Tin::from_string("not room data");
+    let (bytes, wrong_label_id) = wrong_label
+        .encode_plaintext(tin::Compression::Zstd)
+        .unwrap();
+    cellar
+        .store_tin(42, 0, &bytes, &wrong_label_id, None)
+        .await
+        .unwrap();
+    let err = Room::load_from_cellar(&cellar, &wrong_label_id, room_id).await;
+    assert!(err.is_err(), "wrong label must not produce an empty room");
+}
+
+// spec: alhalte-banquette/persistence 0004 heartbeat reports only successful stores
+#[tokio::test]
+async fn test_heartbeat_reports_persisted_tin_and_uses_internal_credential() {
+    let cellar = RecordingCellarSink::default();
+    let mut room = Room::new(1001, 42, 8).unwrap();
+    room.record_client_activity();
+
+    let result = room.step_heartbeat(&cellar, 42).await.unwrap();
+    assert_eq!(result.outcome, HeartbeatOutcome::Continue);
+    let tin_id = result.persisted_tin.expect("successful store reported");
+    assert_eq!(room.head_tin, Some(tin_id));
+
+    // Internal writes carry the owner but never a synthetic user session.
+    let stores = cellar.stores();
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].0, 42);
+    assert_eq!(
+        stores[0].1, 0,
+        "internal room writes must not impersonate a user session"
+    );
+
+    // A failed store is logged and reported as no persisted tin.
+    let failing = RecordingCellarSink::failing();
+    let mut failing_room = Room::new(1002, 42, 8).unwrap();
+    failing_room.record_client_activity();
+    let result = failing_room
+        .step_heartbeat(&failing, 42)
+        .await
+        .expect("store failure is non-fatal");
+    assert_eq!(result.persisted_tin, None);
+    assert_eq!(failing_room.head_tin, None);
+}
+
+// spec: alhalte-banquette/persistence 0005 heartbeat sends RoomPersisted to maitre-d
+#[tokio::test]
+async fn test_heartbeat_reports_room_persisted_frame() {
+    let dir = tempdir().unwrap();
+    let sock_path = dir.path().join("banquette.sock");
+    let cellar = Arc::new(InMemoryCellarSink::new());
+
+    let server = BanquetteServer::new(
+        ServerConfig {
+            socket_path: sock_path.clone(),
+            heartbeat_interval: Duration::from_millis(50),
+            admin_account: 10,
+        },
+        Room::new(2002, 10, 8).unwrap(),
+        Arc::clone(&cellar) as Arc<dyn CellarSink>,
+    );
+    let server_task = tokio::spawn(async move { server.run().await });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (read_half, _write_half) = stream.into_split();
+    let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+
+    let mut persisted = None;
+    for _ in 0..20 {
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done: _ }))) =
+            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
+        {
+            persisted = Some(tin_id);
+            break;
+        }
+    }
+    let tin_id = persisted.expect("heartbeat must report the stored room tin");
+    assert!(cellar.contains(&tin_id).await);
+
+    server_task.abort();
+}
+
+// spec: alhalte-banquette/persistence 0006 graceful shutdown persists once more
+#[tokio::test]
+async fn test_graceful_shutdown_persists_room_head() {
+    let dir = tempdir().unwrap();
+    let sock_path = dir.path().join("banquette.sock");
+    let cellar = Arc::new(InMemoryCellarSink::new());
+
+    let mut room = Room::new(2003, 10, 8).unwrap();
+    room.set_done(10, true).unwrap();
+
+    let server = BanquetteServer::new(
+        ServerConfig {
+            socket_path: sock_path.clone(),
+            heartbeat_interval: Duration::from_secs(3600),
+            admin_account: 10,
+        },
+        room,
+        Arc::clone(&cellar) as Arc<dyn CellarSink>,
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_task = tokio::spawn(async move { server.run_until_shutdown(shutdown_rx).await });
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+    let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+
+    // Wait until the connection is handled so the persistence subscription is active.
+    writer.send(MaitreDToBanquette::Ping).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
+            Ok(Some(Ok(BanquetteToMaitreD::Pong))) => break,
+            Ok(Some(Ok(_))) => continue,
+            other => panic!("expected Pong before shutdown: {other:?}"),
+        }
+    }
+
+    shutdown_tx.send(true).unwrap();
+
+    let mut persisted = None;
+    for _ in 0..20 {
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done }))) =
+            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
+        {
+            persisted = Some((tin_id, done));
+            break;
+        }
+    }
+    let (tin_id, done) = persisted.expect("graceful shutdown must report the final room tin");
+    assert!(done, "the final persist must report the room's done flag");
+    assert!(cellar.contains(&tin_id).await);
+
+    let restored = Room::load_from_cellar(&*cellar, &tin_id, 2003)
+        .await
+        .unwrap();
+    assert!(restored.done);
+
+    let _ = server_task.await;
+}
+
+// spec: alhalte-banquette/persistence 0008 the cellar service token is never logged
+#[test]
+fn test_http_cellar_sink_redacts_service_token() {
+    let sink = alhalte_banquette::HttpCellarSink::new("http://127.0.0.1:1")
+        .with_service_token("internal-service-token");
+    assert!(sink.has_service_token());
+    let debug = format!("{sink:?}");
+    assert!(
+        !debug.contains("internal-service-token"),
+        "service token leaked in Debug: {debug}"
+    );
+    assert!(debug.contains("<redacted>"));
+
+    let untokened = alhalte_banquette::HttpCellarSink::new("http://127.0.0.1:1");
+    assert!(!untokened.has_service_token());
+}
+
+// spec: alhalte-banquette/persistence 0009 SIGTERM runs the graceful final persist
+#[tokio::test]
+async fn test_sigterm_runs_graceful_final_persist() {
+    use alhalte_cellar::{CellarService, InMemorySessionVerifier};
+
+    // A real cellar HTTP service using the shared internal token.
+    let storage = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    let service = Arc::new(
+        CellarService::new_with_in_memory_db(storage.path(), verifier, false)
+            .unwrap()
+            .with_service_token("sigterm-service-token"),
+    );
+    let app = Arc::clone(&service).into_router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cellar_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = tempdir().unwrap();
+    let sock_path = dir.path().join("banquette.sock");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_alhalte-banquette"))
+        .arg("--room-id")
+        .arg("5151515151515151")
+        .arg("--admin")
+        .arg("10")
+        .arg("--socket")
+        .arg(&sock_path)
+        .arg("--cellar-url")
+        .arg(format!("http://{cellar_addr}"))
+        .arg("--service-token")
+        .arg("sigterm-service-token")
+        .arg("--heartbeat-interval-secs")
+        .arg("3600")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the banquette binary");
+
+    for _ in 0..100 {
+        if sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sock_path.exists(), "banquette did not bind its UNIX socket");
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+    let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+    writer.send(MaitreDToBanquette::Ping).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
+            Ok(Some(Ok(BanquetteToMaitreD::Pong))) => break,
+            Ok(Some(Ok(_))) => continue,
+            other => panic!("expected Pong from the standalone binary: {other:?}"),
+        }
+    }
+    // Give the spawned signal task a chance to install its handlers.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let pid = child.id().expect("child pid");
+    // SAFETY: `kill(2)` is an FFI call to the OS and `pid` is a live child of
+    // this test; no pointer or Rust memory is involved.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(sent, 0, "failed to send SIGTERM to banquette");
+
+    let mut persisted = None;
+    for _ in 0..40 {
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done }))) =
+            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
+        {
+            persisted = Some((tin_id, done));
+            break;
+        }
+    }
+    let (tin_id, done) = persisted.expect("SIGTERM must trigger the final RoomPersisted");
+    assert!(!done, "a newly created room must not be public");
+    assert!(
+        service.download(&tin_id, None).await.is_ok(),
+        "the final RoomData must be stored in cellar"
+    );
+
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("banquette must exit after SIGTERM")
+        .unwrap();
+    assert!(
+        status.success(),
+        "banquette must exit cleanly, got {status:?}"
+    );
 }

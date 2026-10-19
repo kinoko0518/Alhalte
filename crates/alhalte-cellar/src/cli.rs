@@ -53,6 +53,14 @@ pub struct CliArgs {
     #[arg(long, default_value_t = false)]
     pub allow_all_sessions: bool,
 
+    /// Internal service token accepted from trusted services (`alhalte-banquette`).
+    ///
+    /// Requests carrying this token in the `X-Alhalte-Service-Token` header may
+    /// store and unregister tins without a user session. User session
+    /// verification is unaffected. The value is never logged.
+    #[arg(long, env = "ALHALTE_CELLAR_SERVICE_TOKEN", hide_env_values = true)]
+    pub service_token: Option<String>,
+
     /// Periodic garbage collection interval in seconds.
     #[arg(long, default_value_t = 3600)]
     pub gc_interval_secs: u64,

@@ -1,11 +1,14 @@
 //! Banquette process and server spawning abstractions.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use alhalte_banquette::{BanquetteServer, CellarSink, InMemoryCellarSink, Room, ServerConfig};
 use async_trait::async_trait;
+use tin::TinId;
+use tokio::sync::{Mutex, watch};
 
 use crate::error::{MaitreDError, Result};
 
@@ -14,17 +17,45 @@ use crate::error::{MaitreDError, Result};
 pub trait BanquetteSpawner: Send + Sync {
     /// Launches or prepares a `banquette` instance for `room_id` and initial administrator `admin_account`.
     ///
+    /// `room_head` is the persisted `RoomData` tin ID read from `room_heads`.
+    /// When it is `Some`, the room must be restored from that tin; a missing,
+    /// corrupt, or mismatched head is an error and the spawner must never fall
+    /// back to an empty room. `None` starts a brand-new room.
+    ///
     /// Returns the UNIX domain socket path where the `banquette` server is listening.
-    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf>;
+    async fn spawn_banquette(
+        &self,
+        room_id: u64,
+        admin_account: u64,
+        room_head: Option<TinId>,
+    ) -> Result<PathBuf>;
 }
 
 /// Spawns external `alhalte-banquette` executable binaries as OS child processes.
-#[derive(Debug, Clone)]
+///
+/// The service token is redacted from the [`std::fmt::Debug`] representation.
+#[derive(Clone)]
 pub struct ProcessBanquetteSpawner {
     binary_path: PathBuf,
     socket_dir: PathBuf,
     cellar_url: String,
     chunk_size_exponent: u8,
+    service_token: Option<String>,
+}
+
+impl std::fmt::Debug for ProcessBanquetteSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessBanquetteSpawner")
+            .field("binary_path", &self.binary_path)
+            .field("socket_dir", &self.socket_dir)
+            .field("cellar_url", &self.cellar_url)
+            .field("chunk_size_exponent", &self.chunk_size_exponent)
+            .field(
+                "service_token",
+                &self.service_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl ProcessBanquetteSpawner {
@@ -40,7 +71,59 @@ impl ProcessBanquetteSpawner {
             socket_dir: socket_dir.into(),
             cellar_url: cellar_url.into(),
             chunk_size_exponent,
+            service_token: None,
         }
+    }
+
+    /// Configures the internal cellar service token passed to spawned banquette processes.
+    ///
+    /// An empty token is treated as unset. The value is never logged.
+    #[must_use]
+    pub fn with_service_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.service_token = if token.trim().is_empty() {
+            None
+        } else {
+            Some(token)
+        };
+        self
+    }
+
+    /// Builds the argument list passed to the spawned `alhalte-banquette` binary.
+    ///
+    /// Exposed so tests can assert the `--room-tin` restore contract without
+    /// launching a child process.
+    pub fn command_args(
+        &self,
+        room_id: u64,
+        admin_account: u64,
+        socket_path: &std::path::Path,
+        room_head: Option<&TinId>,
+    ) -> Vec<String> {
+        let mut args = vec![
+            "--room-id".to_string(),
+            format!("{room_id:016x}"),
+            "--admin".to_string(),
+            admin_account.to_string(),
+            "--socket".to_string(),
+            socket_path.display().to_string(),
+            "--cellar-url".to_string(),
+            self.cellar_url.clone(),
+            "--chunk-size-exponent".to_string(),
+            self.chunk_size_exponent.to_string(),
+        ];
+
+        if let Some(tin_id) = room_head {
+            args.push("--room-tin".to_string());
+            args.push(hex::encode(tin_id));
+        }
+
+        if let Some(token) = self.service_token.as_deref() {
+            args.push("--service-token".to_string());
+            args.push(token.to_string());
+        }
+
+        args
     }
 }
 
@@ -97,7 +180,12 @@ pub fn resolve_banquette_bin(binary_path: &std::path::Path) -> PathBuf {
 
 #[async_trait]
 impl BanquetteSpawner for ProcessBanquetteSpawner {
-    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf> {
+    async fn spawn_banquette(
+        &self,
+        room_id: u64,
+        admin_account: u64,
+        room_head: Option<TinId>,
+    ) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.socket_dir)
             .await
             .map_err(MaitreDError::Io)?;
@@ -115,16 +203,7 @@ impl BanquetteSpawner for ProcessBanquetteSpawner {
         );
 
         let mut cmd = tokio::process::Command::new(&resolved_bin);
-        cmd.arg("--room-id")
-            .arg(room_id.to_string())
-            .arg("--admin")
-            .arg(admin_account.to_string())
-            .arg("--socket")
-            .arg(&socket_path)
-            .arg("--cellar-url")
-            .arg(&self.cellar_url)
-            .arg("--chunk-size-exponent")
-            .arg(self.chunk_size_exponent.to_string());
+        cmd.args(self.command_args(room_id, admin_account, &socket_path, room_head.as_ref()));
 
         cmd.spawn().map_err(|e| {
             MaitreDError::Banquette(format!(
@@ -137,6 +216,12 @@ impl BanquetteSpawner for ProcessBanquetteSpawner {
     }
 }
 
+/// A running in-process room server together with its graceful shutdown handle.
+struct InProcessRoom {
+    shutdown: watch::Sender<bool>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
 /// Spawns in-process [`BanquetteServer`] instances for automated testing without child processes.
 #[derive(Clone)]
 pub struct InProcessBanquetteSpawner {
@@ -144,6 +229,7 @@ pub struct InProcessBanquetteSpawner {
     cellar: Arc<dyn CellarSink>,
     chunk_size_exponent: u8,
     heartbeat_interval: Duration,
+    rooms: Arc<Mutex<HashMap<u64, InProcessRoom>>>,
 }
 
 impl InProcessBanquetteSpawner {
@@ -158,6 +244,7 @@ impl InProcessBanquetteSpawner {
             cellar,
             chunk_size_exponent,
             heartbeat_interval: Duration::from_secs(240),
+            rooms: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -172,11 +259,57 @@ impl InProcessBanquetteSpawner {
             chunk_size_exponent,
         )
     }
+
+    /// Overrides the heartbeat interval of spawned in-process servers.
+    ///
+    /// Mostly useful for tests that need the periodic persist (and therefore
+    /// the reported room head) to happen quickly.
+    #[must_use]
+    pub fn with_heartbeat_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Requests a graceful shutdown of the in-process room for `room_id`.
+    ///
+    /// The room persists its final state before the server returns. Returns
+    /// `false` when no server is tracked for the room.
+    pub async fn shutdown_room(&self, room_id: u64) -> bool {
+        let entry = {
+            let mut rooms = self.rooms.lock().await;
+            rooms.remove(&room_id)
+        };
+        match entry {
+            Some(entry) => {
+                let _ = entry.shutdown.send(true);
+                let _ = entry.handle.await;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Requests a graceful shutdown of every in-process room.
+    pub async fn shutdown_all(&self) {
+        let entries = {
+            let mut rooms = self.rooms.lock().await;
+            std::mem::take(&mut *rooms)
+        };
+        for (_, entry) in entries {
+            let _ = entry.shutdown.send(true);
+            let _ = entry.handle.await;
+        }
+    }
 }
 
 #[async_trait]
 impl BanquetteSpawner for InProcessBanquetteSpawner {
-    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf> {
+    async fn spawn_banquette(
+        &self,
+        room_id: u64,
+        admin_account: u64,
+        room_head: Option<TinId>,
+    ) -> Result<PathBuf> {
         tokio::fs::create_dir_all(&self.socket_dir)
             .await
             .map_err(MaitreDError::Io)?;
@@ -189,23 +322,45 @@ impl BanquetteSpawner for InProcessBanquetteSpawner {
             let _ = tokio::fs::remove_file(&socket_path).await;
         }
 
-        let room = Room::new(room_id, admin_account, self.chunk_size_exponent)
-            .map_err(|e| MaitreDError::Banquette(format!("Failed to create Room data: {e:?}")))?;
+        // A stale in-process server for the same room would fight over the same
+        // socket path and head pointer, so stop it before starting the new one.
+        self.shutdown_room(room_id).await;
+
+        let room = match room_head {
+            Some(tin_id) => Room::load_from_cellar(self.cellar.as_ref(), &tin_id, room_id)
+                .await
+                .map_err(|e| {
+                    MaitreDError::Banquette(format!(
+                        "failed to restore room {room_id} from persisted tin {}: {e}",
+                        hex::encode(tin_id)
+                    ))
+                })?,
+            None => Room::new(room_id, admin_account, self.chunk_size_exponent).map_err(|e| {
+                MaitreDError::Banquette(format!("Failed to create Room data: {e:?}"))
+            })?,
+        };
 
         let config = ServerConfig {
             socket_path: socket_path.clone(),
             heartbeat_interval: self.heartbeat_interval,
             admin_account,
-            system_session_id: 1,
         };
 
         let server = BanquetteServer::new(config, room, Arc::clone(&self.cellar));
-
-        tokio::spawn(async move {
-            if let Err(e) = server.run().await {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let handle = tokio::spawn(async move {
+            if let Err(e) = server.run_until_shutdown(shutdown_rx).await {
                 tracing::error!("In-process BanquetteServer error: {e:?}");
             }
         });
+
+        self.rooms.lock().await.insert(
+            room_id,
+            InProcessRoom {
+                shutdown: shutdown_tx,
+                handle,
+            },
+        );
 
         Ok(socket_path)
     }

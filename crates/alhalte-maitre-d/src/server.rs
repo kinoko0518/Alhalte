@@ -1057,7 +1057,7 @@ async fn get_room_info_handler(
         }
     };
 
-    let done = state.room_manager.is_room_done(room_id.as_u64()).await;
+    let done = room.done;
     let role = match state.db.get_room_role(&room_id_str, caller) {
         Ok(Some(role)) => role,
         Ok(None) if done => RoomRole::Viewer,
@@ -1318,7 +1318,10 @@ async fn handle_ws_upgrade(
         }
     };
 
-    let is_done = state.room_manager.is_room_done(room_id_u64).await;
+    // The persisted `rooms.done` row drives the pre-spawn gate, so a room that
+    // was made public stays reachable after a maitre-d restart (and a private
+    // room still returns 403) even before banquette is restored.
+    let is_done = room.done;
     let user_role = if auth_account != 0 {
         match state.db.get_room_role(&room_id_str, auth_account) {
             Ok(r) => r,
@@ -1365,10 +1368,23 @@ async fn handle_ws_upgrade(
         }
     };
 
-    let bridge = state
+    let bridge = match state
         .room_manager
         .get_or_create_room(room_id_u64, admin_account)
-        .await;
+        .await
+    {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            tracing::error!("Failed to start banquette for room {room_id_str}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to restore the room process: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let state_clone = state.clone();
     ws.on_upgrade(move |socket| {
@@ -1474,7 +1490,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
                     }
 
                     if let ClientFrame::SetDone { done } = &frame {
-                        bridge_ref.set_done(*done);
+                        // Persists `rooms.done` and updates the live bridge.
                         state.room_manager.set_room_done(room_id_u64, *done).await;
                     }
 
@@ -1517,7 +1533,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
                         }
 
                         if let ClientFrame::SetDone { done } = &f {
-                            bridge_ref.set_done(*done);
+                            // Persists `rooms.done` and updates the live bridge.
                             state.room_manager.set_room_done(room_id_u64, *done).await;
                         }
 
@@ -1640,7 +1656,7 @@ async fn export_room_zip_handler(
         }
     };
 
-    let is_done = state.room_manager.is_room_done(room_id.as_u64()).await;
+    let is_done = room.done;
     let caller_role = match caller_account {
         Some(account_id) => match state.db.get_room_role(&room_id_str, account_id) {
             Ok(role) => role,
@@ -1677,10 +1693,26 @@ async fn export_room_zip_handler(
         }
     };
 
-    let bridge = state
+    // A bridge is only created for a registered room, and it restores the room
+    // from the persisted head. If that head cannot be loaded, return an error
+    // instead of exporting a freshly fabricated empty room.
+    let bridge = match state
         .room_manager
         .get_or_create_room(room_id.as_u64(), admin_account)
-        .await;
+        .await
+    {
+        Ok(bridge) => bridge,
+        Err(e) => {
+            tracing::error!("Failed to start banquette for export of room {room_id_str}: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("failed to restore the room state for export: {e}")
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let (mut room_data, chunks) = match bridge.export_room(caller_account).await {
         Ok(data) => data,

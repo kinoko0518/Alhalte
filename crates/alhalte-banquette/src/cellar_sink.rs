@@ -8,10 +8,18 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use tokio::sync::RwLock;
 
-use alhalte_cellar::{StoreRequest, StoreResult, StoreStatus, format_tin_id};
+use alhalte_cellar::{StoreRequest, StoreResult, StoreStatus, UnregisterRequest, format_tin_id};
 use tin::TinId;
 
 use crate::error::{BanquetteError, Result};
+
+/// Session ID used for internal room-level writes.
+///
+/// Room state persistence is authorized by the cellar service token
+/// (`X-Alhalte-Service-Token`), never by a synthetic user session, so no real
+/// session is sent. Client-session writes (log chunks, scene unloads) still use
+/// the real session of the client that triggered them.
+pub const INTERNAL_WRITE_SESSION_ID: u64 = 0;
 
 /// Storage abstraction for sending sealed chunks and persisted scene/room tins to cellar.
 #[async_trait]
@@ -28,6 +36,13 @@ pub trait CellarSink: Send + Sync {
 
     /// Downloads a raw tin binary by its 256-bit `tin_id`.
     async fn download_tin(&self, tin_id: &TinId, owner: Option<u64>) -> Result<Vec<u8>>;
+
+    /// Removes the `(owner, tin_id)` reference so cellar GC can reclaim the entity.
+    ///
+    /// Returns `true` when a reference row was deleted and `false` when the
+    /// reference did not exist (already reclaimed). Retention of superseded room
+    /// heads is best effort: callers log and continue on errors.
+    async fn unregister_tin(&self, owner: u64, session_id: u64, tin_id: &TinId) -> Result<bool>;
 }
 
 #[derive(Debug, Clone)]
@@ -107,13 +122,38 @@ impl CellarSink for InMemoryCellarSink {
             ))),
         }
     }
+
+    async fn unregister_tin(&self, _owner: u64, _session_id: u64, tin_id: &TinId) -> Result<bool> {
+        // The in-memory sink models a single owner per tin, so dropping the
+        // stored entry is equivalent to removing the last reference row.
+        let mut write = self.storage.write().await;
+        Ok(write.remove(tin_id).is_some())
+    }
 }
 
 /// HTTP client implementation of [`CellarSink`] communicating with a remote `alhalte-cellar` server.
-#[derive(Debug, Clone)]
+///
+/// When a cellar service token is configured, internal writes (room state
+/// persistence and superseded-head retention) carry it in the
+/// `X-Alhalte-Service-Token` header instead of a synthetic user session. The
+/// token is redacted from the [`std::fmt::Debug`] representation.
+#[derive(Clone)]
 pub struct HttpCellarSink {
     base_url: String,
     client: reqwest::Client,
+    service_token: Option<String>,
+}
+
+impl std::fmt::Debug for HttpCellarSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpCellarSink")
+            .field("base_url", &self.base_url)
+            .field(
+                "service_token",
+                &self.service_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 impl HttpCellarSink {
@@ -122,6 +162,35 @@ impl HttpCellarSink {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             client: reqwest::Client::new(),
+            service_token: None,
+        }
+    }
+
+    /// Configures the internal cellar service token sent with internal writes.
+    ///
+    /// An empty token is treated as absent. The value is never logged.
+    #[must_use]
+    pub fn with_service_token(mut self, token: impl Into<String>) -> Self {
+        let token = token.into();
+        self.service_token = if token.trim().is_empty() {
+            None
+        } else {
+            Some(token)
+        };
+        self
+    }
+
+    /// Returns whether a service token is configured.
+    #[must_use]
+    pub fn has_service_token(&self) -> bool {
+        self.service_token.is_some()
+    }
+
+    /// Adds the service token header to an internal write request, if configured.
+    fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self.service_token.as_deref() {
+            Some(token) => request.header(alhalte_cellar::handlers::SERVICE_TOKEN_HEADER, token),
+            None => request,
         }
     }
 }
@@ -146,9 +215,7 @@ impl CellarSink for HttpCellarSink {
         };
 
         let resp = self
-            .client
-            .post(&check_url)
-            .json(&store_req)
+            .authorize(self.client.post(&check_url).json(&store_req))
             .send()
             .await
             .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
@@ -170,7 +237,8 @@ impl CellarSink for HttpCellarSink {
                 req = req.header("X-Alhalte-Wrapped-Key", hex::encode(key));
             }
 
-            let upload_resp = req
+            let upload_resp = self
+                .authorize(req)
                 .send()
                 .await
                 .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
@@ -241,5 +309,33 @@ impl CellarSink for HttpCellarSink {
             .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
 
         Ok(bytes.to_vec())
+    }
+
+    async fn unregister_tin(&self, owner: u64, session_id: u64, tin_id: &TinId) -> Result<bool> {
+        let unregister_url = format!("{}/unregister", self.base_url);
+        let request = UnregisterRequest {
+            owner,
+            session_id,
+            tin_id: *tin_id,
+        };
+
+        let resp = self
+            .authorize(self.client.post(&unregister_url).json(&request))
+            .send()
+            .await
+            .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
+
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+
+        if !resp.status().is_success() {
+            return Err(BanquetteError::Cellar(format!(
+                "Cellar unregister failed with status {}",
+                resp.status()
+            )));
+        }
+
+        Ok(true)
     }
 }

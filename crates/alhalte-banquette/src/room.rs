@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use tin::{Compression, Tin, TinId};
 
-use crate::cellar_sink::CellarSink;
+use crate::cellar_sink::{CellarSink, INTERNAL_WRITE_SESSION_ID};
 use crate::character::{CharacterBiblio, get_character_owner};
 use crate::error::{BanquetteError, Result};
 use crate::labels::{KEY_STD_ADMINS, LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID};
@@ -21,6 +21,19 @@ pub enum HeartbeatOutcome {
     Continue,
     /// Room has been idle with no responses for 3 consecutive intervals; process should exit.
     ShouldExit,
+}
+
+/// Result of one [`Room::step_heartbeat`] cycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HeartbeatResult {
+    /// Liveness decision for this cycle.
+    pub outcome: HeartbeatOutcome,
+    /// Tin ID of the `RoomData` tin stored to cellar during this cycle.
+    ///
+    /// `None` when the store failed. `maitre-d` only advances the persisted room
+    /// head pointer after a successful store, so a failed cycle must not report
+    /// one.
+    pub persisted_tin: Option<TinId>,
 }
 
 /// Serialized payload for the whole room state (`alhalte/banquette`).
@@ -68,6 +81,11 @@ pub struct Room {
     pub missed_heartbeats: u32,
     /// Whether any client activity or heartbeat response occurred during the current cycle.
     pub client_activity_in_cycle: bool,
+    /// Tin ID of the most recently stored (or restored) `RoomData` head.
+    ///
+    /// Used for retention: when a newer head is stored, this tin is
+    /// unregistered from cellar on a best-effort basis so GC can reclaim it.
+    pub head_tin: Option<TinId>,
 }
 
 impl Room {
@@ -81,6 +99,7 @@ impl Room {
             character_biblio: CharacterBiblio::new(),
             missed_heartbeats: 0,
             client_activity_in_cycle: true,
+            head_tin: None,
         };
 
         // Create root virtual scene "/"
@@ -451,26 +470,73 @@ impl Room {
         self.client_activity_in_cycle = true;
     }
 
-    /// Advances one heartbeat cycle.
+    /// Persists the whole room state to cellar and advances the in-memory head pointer.
     ///
-    /// - Serializes the whole room state into a `Tin` with label `alhalte/banquette` and saves it to cellar.
-    /// - Checks client activity. If no client activity occurred during the cycle, increments `missed_heartbeats`.
-    /// - If 3 consecutive missed heartbeats are accumulated, returns [`HeartbeatOutcome::ShouldExit`].
-    pub async fn step_heartbeat(
-        &mut self,
-        cellar: &dyn CellarSink,
-        owner: u64,
-        session_id: u64,
-    ) -> Result<HeartbeatOutcome> {
-        // Persist whole room state
+    /// The store is authorized by the cellar service token carried by the
+    /// [`CellarSink`] (or by a real user session when no token is configured);
+    /// internal writes never impersonate a synthetic session, so
+    /// [`INTERNAL_WRITE_SESSION_ID`] is sent.
+    ///
+    /// After a successful store the previous head tin is unregistered on a
+    /// best-effort basis so cellar GC can reclaim it. The current head is never
+    /// unregistered, and retention failures are logged but do not fail the store.
+    ///
+    /// Returns the tin ID of the stored `RoomData`.
+    pub async fn persist(&mut self, cellar: &dyn CellarSink, owner: u64) -> Result<TinId> {
         let room_tin = self.to_tin()?;
         let (wire_bytes, tin_id) = room_tin
             .encode_plaintext(Compression::Zstd)
             .map_err(BanquetteError::Tin)?;
 
         cellar
-            .store_tin(owner, session_id, &wire_bytes, &tin_id, None)
+            .store_tin(owner, INTERNAL_WRITE_SESSION_ID, &wire_bytes, &tin_id, None)
             .await?;
+
+        let previous = self.head_tin.replace(tin_id);
+        if let Some(previous) = previous
+            && previous != tin_id
+        {
+            match cellar
+                .unregister_tin(owner, INTERNAL_WRITE_SESSION_ID, &previous)
+                .await
+            {
+                Ok(true) => tracing::debug!(
+                    "unregistered superseded room head tin {}",
+                    alhalte_cellar::format_tin_id(&previous)
+                ),
+                Ok(false) => tracing::debug!(
+                    "superseded room head tin {} already had no reference",
+                    alhalte_cellar::format_tin_id(&previous)
+                ),
+                Err(e) => tracing::warn!(
+                    "failed to unregister superseded room head tin {}: {e}",
+                    alhalte_cellar::format_tin_id(&previous)
+                ),
+            }
+        }
+
+        Ok(tin_id)
+    }
+
+    /// Advances one heartbeat cycle.
+    ///
+    /// - Persists the whole room state and reports the stored `RoomData` tin ID
+    ///   in [`HeartbeatResult::persisted_tin`]. A failed store is logged and
+    ///   reported as `None` so the process keeps running and retries next cycle.
+    /// - Checks client activity. If no client activity occurred during the cycle, increments `missed_heartbeats`.
+    /// - If 3 consecutive missed heartbeats are accumulated, returns [`HeartbeatOutcome::ShouldExit`].
+    pub async fn step_heartbeat(
+        &mut self,
+        cellar: &dyn CellarSink,
+        owner: u64,
+    ) -> Result<HeartbeatResult> {
+        let persisted_tin = match self.persist(cellar, owner).await {
+            Ok(tin_id) => Some(tin_id),
+            Err(e) => {
+                tracing::error!("Failed to persist room state to cellar: {e}");
+                None
+            }
+        };
 
         // Evaluate activity
         let had_activity = self.client_activity_in_cycle;
@@ -482,17 +548,22 @@ impl Room {
             .values()
             .any(|s| !s.active_clients.is_empty());
 
-        if had_activity || any_connected_clients {
+        let outcome = if had_activity || any_connected_clients {
             self.missed_heartbeats = 0;
-            Ok(HeartbeatOutcome::Continue)
+            HeartbeatOutcome::Continue
         } else {
             self.missed_heartbeats = self.missed_heartbeats.saturating_add(1);
             if self.missed_heartbeats >= 3 {
-                Ok(HeartbeatOutcome::ShouldExit)
+                HeartbeatOutcome::ShouldExit
             } else {
-                Ok(HeartbeatOutcome::Continue)
+                HeartbeatOutcome::Continue
             }
-        }
+        };
+
+        Ok(HeartbeatResult {
+            outcome,
+            persisted_tin,
+        })
     }
 
     /// Serializes whole room state into a `Tin` with label `alhalte/banquette`.
@@ -551,6 +622,10 @@ impl Room {
             scene_biblio.insert(sid, scene);
         }
 
+        if !scene_biblio.contains_key("/") {
+            return Err(BanquetteError::MissingRootScene);
+        }
+
         Ok(Self {
             room_id: data.room_id,
             done: data.done,
@@ -559,7 +634,62 @@ impl Room {
             character_biblio: data.character_biblio,
             missed_heartbeats: 0,
             client_activity_in_cycle: true,
+            head_tin: None,
         })
+    }
+
+    /// Reconstructs a [`Room`] from a persisted `RoomData` tin and records its tin ID as the head.
+    ///
+    /// The head is kept so that the first successful re-persist can unregister
+    /// the superseded head from cellar (retention).
+    pub fn from_tin_with_head(tin: &Tin, head_tin: TinId) -> Result<Self> {
+        let mut room = Self::from_tin(tin)?;
+        room.head_tin = Some(head_tin);
+        Ok(room)
+    }
+
+    /// Downloads, decodes, and validates a persisted room from cellar.
+    ///
+    /// This is the restore path used when `maitre-d` starts a banquette for a
+    /// room that already has a persisted head. It never falls back to an empty
+    /// room: a missing tin, a corrupted payload, a content hash that does not
+    /// match the head pointer, a missing root scene, or a room ID mismatch all
+    /// return an error so the caller can fail the spawn loudly.
+    pub async fn load_from_cellar(
+        cellar: &dyn CellarSink,
+        tin_id: &TinId,
+        expected_room_id: u64,
+    ) -> Result<Self> {
+        let bytes = cellar.download_tin(tin_id, None).await.map_err(|e| {
+            BanquetteError::Cellar(format!(
+                "failed to download room tin {}: {e}",
+                alhalte_cellar::format_tin_id(tin_id)
+            ))
+        })?;
+
+        let (tin, _opener, decoded_tin_id) = Tin::decode(&bytes, None).map_err(|e| {
+            BanquetteError::Cellar(format!(
+                "failed to decode room tin {}: {e}",
+                alhalte_cellar::format_tin_id(tin_id)
+            ))
+        })?;
+
+        if decoded_tin_id != *tin_id {
+            return Err(BanquetteError::TinIdMismatch {
+                expected: alhalte_cellar::format_tin_id(tin_id),
+                actual: alhalte_cellar::format_tin_id(&decoded_tin_id),
+            });
+        }
+
+        let room = Self::from_tin_with_head(&tin, *tin_id)?;
+        if room.room_id != expected_room_id {
+            return Err(BanquetteError::RoomIdMismatch {
+                expected: expected_room_id,
+                actual: room.room_id,
+            });
+        }
+
+        Ok(room)
     }
 
     /// Exports the room data and associated log chunks for permitted scenes.

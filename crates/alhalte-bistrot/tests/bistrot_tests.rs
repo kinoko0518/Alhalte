@@ -308,6 +308,7 @@ fn test_generate_maitre_d_args() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -383,6 +384,7 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -552,6 +554,7 @@ fn test_generate_all_args_and_module_args() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -604,6 +607,7 @@ fn test_systemd_generator() {
             maitre_d_url: None,
             maitre_d_socket: None,
             allow_all_sessions: false,
+            service_token: None,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -1070,4 +1074,116 @@ fn test_root_bistrot_toml_extensions_configuration() {
         assert_eq!(config.extensions[i].path, PathBuf::from(*expected_path));
         assert_eq!(config.extensions[i].enabled, *expected_enabled);
     }
+}
+
+// spec: alhalte-bistrot/service-token 0001 internal cellar service token is passed to maitre-d and cellar
+#[test]
+fn test_generate_args_includes_service_token() {
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+service-token = "internal-service-token"
+"#;
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(
+        config.cellar.service_token.as_deref(),
+        Some("internal-service-token")
+    );
+
+    let maitre_d_args = generate_maitre_d_args(&config);
+    let token_index = maitre_d_args
+        .iter()
+        .position(|arg| arg == "--service-token")
+        .expect("maitre-d must receive --service-token");
+    assert_eq!(maitre_d_args[token_index + 1], "internal-service-token");
+
+    let cellar_args = generate_cellar_args(&config);
+    let token_index = cellar_args
+        .iter()
+        .position(|arg| arg == "--service-token")
+        .expect("cellar must receive --service-token");
+    assert_eq!(cellar_args[token_index + 1], "internal-service-token");
+
+    // Without a token no flag is emitted.
+    let plain = parse_bistrot_toml(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+"#,
+    )
+    .unwrap();
+    assert!(
+        !generate_maitre_d_args(&plain)
+            .iter()
+            .any(|arg| arg == "--service-token")
+    );
+    assert!(
+        !generate_cellar_args(&plain)
+            .iter()
+            .any(|arg| arg == "--service-token")
+    );
+
+    // An explicitly empty token is rejected.
+    let empty = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+service-token = ""
+"#;
+    assert!(parse_bistrot_toml(empty).is_err());
+}
+
+// spec: alhalte-bistrot/service-token 0002 the default Bistrot.toml shares the token
+#[test]
+fn test_root_bistrot_toml_shares_the_local_service_token() {
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    // The checked-in local development configuration must set the token so
+    // `nix run .#bistrot` persists room state out of the box.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root_bistrot = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("Bistrot.toml");
+    let config = load_from_path(&root_bistrot).unwrap();
+    let token = config
+        .cellar
+        .service_token
+        .as_deref()
+        .expect("the default Bistrot.toml must configure cellar.service-token");
+    assert!(!token.trim().is_empty());
+
+    let maitre_d_args = generate_maitre_d_args(&config);
+    let cellar_args = generate_cellar_args(&config);
+    assert_eq!(arg_after(&maitre_d_args, "--service-token"), Some(token));
+    assert_eq!(arg_after(&cellar_args, "--service-token"), Some(token));
+
+    // The generated systemd units carry the same token to both services.
+    let units = generate_systemd_units(&config, &SystemdOptions::default());
+    assert!(
+        units
+            .maitre_d_service
+            .contains(&format!("--service-token {token}"))
+    );
+    assert!(
+        units
+            .cellar_service
+            .contains(&format!("--service-token {token}"))
+    );
 }

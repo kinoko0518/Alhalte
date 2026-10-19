@@ -16,7 +16,11 @@
 //!   and supports creating debug accounts with `sub = "0"` under debug builds.
 //! - **WebSocket Demultiplexer & Banquette Spawner**: Inspects incoming WebSocket headers (`X-Alhalte-Room`),
 //!   query parameters (`room`), and URL paths (`/room/{room_id}`) to demultiplex messages to `alhalte-banquette`
-//!   daemons via UNIX domain sockets, buffering initial traffic while launching room processes on demand.
+//!   daemons via UNIX domain sockets. Spawning, room restore, and the socket connection are awaited before a
+//!   client is registered, so a failed restore is reported to the caller instead of silently starting empty.
+//! - **Room state head**: `room_heads` stores the tin ID of the last persisted `RoomData` per room. It is
+//!   read before spawning banquette (so the room is restored instead of starting empty) and updated from
+//!   `RoomPersisted` control frames.
 //!
 //! ## Example
 //!

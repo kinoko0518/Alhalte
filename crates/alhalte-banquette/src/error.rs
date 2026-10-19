@@ -39,6 +39,28 @@ pub enum BanquetteError {
     #[error("Character with ID {0} not found")]
     CharacterNotFound(u64),
 
+    /// A persisted room tin belongs to a different room than the one being started.
+    #[error("Persisted room tin belongs to room {actual}, expected room {expected}")]
+    RoomIdMismatch {
+        /// Room ID the process was started for.
+        expected: u64,
+        /// Room ID encoded in the persisted `RoomData`.
+        actual: u64,
+    },
+
+    /// A persisted room tin's content hash does not match the head pointer.
+    #[error("Persisted room tin id mismatch: expected {expected}, decoded content id {actual}")]
+    TinIdMismatch {
+        /// Tin ID stored as the room head pointer.
+        expected: String,
+        /// Tin ID computed from the downloaded bytes.
+        actual: String,
+    },
+
+    /// Persisted room data does not contain the root scene `"/"`.
+    #[error("Persisted room data is missing the root scene '/'")]
+    MissingRootScene,
+
     /// Invalid log position requested for edit, delete, or rewind.
     #[error(
         "Invalid log position chunk {chunk}, pos {position}; current head is at chunk {head_chunk}, pos {head_position}"

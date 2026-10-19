@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio_util::codec::Framed;
 
 use crate::cellar_sink::CellarSink;
@@ -39,10 +39,8 @@ pub struct ServerConfig {
     pub socket_path: PathBuf,
     /// Heartbeat interval (default 4 minutes / 240 seconds).
     pub heartbeat_interval: Duration,
-    /// Default room admin account ID.
+    /// Room admin account ID, also used as the cellar owner of internal room writes.
     pub admin_account: u64,
-    /// Default session ID used for room-level cellar persistence.
-    pub system_session_id: u64,
 }
 
 impl Default for ServerConfig {
@@ -51,8 +49,21 @@ impl Default for ServerConfig {
             socket_path: PathBuf::from("/tmp/alhalte-banquette.sock"),
             heartbeat_interval: Duration::from_secs(240),
             admin_account: 1,
-            system_session_id: 1,
         }
+    }
+}
+
+/// Resolves when the optional external shutdown signal fires.
+///
+/// `None` means "no external shutdown" and waits forever. A dropped sender is
+/// treated as a shutdown request so an in-process server can never outlive the
+/// component that owns it.
+async fn wait_for_shutdown(shutdown: Option<watch::Receiver<bool>>) {
+    match shutdown {
+        Some(mut rx) => {
+            let _ = rx.changed().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -109,16 +120,23 @@ pub struct BanquetteServer {
     room: Arc<RwLock<Room>>,
     cellar: Arc<dyn CellarSink>,
     clients: Arc<RwLock<HashMap<u64, ConnectedClient>>>,
+    /// Broadcasts successfully stored `RoomData` heads to connected maitre-d links.
+    ///
+    /// Each entry is `(tin_id, done)`: the stored tin ID together with the
+    /// room's public `done` flag at store time, so maitre-d can persist both.
+    persisted_tx: broadcast::Sender<(TinId, bool)>,
 }
 
 impl BanquetteServer {
     /// Creates a new [`BanquetteServer`].
     pub fn new(config: ServerConfig, room: Room, cellar: Arc<dyn CellarSink>) -> Self {
+        let (persisted_tx, _) = broadcast::channel(16);
         Self {
             config,
             room: Arc::new(RwLock::new(room)),
             cellar,
             clients: Arc::new(RwLock::new(HashMap::new())),
+            persisted_tx,
         }
     }
 
@@ -128,7 +146,23 @@ impl BanquetteServer {
     }
 
     /// Runs the server until shutdown.
+    ///
+    /// On shutdown (idle timeout or socket error) the room is persisted once more
+    /// and the resulting head tin is reported to `maitre-d` before the socket is
+    /// closed.
     pub async fn run(&self) -> Result<()> {
+        self.run_inner(None).await
+    }
+
+    /// Runs the server until `shutdown` is notified, then persists the room once more.
+    ///
+    /// Sending `true` (or dropping the sender) requests a graceful shutdown.
+    /// Used by in-process spawners and tests to stop a room deterministically.
+    pub async fn run_until_shutdown(&self, shutdown: watch::Receiver<bool>) -> Result<()> {
+        self.run_inner(Some(shutdown)).await
+    }
+
+    async fn run_inner(&self, shutdown: Option<watch::Receiver<bool>>) -> Result<()> {
         let socket_path = &self.config.socket_path;
         if socket_path.exists() {
             let _ = std::fs::remove_file(socket_path);
@@ -147,29 +181,36 @@ impl BanquetteServer {
         let heartbeat_cellar = Arc::clone(&self.cellar);
         let heartbeat_interval = self.config.heartbeat_interval;
         let admin_account = self.config.admin_account;
-        let system_session_id = self.config.system_session_id;
-        let hb_shutdown_tx = shutdown_tx.clone();
+        let heartbeat_persisted_tx = self.persisted_tx.clone();
+        let heartbeat_shutdown = shutdown.clone();
 
-        tokio::spawn(async move {
+        let heartbeat_task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(heartbeat_interval);
             // First tick completes immediately, skip it
             interval.tick().await;
 
             loop {
-                interval.tick().await;
-                let mut room = heartbeat_room.write().await;
-                match room
-                    .step_heartbeat(heartbeat_cellar.as_ref(), admin_account, system_session_id)
-                    .await
-                {
-                    Ok(HeartbeatOutcome::ShouldExit) => {
-                        tracing::warn!("3 consecutive missed heartbeats; initiating room shutdown");
-                        let _ = hb_shutdown_tx.send(()).await;
-                        break;
-                    }
-                    Ok(HeartbeatOutcome::Continue) => {}
-                    Err(e) => {
-                        tracing::error!("Error during periodic heartbeat: {:?}", e);
+                tokio::select! {
+                    _ = wait_for_shutdown(heartbeat_shutdown.clone()) => break,
+                    _ = interval.tick() => {
+                        let mut room = heartbeat_room.write().await;
+                        match room.step_heartbeat(heartbeat_cellar.as_ref(), admin_account).await {
+                            Ok(result) => {
+                                if let Some(tin_id) = result.persisted_tin {
+                                    // Only a successful store advances the head pointer.
+                                    let done = room.done;
+                                    let _ = heartbeat_persisted_tx.send((tin_id, done));
+                                }
+                                if result.outcome == HeartbeatOutcome::ShouldExit {
+                                    tracing::warn!("3 consecutive missed heartbeats; initiating room shutdown");
+                                    let _ = shutdown_tx.send(()).await;
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Error during periodic heartbeat: {:?}", e);
+                            }
+                        }
                     }
                 }
             }
@@ -177,6 +218,10 @@ impl BanquetteServer {
 
         loop {
             tokio::select! {
+                _ = wait_for_shutdown(shutdown.clone()) => {
+                    tracing::info!("Shutdown signal received, closing server");
+                    break;
+                }
                 _ = shutdown_rx.recv() => {
                     tracing::info!("Shutdown signal received, closing server");
                     break;
@@ -187,8 +232,9 @@ impl BanquetteServer {
                             let room = Arc::clone(&self.room);
                             let cellar = Arc::clone(&self.cellar);
                             let clients = Arc::clone(&self.clients);
+                            let persisted_tx = self.persisted_tx.clone();
                             tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(stream, room, cellar, clients).await {
+                                if let Err(e) = Self::handle_connection(stream, room, cellar, clients, persisted_tx).await {
                                     tracing::error!("Connection handler error: {:?}", e);
                                 }
                             });
@@ -201,6 +247,12 @@ impl BanquetteServer {
             }
         }
 
+        // Stop the heartbeat loop before the final persist so the two cannot interleave.
+        heartbeat_task.abort();
+        let _ = heartbeat_task.await;
+
+        self.persist_and_report_final_head().await;
+
         if socket_path.exists() {
             let _ = std::fs::remove_file(socket_path);
         }
@@ -208,12 +260,42 @@ impl BanquetteServer {
         Ok(())
     }
 
+    /// Persists the room one last time and reports the head tin to `maitre-d`.
+    ///
+    /// Best effort: a failure is logged and the server still exits. The short
+    /// delay gives the outgoing writer task a chance to flush `RoomPersisted`
+    /// before the socket is torn down.
+    async fn persist_and_report_final_head(&self) {
+        let (persisted, done) = {
+            let mut room = self.room.write().await;
+            let done = room.done;
+            (
+                room.persist(self.cellar.as_ref(), self.config.admin_account)
+                    .await,
+                done,
+            )
+        };
+
+        match persisted {
+            Ok(tin_id) => {
+                let _ = self.persisted_tx.send((tin_id, done));
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => tracing::error!("Final room persist on shutdown failed: {e:?}"),
+        }
+    }
+
     /// Handles a single incoming connection from `maitre-d`.
+    ///
+    /// `persisted_tx` receives `(tin_id, done)` for every successfully stored
+    /// room head; each connection forwards those to `maitre-d` as
+    /// [`BanquetteToMaitreD::RoomPersisted`].
     pub async fn handle_connection(
         stream: UnixStream,
         room: Arc<RwLock<Room>>,
         cellar: Arc<dyn CellarSink>,
         clients: Arc<RwLock<HashMap<u64, ConnectedClient>>>,
+        persisted_tx: broadcast::Sender<(TinId, bool)>,
     ) -> Result<()> {
         let (read_half, write_half) = stream.into_split();
         let mut reader = Framed::new(read_half, ProtocolCodec::<MaitreDToBanquette>::new());
@@ -225,6 +307,20 @@ impl BanquetteServer {
             while let Some(msg) = out_rx.recv().await {
                 if let Err(e) = writer.send(msg).await {
                     tracing::error!("Error sending frame to maitre-d: {:?}", e);
+                    break;
+                }
+            }
+        });
+
+        let mut persisted_rx = persisted_tx.subscribe();
+        let persist_out_tx = out_tx.clone();
+        let persist_task = tokio::spawn(async move {
+            while let Ok((tin_id, done)) = persisted_rx.recv().await {
+                if persist_out_tx
+                    .send(BanquetteToMaitreD::RoomPersisted { tin_id, done })
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -300,6 +396,7 @@ impl BanquetteServer {
         }
 
         write_task.abort();
+        persist_task.abort();
         Ok(())
     }
 

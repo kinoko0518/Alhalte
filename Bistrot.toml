@@ -19,6 +19,11 @@ anti-oracle = false
 # maitre-d-socket = ".alhalte/sockets/maitre-d.sock"
 # ローカル開発専用。true にするとすべての session を許可する（既定 false）。
 allow-all-sessions = false
+# 内部書き込み用のサービス間トークン（rops で暗号化する秘密値）。
+# maitre-d / banquette / cellar が同じ値を使う。未設定の場合、banquette の
+# 部屋状態 persistence は cellar に拒否される（本番では必ず設定する）。
+# 下記はローカル開発専用の既定値。本番では rops で暗号化した値に必ず差し替えること。
+service-token = "alhalte-local-service-token"
 
 [banquette]
 chunk-size-exponent = 8

@@ -46,7 +46,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     };
 
-    let service = Arc::new(CellarService::new(&config, verifier)?);
+    let mut service = CellarService::new(&config, verifier)?;
+    match args.service_token.as_deref() {
+        Some(token) => {
+            tracing::info!("Internal service token configured for trusted room-state persistence");
+            service = service.with_service_token(token);
+        }
+        None => tracing::warn!(
+            "No --service-token configured: internal room-state persistence from banquette \
+             will be rejected unless a user session is supplied"
+        ),
+    }
+    let service = Arc::new(service);
     let _gc_handle = service.spawn_gc_task();
 
     let app = service.into_router();
