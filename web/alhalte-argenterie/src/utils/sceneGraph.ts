@@ -6,7 +6,12 @@
  * - ARCHITECTURE.md: `## alhalte-banquette -> #### log (character-came, character-gone)`
  */
 
-import type { SceneGraphEdge, SceneGraphNode, SceneGraphResult } from '../types/index.js';
+import type {
+  LogRecord,
+  SceneGraphEdge,
+  SceneGraphNode,
+  SceneGraphResult,
+} from '../types/index.js';
 
 export interface SceneMovementEvent {
   characterId: string;
@@ -14,6 +19,16 @@ export interface SceneMovementEvent {
   fromSceneId?: string; // If undefined, initial spawn in toSceneId
   toSceneId: string;
   timestamp: number;
+  /**
+   * Source of the movement. `log` events are reconstructed from
+   * `character-came` / `character-gone` records; `live` events come from a
+   * `CharacterMoved` broadcast. Used by {@link reconcileMovements}.
+   */
+  source?: 'log' | 'live';
+  /** Id of the source log record (stable dedupe key for reconstructed moves). */
+  id?: string;
+  /** Timeline position among log events (ties on the timestamp-less events). */
+  order?: number;
 }
 
 /**
@@ -33,8 +48,13 @@ export function buildSceneGraph(
   sceneNames: Map<string, string>,
   accessibleSceneIds: Set<string>,
 ): SceneGraphResult {
-  // Sort events chronologically: earlier first (top), later last (bottom)
-  const sorted = [...movements].sort((a, b) => a.timestamp - b.timestamp);
+  // Sort events chronologically: earlier first (top), later last (bottom).
+  // System events have no timestamp (0), so the reconstructed log order breaks
+  // ties instead of shuffling all of them to the top.
+  const sorted = [...movements].sort((a, b) => {
+    if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+    return (a.order ?? 0) - (b.order ?? 0);
+  });
 
   const nodes: SceneGraphNode[] = [];
   const edges: SceneGraphEdge[] = [];
@@ -335,4 +355,208 @@ export function buildSceneGraph(
     edges,
     branchCount: nodes.length > 0 ? maxBranch + 1 : 1,
   };
+}
+
+/**
+ * Rebuilds character movements from banquette `character-came` /
+ * `character-gone` system log records (Issue #162).
+ *
+ * The server appends a `gone` record in the source scene and a `came` record
+ * in the destination scene, in that order. Pairing them gives the movement
+ * `from -> to`. When the records arrive out of order (each scene has its own
+ * chunk position), a `gone` retroactively fills in the origin of the latest
+ * came, and a `came` without any `gone` is treated as an initial spawn.
+ *
+ * System events carry no timestamp, so `order` preserves the log order for the
+ * graph / chronological sort.
+ */
+export function buildMovementsFromLogRecords(
+  records: LogRecord[],
+  characterNames: Map<string, string> = new Map(),
+): SceneMovementEvent[] {
+  const seenRecordIds = new Set<string>();
+  const events: Array<{ record: LogRecord; index: number }> = [];
+  for (const record of records) {
+    if (record.kind !== 'system') continue;
+    const event = record.event;
+    if (!event || (event.type !== 'character-came' && event.type !== 'character-gone')) {
+      continue;
+    }
+    if (seenRecordIds.has(record.id)) continue;
+    seenRecordIds.add(record.id);
+    events.push({ record, index: events.length });
+  }
+
+  events.sort((a, b) => {
+    const aIndex = a.record.chunkIndex;
+    const bIndex = b.record.chunkIndex;
+    if (typeof aIndex === 'number' && typeof bIndex === 'number') {
+      if (aIndex !== bIndex) return aIndex - bIndex;
+      const aPosition = a.record.position ?? 0;
+      const bPosition = b.record.position ?? 0;
+      if (aPosition !== bPosition) return aPosition - bPosition;
+    } else if (typeof aIndex === 'number') {
+      return -1;
+    } else if (typeof bIndex === 'number') {
+      return 1;
+    }
+    if (a.record.timestamp !== b.record.timestamp) {
+      return a.record.timestamp - b.record.timestamp;
+    }
+    return a.index - b.index;
+  });
+
+  const movements: SceneMovementEvent[] = [];
+  const pendingGone = new Map<string, string>();
+  const lastSceneByCharacter = new Map<string, string>();
+  const lastMovementByCharacter = new Map<string, SceneMovementEvent>();
+
+  for (let order = 0; order < events.length; order++) {
+    const record = events[order].record;
+    const event = record.event;
+    if (!event || (event.type !== 'character-came' && event.type !== 'character-gone')) {
+      continue;
+    }
+    const characterId = event.characterId;
+    if (event.type === 'character-gone') {
+      const last = lastMovementByCharacter.get(characterId);
+      // Out-of-order (came before gone): this gone is the origin of the most
+      // recent movement into a different scene.
+      if (last && last.fromSceneId === undefined && last.toSceneId !== record.sceneId) {
+        last.fromSceneId = record.sceneId;
+      } else {
+        pendingGone.set(characterId, record.sceneId);
+      }
+      lastSceneByCharacter.set(characterId, record.sceneId);
+      continue;
+    }
+
+    const fromSceneId =
+      pendingGone.get(characterId) ??
+      (lastSceneByCharacter.get(characterId) !== record.sceneId
+        ? lastSceneByCharacter.get(characterId)
+        : undefined);
+    pendingGone.delete(characterId);
+    lastSceneByCharacter.set(characterId, record.sceneId);
+
+    const movement: SceneMovementEvent = {
+      characterId,
+      characterName: characterNames.get(characterId) ?? characterId,
+      ...(fromSceneId !== undefined ? { fromSceneId } : {}),
+      toSceneId: record.sceneId,
+      timestamp: record.timestamp,
+      source: 'log',
+      id: record.id,
+      order,
+    };
+    movements.push(movement);
+    lastMovementByCharacter.set(characterId, movement);
+  }
+
+  return movements;
+}
+
+/** Key used to dedupe one reconstructed log movement against a live one. */
+function exactMovementKey(movement: SceneMovementEvent): string {
+  return `${movement.characterId}|${movement.fromSceneId ?? ''}|${movement.toSceneId}`;
+}
+
+/** Loose key for came-only log events (origin unknown). */
+function looseMovementKey(movement: SceneMovementEvent): string {
+  return `${movement.characterId}|${movement.toSceneId}`;
+}
+
+function compareMovements(a: SceneMovementEvent, b: SceneMovementEvent): number {
+  if (a.timestamp !== b.timestamp) return a.timestamp - b.timestamp;
+  return (a.order ?? 0) - (b.order ?? 0);
+}
+
+/**
+ * Merges live `CharacterMoved` movements with movements reconstructed from the
+ * came/gone log records without double-counting a move (Issue #162).
+ *
+ * A live move is dropped when a reconstructed movement with the same character
+ * and destination exists. The match is exact on `from -> to` first; because a
+ * came-only record has no known origin, it falls back to `character -> to`.
+ * Duplicate live events (the requester gets both the ack and the broadcast) are
+ * collapsed by the same multiplicity matching.
+ */
+export function reconcileMovements(
+  liveMovements: SceneMovementEvent[],
+  logMovements: SceneMovementEvent[],
+): SceneMovementEvent[] {
+  const exactCounts = new Map<string, number>();
+  const anyCounts = new Map<string, number>();
+  const unknownOriginCounts = new Map<string, number>();
+  for (const movement of logMovements) {
+    const exact = exactMovementKey(movement);
+    exactCounts.set(exact, (exactCounts.get(exact) ?? 0) + 1);
+    const loose = looseMovementKey(movement);
+    anyCounts.set(loose, (anyCounts.get(loose) ?? 0) + 1);
+    if (movement.fromSceneId === undefined) {
+      unknownOriginCounts.set(loose, (unknownOriginCounts.get(loose) ?? 0) + 1);
+    }
+  }
+
+  const consume = (movement: SceneMovementEvent) => {
+    const loose = looseMovementKey(movement);
+    anyCounts.set(loose, (anyCounts.get(loose) ?? 0) - 1);
+  };
+
+  const keptLive: SceneMovementEvent[] = [];
+  // The requester can receive the same `CharacterMoved` as both an ack and a
+  // broadcast; collapse live duplicates before matching them against the log.
+  for (const movement of collapseLiveMovements(liveMovements)) {
+    const exactKey = exactMovementKey(movement);
+    const exact = exactCounts.get(exactKey) ?? 0;
+    if (exact > 0) {
+      exactCounts.set(exactKey, exact - 1);
+      consume(movement);
+      const unknownKey = looseMovementKey(movement);
+      const unknown = unknownOriginCounts.get(unknownKey) ?? 0;
+      if (unknown > 0) unknownOriginCounts.set(unknownKey, unknown - 1);
+      continue;
+    }
+
+    const loose = looseMovementKey(movement);
+    // A membership summary may not have hydrated the source scene yet, so a
+    // live move can have no origin while the log record does. Match on
+    // character + destination when either side lacks the origin.
+    const unknown = unknownOriginCounts.get(loose) ?? 0;
+    const any = anyCounts.get(loose) ?? 0;
+    if ((movement.fromSceneId === undefined && any > 0) || unknown > 0) {
+      consume(movement);
+      if (unknown > 0) unknownOriginCounts.set(loose, unknown - 1);
+      continue;
+    }
+    keptLive.push(movement);
+  }
+
+  return [...logMovements, ...keptLive].sort(compareMovements);
+}
+
+/**
+ * Collapses duplicate live movements of the same character / route.
+ *
+ * The requester of a `MoveCharacter` receives the `CharacterMoved` ack and
+ * also appends the movement from the resolved request; both call
+ * {@link collapseLiveMovements}. A short window keeps a genuine return to the
+ * same route a moment later from being swallowed.
+ */
+export function collapseLiveMovements(
+  movements: SceneMovementEvent[],
+  windowSeconds = 5,
+): SceneMovementEvent[] {
+  const result: SceneMovementEvent[] = [];
+  for (const movement of movements) {
+    const duplicate = result.some(
+      (previous) =>
+        previous.characterId === movement.characterId &&
+        previous.fromSceneId === movement.fromSceneId &&
+        previous.toSceneId === movement.toSceneId &&
+        Math.abs(previous.timestamp - movement.timestamp) <= windowSeconds,
+    );
+    if (!duplicate) result.push(movement);
+  }
+  return result;
 }

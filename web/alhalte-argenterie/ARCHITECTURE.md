@@ -74,12 +74,12 @@
 - `VisitedRoom` / `RecentRoom`
 - `Character`（`statuses`、`parameters`、`chatPalette`、`hideStatus`、`isNarrative`、`placedAsPiece`、`piecePosition`）
 - `Scene`（`juices`、`viewTransform`、`members`）
-- `LogRecord`（`content`、`speaker`、`speakerId`、`timestamp`、`chunkId`、任意の `contentTin` / `kind` / `event`）
+- `LogRecord`（`content`、`speaker`、`speakerId`、`timestamp`、`chunkId`、任意の `chunkIndex` / `position` / `contentTin` / `kind` / `event` / `cached`）
 - `ExtensionItem`（`wasmBytes`、`priority`、`enabled`、`cellarTinId`）
 
 ### ローカル保存
 
-- `localStorage`: account ID、session ID、訪問済み部屋、最近の部屋、アセット（`alhalte_pantry_assets`）、部屋ログのキャッシュ。
+- `localStorage`: account ID、session ID、訪問済み部屋、最近の部屋、アセット（`alhalte_pantry_assets`）、部屋ログのキャッシュ（`alhalte:room-logs:<roomId>`）。部屋ログは `kind` / `event` / `contentTin` を含めて保存し、復元時は cache-origin として扱う。オフライン表示専用で、サーバーの biblio / chunk snapshot が届いた scene はキャッシュではなくサーバーを正とする。
 - IndexedDB `alhalte-argenterie-outbox`（store `outbox`）: 送信できなかった message / character（拡張用に state / asset も型として許容）を `{ id, roomId, kind, createdAt, payload }` で保存する。`createdAt` から `OUTBOX_TTL_MS = 30 日` を超えたエントリは読み出し時に prune する。IndexedDB が無い環境ではメモリ実装へフォールバックする。
 - Cookie: `session_id`（`SameSite=Lax`）。
 - `sessionStorage`: OAuth の `state`、認可後の戻り先 URL（クエリと部屋鍵フラグメントを含む）、OAuth の `redirect_uri`。サインイン中だけ保持し、完了時に削除する。
@@ -134,11 +134,20 @@
 5. `renderGenerast` が Saignant WASM で HTML にし、`{@html}` で表示する。WASM 未初期化時は HTML エスケープしたテキストを返す。
 6. `change-bgm` / `change-bg-img` / `character-came` / `character-gone` の Tin は label で postcard payload を decode し、`kind: 'system'` の控えめな M3 行として時刻付きで表示する。postcard bytes を UTF-8 のチャット本文として decode しない。ラベル不明は従来どおりテキスト fallback にする。
 
-### 最新 chunk の読み込み
+### chunk の読み込み（最新・過去）
 
 - `LogTab` は表示時と scene 切り替え時に `queryLogBiblio(sceneId)` → biblio の head から最新 `chunk_index` を得る → `queryLogChunk(sceneId, chunkIndex)` の順で要求する。scene ごとに in-flight / loaded を管理し、二重ロードしない。
+- biblio は `ChunkLogManager.applyServerBiblio` に渡す。`chunks[i]` を chunk index `i` とみなし、`readLogBiblioChunkIds` が作る stable な chunk id（`log-chunk:<sceneId>:<index>`）を `registerSceneChunks` で登録する。active chunk は `head.chunkIndex` の位置になる。
 - 読み込み中はメッセージ一覧上に contained `LoadingIndicator` を出し、「ログはありません」は出さない。応答後は `ChunkLogManager` に snapshot を取り込み、`id` / `(chunkIndex, position)` で dedupe する。
-- タイムアウト / 通信エラー時は `OfflineQueueNotice kind="generic"`（「接続が回復したらログを再読み込みします」）を出し、再接続時に再試行する。既存の遅延読み込み（スクロール端）と Saignant 描画は維持する。
+- 上端スクロール（`handleScrollEdge('top')`）は「読み込み済みの最小 chunk index の 1 つ前」を 1 回だけ `ChunkLogManager` の fetch handler 経由で `queryLogChunk` する。fetch handler は `tinToLogRecord` で entry を `LogRecord` に変換する。同一 chunk の並行要求は in-flight Promise を共有し、最古 chunk まで到達したら `null` を返して追加要求しない（無限ループしない）。
+- 過去 chunk の挿入時はサーバーの `(chunkIndex, position)` 順で並べ、読み手のスクロール位置を維持する（最下部へジャンプしない）。
+- タイムアウト / 通信エラー時は `OfflineQueueNotice kind="generic"`（「接続が回復したらログを再読み込みします」）を出し、再接続時に再試行する。Saignant 描画は維持する。
+
+### ログキャッシュと scene graph 復元
+
+- `ChunkLogManager` の cache-origin record は `cached: true` を持ち、`alhalte:room-logs:<roomId>` から復元したものだけが該当する。オフラインで cache-origin record を表示している間は LogTab に「キャッシュ表示中」を出す。
+- `LogBiblioSnapshot` / `LogChunkSnapshot` はサーバー正。biblio が head を持つ scene では cache-origin record を破棄し、chunk snapshot は該当 chunk の entries を置換する（append しない）。head が無い biblio は cache とサーバー由来 chunk を空にし、サーバーで削除されたログをキャッシュから復活させない。live echo だけは空 biblio 応答との race を避けるため保持する。
+- `SceneGraphTab` の `movements` は、ライブの `CharacterMoved` と `character-came` / `character-gone` system record から再構築した履歴を `reconcileMovements` で統合する。came の scene を到着先、直前の gone の scene を出発元として `fromSceneId` を復元し、timestamp が無い system event は `(chunkIndex, position)` の順で並べる。同じ character / route の live move は log record が読み込まれた時点で二重計上しない。再入室・再接続後も、読み込み済み（キャッシュ含む）の came/gone から graph が復元される。
 
 ### BGM
 
@@ -197,7 +206,7 @@
 ## 既知の差分・制約
 
 - `contentTin` は送信時に一度だけ生成する。pipeline を実行できない場合（wasm 欠落・実行エラー）は `content` のみを保存し、表示は従来どおり render 時 pipeline にフォールバックする。
-- システムイベント（BGM / 背景 / 入退場）は banquette の Tin に timestamp を持たないため、ログ上の時刻は 0（1970）になる。kitchen は前後の発言から補間する。
+- システムイベント（BGM / 背景 / 入退場）は banquette の Tin に timestamp を持たないため、ログ上の時刻は 0（1970）になる。kitchen は前後の発言から補間する。scene graph は `(chunkIndex, position)` の順で並べ、表示時刻は 0 のままになる。
 - アセットは cellar へ実アップロードするが、`personal` のメタデータは localStorage のみで、他クライアントとは共有されない。アセット本体は RoomKey で暗号化して cellar に置くが、maitre-d proxy と cellar は `Bytes` でリクエストを全量メモリにバッファする（64 MiB 上限）。大きなファイルほどメモリを消費する。
 - アウトボックス flush は at-least-once。ack を受け取れずにタイムアウトした操作は再送されるため、サーバー側で適用済みの場合は重複する可能性がある（冪等キーは持たない）。
 - 拡張機能タブは開いた時点の `queryState('/')` を正とし、開いている間の `StateUpdated` broadcast は反映しない（再接続・再表示で取り直す）。

@@ -169,6 +169,15 @@ export interface LogRecord {
   speakerId?: string;
   timestamp: number; // Unix timestamp in seconds (fallback: 0)
   chunkId?: string;
+  /** Log chunk index this record belongs to (when known). */
+  chunkIndex?: number;
+  /** Zero-based position inside {@link LogRecord.chunkIndex} (when known). */
+  position?: number;
+  /**
+   * True when the record was restored from the offline `localStorage` cache and
+   * has not been replaced by an authoritative server snapshot yet.
+   */
+  cached?: boolean;
   /**
    * Extension-pipeline output: the `alhalte/generast` Tin plaintext bytes
    * (a `(Generast, speaker_id)` ext-io Tin when produced by the send path).
@@ -189,6 +198,8 @@ export interface LogChunk {
   sceneId: string;
   entries: LogRecord[];
   isLoaded: boolean;
+  /** Banquette chunk index; absent for live / cache chunks. */
+  chunkIndex?: number;
 }
 
 /**

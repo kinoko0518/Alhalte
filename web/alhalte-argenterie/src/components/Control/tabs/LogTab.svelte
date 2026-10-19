@@ -8,7 +8,7 @@
    * - ARCHITECTURE.md: `## alhalte-saignant`, `## alhalte-argenterie -> ### 部屋内 -> ログタブ`
    * - GitHub Issue #55: `feat(argenterie): ログタブの共通ヘッダー (Search)、ZIP 出力、キャラカラー Pill、Saignant WASM 描画`
    */
-  import { untrack } from 'svelte';
+  import { tick, untrack } from 'svelte';
   import { LoadingIndicator } from 'noph-ui';
   import type { Character, ExtensionItem, LogRecord, Scene } from '../../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../../utils/assets.js';
@@ -18,7 +18,7 @@
     type GenerastAST,
   } from '../../../utils/generast.js';
   import { ChunkLogManager, logRecordContentTin, readLogBiblioHead } from '../../../utils/log.js';
-  import type { RoomSocket } from '../../../utils/roomSocket.js';
+  import { tinToLogRecord, type RoomSocket } from '../../../utils/roomSocket.js';
   import {
     clearSaignantCache,
     initSaignant,
@@ -118,6 +118,11 @@
 
   let isLoading = $derived(loadState === 'loading');
   let isQueueing = $derived(loadState === 'queued');
+  /** Offline cache rows are shown as a read-only view (Issue #162). */
+  let isOffline = $derived(
+    connectionState === 'disconnected' || connectionState === 'reconnecting',
+  );
+  let showsCachedRecords = $derived(messages.some((record) => record.cached === true));
 
   /**
    * Loads the newest chunk of `targetSceneId`:
@@ -153,6 +158,12 @@
     try {
       const biblio = await socket.queryLogBiblio(targetSceneId);
       if (isStale()) return;
+
+      // Register the server's chunk list (array index = chunk index) before
+      // requesting the head chunk so scroll-edge loading knows every chunk that
+      // exists (Issue #162). Applying the biblio also drops cache-only records:
+      // the server is authoritative.
+      chunkManager.applyServerBiblio(targetSceneId, biblio);
 
       const head = readLogBiblioHead(biblio);
       if (!head) {
@@ -217,6 +228,28 @@
       refreshLogs();
     });
     return unsubscribe;
+  });
+
+  // Lazy older-chunk fetches go through the same socket and decoder as the
+  // eager latest-chunk load (Issue #162). The manager dedupes / shares in-flight
+  // requests, so repeated scroll events cannot issue duplicate queries.
+  $effect(() => {
+    const socket = roomSocket;
+    const manager = chunkManager;
+    if (!socket) return;
+    const handler = async (chunkId: string, chunkIndex: number, sceneId: string) => {
+      const entries = await socket.queryLogChunk(sceneId, chunkIndex);
+      return entries
+        .map((entry, position) => tinToLogRecord(entry, sceneId, chunkIndex, position))
+        .filter((record): record is LogRecord => record !== null) as unknown as Record<
+        string,
+        unknown
+      >[];
+    };
+    manager.setChunkFetchHandler(handler);
+    return () => {
+      manager.setChunkFetchHandler(undefined);
+    };
   });
 
   async function updateRenderedHtml(recs: LogRecord[]) {
@@ -290,6 +323,9 @@
   });
 
   function refreshLogs() {
+    const stickToBottom = listElement
+      ? listElement.scrollHeight - listElement.scrollTop - listElement.clientHeight <= 24
+      : true;
     const currentRecords = chunkManager.getLoadedRecords(scene.id);
     if (currentRecords.length === 0) {
       initialRecordIds.clear();
@@ -310,7 +346,8 @@
     messages = currentRecords;
     void updateRenderedHtml(messages);
     queueMicrotask(() => {
-      if (listElement) {
+      // Prepending an older chunk must not jump the reader to the bottom.
+      if (listElement && stickToBottom) {
         listElement.scrollTop = listElement.scrollHeight;
       }
     });
@@ -378,22 +415,36 @@
 
   async function handleScroll(e: Event) {
     const el = e.currentTarget as HTMLDivElement;
-    if (el.scrollTop <= 5) {
-      const newRecords = await chunkManager.handleScrollEdge(scene.id, 'top');
-      if (newRecords) {
-        for (const r of newRecords) {
-          initialRecordIds.add(r.id);
+    try {
+      if (el.scrollTop <= 5) {
+        const previousHeight = el.scrollHeight;
+        const previousTop = el.scrollTop;
+        const newRecords = await chunkManager.handleScrollEdge(scene.id, 'top');
+        if (newRecords) {
+          for (const r of newRecords) {
+            initialRecordIds.add(r.id);
+          }
+          refreshLogs();
+          // Keep the previously visible message at the same viewport position
+          // after the older chunk was prepended.
+          await tick();
+          if (listElement) {
+            listElement.scrollTop = listElement.scrollHeight - previousHeight + previousTop;
+          }
         }
-        refreshLogs();
-      }
-    } else if (el.scrollHeight - el.scrollTop - el.clientHeight <= 5) {
-      const newRecords = await chunkManager.handleScrollEdge(scene.id, 'bottom');
-      if (newRecords) {
-        for (const r of newRecords) {
-          initialRecordIds.add(r.id);
+      } else if (el.scrollHeight - el.scrollTop - el.clientHeight <= 5) {
+        const newRecords = await chunkManager.handleScrollEdge(scene.id, 'bottom');
+        if (newRecords) {
+          for (const r of newRecords) {
+            initialRecordIds.add(r.id);
+          }
+          refreshLogs();
         }
-        refreshLogs();
       }
+    } catch {
+      // The older-chunk query timed out / the connection dropped: keep the
+      // current records and show the same reconnect notice as the eager load.
+      if (loadState !== 'loading') loadState = 'queued';
     }
   }
 
@@ -474,6 +525,14 @@
       {onManagePermissions}
       {onSetDone}
     />
+  {/if}
+
+  {#if isOffline && showsCachedRecords}
+    <!-- Offline display: these records came from localStorage, not the server.
+         They are replaced as soon as the authoritative snapshots arrive. -->
+    <div class="log-cache-notice" data-testid="log-cache-indicator" role="status">
+      キャッシュ表示中
+    </div>
   {/if}
 
   {#if isQueueing}
@@ -650,6 +709,18 @@
   .log-queue-notice {
     flex: none;
     padding: 8px 16px 0;
+  }
+
+  .log-cache-notice {
+    flex: none;
+    margin: 8px 16px 0;
+    padding: 6px 12px;
+    border-radius: var(--np-shape-corner-full, 9999px);
+    background-color: var(--np-color-surface-container-high, #ece6f0);
+    color: var(--np-color-on-surface-variant, #49454f);
+    border: 1px solid var(--np-color-outline-variant, #cac4d0);
+    font-size: 0.78rem;
+    text-align: center;
   }
 
   /*
