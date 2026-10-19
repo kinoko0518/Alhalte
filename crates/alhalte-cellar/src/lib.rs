@@ -9,10 +9,15 @@
 //!
 //! When receiving a store request:
 //! - Validates the owner's session rights via [`SessionVerifier`].
-//! - If the tin is not yet stored: returns status **210** (Upload Required).
-//! - If the tin is already stored by another owner: links the existing entity, inserts a new DB reference row, and returns **211** (Deduplicated).
-//! - If the tin is already owned by the same owner: returns **212** (Already Owned).
-//! - In **anti-oracle** mode (`--anti-oracle true`): always returns **210** and discards the uploaded payload into `/dev/null` if the entity is already present.
+//! - Answers `POST /store` with `200 OK` and a [`StoreResponse`] body whose
+//!   `result` is one of:
+//!   - `upload_required`: the tin is not yet stored, so the client must upload it.
+//!   - `deduplicated`: the tin is already stored by another owner; the existing
+//!     entity is linked, a new DB reference row is inserted, and no upload is needed.
+//!   - `already_owned`: the tin is already owned by the same owner.
+//! - In **anti-oracle** mode (`--anti-oracle true`): always answers
+//!   `upload_required` and discards the uploaded payload into `/dev/null` if the
+//!   entity is already present.
 //!
 //! ## Example
 //!

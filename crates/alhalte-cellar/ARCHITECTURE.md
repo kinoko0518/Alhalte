@@ -15,7 +15,7 @@ tin の実体をファイルとして保存し、`(tin_id, path, owner, wrapped_
 | メソッド | パス | 内容 |
 | --- | --- | --- |
 | `GET` | `/health` | ヘルスチェック。 |
-| `POST` | `/store` | `StoreRequest` を受け取り、210 / 211 / 212 を返す。 |
+| `POST` | `/store` | `StoreRequest` を受け取り、`200 OK` と `StoreResponse`（`{"result": ...}`）を返す。 |
 | `POST` / `PUT` | `/store/{tin_id}` | 本体をアップロードする。 |
 | `POST` / `PUT` | `/tin/{tin_id}` | 同上。 |
 | `GET` | `/tin/{tin_id}` | 本体を返す。wrapped key があれば `X-Alhalte-Wrapped-Key` に hex で付ける。 |
@@ -34,13 +34,17 @@ tin の実体をファイルとして保存し、`(tin_id, path, owner, wrapped_
 
 ### ステータス
 
-| コード | 意味 |
-| --- | --- |
-| 210 | Upload Required。本体を送る必要がある。 |
-| 211 | Deduplicated。実体は既にあり、参照行を追加した。 |
-| 212 | Already Owned。同じ owner が既に参照を持つ。 |
+`POST /store` の store check は常に `200 OK` を返し、body の `result` で結果を表す。
 
-anti-oracle が有効な場合、`/store` は常に 210 を返し、既存実体への再送は `/dev/null` へ捨てる。
+| `result` | 意味 |
+| --- | --- |
+| `upload_required` | Upload Required。本体を送る必要がある。 |
+| `deduplicated` | Deduplicated。実体は既にあり、参照行を追加した。 |
+| `already_owned` | Already Owned。同じ owner が既に参照を持つ。 |
+
+anti-oracle が有効な場合、`/store` は常に `upload_required` を返し、既存実体への再送は `/dev/null` へ捨てる。
+
+認可・入力・未検出・内部エラーは従来どおり HTTP status（401 / 400 / 404 / 5xx）で返す。旧 210 / 211 / 212 は廃止し、受理しない。
 
 ### 主な公開型
 
@@ -81,10 +85,12 @@ tin_references(
 ### store check
 
 1. `verify_session(owner, session_id)`。`X-Alhalte-Service-Token` がある場合は代わりにトークンを検証する。
-2. anti-oracle なら常に 210。
-3. 同じ owner の参照があれば 212。
-4. 実体ファイルがあれば、参照行を追加して 211。
-5. どちらもなければ 210。
+2. anti-oracle なら常に `upload_required`。
+3. 同じ owner の参照があれば `already_owned`。
+4. 実体ファイルがあれば、参照行を追加して `deduplicated`。
+5. どちらもなければ `upload_required`。
+
+いずれの結果も `200 OK` + `{"result": ...}` で返す。
 
 ### store payload
 
@@ -109,7 +115,7 @@ tin_references(
 ## 既知の差分・制約
 
 - ダウンロードは session 検証を行わない。`owner` は参照の絞り込みにだけ使う。
-- `/store` の 210 / 211 / 212 は HTTP ステータスそのものとして返る。通常の 2xx ではないため、クライアントは数値で分岐する必要がある。
+- `/store` は常に `200 OK` を返し、結果は body の `result`（`upload_required` / `deduplicated` / `already_owned`）で表す。旧 210 / 211 / 212 は廃止済みで、受理しない。
 - `path` は現状 tin id の hex で、ディレクトリ階層は持たない。
 - anti-oracle 時の `/dev/null` は `StorageManager::discard_to_dev_null` による no-op で、実際のファイルディスクリプタは開かない。
 - GC は DB の参照だけを見る。tin 間の参照関係（chunk 内の tin id など）は追跡しない。

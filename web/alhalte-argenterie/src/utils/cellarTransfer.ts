@@ -12,10 +12,12 @@
  * `X-Alhalte-Account` claim), so a stale `localStorage` account can never make
  * the proxy reject a request.
  *
- * Transfer flow (2-step, see the cellar status codes):
- * 1. `POST /api/cellar/store` with a metadata handshake.
- * 2. `210` → `PUT /api/cellar/store/{tinId}` sends the body.
- *    `211` / `212` → the body already exists; the upload is skipped.
+ * Transfer flow (2-step):
+ * 1. `POST /api/cellar/store` with a metadata handshake. It always answers
+ *    `200 OK` with `{ "result": ... }`.
+ * 2. `upload_required` → `PUT /api/cellar/store/{tinId}` sends the body.
+ *    `deduplicated` / `already_owned` → the body already exists; the upload is
+ *    skipped.
  *
  * The room key is the 64-hex URL fragment of a room URL (`#<64hex>`); it is
  * only ever sent to the cellar wrapped inside the tin, never on the wire.
@@ -45,12 +47,18 @@ export const CELLAR_PROXY_BASE_PATH = '/api/cellar';
  */
 export const DEFAULT_OPERATION_TIMEOUT_MS = 8000;
 
-/** Cellar status codes returned by the metadata handshake. */
-export const CELLAR_STATUS_UPLOAD_REQUIRED = 210;
-/** The entity already existed; a reference row was added. */
-export const CELLAR_STATUS_DEDUPLICATED = 211;
-/** The caller already owns the entity. */
-export const CELLAR_STATUS_ALREADY_OWNED = 212;
+/** `result` of the store check: the client must upload the tin body. */
+export const CELLAR_RESULT_UPLOAD_REQUIRED = 'upload_required';
+/** `result` of the store check: the entity already existed; a reference row was added. */
+export const CELLAR_RESULT_DEDUPLICATED = 'deduplicated';
+/** `result` of the store check: the caller already owns the entity. */
+export const CELLAR_RESULT_ALREADY_OWNED = 'already_owned';
+
+/** Every `result` the cellar store check may return. */
+export type CellarStoreResult =
+  | typeof CELLAR_RESULT_UPLOAD_REQUIRED
+  | typeof CELLAR_RESULT_DEDUPLICATED
+  | typeof CELLAR_RESULT_ALREADY_OWNED;
 
 /** 64 hex characters: a room key or a 256-bit tin id. */
 const HEX_64_PATTERN = /^[0-9a-fA-F]{64}$/;
@@ -545,12 +553,49 @@ function describeBody(body: string): string {
 }
 
 /**
+ * Parses the `{ "result": ... }` body of a cellar store check.
+ *
+ * @throws {CellarTransferError} `invalid-response` when the body is not JSON or
+ * `result` is not one of {@link CellarStoreResult}.
+ */
+function parseStoreResult(responseText: string): CellarStoreResult {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(responseText);
+  } catch {
+    throw new CellarTransferError(
+      'invalid-response',
+      `Cellar store handshake body was not JSON: ${describeBody(responseText)}`,
+    );
+  }
+
+  const result =
+    typeof parsed === 'object' && parsed !== null
+      ? (parsed as { result?: unknown }).result
+      : undefined;
+
+  if (
+    result === CELLAR_RESULT_UPLOAD_REQUIRED ||
+    result === CELLAR_RESULT_DEDUPLICATED ||
+    result === CELLAR_RESULT_ALREADY_OWNED
+  ) {
+    return result;
+  }
+
+  throw new CellarTransferError(
+    'invalid-response',
+    `Cellar store handshake returned an unknown result: ${describeBody(responseText)}`,
+  );
+}
+
+/**
  * Uploads an already encoded tin to cellar through the maitre-d proxy.
  *
  * Performs the 2-step handshake:
- * 1. `POST /api/cellar/store` with `{ tin_id, size, wrapped_key }`.
- * 2. `210` → `PUT /api/cellar/store/{tinId}` with the wire bytes.
- *    `211` / `212` → resolves without uploading.
+ * 1. `POST /api/cellar/store` with `{ tin_id, size, wrapped_key }`. The answer is
+ *    always `200 OK` with `{ "result": ... }`.
+ * 2. `upload_required` → `PUT /api/cellar/store/{tinId}` with the wire bytes.
+ *    `deduplicated` / `already_owned` → resolves without uploading.
  *
  * `onProgress` reports the upload of step 2 as `0..1`; step 1 is a small
  * metadata request that reports no progress. Both steps are bounded by
@@ -559,8 +604,8 @@ function describeBody(body: string): string {
  * @param wireBytes Encoded tin bytes (see {@link encodeRoomTin}).
  * @param options Progress, cancellation, timeout, and injection hooks.
  * @returns The tin id cellar stored the bytes under.
- * @throws {CellarTransferError} with `http-error`, `timeout`, `aborted`, or
- * `network-error`.
+ * @throws {CellarTransferError} with `http-error`, `invalid-response`, `timeout`,
+ * `aborted`, or `network-error`.
  */
 export async function uploadTin(
   wireBytes: Uint8Array,
@@ -598,11 +643,9 @@ export async function uploadTin(
     timeoutMs,
   });
 
-  if (
-    handshake.status !== CELLAR_STATUS_UPLOAD_REQUIRED &&
-    handshake.status !== CELLAR_STATUS_DEDUPLICATED &&
-    handshake.status !== CELLAR_STATUS_ALREADY_OWNED
-  ) {
+  // The handshake answers 200 with a result body; the legacy 210 / 211 / 212
+  // status codes are no longer accepted.
+  if (handshake.status !== 200) {
     throw new CellarTransferError(
       'http-error',
       `Cellar store handshake failed with HTTP ${handshake.status}: ${describeBody(handshake.responseText)}`,
@@ -610,8 +653,11 @@ export async function uploadTin(
     );
   }
 
-  if (handshake.status !== CELLAR_STATUS_UPLOAD_REQUIRED) {
-    // 211 / 212: the entity already exists, the reference is registered.
+  const result = parseStoreResult(handshake.responseText);
+
+  if (result !== CELLAR_RESULT_UPLOAD_REQUIRED) {
+    // deduplicated / already_owned: the entity already exists and the
+    // reference is registered.
     options?.onProgress?.(1);
     return { tinId };
   }

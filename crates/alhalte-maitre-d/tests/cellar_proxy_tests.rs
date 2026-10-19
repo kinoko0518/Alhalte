@@ -46,7 +46,7 @@ impl RecordedCall {
 /// Shared state of the in-process mock cellar.
 struct MockState {
     calls: Vec<RecordedCall>,
-    store_status: u16,
+    store_result: String,
     upload_status: u16,
     download_status: StatusCode,
     download_body: Vec<u8>,
@@ -65,7 +65,7 @@ impl MockCellar {
         Self {
             inner: Arc::new(Mutex::new(MockState {
                 calls: Vec::new(),
-                store_status: 210,
+                store_result: "upload_required".to_string(),
                 upload_status: StatusCode::CREATED.as_u16(),
                 download_status: StatusCode::OK,
                 download_body: b"wire-bytes".to_vec(),
@@ -75,9 +75,9 @@ impl MockCellar {
         }
     }
 
-    fn set_store_status(&self, status: u16) {
+    fn set_store_result(&self, result: &str) {
         if let Ok(mut state) = self.inner.lock() {
-            state.store_status = status;
+            state.store_result = result.to_string();
         }
     }
 
@@ -152,18 +152,13 @@ async fn mock_store_check(
 ) -> Response {
     cellar.maybe_delay().await;
     cellar.record("POST", "/store".to_string(), &headers, query, &body);
-    let status = match cellar.inner.lock() {
-        Ok(state) => state.store_status,
-        Err(poisoned) => poisoned.into_inner().store_status,
+    let result = match cellar.inner.lock() {
+        Ok(state) => state.store_result.clone(),
+        Err(poisoned) => poisoned.into_inner().store_result.clone(),
     };
-    let code = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
     (
-        code,
-        Json(serde_json::json!({
-            "code": status,
-            "tin_id": TIN_ID,
-            "message": "mock store status",
-        })),
+        StatusCode::OK,
+        Json(serde_json::json!({ "result": result })),
     )
         .into_response()
 }
@@ -270,11 +265,11 @@ fn cookie_header(session_id: u64) -> String {
     format!("session_id={session_id}")
 }
 
-// spec: alhalte-maitre-d/cellar-proxy 210 handshake (owner/session rewritten)
+// spec: alhalte-maitre-d/cellar-proxy store check 200 + result (owner/session rewritten)
 #[tokio::test]
 async fn test_cellar_proxy_store_check_rewrites_owner_and_session() {
     let mock = MockCellar::new();
-    mock.set_store_status(210);
+    mock.set_store_result("upload_required");
     let cellar_addr = spawn_mock_cellar(mock.clone()).await;
 
     let (db, account_id, session_id) = test_identity();
@@ -297,9 +292,9 @@ async fn test_cellar_proxy_store_check_rewrites_owner_and_session() {
         .await
         .unwrap();
 
-    assert_eq!(response.status().as_u16(), 210);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     let payload: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(payload["code"], 210);
+    assert_eq!(payload, serde_json::json!({ "result": "upload_required" }));
 
     let calls = mock.calls();
     assert_eq!(calls.len(), 1);
@@ -324,9 +319,9 @@ async fn test_cellar_proxy_store_check_rewrites_owner_and_session() {
     assert_eq!(forwarded["size"], 1234);
 }
 
-// spec: alhalte-maitre-d/cellar-proxy 211/212 pass through without a PUT
+// spec: alhalte-maitre-d/cellar-proxy deduplicated/already_owned pass through without a PUT
 #[tokio::test]
-async fn test_cellar_proxy_store_check_returns_211_and_212_verbatim() {
+async fn test_cellar_proxy_store_check_passes_results_through() {
     let mock = MockCellar::new();
     let cellar_addr = spawn_mock_cellar(mock.clone()).await;
 
@@ -335,8 +330,8 @@ async fn test_cellar_proxy_store_check_returns_211_and_212_verbatim() {
     let addr = spawn_maitre_d(db, Some(proxy)).await;
 
     let client = reqwest::Client::new();
-    for code in [211u16, 212u16] {
-        mock.set_store_status(code);
+    for result in ["deduplicated", "already_owned"] {
+        mock.set_store_result(result);
         let response = client
             .post(format!("http://{addr}/api/cellar/store"))
             .header("Cookie", cookie_header(session_id))
@@ -349,9 +344,9 @@ async fn test_cellar_proxy_store_check_returns_211_and_212_verbatim() {
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status().as_u16(), code);
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
         let payload: serde_json::Value = response.json().await.unwrap();
-        assert_eq!(payload["code"], code);
+        assert_eq!(payload, serde_json::json!({ "result": result }));
     }
 
     // No upload followed the handshakes.
@@ -749,7 +744,7 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
     let wire_bytes = b"room-asset-wire-bytes".to_vec();
     let wrapped_key = "aabbccdd";
 
-    // 1. First handshake: the cellar has never seen this tin -> 210.
+    // 1. First handshake: the cellar has never seen this tin -> upload_required.
     //    owner / session_id in the body are wrong on purpose; the proxy must
     //    replace them with the authenticated identity or the cellar would
     //    reject the session.
@@ -765,7 +760,9 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status().as_u16(), 210);
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(payload, serde_json::json!({ "result": "upload_required" }));
 
     // 2. Upload the body.
     let response = client
@@ -778,7 +775,7 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::CREATED);
 
-    // 3. A second handshake now reports 211 (deduplicated) or 212 (owned).
+    // 3. A second handshake now reports deduplicated or already_owned.
     let response = client
         .post(format!("{base}/store"))
         .header("Cookie", cookie_header(session_id))
@@ -791,10 +788,12 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
         .send()
         .await
         .unwrap();
-    let status = response.status().as_u16();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let payload: serde_json::Value = response.json().await.unwrap();
+    let result = payload["result"].as_str().unwrap_or_default();
     assert!(
-        status == 211 || status == 212,
-        "unexpected handshake status {status}"
+        result == "deduplicated" || result == "already_owned",
+        "unexpected handshake result {result}"
     );
 
     // 4. Download through the proxy: bytes and wrapped key round-trip.

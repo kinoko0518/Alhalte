@@ -8,7 +8,9 @@ use bytes::Bytes;
 use reqwest::StatusCode;
 use tokio::sync::RwLock;
 
-use alhalte_cellar::{StoreRequest, StoreResult, StoreStatus, UnregisterRequest, format_tin_id};
+use alhalte_cellar::{
+    StoreRequest, StoreResponse, StoreResult, StoreStatus, UnregisterRequest, format_tin_id,
+};
 use tin::TinId;
 
 use crate::error::{BanquetteError, Result};
@@ -220,60 +222,68 @@ impl CellarSink for HttpCellarSink {
             .await
             .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
 
-        let status = resp.status();
-        let status_code = status.as_u16();
+        // The store check always answers `200 OK` with `{"result": ...}`.
+        // Every other status (401 / 400 / 5xx, or a legacy 210 / 211 / 212) is
+        // an error; the old non-standard status codes are not accepted.
+        if resp.status() != StatusCode::OK {
+            return Err(BanquetteError::Cellar(format!(
+                "Cellar store check failed with HTTP status {}",
+                resp.status()
+            )));
+        }
 
-        if status_code == StoreStatus::UploadRequired.as_u16() {
-            // Need to upload the body
-            let upload_url = format!("{}/store/{}", self.base_url, format_tin_id(tin_id));
-            let mut req = self
-                .client
-                .post(&upload_url)
-                .header("X-Alhalte-Owner", owner.to_string())
-                .header("X-Alhalte-Session-Id", session_id.to_string())
-                .body(Bytes::copy_from_slice(tin_bytes));
+        let check: StoreResponse = resp
+            .json()
+            .await
+            .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
 
-            if let Some(ref key) = wrapped_key {
-                req = req.header("X-Alhalte-Wrapped-Key", hex::encode(key));
+        match check.result {
+            StoreStatus::UploadRequired => {
+                // Need to upload the body
+                let upload_url = format!("{}/store/{}", self.base_url, format_tin_id(tin_id));
+                let mut req = self
+                    .client
+                    .post(&upload_url)
+                    .header("X-Alhalte-Owner", owner.to_string())
+                    .header("X-Alhalte-Session-Id", session_id.to_string())
+                    .body(Bytes::copy_from_slice(tin_bytes));
+
+                if let Some(ref key) = wrapped_key {
+                    req = req.header("X-Alhalte-Wrapped-Key", hex::encode(key));
+                }
+
+                let upload_resp = self
+                    .authorize(req)
+                    .send()
+                    .await
+                    .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
+
+                if !upload_resp.status().is_success() {
+                    return Err(BanquetteError::Cellar(format!(
+                        "Cellar upload failed with HTTP status {}",
+                        upload_resp.status()
+                    )));
+                }
+
+                let result: StoreResult = upload_resp
+                    .json()
+                    .await
+                    .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
+
+                Ok(result)
             }
-
-            let upload_resp = self
-                .authorize(req)
-                .send()
-                .await
-                .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
-
-            if !upload_resp.status().is_success() {
-                return Err(BanquetteError::Cellar(format!(
-                    "Cellar upload failed with HTTP status {}",
-                    upload_resp.status()
-                )));
-            }
-
-            let result: StoreResult = upload_resp
-                .json()
-                .await
-                .map_err(|e| BanquetteError::Cellar(e.to_string()))?;
-
-            Ok(result)
-        } else if status_code == StoreStatus::Deduplicated.as_u16() {
-            Ok(StoreResult {
+            StoreStatus::Deduplicated => Ok(StoreResult {
                 tin_id: *tin_id,
                 owner,
                 written_to_disk: false,
                 reference_added: true,
-            })
-        } else if status_code == StoreStatus::AlreadyOwned.as_u16() {
-            Ok(StoreResult {
+            }),
+            StoreStatus::AlreadyOwned => Ok(StoreResult {
                 tin_id: *tin_id,
                 owner,
                 written_to_disk: false,
                 reference_added: false,
-            })
-        } else {
-            Err(BanquetteError::Cellar(format!(
-                "Unexpected response status from cellar store check: {status}"
-            )))
+            }),
         }
     }
 
