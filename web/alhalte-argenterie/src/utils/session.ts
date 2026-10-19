@@ -182,6 +182,8 @@ export async function setRoomPermission(
   options?: {
     baseUrl?: string;
     fetchFn?: typeof fetch;
+    /** Caller account ID (defaults to the saved account, never the target). */
+    callerAccountId?: string | number | null;
     sessionId?: string | number | null;
   },
 ): Promise<void> {
@@ -193,7 +195,10 @@ export async function setRoomPermission(
 
   const res = await fetchFn(url, {
     method: 'POST',
-    headers: buildAuthHeaders(accountId, options?.sessionId),
+    // `accountId` is the target of the permission change, not the caller.
+    // Sending it as X-Alhalte-Account would make maitre-d verify the target's
+    // session and reject a GM editing another account.
+    headers: buildAuthHeaders(options?.callerAccountId, options?.sessionId),
     credentials: 'include',
     body: JSON.stringify({
       account_id: Number(accountId),
@@ -215,6 +220,8 @@ export async function deleteRoomPermission(
   options?: {
     baseUrl?: string;
     fetchFn?: typeof fetch;
+    /** Caller account ID (defaults to the saved account, never the target). */
+    callerAccountId?: string | number | null;
     sessionId?: string | number | null;
   },
 ): Promise<void> {
@@ -226,7 +233,8 @@ export async function deleteRoomPermission(
 
   const res = await fetchFn(url, {
     method: 'DELETE',
-    headers: buildAuthHeaders(accountId, options?.sessionId),
+    // See setRoomPermission: the target account is not the caller identity.
+    headers: buildAuthHeaders(options?.callerAccountId, options?.sessionId),
     credentials: 'include',
   });
 

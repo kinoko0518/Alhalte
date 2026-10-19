@@ -2144,7 +2144,7 @@
                 onRequestDeleteCharacter={handleRequestDeleteCharacter}
                 roomId={currentRoom.id || (currentRoom as any).roomId}
                 onManagePermissions={() => (isPermissionModalOpen = true)}
-                onSetDone={(done) => roomSocket?.setDone(done)}
+                onSetDone={handleSetDone}
                 onRequestAssetPicker={handleRequestAssetPicker}
                 onRequestEditCharacter={handleRequestEditCharacter}
                 onRequestCreateCharacter={handleRequestCreateCharacter}

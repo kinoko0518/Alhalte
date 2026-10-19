@@ -14,6 +14,7 @@ import CommonFooter from '../src/components/Control/CommonFooter.svelte';
 import App from '../src/components/App.svelte';
 import type { Scene, Character, VisitedRoom } from '../src/types/index.js';
 import type { AccountSearchItem, RoomPermissionItem } from '../src/utils/session.js';
+import { LOCAL_STORAGE_ACCOUNT_ID_KEY, setRoomPermission } from '../src/utils/session.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 
 describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
@@ -331,6 +332,24 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     expect(target.querySelector('[data-testid="permission-error"]')).toBeNull();
 
     unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/permissions 0061 権限変更の認証は caller account を使う
+  it('sends the caller account, not the permission target, as the auth identity', async () => {
+    localStorage.setItem(LOCAL_STORAGE_ACCOUNT_ID_KEY, '9001');
+    const mockFetch = vi.fn(
+      async (_url: string | URL | Request, _init?: RequestInit) =>
+        ({ ok: true, status: 200, json: async () => ({ status: 'ok' }) }) as Response,
+    );
+
+    await setRoomPermission('fedcba9876543210', 1001, 'gm', {
+      fetchFn: mockFetch as unknown as typeof fetch,
+    });
+
+    const init = mockFetch.mock.calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers['X-Alhalte-Account']).toBe('9001');
+    expect(headers['X-Alhalte-Account']).not.toBe('1001');
   });
 
   // spec: alhalte-argenterie/permissions 0070 権限変更失敗時のロールバックとエラー表示
