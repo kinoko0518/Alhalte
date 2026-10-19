@@ -709,30 +709,38 @@ export class FakeRoomSocket {
    * Resolves the oldest pending biblio query (optionally for a specific scene).
    */
   resolveLogBiblio(biblio: unknown, sceneId?: string): void {
-    this.takeLogQuery('biblio', sceneId).resolve(biblio);
+    const operation = this.takeLogQuery('biblio', sceneId);
+    // Mirror RoomSocket.handleServerFrame: the biblio is authoritative for the
+    // scene's cache and registers the chunk list before the chunk arrives.
+    this.chunkManager?.applyServerBiblio(operation.sceneId, biblio);
+    operation.resolve(biblio);
   }
 
   /**
-   * Resolves the oldest pending chunk query and appends its entries to the
+   * Resolves the oldest pending chunk query and ingests its entries into the
    * chunk manager, mirroring `RoomSocket.handleServerFrame`: the pending
-   * operation settles first, then the `LogChunkSnapshot` entries are ingested
-   * with positional IDs (`log-<chunkIndex>-<position>`) unless they carry one.
+   * operation settles first, then the `LogChunkSnapshot` replaces the chunk's
+   * entries with positional IDs (`log-<chunkIndex>-<position>`) unless one is
+   * already present.
    */
   resolveLogChunk(entries: LogRecord[], sceneId?: string, chunkIndex?: number): void {
     const operation = this.takeLogQuery('chunk', sceneId);
     const resolvedChunkIndex = chunkIndex ?? operation.chunkIndex;
 
-    // Same order as the real socket: dispatch the acknowledgement, then append
-    // the snapshot entries (a microtask continuation sees them either way).
+    // Same order as the real socket: dispatch the acknowledgement, then ingest
+    // the snapshot as the authoritative content of its chunk.
     operation.resolve(entries);
-    entries.forEach((entry, position) => {
-      this.chunkManager?.appendRecord({
+    this.chunkManager?.ingestChunkSnapshot(
+      operation.sceneId,
+      resolvedChunkIndex,
+      entries.map((entry, position) => ({
         ...entry,
         id: entry.id || `log-${resolvedChunkIndex}-${position}`,
         sceneId: entry.sceneId || operation.sceneId,
-        chunkId: entry.chunkId ?? `log-chunk-${resolvedChunkIndex}`,
-      });
-    });
+        chunkIndex: resolvedChunkIndex,
+        position,
+      })),
+    );
   }
 
   /** Rejects the oldest pending log query (optionally for a specific scene). */

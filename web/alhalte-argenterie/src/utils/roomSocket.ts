@@ -523,6 +523,8 @@ function systemEventToLogRecord(
       content: '',
       speaker: 'System',
       timestamp: 0,
+      chunkIndex,
+      position,
       kind: 'system',
       ...(event ? { event } : {}),
     },
@@ -615,7 +617,7 @@ export function tinToLogRecord(
   }
 
   return parseLogRecord(
-    { ...raw, sceneId: raw.sceneId || sceneId },
+    { ...raw, sceneId: raw.sceneId || sceneId, chunkIndex, position },
     `log-${chunkIndex}-${position}`,
   );
 }
@@ -1126,7 +1128,7 @@ export function entryToLogRecord(
     typeof entry.speaker === 'string'
   ) {
     return parseLogRecord(
-      { ...entry, sceneId: entry.sceneId || sceneId },
+      { ...entry, sceneId: entry.sceneId || sceneId, chunkIndex, position },
       `log-${chunkIndex}-${position}`,
     );
   }
@@ -1144,14 +1146,17 @@ export function entryToLogRecord(
         const json = JSON.parse(text);
         if (typeof json === 'object' && json !== null) {
           return parseLogRecord(
-            { ...json, sceneId: json.sceneId || sceneId },
+            { ...json, sceneId: json.sceneId || sceneId, chunkIndex, position },
             `log-${chunkIndex}-${position}`,
           );
         }
       } catch {
         // Plain text string payload
       }
-      return parseLogRecord({ content: text, sceneId }, `log-${chunkIndex}-${position}`);
+      return parseLogRecord(
+        { content: text, sceneId, chunkIndex, position },
+        `log-${chunkIndex}-${position}`,
+      );
     } catch {
       // Decode failed
     }
@@ -1159,13 +1164,16 @@ export function entryToLogRecord(
 
   // Plain string
   if (typeof entry === 'string') {
-    return parseLogRecord({ content: entry, sceneId }, `log-${chunkIndex}-${position}`);
+    return parseLogRecord(
+      { content: entry, sceneId, chunkIndex, position },
+      `log-${chunkIndex}-${position}`,
+    );
   }
 
   // Generic object
   if (typeof entry === 'object') {
     return parseLogRecord(
-      { ...entry, sceneId: entry.sceneId || sceneId },
+      { ...entry, sceneId: entry.sceneId || sceneId, chunkIndex, position },
       `log-${chunkIndex}-${position}`,
     );
   }
@@ -2462,6 +2470,9 @@ export class RoomSocket {
     // 4b. LogBiblioSnapshot
     if ('LogBiblioSnapshot' in frame) {
       const { scene_id, biblio } = frame.LogBiblioSnapshot;
+      // The biblio is server-authoritative: cache-origin records for the scene
+      // are cleared here and the chunk list is (re)registered for lazy loads.
+      this.chunkLogManager?.applyServerBiblio(scene_id, biblio);
       this.options.onLogBiblioSnapshot?.(scene_id, biblio);
     }
 
@@ -2495,13 +2506,18 @@ export class RoomSocket {
     if ('LogChunkSnapshot' in frame) {
       const { scene_id, chunk_index, entries } = frame.LogChunkSnapshot;
       if (Array.isArray(entries)) {
+        const records: LogRecord[] = [];
         entries.forEach((entry, pos) => {
           const record = entryToLogRecord(scene_id, entry, chunk_index, pos);
-          if (record) {
-            this.chunkLogManager?.appendRecord(record);
-            this.options.onLogAppended?.(record);
-          }
+          if (record) records.push(record);
         });
+        // A snapshot is authoritative for its chunk: replacing the chunk's
+        // entries (instead of appending) means a cached / deleted record cannot
+        // survive a server response.
+        this.chunkLogManager?.ingestChunkSnapshot(scene_id, chunk_index, records);
+        for (const record of records) {
+          this.options.onLogAppended?.(record);
+        }
       }
     }
 

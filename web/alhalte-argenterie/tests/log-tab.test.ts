@@ -85,8 +85,8 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     expect(record2.timestamp).toBe(1700000000);
   });
 
-  // spec: alhalte-argenterie/log-tab チャンク遅延取得
-  it('loads chunks lazily only when scroll reaches an edge', async () => {
+  // spec: alhalte-argenterie/log-tab チャンク遅延取得 (Issue #162)
+  it('loads the previous chunk lazily on a top edge and stops at the oldest chunk', async () => {
     const fetchHandler = vi.fn().mockImplementation(async (chunkId: string) => {
       if (chunkId === 'chunk-1') {
         return [
@@ -103,18 +103,27 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     const manager = new ChunkLogManager(fetchHandler);
     manager.registerSceneChunks('scene-1', ['chunk-1', 'chunk-2']);
 
-    // Initially nothing loaded
+    // The eager latest-chunk load populates chunk-2 first.
+    await manager.loadChunk('chunk-2');
     expect(manager.isChunkLoaded('chunk-1')).toBe(false);
-    expect(manager.isChunkLoaded('chunk-2')).toBe(false);
-    expect(fetchHandler).not.toHaveBeenCalled();
-
-    // Reaching top edge loads oldest chunk
-    const loaded = await manager.handleScrollEdge('scene-1', 'top');
-    expect(loaded).toHaveLength(1); // chunk-2 in reverse or chunk-1
+    expect(manager.isChunkLoaded('chunk-2')).toBe(true);
     expect(fetchHandler).toHaveBeenCalledTimes(1);
 
+    // Reaching the top edge loads the preceding chunk exactly once.
+    const loaded = await manager.handleScrollEdge('scene-1', 'top');
+    expect(loaded).toHaveLength(2);
+    expect(fetchHandler).toHaveBeenCalledTimes(2);
+
     const records = manager.getLoadedRecords('scene-1');
-    expect(records.length).toBeGreaterThan(0);
+    expect(records.map((entry) => entry.content)).toEqual([
+      'メッセージ1',
+      'メッセージ2',
+      'メッセージ3',
+    ]);
+
+    // Already at the oldest chunk: no further request / infinite loop.
+    expect(await manager.handleScrollEdge('scene-1', 'top')).toBeNull();
+    expect(fetchHandler).toHaveBeenCalledTimes(2);
   });
 
   // spec: alhalte-argenterie/log-tab LogTab コンポーネントヘッダーと管理者メニュー

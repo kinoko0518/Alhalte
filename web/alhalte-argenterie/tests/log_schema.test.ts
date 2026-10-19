@@ -50,8 +50,10 @@ function testScene(id: string): Scene {
   };
 }
 
+let systemRecordPosition = 0;
+
 function systemRecord(label: number, payload: number[], id: string) {
-  const record = entryToLogRecord('scene-schema', { label, payload }, 0, 0);
+  const record = entryToLogRecord('scene-schema', { label, payload }, 0, systemRecordPosition++);
   expect(record).not.toBeNull();
   return { ...record!, id };
 }

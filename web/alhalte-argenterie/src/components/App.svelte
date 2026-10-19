@@ -18,8 +18,17 @@
   import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
   import { fetchRoomInfo, resolveRoomFromLocation, RoomApiError } from '../utils/home.js';
   import { buildContentTinFromText } from '../utils/generast.js';
-  import { ChunkLogManager } from '../utils/log.js';
-  import type { SceneMovementEvent } from '../utils/sceneGraph.js';
+  import {
+    ChunkLogManager,
+    deserializeRoomLogs,
+    serializeRoomLogs,
+  } from '../utils/log.js';
+  import {
+    buildMovementsFromLogRecords,
+    collapseLiveMovements,
+    reconcileMovements,
+    type SceneMovementEvent,
+  } from '../utils/sceneGraph.js';
   import {
     createDefaultJuices,
     downloadSceneBackground,
@@ -56,6 +65,7 @@
     RoomSocket,
     OperationTimeoutError,
     ServerOperationError,
+    entryToLogRecord,
     sceneListEntrySummary,
     tinMapToCharacter,
     tinToJson,
@@ -343,7 +353,12 @@
       ? initialExtensions
       : DEFAULT_OFFICIAL_EXTENSIONS.map((ext) => ({ ...ext })),
   );
-  let movements = $state<SceneMovementEvent[]>(initialMovements);
+  let liveMovements = $state<SceneMovementEvent[]>(initialMovements);
+  let logMovements = $state<SceneMovementEvent[]>([]);
+  // The scene graph shows both live `CharacterMoved` events and the movement
+  // history reconstructed from the came/gone log records (Issue #162). The
+  // reconciliation drops a live movement once its log record has loaded.
+  let movements = $derived(reconcileMovements(liveMovements, logMovements));
   let selectedCharacterId = $state<string | undefined>(characters[0]?.id);
 
   /**
@@ -478,32 +493,34 @@
     return `alhalte:room-logs:${roomId}`;
   }
 
+  /**
+   * Restores the offline-only log cache for a room (Issue #162).
+   *
+   * Restored records are tagged as cache-origin; the next server biblio / chunk
+   * snapshot replaces them, so a log deleted on the server cannot be resurrected
+   * from this cache.
+   */
   function restoreRoomLogs(roomId: string) {
     if (typeof localStorage === 'undefined') return;
     try {
       const raw = localStorage.getItem(getRoomLogsStorageKey(roomId));
-      if (!raw) return;
-      const savedRecords = JSON.parse(raw) as LogRecord[];
-      if (Array.isArray(savedRecords)) {
-        for (const rec of savedRecords) {
-          if (rec && typeof rec.id === 'string' && typeof rec.sceneId === 'string') {
-            chunkManager.appendRecord(rec);
-          }
-        }
+      for (const record of deserializeRoomLogs(raw)) {
+        chunkManager.appendCachedRecord(record);
       }
     } catch {
       // Ignore storage read errors
     }
   }
 
+  /**
+   * Persists loaded records for offline display. System records keep
+   * `kind` / `event` / `contentTin` (see `serializeRoomLogs`).
+   */
   function persistRoomLogs(roomId: string) {
     if (typeof localStorage === 'undefined') return;
     try {
-      const allRecords: LogRecord[] = [];
-      for (const sc of scenes) {
-        allRecords.push(...chunkManager.getLoadedRecords(sc.id));
-      }
-      localStorage.setItem(getRoomLogsStorageKey(roomId), JSON.stringify(allRecords));
+      const allRecords: LogRecord[] = chunkManager.getAllLoadedRecords();
+      localStorage.setItem(getRoomLogsStorageKey(roomId), serializeRoomLogs(allRecords));
     } catch {
       // Ignore storage write errors
     }
@@ -953,6 +970,7 @@
    */
   function applyCharacterMoved(characterId: string | number, toSceneId: string): void {
     const id = String(characterId);
+    const fromSceneId = scenes.find((scene) => scene.members.includes(id))?.id;
     for (const scene of scenes) {
       if (scene.members.includes(id)) {
         scene.members = scene.members.filter((member) => member !== id);
@@ -963,6 +981,29 @@
       target.members = [...target.members, id];
     }
     if (currentSceneId === toSceneId) applyPieceStatesToCharacters(currentSceneId);
+    if (fromSceneId !== toSceneId) {
+      recordLiveMovement({
+        characterId: id,
+        characterName: characters.find((character) => character.id === id)?.name || id,
+        ...(fromSceneId !== undefined ? { fromSceneId } : {}),
+        toSceneId,
+        timestamp: Math.floor(Date.now() / 1000),
+        source: 'live',
+      });
+    }
+  }
+
+  /**
+   * Adds one live movement after a `CharacterMoved` frame / ack.
+   *
+   * The requester receives both the broadcast and the resolved request, so
+   * same-route duplicates inside a short window are collapsed. The movement is
+   * dropped later if the matching came/gone log record loads
+   * ({@link reconcileMovements}).
+   */
+  function recordLiveMovement(movement: SceneMovementEvent): void {
+    if (movement.fromSceneId === movement.toSceneId) return;
+    liveMovements = collapseLiveMovements([...liveMovements, movement]);
   }
 
   /**
@@ -1031,6 +1072,20 @@
       return;
     }
     void refreshPendingCharacterCount();
+  });
+
+  // Rebuild the scene graph's movement history from the came/gone system log
+  // records (Issue #162). This runs after every chunk / live-log change, so a
+  // reload that restores cached records shows the graph immediately and the
+  // server snapshots replace those records in place.
+  $effect(() => {
+    const names = new Map(characters.map((character) => [character.id, character.name]));
+    const refresh = () => {
+      logMovements = buildMovementsFromLogRecords(chunkManager.getAllLoadedRecords(), names);
+    };
+    const unsubscribe = chunkManager.subscribe(refresh);
+    refresh();
+    return unsubscribe;
   });
 
   // Persist the room log cache from a `chunkManager` subscription: the
@@ -1814,6 +1869,31 @@
       if ('SceneDeleted' in frame) {
         removeSceneLocally(String(frame.SceneDeleted.scene_id));
       }
+      // Custom / test sockets may only deliver frames (the real RoomSocket
+      // already ingests them before notifying). Applying the log frames here as
+      // well is idempotent and keeps the cache authority rule for every socket.
+      if ('LogBiblioSnapshot' in frame) {
+        chunkManager.applyServerBiblio(
+          frame.LogBiblioSnapshot.scene_id,
+          frame.LogBiblioSnapshot.biblio,
+        );
+      }
+      if ('LogChunkSnapshot' in frame) {
+        const { scene_id, chunk_index, entries } = frame.LogChunkSnapshot;
+        if (Array.isArray(entries)) {
+          const records: LogRecord[] = [];
+          entries.forEach((entry, position) => {
+            const record = entryToLogRecord(scene_id, entry, chunk_index, position);
+            if (record) records.push(record);
+          });
+          chunkManager.ingestChunkSnapshot(scene_id, chunk_index, records);
+        }
+      }
+      if ('LogEventAppended' in frame) {
+        const { scene_id, chunk_index, position, entry } = frame.LogEventAppended;
+        const record = entryToLogRecord(scene_id, entry, chunk_index, position);
+        if (record) chunkManager.appendRecord(record);
+      }
       if ('CharacterList' in frame) {
         const charList: Character[] = [];
         if (frame.CharacterList?.characters) {
@@ -2028,12 +2108,13 @@
     currentSceneId = result.targetScene.id;
 
     const char = characters.find((c) => c.id === characterId);
-    movements.push({
+    recordLiveMovement({
       characterId,
       characterName: char?.name || 'Unknown',
       fromSceneId,
       toSceneId: result.targetScene.id,
       timestamp: Math.floor(Date.now() / 1000),
+      source: 'live',
     });
   }
 
