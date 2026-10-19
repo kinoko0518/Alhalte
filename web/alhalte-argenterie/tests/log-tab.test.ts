@@ -638,7 +638,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       target,
       props: {
         scene: testScene,
-        roomId: 'room-abc-789',
+        roomId: '9f3a7c1e5b2d8046',
         onExportZip: (type) => {
           exportedType = type;
         },
@@ -656,10 +656,10 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(exportedType).toBe('full');
-    expect(fetchMock).toHaveBeenCalledWith(`${window.location.origin}/api/room/room-abc-789/export/zip?type=full`);
+    expect(fetchMock).toHaveBeenCalledWith(`${window.location.origin}/api/room/9f3a7c1e5b2d8046/export/zip?type=full`);
     expect(createObjectURLMock).toHaveBeenCalledWith(mockBlob);
     expect(anchorClickSpy).toHaveBeenCalled();
-    expect(createdDownloadAnchor?.download).toBe('room_room-abc-789_full.zip');
+    expect(createdDownloadAnchor?.download).toBe('room_9f3a7c1e5b2d8046_full.zip');
     expect(revokeObjectURLMock).toHaveBeenCalledWith('blob:http://localhost/test-blob-uuid');
 
     // 2. Test clicking logs ZIP export item
@@ -678,10 +678,10 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     await new Promise((r) => setTimeout(r, 50));
 
     expect(exportedType).toBe('logs');
-    expect(fetchMock).toHaveBeenCalledWith(`${window.location.origin}/api/room/room-abc-789/export/zip?type=logs`);
+    expect(fetchMock).toHaveBeenCalledWith(`${window.location.origin}/api/room/9f3a7c1e5b2d8046/export/zip?type=logs`);
     expect(createObjectURLMock).toHaveBeenCalledWith(mockBlob);
     expect(anchorClickSpy).toHaveBeenCalled();
-    expect(createdDownloadAnchor?.download).toBe('room_room-abc-789_logs.zip');
+    expect(createdDownloadAnchor?.download).toBe('room_9f3a7c1e5b2d8046_logs.zip');
     expect(revokeObjectURLMock).toHaveBeenCalledWith('blob:http://localhost/test-blob-uuid');
 
     // Cleanup

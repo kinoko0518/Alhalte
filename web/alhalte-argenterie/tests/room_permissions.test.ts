@@ -47,7 +47,7 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
           json: async () => mockAccounts,
         } as Response;
       }
-      if (urlStr.includes('/api/room/room-123/permissions') && init?.method === 'POST') {
+      if (urlStr.includes('/api/room/0123456789abcdef/permissions') && init?.method === 'POST') {
         return {
           ok: true,
           status: 200,
@@ -65,7 +65,7 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     const instance = mount(RoomPermissionModal, {
       target,
       props: {
-        roomId: 'room-123',
+        roomId: '0123456789abcdef',
         initialPermissions: [],
         isOpen: true,
         fetchFn: mockFetch as unknown as typeof fetch,
@@ -128,7 +128,7 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     const instance = mount(RoomPermissionModal, {
       target,
       props: {
-        roomId: 'room-test',
+        roomId: 'fedcba9876543210',
         initialPermissions: initialPerms,
         isOpen: true,
         fetchFn: mockFetch as unknown as typeof fetch,
@@ -165,7 +165,7 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     const instance = mount(RoomPermissionModal, {
       target,
       props: {
-        roomId: 'room-test',
+        roomId: 'fedcba9876543210',
         initialPermissions: initialPerms,
         isOpen: true,
       },
@@ -213,7 +213,7 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     const instance = mount(RoomPermissionModal, {
       target,
       props: {
-        roomId: 'room-test',
+        roomId: 'fedcba9876543210',
         initialPermissions: initialPerms,
         isOpen: true,
       },
@@ -251,7 +251,7 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     const instance = mount(RoomPermissionModal, {
       target,
       props: {
-        roomId: 'room-test',
+        roomId: 'fedcba9876543210',
         initialPermissions: initialPerms,
         isOpen: true,
         onPermissionsChange: (perms) => {

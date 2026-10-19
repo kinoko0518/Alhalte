@@ -1,7 +1,10 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mount, unmount } from 'svelte';
 import App from '../src/components/App.svelte';
 import {
+  NON_RETRYABLE_CLOSE_CODES,
   RoomSocket,
   buildRoomWebSocketUrl,
   entryToLogRecord,
@@ -10,9 +13,21 @@ import {
   type ClientFrame,
   type ServerFrame,
 } from '../src/utils/roomSocket.js';
+import { isValidRoomId } from '../src/utils/home.js';
 import { ConnectionManager } from '../src/utils/connection.js';
 import { ChunkLogManager } from '../src/utils/log.js';
 import type { Character, VisitedRoom } from '../src/types/index.js';
+
+interface RoomIdContract {
+  generated_hex: string[];
+  legacy_decimal: string[];
+}
+
+function loadRoomIdContract(): RoomIdContract {
+  // `pnpm test` runs from `web/alhalte-argenterie`.
+  const contractPath = resolve(process.cwd(), '../../contracts/room_ids.json');
+  return JSON.parse(readFileSync(contractPath, 'utf8')) as RoomIdContract;
+}
 
 /**
  * Mock WebSocket implementation for unit and integration tests.
@@ -62,40 +77,90 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     MockWebSocket.instances = [];
   });
 
-  // spec: roomSocket url construction
+  // spec: roomSocket url construction (Issue #154)
   describe('URL Construction (buildRoomWebSocketUrl)', () => {
     it('constructs default ws URL with room ID and credentials', () => {
       const url = buildRoomWebSocketUrl({
-        roomId: 'room-123',
+        roomId: '0123456789abcdef',
         host: 'localhost:8080',
         accountId: 42,
         sessionId: 99,
       });
-      expect(url).toBe('ws://localhost:8080/ws/room/room-123?account_id=42&session_id=99');
+      expect(url).toBe(
+        'ws://localhost:8080/ws/room/0123456789abcdef?account_id=42&session_id=99',
+      );
     });
 
-    it('converts http/https URLs to ws/wss URLs', () => {
-      const urlHttp = buildRoomWebSocketUrl({
-        roomId: 'room-1',
-        url: 'http://example.com/api/room/room-1',
-      });
-      expect(urlHttp).toBe('ws://example.com/api/room/room-1');
-
+    it('uses only the origin of an invitation page URL and builds /ws/room/<id>', () => {
       const urlHttps = buildRoomWebSocketUrl({
-        roomId: 'room-1',
-        url: 'https://example.com/room/room-1?custom=1',
+        roomId: 'abcdef0123456789',
+        url: 'https://alhalte.example/rooms/abcdef0123456789#room-key',
         accountId: 10,
       });
-      expect(urlHttps).toBe('wss://example.com/room/room-1?custom=1&account_id=10');
+      expect(urlHttps).toBe(
+        'wss://alhalte.example/ws/room/abcdef0123456789?account_id=10',
+      );
+
+      const urlHttp = buildRoomWebSocketUrl({
+        roomId: '777',
+        url: 'http://127.0.0.1:5173/rooms/777#room-key',
+      });
+      expect(urlHttp).toBe('ws://127.0.0.1:5173/ws/room/777');
     });
 
-    it('preserves existing ws/wss protocols and appends query parameters', () => {
+    it('does not inherit application paths such as /api or /room from page URLs', () => {
+      const apiUrl = buildRoomWebSocketUrl({
+        roomId: '9f3a7c1e5b2d8046',
+        url: 'http://example.com/api/room/9f3a7c1e5b2d8046',
+      });
+      expect(apiUrl).toBe('ws://example.com/ws/room/9f3a7c1e5b2d8046');
+
+      const pageUrl = buildRoomWebSocketUrl({
+        roomId: '9f3a7c1e5b2d8046',
+        url: 'https://example.com/room/9f3a7c1e5b2d8046?custom=1',
+        accountId: 10,
+      });
+      expect(pageUrl).toBe('wss://example.com/ws/room/9f3a7c1e5b2d8046?account_id=10');
+    });
+
+    it('uses an explicit ws(s)://.../ws/room/... URL as-is', () => {
       const url = buildRoomWebSocketUrl({
-        roomId: 'room-456',
-        url: 'wss://alhalte.org/ws/room/room-456',
+        roomId: 'fedcba9876543210',
+        url: 'wss://alhalte.org/ws/room/fedcba9876543210',
         sessionId: 'sess-abc',
       });
-      expect(url).toBe('wss://alhalte.org/ws/room/room-456?session_id=sess-abc');
+      expect(url).toBe('wss://alhalte.org/ws/room/fedcba9876543210?session_id=sess-abc');
+    });
+
+    it('rebuilds an explicit ws URL outside /ws/room/ from its origin', () => {
+      const url = buildRoomWebSocketUrl({
+        roomId: 'fedcba9876543210',
+        url: 'wss://alhalte.org/socket/legacy',
+      });
+      expect(url).toBe('wss://alhalte.org/ws/room/fedcba9876543210');
+    });
+
+    it('builds /ws/room/<id> from a relative invitation path', () => {
+      const url = buildRoomWebSocketUrl({
+        roomId: 'a1b2c3d4e5f60718',
+        url: '/rooms/a1b2c3d4e5f60718#room-key',
+        host: 'alhalte.example:8443',
+      });
+      expect(url).toBe('ws://alhalte.example:8443/ws/room/a1b2c3d4e5f60718');
+    });
+
+    // spec: contracts/room_ids.json room ID contract (TypeScript side)
+    it('accepts every contract room ID and builds the same /ws/room path', () => {
+      const contract = loadRoomIdContract();
+      expect(contract.generated_hex.length).toBeGreaterThan(0);
+      expect(contract.legacy_decimal.length).toBeGreaterThan(0);
+
+      for (const roomId of [...contract.generated_hex, ...contract.legacy_decimal]) {
+        expect(isValidRoomId(roomId)).toBe(true);
+        expect(
+          buildRoomWebSocketUrl({ roomId, host: 'alhalte.example' }),
+        ).toBe(`ws://alhalte.example/ws/room/${roomId}`);
+      }
     });
   });
 
@@ -107,7 +172,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       connectionManager.subscribe((st) => states.push(st));
 
       const socket = new RoomSocket({
-        roomId: 'room-test',
+        roomId: '00000000000000aa',
         connectionManager,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
@@ -129,7 +194,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       vi.useFakeTimers();
       const connectionManager = new ConnectionManager();
       const socket = new RoomSocket({
-        roomId: 'room-test',
+        roomId: '00000000000000aa',
         connectionManager,
         reconnectInterval: 1000,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
@@ -163,7 +228,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     it('triggers manual reconnection via connectionManager.reconnect()', async () => {
       const connectionManager = new ConnectionManager({ initialState: 'disconnected' });
       const socket = new RoomSocket({
-        roomId: 'room-test',
+        roomId: '00000000000000aa',
         connectionManager,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
@@ -183,7 +248,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       vi.useFakeTimers();
       const connectionManager = new ConnectionManager();
       const socket = new RoomSocket({
-        roomId: 'room-test',
+        roomId: '00000000000000aa',
         connectionManager,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
@@ -200,6 +265,54 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
 
       vi.useRealTimers();
     });
+
+    // spec: alhalte-argenterie/roomSocket onclose event and non-retryable close codes (Issue #154)
+    it('captures onclose(event) and exposes it via onClose and getLastCloseEvent', () => {
+      const onClose = vi.fn();
+      const socket = new RoomSocket({
+        roomId: '0123456789abcdef',
+        onClose,
+        webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+      });
+
+      socket.connect();
+      const mockWs = MockWebSocket.instances[0];
+      mockWs.open();
+      mockWs.close(4403, 'room access denied');
+
+      expect(onClose).toHaveBeenCalledTimes(1);
+      const event = onClose.mock.calls[0][0] as CloseEvent;
+      expect(event.code).toBe(4403);
+      expect(event.reason).toBe('room access denied');
+      expect(socket.getLastCloseEvent()).toBe(event);
+    });
+
+    it('stops automatic reconnection on non-retryable close codes', () => {
+      vi.useFakeTimers();
+
+      for (const code of [...NON_RETRYABLE_CLOSE_CODES]) {
+        MockWebSocket.instances = [];
+        const connectionManager = new ConnectionManager();
+        const socket = new RoomSocket({
+          roomId: '0123456789abcdef',
+          connectionManager,
+          reconnectInterval: 1000,
+          webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+        });
+
+        socket.connect();
+        const mockWs = MockWebSocket.instances[0];
+        mockWs.open();
+        mockWs.close(code, 'rejected');
+
+        expect(connectionManager.getState()).toBe('disconnected');
+        vi.advanceTimersByTime(5000);
+        expect(MockWebSocket.instances.length).toBe(1);
+        vi.clearAllTimers();
+      }
+
+      vi.useRealTimers();
+    });
   });
 
   // spec: roomSocket ClientFrame helper methods
@@ -209,7 +322,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
 
     beforeEach(() => {
       socket = new RoomSocket({
-        roomId: 'room-1',
+        roomId: '00000000000000af',
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
       socket.connect();
@@ -300,7 +413,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
 
     it('queues outgoing frames while disconnected and flushes upon connection', () => {
       const disconnectedSocket = new RoomSocket({
-        roomId: 'room-queue',
+        roomId: '00000000000000ab',
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
 
@@ -322,7 +435,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     // spec: alhalte-argenterie/roomSocket offline message queueing & bulk sending (Issue #88)
     it('accumulates chat messages in queue while disconnected and bulk-sends upon reconnecting', () => {
       const socket = new RoomSocket({
-        roomId: 'room-msg-queue',
+        roomId: '00000000000000ac',
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
 
@@ -352,7 +465,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     // spec: alhalte-argenterie/roomSocket offline state changes final state sync (Issue #88)
     it('deduplicates offline state updates and transmits only the final state upon reconnecting', () => {
       const socket = new RoomSocket({
-        roomId: 'room-state-sync',
+        roomId: '00000000000000ad',
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
 
@@ -416,7 +529,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     beforeEach(() => {
       chunkManager = new ChunkLogManager();
       socket = new RoomSocket({
-        roomId: 'room-sync',
+        roomId: '00000000000000ae',
         chunkLogManager: chunkManager,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
@@ -428,7 +541,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     it('synchronizes SceneList frame into getScenes() and triggers onSceneList', () => {
       const sceneListCallback = vi.fn();
       socket = new RoomSocket({
-        roomId: 'room-sync',
+        roomId: '00000000000000ae',
         onSceneList: sceneListCallback,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
@@ -449,7 +562,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     it('appends LogEventAppended frame into ChunkLogManager and notifies listener', () => {
       const logAppendedCallback = vi.fn();
       socket = new RoomSocket({
-        roomId: 'room-sync',
+        roomId: '00000000000000ae',
         chunkLogManager: chunkManager,
         onLogAppended: logAppendedCallback,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
@@ -501,7 +614,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       const charListCallback = vi.fn();
       const charDeletedCallback = vi.fn();
       socket = new RoomSocket({
-        roomId: 'room-sync',
+        roomId: '00000000000000ae',
         onCharacterList: charListCallback,
         onCharacterDeleted: charDeletedCallback,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
@@ -539,7 +652,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
       const stateUpdatedCallback = vi.fn();
       const stateDeletedCallback = vi.fn();
       socket = new RoomSocket({
-        roomId: 'room-sync',
+        roomId: '00000000000000ae',
         onStateUpdated: stateUpdatedCallback,
         onStateDeleted: stateDeletedCallback,
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
@@ -574,15 +687,15 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
   // spec: App.svelte component integration with RoomSocket
   describe('App.svelte Component Integration', () => {
     const dummyRoom: VisitedRoom = {
-      id: 'room-app-test',
+      id: 'aabbccddeeff0011',
       name: '結合テスト部屋',
-      url: 'ws://localhost:8080/ws/room/room-app-test',
+      url: 'ws://localhost:8080/ws/room/aabbccddeeff0011',
       lastVisited: Date.now(),
     };
 
     it('connects RoomSocket when entering room and sends ClientFrame on chat and scene operations', async () => {
       const socket = new RoomSocket({
-        roomId: 'room-app-test',
+        roomId: 'aabbccddeeff0011',
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
       socket.connect();
@@ -637,7 +750,7 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     // spec: argenterie/roomSocket Appのシーン管理操作はrequest*のack後にのみローカルへ反映する (Issue #109 / #143)
     it('sends CreateScene through requestCreateScene and applies the scene only after the SceneCreated ack', async () => {
       const socket = new RoomSocket({
-        roomId: 'room-app-test',
+        roomId: 'aabbccddeeff0011',
         webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
       });
       socket.connect();

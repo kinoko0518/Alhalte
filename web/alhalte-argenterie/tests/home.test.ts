@@ -57,6 +57,18 @@ describe('Home Screen & Room URL', () => {
       roomUrl: `http://127.0.0.1:5173/?room=feedfacecafebeef#${key}`,
     });
 
+    // Legacy decimal room IDs are still accepted.
+    const p4 = parseRoomUrl(`/rooms/777#${key}`);
+    expect(p4).toEqual({
+      roomId: '777',
+      roomKeyHex: key,
+      roomUrl: `/rooms/777#${key}`,
+    });
+
+    // Invalid / decorative room IDs are rejected explicitly.
+    expect(parseRoomUrl(`https://alhalte.example/rooms/room-1#${key}`)).toBeNull();
+    expect(parseRoomUrl(`/room/not-a-room#${key}`)).toBeNull();
+    expect(parseRoomUrl(`/?room=visited-room-1#${key}`)).toBeNull();
     expect(parseRoomUrl('https://alhalte.example/')).toBeNull();
   });
 
@@ -93,23 +105,23 @@ describe('Home Screen & Room URL', () => {
   // spec: alhalte-argenterie/home localStorage保存・取得・管理者除外
   it('saves visited rooms and excludes rooms where user is admin from display', () => {
     const room1: VisitedRoom = {
-      id: 'room-1',
+      id: '1111111111111111',
       name: 'Player Room',
-      url: 'https://alhalte.example/rooms/room-1#key1',
+      url: 'https://alhalte.example/rooms/1111111111111111#key1',
       lastVisited: 1000,
       isAdmin: false,
     };
     const room2: VisitedRoom = {
-      id: 'room-2',
+      id: '2222222222222222',
       name: 'Admin Room',
-      url: 'https://alhalte.example/rooms/room-2#key2',
+      url: 'https://alhalte.example/rooms/2222222222222222#key2',
       lastVisited: 2000,
       isAdmin: true, // Should be excluded from visited list display
     };
     const room3: VisitedRoom = {
-      id: 'room-3',
+      id: '3333333333333333',
       name: 'Another Player Room',
-      url: 'https://alhalte.example/rooms/room-3#key3',
+      url: 'https://alhalte.example/rooms/3333333333333333#key3',
       lastVisited: 3000,
       isAdmin: false,
     };
@@ -120,19 +132,19 @@ describe('Home Screen & Room URL', () => {
 
     const visited = getVisitedRooms();
     expect(visited).toHaveLength(2);
-    expect(visited.map((r) => r.id)).toEqual(['room-3', 'room-1']);
+    expect(visited.map((r) => r.id)).toEqual(['3333333333333333', '1111111111111111']);
     expect(visited.some((r) => r.isAdmin)).toBe(false);
 
-    removeVisitedRoom('room-1');
-    expect(getVisitedRooms().map((r) => r.id)).toEqual(['room-3']);
+    removeVisitedRoom('1111111111111111');
+    expect(getVisitedRooms().map((r) => r.id)).toEqual(['3333333333333333']);
   });
 
   // spec: alhalte-argenterie/account 0030 ホーム画面のテーマ設定削除とアカウントUI配置 (Issue #116)
   it('renders rich M3 Expressive HomeScreen with account controls in place of theme settings, displays visited cards, and opens creation dialog', async () => {
     const testRoom: VisitedRoom = {
-      id: 'visited-room-1',
+      id: 'aabbccddeeff0011',
       name: '冒険者ギルド',
-      url: 'https://alhalte.example/rooms/visited-room-1#abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
+      url: 'https://alhalte.example/rooms/aabbccddeeff0011#abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
       lastVisited: Date.now(),
       isAdmin: false,
     };
@@ -174,7 +186,7 @@ describe('Home Screen & Room URL', () => {
     expect(signInBtn?.classList.contains('tonal')).toBe(true);
 
     // Check visited room card is rendered
-    expect(target.querySelector('[data-testid="room-card-visited-room-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="room-card-aabbccddeeff0011"]')).toBeTruthy();
     expect(target.textContent).toContain('冒険者ギルド');
 
     // Click "部屋の新規作成" ExtendedFab button
@@ -226,7 +238,7 @@ describe('Home Screen & Room URL', () => {
   // spec: alhalte-argenterie/home 招待リンク直接アクセスで部屋へ直接入室 (#34)
   it('directly enters the room when App is mounted at a room invitation URL', () => {
     const key = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
-    window.history.replaceState(null, '', `/rooms/direct-room-0001#${key}`);
+    window.history.replaceState(null, '', `/rooms/1122334455667788#${key}`);
 
     const target = document.createElement('div');
     document.body.appendChild(target);

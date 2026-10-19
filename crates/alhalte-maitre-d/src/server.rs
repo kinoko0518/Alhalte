@@ -21,6 +21,7 @@ use crate::crypto;
 use crate::db::{Account, Database, RoomRole};
 use crate::gateway::RoomBridgeManager;
 use crate::oauth::OAuthProvider;
+use crate::room_id::RoomId;
 
 /// Application shared state.
 #[derive(Clone)]
@@ -227,8 +228,8 @@ pub struct CreateDebugAccountRequest {
 /// Query parameters for WebSocket connection.
 #[derive(Debug, Deserialize, Default)]
 pub struct WsQuery {
-    /// Room identifier.
-    pub room: Option<u64>,
+    /// Room identifier (16 hex or legacy decimal).
+    pub room: Option<RoomId>,
     /// Account identifier.
     pub account_id: Option<u64>,
     /// Session identifier.
@@ -788,9 +789,9 @@ async fn search_accounts_handler(
 /// Handles `GET /api/room/{room_id}/permissions`.
 async fn get_room_permissions_handler(
     State(state): State<AppState>,
-    AxumPath(room_id): AxumPath<String>,
+    AxumPath(room_id): AxumPath<RoomId>,
 ) -> Response {
-    match state.db.get_room_permissions(&room_id) {
+    match state.db.get_room_permissions(&room_id.to_string()) {
         Ok(perms) => (StatusCode::OK, Json(perms)).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -803,7 +804,7 @@ async fn get_room_permissions_handler(
 /// Handles `POST /api/room/{room_id}/permissions`.
 async fn set_room_permission_handler(
     State(state): State<AppState>,
-    AxumPath(room_id): AxumPath<String>,
+    AxumPath(room_id): AxumPath<RoomId>,
     Json(req): Json<SetRoomPermissionRequest>,
 ) -> Response {
     match state.db.get_account(req.account_id) {
@@ -825,15 +826,16 @@ async fn set_room_permission_handler(
     }
 
     let now = chrono::Utc::now().timestamp();
+    let room_id_str = room_id.to_string();
     match state
         .db
-        .set_room_permission(&room_id, req.account_id, req.role, now)
+        .set_room_permission(&room_id_str, req.account_id, req.role, now)
     {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "ok",
-                "room_id": room_id,
+                "room_id": room_id_str,
                 "account_id": req.account_id,
                 "role": req.role
             })),
@@ -850,9 +852,12 @@ async fn set_room_permission_handler(
 /// Handles `DELETE /api/room/{room_id}/permissions/{account_id}`.
 async fn delete_room_permission_handler(
     State(state): State<AppState>,
-    AxumPath((room_id, account_id)): AxumPath<(String, u64)>,
+    AxumPath((room_id, account_id)): AxumPath<(RoomId, u64)>,
 ) -> Response {
-    match state.db.delete_room_permission(&room_id, account_id) {
+    match state
+        .db
+        .delete_room_permission(&room_id.to_string(), account_id)
+    {
         Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -894,7 +899,7 @@ async fn ws_handler(
         headers
             .get("X-Alhalte-Room")
             .and_then(|v| v.to_str().ok())
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| s.parse::<RoomId>().ok())
     });
 
     let room_id = match room_id {
@@ -914,7 +919,7 @@ async fn ws_handler(
 /// Handles `/ws/room/{room_id}`, `/room/{room_id}`, `/room/{room_id}/ws`.
 async fn ws_room_handler(
     State(state): State<AppState>,
-    AxumPath(room_id): AxumPath<u64>,
+    AxumPath(room_id): AxumPath<RoomId>,
     headers: HeaderMap,
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
@@ -926,7 +931,7 @@ async fn handle_ws_upgrade(
     state: AppState,
     headers: HeaderMap,
     query: WsQuery,
-    room_id: u64,
+    room_id: RoomId,
     ws: WebSocketUpgrade,
 ) -> Response {
     let session_id = query
@@ -988,8 +993,10 @@ async fn handle_ws_upgrade(
     let auth_account = account_id.unwrap_or(0);
     let auth_session = session_id.unwrap_or(0);
 
-    // Check room permissions and done flag
+    // Check room permissions and done flag. Permission rows use the canonical
+    // 16-hex form, matching the room ID in invitation URLs.
     let room_id_str = room_id.to_string();
+    let room_id_u64 = room_id.as_u64();
     let has_permissions = match state.db.has_room_permissions(&room_id_str) {
         Ok(has) => has,
         Err(e) => {
@@ -1017,7 +1024,7 @@ async fn handle_ws_upgrade(
     };
 
     if has_permissions && user_role.is_none() {
-        let is_done = state.room_manager.is_room_done(room_id).await;
+        let is_done = state.room_manager.is_room_done(room_id_u64).await;
         if !is_done {
             return (
                 StatusCode::FORBIDDEN,
@@ -1049,7 +1056,7 @@ async fn handle_ws_upgrade(
 
     let bridge = state
         .room_manager
-        .get_or_create_room(room_id, admin_account)
+        .get_or_create_room(room_id_u64, admin_account)
         .await;
 
     let state_clone = state.clone();
@@ -1072,7 +1079,7 @@ async fn handle_ws_upgrade(
 struct WsClientContext {
     bridge: Arc<crate::gateway::RoomBridge>,
     state: AppState,
-    room_id: u64,
+    room_id: RoomId,
     client_id: u64,
     account_id: u64,
     session_id: u64,
@@ -1084,6 +1091,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
     let account_id = ctx.account_id;
     let session_id = ctx.session_id;
     let room_id = ctx.room_id;
+    let room_id_u64 = room_id.as_u64();
     let state = ctx.state;
     let bridge = ctx.bridge;
     let is_viewer_initial = ctx.is_viewer_initial;
@@ -1156,7 +1164,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
 
                     if let ClientFrame::SetDone { done } = &frame {
                         bridge_ref.set_done(*done);
-                        state.room_manager.set_room_done(room_id, *done).await;
+                        state.room_manager.set_room_done(room_id_u64, *done).await;
                     }
 
                     bridge_ref.send_client_frame(client_id, frame);
@@ -1199,7 +1207,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
 
                         if let ClientFrame::SetDone { done } = &f {
                             bridge_ref.set_done(*done);
-                            state.room_manager.set_room_done(room_id, *done).await;
+                            state.room_manager.set_room_done(room_id_u64, *done).await;
                         }
 
                         bridge_ref.send_client_frame(client_id, f);
@@ -1226,7 +1234,7 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
 /// Handles `GET /api/room/{room_id}/export/zip` and `GET /room/{room_id}/export/zip`.
 async fn export_room_zip_handler(
     State(state): State<AppState>,
-    AxumPath(room_id): AxumPath<u64>,
+    AxumPath(room_id): AxumPath<RoomId>,
     headers: HeaderMap,
     Query(q): Query<ExportZipQuery>,
 ) -> Response {
@@ -1303,7 +1311,7 @@ async fn export_room_zip_handler(
     let admin_account = caller_account.unwrap_or(1);
     let bridge = state
         .room_manager
-        .get_or_create_room(room_id, admin_account)
+        .get_or_create_room(room_id.as_u64(), admin_account)
         .await;
 
     let (mut room_data, chunks) = match bridge.export_room(caller_account).await {
@@ -1335,6 +1343,7 @@ async fn export_room_zip_handler(
     };
 
     let filename = format!("room_{room_id}_{export_type}.zip");
+    // `room_id` is rendered in its canonical 16-hex form.
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert(
         axum::http::header::CONTENT_TYPE,

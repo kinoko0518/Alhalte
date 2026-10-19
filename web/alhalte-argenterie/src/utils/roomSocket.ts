@@ -656,6 +656,13 @@ export interface RoomSocketOptions {
   maxReconnectAttempts?: number;
   /** Custom WebSocket factory for testing */
   webSocketFactory?: (url: string) => WebSocket;
+  /**
+   * Called for every `close` event, including intentional disconnects.
+   *
+   * The event's `code` / `reason` are also available through
+   * {@link RoomSocket.getLastCloseEvent}.
+   */
+  onClose?: (event: CloseEvent) => void;
 
   // Frame event callbacks
   onSceneList?: (scenes: string[]) => void;
@@ -712,8 +719,32 @@ export function ensureTin(val: any): any {
   return val;
 }
 
+/** Close codes that mean "do not retry this connection". */
+export const NON_RETRYABLE_CLOSE_CODES: ReadonlySet<number> = new Set([1008, 4403, 4404]);
+
+/** Returns the WebSocket origin for a page or socket URL protocol. */
+function webSocketOrigin(protocol: string, host: string): string {
+  return `${protocol === 'https:' || protocol === 'wss:' ? 'wss:' : 'ws:'}//${host}`;
+}
+
+/** Returns the default WebSocket origin from `window` or the `host` option. */
+function defaultWebSocketOrigin(host?: string): string {
+  const protocol =
+    typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const targetHost = host || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000');
+  return `${protocol}//${targetHost}`;
+}
+
 /**
- * Builds standard WebSocket URL for room connection with optional credentials.
+ * Builds the standard WebSocket URL for a room connection with optional
+ * credentials.
+ *
+ * Invitation URLs (`https://host/rooms/<id>#<key>`) are page URLs, not socket
+ * URLs: only their origin is used and the socket path is always
+ * `/ws/room/<roomId>`. An explicit `ws(s)://.../ws/room/...` URL is used as-is
+ * (plus credentials); any other URL is reduced to its origin.
+ *
+ * Reference: `web/alhalte-argenterie/ARCHITECTURE.md` (WebSocket).
  */
 export function buildRoomWebSocketUrl(options: {
   roomId: string | number;
@@ -729,23 +760,26 @@ export function buildRoomWebSocketUrl(options: {
     const hashIdx = url.indexOf('#');
     const cleanUrl = hashIdx >= 0 ? url.slice(0, hashIdx) : url;
 
-    if (cleanUrl.startsWith('http://')) {
-      base = 'ws://' + cleanUrl.slice('http://'.length);
-    } else if (cleanUrl.startsWith('https://')) {
-      base = 'wss://' + cleanUrl.slice('https://'.length);
-    } else if (cleanUrl.startsWith('ws://') || cleanUrl.startsWith('wss://')) {
-      base = cleanUrl;
-    } else {
-      const proto =
-        typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const h = host || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000');
-      base = `${proto}//${h}${cleanUrl.startsWith('/') ? '' : '/'}${cleanUrl}`;
+    try {
+      if (/^wss?:\/\//i.test(cleanUrl)) {
+        const parsed = new URL(cleanUrl);
+        // Only an explicit room socket URL may be used as-is.
+        base = /^\/ws\/room\/[^/]+\/?$/.test(parsed.pathname)
+          ? `${webSocketOrigin(parsed.protocol, parsed.host)}${parsed.pathname}${parsed.search}`
+          : `${webSocketOrigin(parsed.protocol, parsed.host)}/ws/room/${roomId}`;
+      } else if (/^https?:\/\//i.test(cleanUrl)) {
+        // Invitation / application page URL: keep only the origin.
+        const parsed = new URL(cleanUrl);
+        base = `${webSocketOrigin(parsed.protocol, parsed.host)}/ws/room/${roomId}`;
+      } else {
+        // Relative page path (`/rooms/<id>#<key>`, `/room/<id>`, ...).
+        base = `${defaultWebSocketOrigin(host)}/ws/room/${roomId}`;
+      }
+    } catch {
+      base = `${defaultWebSocketOrigin(host)}/ws/room/${roomId}`;
     }
   } else {
-    const proto =
-      typeof window !== 'undefined' && window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const h = host || (typeof window !== 'undefined' ? window.location.host : 'localhost:3000');
-    base = `${proto}//${h}/ws/room/${roomId}`;
+    base = `${defaultWebSocketOrigin(host)}/ws/room/${roomId}`;
   }
 
   const hashIdx = base.indexOf('#');
@@ -943,6 +977,7 @@ export class RoomSocket {
   private connectPromises: Array<{ resolve: () => void; reject: (err: any) => void }> = [];
   private pendingOperations: PendingOperation[] = [];
   private operationCounter = 0;
+  private lastCloseEvent: CloseEvent | null = null;
 
   // Local state cache
   private scenes: string[] = [];
@@ -989,6 +1024,16 @@ export class RoomSocket {
    */
   public getUrl(): string {
     return this.wsUrl;
+  }
+
+  /**
+   * Most recent close event, including its `code` and `reason`.
+   *
+   * Returns `null` until the first close. Non-retryable codes
+   * ({@link NON_RETRYABLE_CLOSE_CODES}) stop automatic reconnection.
+   */
+  public getLastCloseEvent(): CloseEvent | null {
+    return this.lastCloseEvent;
   }
 
   /**
@@ -1066,7 +1111,10 @@ export class RoomSocket {
         console.warn('RoomSocket error:', event);
       };
 
-      ws.onclose = () => {
+      ws.onclose = (event: CloseEvent) => {
+        this.lastCloseEvent = event;
+        this.options.onClose?.(event);
+
         const wasIntentional = this.intentionalClose;
         this.socket = null;
 
@@ -1093,8 +1141,11 @@ export class RoomSocket {
           new ServerOperationError('disconnected', 'WebSocket connection lost before the acknowledgement'),
         );
 
+        // 1008 (policy violation) and the application close codes 4403 / 4404
+        // mean the server rejected the join; retrying cannot succeed.
+        const retryable = !NON_RETRYABLE_CLOSE_CODES.has(event?.code);
         const maxAttempts = this.options.maxReconnectAttempts ?? Infinity;
-        if (this.reconnectAttempts < maxAttempts) {
+        if (retryable && this.reconnectAttempts < maxAttempts) {
           this.reconnectAttempts++;
           this.clearReconnectTimer();
           const delay = this.options.reconnectInterval ?? 2000;

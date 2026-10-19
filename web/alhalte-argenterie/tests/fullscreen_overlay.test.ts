@@ -7,9 +7,9 @@ import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
 
 describe('Fullscreen Warnings & Overlays Viewport Hoisting (Issue #60)', () => {
   const dummyRoom: VisitedRoom = {
-    id: 'room-test-60',
+    id: '0000000000000060',
     name: '全画面オーバーレイ検証部屋',
-    url: 'https://alhalte.example/rooms/room-test-60#secret',
+    url: 'https://alhalte.example/rooms/0000000000000060#secret',
     lastVisited: Date.now(),
     isAdmin: true,
   };

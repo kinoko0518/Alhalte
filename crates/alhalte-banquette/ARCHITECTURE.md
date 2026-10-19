@@ -19,7 +19,7 @@
 
 CLI（`CliArgs`）:
 
-- `--room-id` / `ALHALTE_ROOM_ID`
+- `--room-id` / `ALHALTE_ROOM_ID`: 16 hex（正）または移行用 decimal の `u64`。内部の `RoomData.room_id` は `u64` のまま。
 - `--admin`（別名 `--owner`）/ `ALHALTE_ADMIN_ACCOUNT`
 - `--socket` / `ALHALTE_SOCKET_PATH`（既定 `/tmp/alhalte-banquette.sock`）
 - `--cellar-url` / `ALHALTE_CELLAR_URL`（既定 `http://127.0.0.1:8080`）
@@ -30,7 +30,7 @@ CLI（`CliArgs`）:
 
 | API | 内容 |
 | --- | --- |
-| `Room` / `RoomData` / `RoomPermissionLevel` | 部屋全体。scene biblio、character biblio、権限、chunk exponent。 |
+| `Room` / `RoomData` / `RoomPermissionLevel` | 部屋全体。scene biblio、character biblio、権限、chunk exponent。`room_id` は `u64`。 |
 | `Scene` / `SceneData` | 独立した log と state を持つ scene。 |
 | `SceneLog` / `LogBiblio` / `LogChunk` | chunk 化された log と head。 |
 | `SceneState` | `BTreeMap<String, Tin>`。4KiB 制限と `::` 名前空間検証。 |
