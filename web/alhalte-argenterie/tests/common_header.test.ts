@@ -144,3 +144,86 @@ describe('CommonHeader Component & Gear Menu Positioning (Issue #124)', () => {
     target.remove();
   });
 });
+
+// spec: alhalte-argenterie/common-header SetDone 完了ダイアログは ack 後にのみ閉じる
+describe('CommonHeader SetDone acknowledgement', () => {
+  const scene: Scene = {
+    id: '/',
+    name: 'メインシーン',
+    members: [],
+    juices: { bgUrl: '', bgWidth: 1920, bgHeight: 1080, bgmSlots: [] },
+  };
+
+  beforeEach(() => {
+    document.body.innerHTML = '';
+    window.innerWidth = 1200;
+    window.innerHeight = 800;
+  });
+
+  async function openDoneDialog(target: HTMLDivElement) {
+    target.querySelector<HTMLButtonElement>('[data-testid="gear-menu-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLElement>('[data-testid="set-done-item"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeTruthy();
+  }
+
+  it('keeps the dialog open until onSetDone resolves', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    let resolveRequest!: () => void;
+    const request = new Promise<void>((resolve) => {
+      resolveRequest = resolve;
+    });
+    const onSetDone = vi.fn(() => request);
+
+    const instance = mount(CommonHeader, {
+      target,
+      props: { scene, isAdmin: true, onSetDone },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await openDoneDialog(target);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="confirm-done-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(onSetDone).toHaveBeenCalledWith(true);
+    // Still waiting for the banquette acknowledgement.
+    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeTruthy();
+
+    resolveRequest();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  it('stays open and shows the error when the acknowledgement fails', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const onSetDone = vi.fn(async () => {
+      throw new Error('SetDoneFailed');
+    });
+
+    const instance = mount(CommonHeader, {
+      target,
+      props: { scene, isAdmin: true, onSetDone },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+    await openDoneDialog(target);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="confirm-done-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    expect(target.querySelector('[data-testid="set-done-warning-dialog"]')).toBeTruthy();
+    const error = target.querySelector('[data-testid="done-error-message"]');
+    expect(error).toBeTruthy();
+    expect(error?.textContent).toContain('SetDoneFailed');
+
+    unmount(instance);
+    target.remove();
+  });
+});

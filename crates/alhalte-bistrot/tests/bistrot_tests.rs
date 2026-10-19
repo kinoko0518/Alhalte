@@ -337,6 +337,16 @@ fn test_generate_maitre_d_args() {
             "http://127.0.0.1:8081",
             "--chunk-size-exponent",
             "8",
+            "--cors-origin",
+            "http://127.0.0.1:5173",
+            "--cors-origin",
+            "http://vtt.example.com:5173",
+            "--cors-origin",
+            "https://vtt.example.com:5173",
+            "--cors-origin",
+            "http://vtt.example.com",
+            "--cors-origin",
+            "https://vtt.example.com",
         ]
     );
 

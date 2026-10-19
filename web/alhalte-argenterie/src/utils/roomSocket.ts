@@ -159,6 +159,11 @@ export interface LogRewoundAck {
   position: number;
 }
 
+/** Acknowledgement payload of `DoneUpdated`. */
+export interface DoneUpdatedAck {
+  done: boolean;
+}
+
 // =========================================================================
 // Tin codec
 // =========================================================================
@@ -626,6 +631,7 @@ export type ServerFrame =
   | { SceneCreated: { scene_id: string } }
   | { SceneDeleted: { scene_id: string } }
   | { CharacterMoved: { character_id: number; to_scene_id: string } }
+  | { DoneUpdated: { done: boolean } }
   | { Error: { code: string; message: string } };
 
 /**
@@ -931,6 +937,7 @@ type OperationKind =
   | 'deleteCharacter'
   | 'rewindLog'
   | 'changeBgm'
+  | 'setDone'
   | 'querySceneList'
   | 'queryState'
   | 'queryLogBiblio'
@@ -1441,10 +1448,42 @@ export class RoomSocket {
   }
 
   /**
-   * Sets the room's done flag (admin only).
+   * Sets the room's done flag (admin only), fire-and-forget.
+   *
+   * Use {@link RoomSocket.requestSetDone} when the caller must only report
+   * success after banquette acknowledged the change.
    */
   public setDone(done: boolean): void {
     this.send({ SetDone: { done } });
+  }
+
+  /**
+   * Sets the room's done flag and resolves only when banquette acknowledges it
+   * with `DoneUpdated`.
+   *
+   * banquette sends `SetDoneFailed` for a non-admin request and maitre-d never
+   * persists `rooms.done` before the success frame, so a rejected call leaves
+   * both the DB and the UI unchanged. `PermissionDenied` rejects the pending
+   * operation as well.
+   */
+  public requestSetDone(done: boolean, timeoutMs?: number): Promise<DoneUpdatedAck> {
+    const promise = this.registerOperation<DoneUpdatedAck>(
+      'setDone',
+      ['SetDoneFailed'],
+      (frame) => {
+        if (typeof frame !== 'object' || frame === null || !('DoneUpdated' in frame)) {
+          return { matched: false };
+        }
+        if (Boolean(frame.DoneUpdated.done) !== Boolean(done)) {
+          return { matched: false };
+        }
+        return { matched: true, value: frame.DoneUpdated };
+      },
+      timeoutMs,
+    );
+
+    this.send({ SetDone: { done } });
+    return promise;
   }
 
   /**

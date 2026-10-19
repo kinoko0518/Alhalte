@@ -14,6 +14,7 @@ import CommonFooter from '../src/components/Control/CommonFooter.svelte';
 import App from '../src/components/App.svelte';
 import type { Scene, Character, VisitedRoom } from '../src/types/index.js';
 import type { AccountSearchItem, RoomPermissionItem } from '../src/utils/session.js';
+import { LOCAL_STORAGE_ACCOUNT_ID_KEY, setRoomPermission } from '../src/utils/session.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 
 describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
@@ -246,6 +247,9 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
       { account_id: 1001, username: 'Alice', role: 'pl' },
       { account_id: 2002, username: 'Bob', role: 'viewer' },
     ];
+    const mockFetch = vi.fn(async () => {
+      return { ok: true, status: 200, json: async () => ({ status: 'ok' }) } as Response;
+    });
 
     let currentList: RoomPermissionItem[] = [...initialPerms];
     const instance = mount(RoomPermissionModal, {
@@ -254,6 +258,7 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
         roomId: 'fedcba9876543210',
         initialPermissions: initialPerms,
         isOpen: true,
+        fetchFn: mockFetch as unknown as typeof fetch,
         onPermissionsChange: (perms) => {
           currentList = perms;
         },
@@ -282,6 +287,170 @@ describe('Room Permission Management & Viewer Restrictions (Issue #94)', () => {
     expect(target.querySelector('[data-testid="permission-row-2002"]')).toBeNull();
     expect(target.querySelector('[data-testid="permission-row-1001"]')).toBeTruthy();
     expect(currentList.some((p) => p.account_id === 2002)).toBe(false);
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/permissions 0060 権限変更はサーバー成功後にのみ確定する
+  it('commits a GM role change only after setRoomPermission succeeds', async () => {
+    const initialPerms: RoomPermissionItem[] = [
+      { account_id: 1001, username: 'Alice', role: 'pl' },
+    ];
+    const mockFetch = vi.fn(async () => {
+      return { ok: true, status: 200, json: async () => ({ status: 'ok' }) } as Response;
+    });
+    let updated: RoomPermissionItem[] | null = null;
+
+    const instance = mount(RoomPermissionModal, {
+      target,
+      props: {
+        roomId: 'fedcba9876543210',
+        initialPermissions: initialPerms,
+        isOpen: true,
+        fetchFn: mockFetch as unknown as typeof fetch,
+        onPermissionsChange: (perms) => {
+          updated = perms;
+        },
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    target.querySelector<HTMLButtonElement>('[data-testid="role-gm-btn-1001"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLButtonElement>('[data-testid="warning-confirm-role-btn"]')?.click();
+    // Wait for the awaited POST to settle.
+    for (let i = 0; i < 20 && updated === null; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+
+    expect(mockFetch).toHaveBeenCalled();
+    expect(updated).not.toBeNull();
+    expect(updated!.find((p) => p.account_id === 1001)?.role).toBe('gm');
+    expect(target.querySelector('[data-testid="permission-row-1001"]')?.getAttribute('data-role')).toBe(
+      'gm',
+    );
+    expect(target.querySelector('[data-testid="permission-error"]')).toBeNull();
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/permissions 0061 権限変更の認証は caller account を使う
+  it('sends the caller account, not the permission target, as the auth identity', async () => {
+    localStorage.setItem(LOCAL_STORAGE_ACCOUNT_ID_KEY, '9001');
+    const mockFetch = vi.fn(
+      async (_url: string | URL | Request, _init?: RequestInit) =>
+        ({ ok: true, status: 200, json: async () => ({ status: 'ok' }) }) as Response,
+    );
+
+    await setRoomPermission('fedcba9876543210', 1001, 'gm', {
+      fetchFn: mockFetch as unknown as typeof fetch,
+    });
+
+    const init = mockFetch.mock.calls[0][1] as RequestInit;
+    const headers = init.headers as Record<string, string>;
+    expect(headers['X-Alhalte-Account']).toBe('9001');
+    expect(headers['X-Alhalte-Account']).not.toBe('1001');
+  });
+
+  // spec: alhalte-argenterie/permissions 0070 権限変更失敗時のロールバックとエラー表示
+  it('rolls back a denied role change and shows an error banner', async () => {
+    const initialPerms: RoomPermissionItem[] = [
+      { account_id: 1001, username: 'Alice', role: 'pl' },
+    ];
+    const mockFetch = vi.fn(async () => {
+      return {
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        json: async () => ({ error: 'permission denied' }),
+      } as Response;
+    });
+    let updated: RoomPermissionItem[] | null = null;
+
+    const instance = mount(RoomPermissionModal, {
+      target,
+      props: {
+        roomId: 'fedcba9876543210',
+        initialPermissions: initialPerms,
+        isOpen: true,
+        fetchFn: mockFetch as unknown as typeof fetch,
+        onPermissionsChange: (perms) => {
+          updated = perms;
+        },
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    target.querySelector<HTMLButtonElement>('[data-testid="role-gm-btn-1001"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target.querySelector<HTMLButtonElement>('[data-testid="warning-confirm-role-btn"]')?.click();
+
+    let errorBanner: Element | null = null;
+    for (let i = 0; i < 20 && errorBanner === null; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      errorBanner = target.querySelector('[data-testid="permission-error"]');
+    }
+
+    expect(errorBanner).toBeTruthy();
+    expect(errorBanner?.textContent).toContain('失敗');
+    // Rolled back: the role is still PL and no optimistic list was published.
+    expect(target.querySelector('[data-testid="permission-row-1001"]')?.getAttribute('data-role')).toBe(
+      'pl',
+    );
+    expect(updated).toBeNull();
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/permissions 0080 権限削除失敗時のロールバックとエラー表示
+  it('rolls back a failed permission delete and shows an error banner', async () => {
+    const initialPerms: RoomPermissionItem[] = [
+      { account_id: 1001, username: 'Alice', role: 'pl' },
+      { account_id: 2002, username: 'Bob', role: 'viewer' },
+    ];
+    const mockFetch = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        return {
+          ok: false,
+          status: 403,
+          statusText: 'Forbidden',
+          json: async () => ({ error: 'permission denied' }),
+        } as Response;
+      }
+      return { ok: true, status: 200, json: async () => initialPerms } as Response;
+    });
+    let updated: RoomPermissionItem[] | null = null;
+
+    const instance = mount(RoomPermissionModal, {
+      target,
+      props: {
+        roomId: 'fedcba9876543210',
+        initialPermissions: initialPerms,
+        isOpen: true,
+        fetchFn: mockFetch as unknown as typeof fetch,
+        onPermissionsChange: (perms) => {
+          updated = perms;
+        },
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    target.querySelector<HTMLButtonElement>('[data-testid="delete-permission-btn-2002"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    target
+      .querySelector<HTMLButtonElement>('[data-testid="warning-confirm-delete-btn"]')
+      ?.click();
+
+    let errorBanner: Element | null = null;
+    for (let i = 0; i < 20 && errorBanner === null; i++) {
+      await new Promise((r) => setTimeout(r, 10));
+      errorBanner = target.querySelector('[data-testid="permission-error"]');
+    }
+
+    expect(errorBanner).toBeTruthy();
+    // Rolled back: the row is still present and nothing was published.
+    expect(target.querySelector('[data-testid="permission-row-2002"]')).toBeTruthy();
+    expect(updated).toBeNull();
 
     unmount(instance);
   });

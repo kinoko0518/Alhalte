@@ -40,7 +40,7 @@ CLI（`CliArgs`）:
 | `SceneState` | `BTreeMap<String, Tin>`。4KiB 制限と `::` 名前空間検証。 |
 | `Character` / `CharacterBiblio` | `HashMap<String, Tin>` と所有権。 |
 | `ClientFrame` / `ServerFrame` | クライアントと banquette の論理フレーム。 |
-| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`BanquetteToMaitreD::RoomPersisted` で head と `done` を報告する。 |
+| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`BanquetteToMaitreD::RoomPersisted` で head と `done` を報告し、`SetAdmins` / `AdminsUpdated` で DB の GM 集合を実行中の部屋へ同期する。 |
 | `ProtocolCodec<T>` | 長さ前置 postcard コーデック。 |
 | `BanquetteServer` / `ServerConfig` | UNIX ソケットサーバー。`run_until_shutdown` で明示的に停止できる。 |
 | `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。`unregister_tin` を含む。 |
@@ -48,9 +48,13 @@ CLI（`CliArgs`）:
 
 ### プロトコル
 
-`MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom` を持つ。
+`MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom`、`SetAdmins { admins }` を持つ。
 
-`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`RoomPersisted` を持つ。`RoomPersisted { tin_id, done }` は `RoomData` の store が成功したときだけ送られ、`maitre-d` が `room_heads` と `rooms.done` を更新する。`done` を `RoomData` の外に出すことで wire schema を変えずに pre-spawn gate を永続化できる。
+`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`RoomPersisted`、`AdminsUpdated { admins }` を持つ。`RoomPersisted { tin_id, done }` は `RoomData` の store が成功したときだけ送られ、`maitre-d` が `room_heads` と `rooms.done` を更新する。`done` を `RoomData` の外に出すことで wire schema を変えずに pre-spawn gate を永続化できる。
+
+`SetAdmins` は maitre-d が DB の `room_permissions` を正として送る内部制御フレームで、`Room::apply_admin_set` が `std::admins` を置き換える。クライアント由来の `ClientFrame` ではないため caller の管理者チェックは行わない（認可は maitre-d 側で完了している）。成功すると `AdminsUpdated` を返す。`Room::set_admins` は従来どおりクライアント向けの管理者チェック付き経路として残す。
+
+`SetDone` は `Room::set_done` が成功したときだけ `ServerFrame::DoneUpdated { done }` を要求元へ返す。失敗時は `SetDoneFailed` のみで、`maitre-d` は成功 frame を観測するまで `rooms.done` を更新しない。
 
 `ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答、BGM 変更を持つ。`ServerFrame` はその結果と broadcast を返す。
 
@@ -160,10 +164,16 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 
 `SetDone` は後方互換のため `true -> Viewer`、`false -> Denied` として残す。`SetMemberPermission` / `SetDefaultPermission` が追加されている。
 
+### Issue #158 の権限同期（このブランチ）
+
+- DB の `room_permissions` を正とし、`maitre-d` が `SetAdmins { admins }` で GM 集合全体を送る。banquette は `Room::apply_admin_set` で `std::admins` を置き換え、`AdminsUpdated` を返す。この経路はクライアント由来ではないため caller の管理者チェックを行わない。
+- `SetDone` の成功は `ServerFrame::DoneUpdated { done }` で通知する。`maitre-d` はこの frame を受けるまで `rooms.done` を更新しない。
+- 4 段階権限モデル / scene 認可（#114）は別ブランチのまま。
+
 ## 既知の差分・制約
 
 - Issue #114 のブランチでは変更が未完了で、`cargo check` が `room.rs` のパターンで失敗する状態。main には未反映。
-- `maitre-d` 側の `AccountPermissionResponse` の受信処理が未接続で、権限問い合わせが完了しない経路がある。
+- 権限同期は GM 集合（`std::admins`）の push のみで、`pl` / `viewer` の差分を banquette に送る専用 frame は持たない。viewer の mutate 遮断は引き続き `maitre-d` が行う。
 - `RoomData` の `done` から `default_permission` への変更に伴い、`alhalte-kitchen` の `RoomArchive` がまだ `room_data.done` を参照している。
 - `ChangeBgmEvent` は `slot: u32` を主とし、旧 `track_index: Option<u8>` をフォールバックとして受け付ける。
 - log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。

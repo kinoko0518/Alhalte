@@ -86,6 +86,7 @@ fn test_new_frames_are_appended_and_roundtrip() {
             character_id: 7,
             to_scene_id: "dungeon".to_string(),
         },
+        ServerFrame::DoneUpdated { done: true },
     ];
 
     for frame in frames {
@@ -95,6 +96,24 @@ fn test_new_frames_are_appended_and_roundtrip() {
         let bytes = postcard::to_allocvec(&frame).unwrap();
         assert_eq!(postcard::from_bytes::<ServerFrame>(&bytes).unwrap(), frame);
     }
+
+    // The permission-sync control frames round-trip as well.
+    let set_admins = MaitreDToBanquette::SetAdmins {
+        admins: vec![10, 55],
+    };
+    let bytes = postcard::to_allocvec(&set_admins).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<MaitreDToBanquette>(&bytes).unwrap(),
+        set_admins
+    );
+    let admins_updated = BanquetteToMaitreD::AdminsUpdated {
+        admins: vec![10, 55],
+    };
+    let bytes = postcard::to_allocvec(&admins_updated).unwrap();
+    assert_eq!(
+        postcard::from_bytes::<BanquetteToMaitreD>(&bytes).unwrap(),
+        admins_updated
+    );
 
     // Backward compatibility: the postcard variant index is a positional varint, so new
     // variants must be appended last. These values pin the pre-existing indices.
@@ -130,6 +149,33 @@ fn test_new_frames_are_appended_and_roundtrip() {
         .unwrap()
         .first(),
         Some(&19u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&ServerFrame::CharacterMoved {
+            character_id: 0,
+            to_scene_id: String::new(),
+        })
+        .unwrap()
+        .first(),
+        Some(&21u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&ServerFrame::DoneUpdated { done: false })
+            .unwrap()
+            .first(),
+        Some(&22u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&MaitreDToBanquette::SetAdmins { admins: vec![] })
+            .unwrap()
+            .first(),
+        Some(&5u8)
+    );
+    assert_eq!(
+        postcard::to_allocvec(&BanquetteToMaitreD::AdminsUpdated { admins: vec![] })
+            .unwrap()
+            .first(),
+        Some(&7u8)
     );
 }
 
@@ -786,6 +832,83 @@ async fn test_state_acks_are_direct_and_broadcast() {
         ServerFrame::StateDeleted { key, .. } => assert_eq!(key, "atmos::fog"),
         other => panic!("expected StateDeleted, got {other:?}"),
     }
+
+    server_task.abort();
+}
+
+// spec: alhalte-banquette/protocol SetDone success ack and admin-set control frame
+#[tokio::test]
+async fn test_set_done_ack_and_admin_set_control_frame() {
+    let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
+
+    // Client 101 (account 55) is a plain participant.
+    sink.send(MaitreDToBanquette::ClientConnected {
+        client_id: 101,
+        account_id: 55,
+        session_id: 2,
+    })
+    .await
+    .unwrap();
+
+    // A non-admin SetDone is rejected and emits SetDoneFailed, never DoneUpdated.
+    send_frame(&mut sink, 101, ClientFrame::SetDone { done: true }).await;
+    let (client_id, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(f, BanquetteToMaitreD::SendToClient { .. })
+        })
+        .await,
+    );
+    assert_eq!(client_id, 101);
+    assert!(matches!(frame, ServerFrame::Error { code, .. } if code == "SetDoneFailed"));
+
+    // maitre-d applies the database GM set without a room-client caller check.
+    sink.send(MaitreDToBanquette::SetAdmins {
+        admins: vec![10, 55],
+    })
+    .await
+    .unwrap();
+    match wait_for_frame(&mut stream, |f| {
+        matches!(f, BanquetteToMaitreD::AdminsUpdated { .. })
+    })
+    .await
+    {
+        BanquetteToMaitreD::AdminsUpdated { admins } => assert_eq!(admins, vec![10, 55]),
+        other => panic!("expected AdminsUpdated, got {other:?}"),
+    }
+
+    // The promoted account now succeeds; the success ack carries the new flag.
+    send_frame(&mut sink, 101, ClientFrame::SetDone { done: true }).await;
+    let (client_id, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::DoneUpdated { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    assert_eq!(client_id, 101);
+    assert_eq!(frame, ServerFrame::DoneUpdated { done: true });
+
+    // The original administrator still succeeds too.
+    send_frame(&mut sink, 100, ClientFrame::SetDone { done: false }).await;
+    let (client_id, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::DoneUpdated { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    assert_eq!(client_id, 100);
+    assert_eq!(frame, ServerFrame::DoneUpdated { done: false });
 
     server_task.abort();
 }

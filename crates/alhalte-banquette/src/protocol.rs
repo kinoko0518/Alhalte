@@ -340,6 +340,19 @@ pub enum ServerFrame {
         /// Destination scene ID.
         to_scene_id: String,
     },
+    /// Confirmation that the room's `done` flag was changed by an administrator.
+    ///
+    /// Sent only after [`crate::room::Room::set_done`] succeeds. A rejected
+    /// request emits [`ServerFrame::Error`] with `code = "SetDoneFailed"`
+    /// instead, and `maitre-d` persists `rooms.done` only after observing this
+    /// success frame.
+    ///
+    /// Declared last so that the postcard variant indices of pre-existing
+    /// frames stay stable (backward compatibility).
+    DoneUpdated {
+        /// New value of the room's public `done` flag.
+        done: bool,
+    },
 }
 
 /// Multiplexed messages sent from `maitre-d` gateway into `banquette` over UNIX domain socket.
@@ -374,6 +387,19 @@ pub enum MaitreDToBanquette {
         request_id: u64,
         /// Calling account ID, if authenticated.
         caller_account: Option<u64>,
+    },
+    /// Replaces the room's administrator set from the database permission rows.
+    ///
+    /// This is an internal control frame: `maitre-d` has already authorized the
+    /// change against `room_permissions`, so `banquette` applies the set without
+    /// a room-client caller check. It is deliberately not reachable from a
+    /// [`ClientFrame`].
+    ///
+    /// Declared last so that the postcard variant indices of pre-existing
+    /// frames stay stable (backward compatibility).
+    SetAdmins {
+        /// Complete replacement administrator account ID set.
+        admins: Vec<u64>,
     },
 }
 
@@ -430,6 +456,17 @@ pub enum BanquetteToMaitreD {
         tin_id: TinId,
         /// Whether the stored room is fully public.
         done: bool,
+    },
+    /// The administrator set from a [`MaitreDToBanquette::SetAdmins`] was applied.
+    ///
+    /// Allows `maitre-d` and tests to observe that a runtime permission change
+    /// took effect in the running room without a restart.
+    ///
+    /// Declared last so that the postcard variant indices of pre-existing
+    /// frames stay stable (backward compatibility).
+    AdminsUpdated {
+        /// Administrator account ID set that is now in effect.
+        admins: Vec<u64>,
     },
 }
 

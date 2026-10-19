@@ -1847,6 +1847,19 @@
    *   nowhere to key an outbox entry, so the record is appended locally and
    *   treated as local-only.
    */
+  /**
+   * Requests a room `done` change and resolves only after the banquette ack.
+   *
+   * `CommonHeader` keeps its confirmation dialog open until this resolves, so a
+   * failed or denied request never looks like success.
+   */
+  async function handleSetDone(done: boolean): Promise<void> {
+    if (!roomSocket) {
+      throw new Error('ルームに接続していません');
+    }
+    await roomSocket.requestSetDone(done);
+  }
+
   async function handleSendMessage(text: string, characterId?: string) {
     if (isViewer) return;
     if (isSending) return; // prevent double sends while an echo is pending
@@ -2037,7 +2050,7 @@
                   onRequestDeleteCharacter={handleRequestDeleteCharacter}
                   roomId={currentRoom.id || (currentRoom as any).roomId}
                   onManagePermissions={() => (isPermissionModalOpen = true)}
-                  onSetDone={(done) => roomSocket?.setDone(done)}
+                  onSetDone={handleSetDone}
                   onRequestAssetPicker={handleRequestAssetPicker}
                   onRequestEditCharacter={handleRequestEditCharacter}
                   onRequestCreateCharacter={handleRequestCreateCharacter}
@@ -2131,7 +2144,7 @@
                 onRequestDeleteCharacter={handleRequestDeleteCharacter}
                 roomId={currentRoom.id || (currentRoom as any).roomId}
                 onManagePermissions={() => (isPermissionModalOpen = true)}
-                onSetDone={(done) => roomSocket?.setDone(done)}
+                onSetDone={handleSetDone}
                 onRequestAssetPicker={handleRequestAssetPicker}
                 onRequestEditCharacter={handleRequestEditCharacter}
                 onRequestCreateCharacter={handleRequestCreateCharacter}

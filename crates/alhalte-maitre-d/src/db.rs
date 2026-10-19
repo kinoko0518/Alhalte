@@ -1034,6 +1034,32 @@ impl Database {
         Ok(gm_id.map(|id| id as u64))
     }
 
+    /// Returns every `gm` account ID configured for a room, oldest first.
+    ///
+    /// This is the set pushed to a running `banquette` as its `std::admins`
+    /// state, so the database `room_permissions` rows remain the source of
+    /// truth for runtime permission changes.
+    pub fn get_room_admin_ids(&self, room_id: &str) -> Result<Vec<u64>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare(
+            "SELECT account_id FROM room_permissions
+             WHERE room_id = ?1 AND role = 'gm'
+             ORDER BY created_at ASC, account_id ASC",
+        )?;
+        let rows = stmt.query_map(params![room_id], |row| row.get::<_, i64>(0))?;
+
+        let mut admins = Vec::new();
+        for row in rows {
+            admins.push(row? as u64);
+        }
+        Ok(admins)
+    }
+
     /// Searches accounts by username or account ID.
     pub fn search_accounts(&self, query: &str) -> Result<Vec<Account>> {
         let conn = self.conn.lock().map_err(|e| {

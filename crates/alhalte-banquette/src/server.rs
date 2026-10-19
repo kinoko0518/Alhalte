@@ -392,6 +392,19 @@ impl BanquetteServer {
                         })
                         .await;
                 }
+                MaitreDToBanquette::SetAdmins { admins } => {
+                    let mut r = room.write().await;
+                    match r.apply_admin_set(admins.clone()) {
+                        Ok(()) => {
+                            let _ = out_tx
+                                .send(BanquetteToMaitreD::AdminsUpdated { admins })
+                                .await;
+                        }
+                        Err(e) => {
+                            tracing::error!("Failed to apply administrator set: {e:?}");
+                        }
+                    }
+                }
             }
         }
 
@@ -531,16 +544,23 @@ impl BanquetteServer {
             }
             ClientFrame::SetDone { done } => {
                 let mut r = room.write().await;
-                if let Err(e) = r.set_done(account_id, done) {
-                    let _ = out_tx
-                        .send(BanquetteToMaitreD::SendToClient {
+                match r.set_done(account_id, done) {
+                    Ok(()) => {
+                        // Success ack only after the room actually changed. `maitre-d`
+                        // persists `rooms.done` from this frame, never from the request.
+                        send_to_client(out_tx, client_id, ServerFrame::DoneUpdated { done }).await;
+                    }
+                    Err(e) => {
+                        send_to_client(
+                            out_tx,
                             client_id,
-                            frame: ServerFrame::Error {
+                            ServerFrame::Error {
                                 code: "SetDoneFailed".to_string(),
                                 message: e.to_string(),
                             },
-                        })
+                        )
                         .await;
+                    }
                 }
             }
             ClientFrame::QueryState { scene_id } => {

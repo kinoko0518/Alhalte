@@ -175,7 +175,7 @@
 
 ### 権限 UI
 
-`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。`App` は `isViewer` を `SceneSettingsTab`（シーン作成・削除・メンバー移動）、`SceneGraphTab`（シーン削除）、`CharacterManagementTab`（作成・編集・削除・駒配置）、`ExtensionManagementTab`（追加・並べ替え・削除・toggle）へ渡し、viewer では該当操作を無効化する。viewer の場合はフッターの送信・ダイス・scene 変更も無効化する。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
+`utils/session.ts` が account 検索・部屋権限 CRUD を呼ぶ。`RoomPermissionModal` は M3 Search、Divider、Connected Button Group で viewer / PL / GM を切り替える。ロール変更・追加・削除は API の成功を待ってからローカル一覧へ反映し、失敗時は元の一覧へ戻してエラーバナーを表示する（楽観的に確定しない）。`CommonHeader` の「部屋の全てをPLに公開」は `RoomSocket.requestSetDone` の `DoneUpdated` ack 後にのみダイアログを閉じ、`SetDoneFailed` / `PermissionDenied` / timeout ではエラーを表示して開いたままにする。`App` は `isViewer` を `SceneSettingsTab`（シーン作成・削除・メンバー移動）、`SceneGraphTab`（シーン削除）、`CharacterManagementTab`（作成・編集・削除・駒配置）、`ExtensionManagementTab`（追加・並べ替え・削除・toggle）へ渡し、viewer では該当操作を無効化する。viewer の場合はフッターの送信・ダイス・scene 変更も無効化する。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
 
 ## 既知の差分・制約
 

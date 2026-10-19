@@ -128,6 +128,20 @@ fn account_with_session(db: &Database, sub: &str, name: &str) -> (u64, u64) {
     (account.account_id, session.session_id)
 }
 
+/// Asserts that a WebSocket handshake is rejected with `expected`.
+async fn expect_ws_rejection(url: String, expected: axum::http::StatusCode) {
+    match connect_async(url).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), expected);
+        }
+        Ok((mut ws, _)) => {
+            let _ = ws.close(None).await;
+            panic!("expected HTTP {expected:?} but the WebSocket handshake succeeded");
+        }
+        other => panic!("expected HTTP {expected:?}, got {other:?}"),
+    }
+}
+
 // spec: alhalte-maitre-d/labels
 #[test]
 fn test_labels_and_tin_conversions() {
@@ -945,7 +959,8 @@ async fn test_room_zip_export_endpoints() {
     let unauth_resp = client.get(&bad_session_url).send().await.unwrap();
     assert_eq!(unauth_resp.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // Test 6: CORS GET request with Origin header receives access-control-allow-origin and ZIP binary
+    // Test 6: CORS GET request with a configured Origin receives the explicit
+    // allow-origin (never `*` with credentials) and the ZIP binary.
     let origin_resp = client
         .get(&full_url)
         .header("Origin", "http://localhost:5173")
@@ -958,7 +973,7 @@ async fn test_room_zip_export_endpoints() {
             .headers()
             .get("access-control-allow-origin")
             .unwrap(),
-        "*"
+        "http://localhost:5173"
     );
     let origin_body = origin_resp.bytes().await.unwrap();
     assert_eq!(&origin_body[0..4], b"PK\x03\x04");
@@ -977,7 +992,7 @@ async fn test_room_zip_export_endpoints() {
             .headers()
             .get("access-control-allow-origin")
             .unwrap(),
-        "*"
+        "http://localhost:5173"
     );
 
     // Clean up
@@ -1115,7 +1130,7 @@ fn test_sqlite_account_search() {
     assert!(results_empty.is_empty());
 }
 
-// spec: alhalte-maitre-d/accounts-search-api
+// spec: alhalte-maitre-d/accounts-search-api requires a valid session
 #[tokio::test]
 async fn test_accounts_search_endpoint() {
     let db = Database::new_in_memory().unwrap();
@@ -1126,6 +1141,11 @@ async fn test_accounts_search_endpoint() {
     let acc2 = db
         .get_or_create_account("sub-search-2", "Asuka", None, 1000)
         .unwrap();
+    let session = db.create_session(acc1.account_id, 1000).unwrap();
+    let auth = format!(
+        "account_id={}&session_id={}",
+        acc1.account_id, session.session_id
+    );
 
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         "/tmp", 8,
@@ -1143,9 +1163,17 @@ async fn test_accounts_search_endpoint() {
 
     let client = reqwest::Client::new();
 
+    // Anonymous search is rejected.
+    let anonymous = client
+        .get(format!("http://{addr}/api/accounts/search?q=Shinji"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
     // 1. Search by name "Shinji"
     let resp = client
-        .get(format!("http://{addr}/api/accounts/search?q=Shinji"))
+        .get(format!("http://{addr}/api/accounts/search?q=Shinji&{auth}"))
         .send()
         .await
         .unwrap();
@@ -1162,7 +1190,7 @@ async fn test_accounts_search_endpoint() {
     // 2. Search by ID
     let resp_id = client
         .get(format!(
-            "http://{addr}/api/accounts/search?q={}",
+            "http://{addr}/api/accounts/search?q={}&{auth}",
             acc2.account_id
         ))
         .send()
@@ -1177,7 +1205,7 @@ async fn test_accounts_search_endpoint() {
 
     // 3. Empty query returns empty array
     let resp_empty = client
-        .get(format!("http://{addr}/api/accounts/search?q="))
+        .get(format!("http://{addr}/api/accounts/search?q=&{auth}"))
         .send()
         .await
         .unwrap();
@@ -1186,71 +1214,100 @@ async fn test_accounts_search_endpoint() {
     assert!(items_empty.is_empty());
 }
 
-// spec: alhalte-maitre-d/room-permissions-api
+// spec: alhalte-maitre-d/room-permissions-api requires a session and GM
 #[tokio::test]
 async fn test_room_permissions_rest_api() {
-    let db = Database::new_in_memory().unwrap();
-    let acc1 = db
-        .get_or_create_account("sub-perm-1", "GM_Player", None, 1000)
+    let (addr, _temp_dir, db, _spawner, _manager) = spawn_recording_router().await;
+    let (gm, gm_session) = account_with_session(&db, "sub-perm-1", "GM_Player");
+    let (player, player_session) = account_with_session(&db, "sub-perm-2", "Normal_Player");
+    let (outsider, outsider_session) = account_with_session(&db, "sub-perm-3", "Outsider");
+    let room_id = "0123456789abcdef";
+    db.create_room(room_id, "Permissions room", gm, 1000)
         .unwrap();
-    let acc2 = db
-        .get_or_create_account("sub-perm-2", "Normal_Player", None, 1000)
+    db.set_room_permission(room_id, player, RoomRole::Pl, 1010)
         .unwrap();
-
-    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
-        "/tmp", 8,
-    ));
-    let room_manager = RoomBridgeManager::new(spawner, db.clone());
-    let oauth = Arc::new(MockOAuthProvider::new());
-    let state = AppState::new(db, "salt", oauth, room_manager);
-    let app = create_router(state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
 
     let client = reqwest::Client::new();
-    let room_id = "0123456789abcdef";
+    let gm_auth = format!("account_id={gm}&session_id={gm_session}");
+    let player_auth = format!("account_id={player}&session_id={player_session}");
+    let outsider_auth = format!("account_id={outsider}&session_id={outsider_session}");
 
-    // 1. Initial GET /api/room/{room_id}/permissions returns empty list
-    let get_initial = client
+    // 1. Anonymous GET / candidate membership are rejected.
+    let get_anonymous = client
         .get(format!("http://{addr}/api/room/{room_id}/permissions"))
         .send()
         .await
         .unwrap();
-    assert_eq!(get_initial.status(), reqwest::StatusCode::OK);
-    let perms: Vec<RoomPermissionItem> = get_initial.json().await.unwrap();
-    assert!(perms.is_empty());
+    assert_eq!(get_anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // 2. POST /api/room/{room_id}/permissions to add GM
-    let post_gm = client
+    let get_outsider_private = client
+        .get(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{outsider_auth}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        get_outsider_private.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    // 2. A member can list permissions.
+    let get_member = client
+        .get(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{player_auth}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_member.status(), reqwest::StatusCode::OK);
+    let perms: Vec<RoomPermissionItem> = get_member.json().await.unwrap();
+    assert_eq!(perms.len(), 2);
+
+    // 3. Anonymous POST is rejected; a member that is not GM is forbidden.
+    let post_anonymous = client
         .post(format!("http://{addr}/api/room/{room_id}/permissions"))
         .json(&SetRoomPermissionRequest {
-            account_id: acc1.account_id,
-            role: RoomRole::Gm,
+            account_id: outsider,
+            role: RoomRole::Viewer,
         })
         .send()
         .await
         .unwrap();
-    assert_eq!(post_gm.status(), reqwest::StatusCode::OK);
+    assert_eq!(post_anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // 3. POST /api/room/{room_id}/permissions to add Player
-    let post_pl = client
-        .post(format!("http://{addr}/api/room/{room_id}/permissions"))
+    let post_non_gm = client
+        .post(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{player_auth}"
+        ))
         .json(&SetRoomPermissionRequest {
-            account_id: acc2.account_id,
-            role: RoomRole::Pl,
+            account_id: outsider,
+            role: RoomRole::Viewer,
         })
         .send()
         .await
         .unwrap();
-    assert_eq!(post_pl.status(), reqwest::StatusCode::OK);
+    assert_eq!(post_non_gm.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(db.get_room_role(room_id, outsider).unwrap(), None);
 
-    // 4. POST with non-existent account returns 404
+    // 4. The GM adds a viewer and a non-existent target is 404.
+    let post_viewer = client
+        .post(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{gm_auth}"
+        ))
+        .json(&SetRoomPermissionRequest {
+            account_id: outsider,
+            role: RoomRole::Viewer,
+        })
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_viewer.status(), reqwest::StatusCode::OK);
+
     let post_unknown = client
-        .post(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .post(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{gm_auth}"
+        ))
         .json(&serde_json::json!({
             "account_id": 99999,
             "role": "viewer"
@@ -1260,40 +1317,231 @@ async fn test_room_permissions_rest_api() {
         .unwrap();
     assert_eq!(post_unknown.status(), reqwest::StatusCode::NOT_FOUND);
 
-    // 5. GET /api/room/{room_id}/permissions verifies both permissions
-    let get_resp = client
-        .get(format!("http://{addr}/api/room/{room_id}/permissions"))
+    // 5. The GM promotes the player to GM; the member can promote nobody.
+    let post_player_to_gm = client
+        .post(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{gm_auth}"
+        ))
+        .json(&SetRoomPermissionRequest {
+            account_id: player,
+            role: RoomRole::Gm,
+        })
         .send()
         .await
         .unwrap();
-    assert_eq!(get_resp.status(), reqwest::StatusCode::OK);
-    let perms_list: Vec<RoomPermissionItem> = get_resp.json().await.unwrap();
-    assert_eq!(perms_list.len(), 2);
-    assert_eq!(perms_list[0].account_id, acc1.account_id);
-    assert_eq!(perms_list[0].role, RoomRole::Gm);
-    assert_eq!(perms_list[1].account_id, acc2.account_id);
-    assert_eq!(perms_list[1].role, RoomRole::Pl);
+    assert_eq!(post_player_to_gm.status(), reqwest::StatusCode::OK);
 
-    // 6. DELETE /api/room/{room_id}/permissions/{account_id}
-    let del_resp = client
-        .delete(format!(
-            "http://{addr}/api/room/{room_id}/permissions/{}",
-            acc2.account_id
+    // 6. An unknown room is 404, and the viewer cannot delete permissions.
+    let get_unknown = client
+        .get(format!(
+            "http://{addr}/api/room/ffffffffffffffff/permissions?{gm_auth}"
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(del_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(get_unknown.status(), reqwest::StatusCode::NOT_FOUND);
 
-    // 7. Verify deletion
+    let del_non_gm = client
+        .delete(format!(
+            "http://{addr}/api/room/{room_id}/permissions/{outsider}?{outsider_auth}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_non_gm.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        db.get_room_role(room_id, outsider).unwrap(),
+        Some(RoomRole::Viewer)
+    );
+
+    // 7. The GM deletes the viewer's permission.
+    let del_gm = client
+        .delete(format!(
+            "http://{addr}/api/room/{room_id}/permissions/{outsider}?{gm_auth}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_gm.status(), reqwest::StatusCode::OK);
+    assert_eq!(db.get_room_role(room_id, outsider).unwrap(), None);
+
     let get_after_del = client
-        .get(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .get(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{gm_auth}"
+        ))
         .send()
         .await
         .unwrap();
     let perms_after_del: Vec<RoomPermissionItem> = get_after_del.json().await.unwrap();
-    assert_eq!(perms_after_del.len(), 1);
-    assert_eq!(perms_after_del[0].account_id, acc1.account_id);
+    assert_eq!(perms_after_del.len(), 2);
+    assert!(
+        perms_after_del
+            .iter()
+            .all(|permission| permission.account_id != outsider)
+    );
+}
+
+// spec: alhalte-maitre-d/account-api 0001 GET /api/account/{id} requires a session and hides encrypted_sub
+#[tokio::test]
+async fn test_get_account_response_hides_encrypted_sub_and_requires_session() {
+    let (addr, _temp_dir, db, _spawner, _manager) = spawn_recording_router().await;
+    let icon_bytes = [0x33u8; 32];
+    let account = db
+        .get_or_create_account("sub-account-dto", "DtoUser", Some(icon_bytes), 1000)
+        .unwrap();
+    let session = db.create_session(account.account_id, 1000).unwrap();
+    let auth = format!(
+        "account_id={}&session_id={}",
+        account.account_id, session.session_id
+    );
+    let client = reqwest::Client::new();
+
+    let anonymous = client
+        .get(format!("http://{addr}/api/account/{}", account.account_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let response = client
+        .get(format!(
+            "http://{addr}/api/account/{}?{auth}",
+            account.account_id
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    let value: serde_json::Value = response.json().await.unwrap();
+    assert!(
+        value.get("encrypted_sub").is_none(),
+        "encrypted_sub must never be serialized to clients"
+    );
+    assert_eq!(value["account_id"], account.account_id);
+    assert_eq!(value["handle_name"], "DtoUser");
+    assert_eq!(value["icon_tin_id"], serde_json::json!(icon_bytes));
+
+    let unknown = client
+        .get(format!("http://{addr}/api/account/99999?{auth}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+// spec: alhalte-maitre-d/cors 0001 configured origins only, never permissive
+#[tokio::test]
+async fn test_cors_allows_only_configured_origins() {
+    let temp_dir = tempdir().unwrap();
+    let spawner = RecordingSpawner::new(temp_dir.path().to_path_buf());
+    let db = Database::new_in_memory().unwrap();
+    let manager = RoomBridgeManager::new(Arc::new(spawner), db.clone());
+    let state = AppState::new(db, "salt", Arc::new(MockOAuthProvider::new()), manager)
+        .with_allowed_origins(["http://allowed.example"]);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let preflight = |origin: &'static str| {
+        client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/api/accounts/search"),
+            )
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+    };
+
+    let allowed = preflight("http://allowed.example").await.unwrap();
+    assert_eq!(allowed.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        allowed
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("http://allowed.example")
+    );
+
+    let denied = preflight("http://evil.example").await.unwrap();
+    assert!(
+        denied
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "an unconfigured origin must not receive an allow-origin header"
+    );
+
+    // The local development origins remain the default allow-list.
+    let defaults = alhalte_maitre_d::DEFAULT_ALLOWED_ORIGINS;
+    assert!(defaults.contains(&"http://127.0.0.1:5173"));
+    assert!(defaults.contains(&"http://localhost:5173"));
+}
+
+// spec: alhalte-maitre-d/websocket-identity 0001 account-only 401, session-only derives account
+#[tokio::test]
+async fn test_websocket_identity_rules() {
+    let (addr, _temp_dir, db, _spawner, manager) = spawn_recording_router().await;
+    let (account, session) = account_with_session(&db, "sub-ws-identity", "WsUser");
+    let room_id = "0123456789abcdfe";
+    let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
+    db.create_room(room_id, "Identity room", account, 1000)
+        .unwrap();
+
+    // 1. account_id alone is not proof of identity.
+    expect_ws_rejection(
+        format!("ws://{addr}/ws/room/{room_id}?account_id={account}"),
+        axum::http::StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // 2. An invalid session is rejected, with or without an account claim.
+    expect_ws_rejection(
+        format!("ws://{addr}/ws/room/{room_id}?account_id={account}&session_id=99999"),
+        axum::http::StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    expect_ws_rejection(
+        format!("ws://{addr}/ws/room/{room_id}?session_id=99999"),
+        axum::http::StatusCode::UNAUTHORIZED,
+    )
+    .await;
+
+    // 3. Anonymous private room is forbidden before banquette is spawned.
+    expect_ws_rejection(
+        format!("ws://{addr}/ws/room/{room_id}"),
+        axum::http::StatusCode::FORBIDDEN,
+    )
+    .await;
+
+    // 4. A session alone derives the account and is accepted.
+    let (mut session_only, _) = connect_async(format!(
+        "ws://{addr}/ws/room/{room_id}?session_id={session}"
+    ))
+    .await
+    .expect("a session-only connection must derive its account");
+    let _ = session_only.close(None).await;
+
+    // 5. account_id + a matching valid session is accepted.
+    let (mut both, _) = connect_async(format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={account}&session_id={session}"
+    ))
+    .await
+    .expect("account_id plus a valid session must be accepted");
+    let _ = both.close(None).await;
+
+    // 6. Anonymous is accepted only once the room is public.
+    manager.set_room_done(room_u64, true).await;
+    let (mut anonymous, _) = connect_async(format!("ws://{addr}/ws/room/{room_id}"))
+        .await
+        .expect("anonymous must be accepted for a public room");
+    let _ = anonymous.close(None).await;
 }
 
 // spec: alhalte-maitre-d/rooms registry sqlite
