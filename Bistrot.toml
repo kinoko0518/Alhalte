@@ -13,6 +13,12 @@ salt = "alhalte-local-instance-salt-0001"
 [cellar]
 port = 8081
 anti-oracle = false
+# maitre-d の session 検証エンドポイント。未指定なら
+# http://<restaurant.host>:<maitre-d.port>（0.0.0.0 / :: は 127.0.0.1）を使う。
+# maitre-d-url = "http://127.0.0.1:8080"
+# maitre-d-socket = ".alhalte/sockets/maitre-d.sock"
+# ローカル開発専用。true にするとすべての session を許可する（既定 false）。
+allow-all-sessions = false
 
 [banquette]
 chunk-size-exponent = 8

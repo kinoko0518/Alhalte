@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alhalte_cellar::verifier::{InMemorySessionVerifier, MaitreDVerifier, SessionVerifier};
+use alhalte_cellar::verifier::VerifierMode;
 use alhalte_cellar::{CellarConfig, CellarService, CliArgs};
 use clap::Parser;
 
@@ -16,22 +16,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = CliArgs::parse();
 
-    let verifier: Arc<dyn SessionVerifier> = if args.allow_all_sessions {
-        tracing::warn!("Using InMemorySessionVerifier with allow_all = true (development mode)");
-        Arc::new(InMemorySessionVerifier::allow_all_verifier())
-    } else if let Some(socket_path) = args.maitre_d_socket {
-        tracing::info!(
-            "Using MaitreDVerifier via unix socket: {}",
-            socket_path.display()
-        );
-        Arc::new(MaitreDVerifier::new_unix(socket_path))
-    } else if let Some(url) = args.maitre_d_url {
-        tracing::info!("Using MaitreDVerifier via HTTP: {}", url);
-        Arc::new(MaitreDVerifier::new_http(url))
+    let allow_all_sessions = args.allow_all_sessions;
+    let endpoint_configured = args.maitre_d_url.is_some() || args.maitre_d_socket.is_some();
+    let verifier_mode =
+        VerifierMode::resolve(args.maitre_d_url, args.maitre_d_socket, allow_all_sessions)?;
+
+    if verifier_mode.is_allow_all() {
+        tracing::warn!("Session verifier mode: {verifier_mode} (every session will be accepted)");
+        if endpoint_configured {
+            tracing::warn!(
+                "--allow-all-sessions takes precedence over the configured maitre-d endpoint"
+            );
+        }
     } else {
-        tracing::info!("No maitre-d endpoint specified, defaulting to InMemorySessionVerifier");
-        Arc::new(InMemorySessionVerifier::new())
-    };
+        tracing::info!("Session verifier mode: {verifier_mode}");
+    }
+    let verifier = verifier_mode.into_verifier();
 
     let config = CellarConfig {
         host: args.host.clone(),

@@ -131,24 +131,36 @@ impl BistrotConfig {
         Ok(())
     }
 
+    /// Returns the host to dial for locally generated URLs.
+    ///
+    /// Wildcard bind addresses (`0.0.0.0` and `::`) are not connectable, so
+    /// they are replaced with the loopback address.
+    fn connect_host(&self) -> &str {
+        match self.restaurant.host.as_str() {
+            "0.0.0.0" | "::" => "127.0.0.1",
+            host => host,
+        }
+    }
+
     /// Resolves the URL for the `alhalte-argenterie` web frontend in a browser.
     pub fn argenterie_url(&self) -> String {
-        let host = if self.restaurant.host == "0.0.0.0" || self.restaurant.host == "::" {
-            "127.0.0.1"
-        } else {
-            &self.restaurant.host
-        };
-        format!("http://{host}:{}/", self.argenterie.port)
+        format!("http://{}:{}/", self.connect_host(), self.argenterie.port)
     }
 
     /// Resolves the HTTP URL for `cellar`.
     pub fn cellar_url(&self) -> String {
-        let host = if self.restaurant.host == "0.0.0.0" || self.restaurant.host == "::" {
-            "127.0.0.1"
-        } else {
-            &self.restaurant.host
-        };
-        format!("http://{host}:{}", self.cellar.port)
+        format!("http://{}:{}", self.connect_host(), self.cellar.port)
+    }
+
+    /// Resolves the `maitre-d` URL that `cellar` uses to verify sessions.
+    ///
+    /// Defaults to `http://<restaurant.host>:<maitre-d.port>`, with wildcard
+    /// bind addresses (`0.0.0.0` and `::`) replaced by `127.0.0.1`.
+    pub fn cellar_maitre_d_url(&self) -> String {
+        self.cellar
+            .maitre_d_url
+            .clone()
+            .unwrap_or_else(|| format!("http://{}:{}", self.connect_host(), self.maitre_d.port))
     }
 
     /// Resolves the SQLite database path for `maitre-d`.
@@ -357,6 +369,24 @@ pub struct CellarConfig {
     /// Anti-oracle mode flag (when true, hides duplicate detection from clients to prevent oracle attacks).
     #[serde(default = "default_anti_oracle", alias = "anti_oracle")]
     pub anti_oracle: bool,
+
+    /// Optional explicit URL for the `maitre-d` session verification endpoint.
+    ///
+    /// Defaults to `http://<restaurant.host>:<maitre-d.port>` when omitted.
+    #[serde(default, alias = "maitre_d_url")]
+    pub maitre_d_url: Option<String>,
+
+    /// Optional UNIX socket path for the `maitre-d` session verification endpoint.
+    ///
+    /// When set, it takes precedence over [`Self::maitre_d_url`].
+    #[serde(default, alias = "maitre_d_socket")]
+    pub maitre_d_socket: Option<PathBuf>,
+
+    /// Allows every session without contacting `maitre-d` (local development only).
+    ///
+    /// Defaults to `false`. Never enable this in a production configuration.
+    #[serde(default, alias = "allow_all_sessions")]
+    pub allow_all_sessions: bool,
 }
 
 /// Configuration for `alhalte-banquette` (in-memory room session processes).

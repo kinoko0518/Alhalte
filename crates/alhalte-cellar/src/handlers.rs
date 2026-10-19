@@ -55,6 +55,7 @@ impl IntoResponse for CellarError {
             | Self::Database(_)
             | Self::Tin(_)
             | Self::Verifier(_)
+            | Self::Configuration(_)
             | Self::Internal(_) => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
 

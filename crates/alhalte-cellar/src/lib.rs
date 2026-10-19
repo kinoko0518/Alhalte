@@ -68,4 +68,6 @@ pub use model::{
 pub use service::{CellarConfig, CellarService};
 pub use storage::StorageManager;
 pub use tin::TinId;
-pub use verifier::{InMemorySessionVerifier, MaitreDTarget, MaitreDVerifier, SessionVerifier};
+pub use verifier::{
+    InMemorySessionVerifier, MaitreDTarget, MaitreDVerifier, SessionVerifier, VerifierMode,
+};

@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -14,6 +14,78 @@ use crate::error::{CellarError, Result};
 pub trait SessionVerifier: Send + Sync {
     /// Checks whether `(owner, session_id)` represents an active, authorized session.
     async fn verify_session(&self, owner: u64, session_id: u64) -> Result<bool>;
+}
+
+/// Session verification backend selected from `alhalte-cellar` CLI options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifierMode {
+    /// Accept every session without contacting `maitre-d` (local development only).
+    AllowAll,
+    /// Query `alhalte-maitre-d` over HTTP.
+    Http(String),
+    /// Query `alhalte-maitre-d` over a UNIX domain socket.
+    UnixSocket(PathBuf),
+}
+
+impl VerifierMode {
+    /// Selects the verifier mode from CLI options.
+    ///
+    /// `allow_all_sessions` takes precedence over any configured endpoint.
+    /// Otherwise a UNIX socket takes precedence over an HTTP URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CellarError::Configuration`] when no endpoint is configured
+    /// and `allow_all_sessions` is `false`, instead of silently falling back
+    /// to a deny-all verifier.
+    pub fn resolve(
+        maitre_d_url: Option<String>,
+        maitre_d_socket: Option<PathBuf>,
+        allow_all_sessions: bool,
+    ) -> Result<Self> {
+        if allow_all_sessions {
+            return Ok(Self::AllowAll);
+        }
+        if let Some(socket_path) = maitre_d_socket {
+            return Ok(Self::UnixSocket(socket_path));
+        }
+        if let Some(url) = maitre_d_url {
+            return Ok(Self::Http(url));
+        }
+        Err(CellarError::Configuration(
+            "no session verifier configured: pass --maitre-d-url, --maitre-d-socket, \
+             or --allow-all-sessions (local development only)"
+                .to_string(),
+        ))
+    }
+
+    /// Returns `true` when this mode accepts every session.
+    #[must_use]
+    pub fn is_allow_all(&self) -> bool {
+        matches!(self, Self::AllowAll)
+    }
+
+    /// Builds the [`SessionVerifier`] for this mode.
+    #[must_use]
+    pub fn into_verifier(self) -> Arc<dyn SessionVerifier> {
+        match self {
+            Self::AllowAll => Arc::new(InMemorySessionVerifier::allow_all_verifier()),
+            Self::Http(url) => Arc::new(MaitreDVerifier::new_http(url)),
+            Self::UnixSocket(socket_path) => Arc::new(MaitreDVerifier::new_unix(socket_path)),
+        }
+    }
+}
+
+impl std::fmt::Display for VerifierMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AllowAll => f.write_str("allow-all (development only)"),
+            Self::Http(url) => write!(f, "maitre-d HTTP ({url})"),
+            Self::UnixSocket(socket_path) => {
+                write!(f, "maitre-d UNIX socket ({})", socket_path.display())
+            }
+        }
+    }
 }
 
 /// In-memory session verifier for unit and integration testing.

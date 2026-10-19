@@ -56,6 +56,9 @@ salt = "..."
 port = 8081
 anti-oracle = false
 # storage-path, db-path は任意
+# maitre-d-url = "http://127.0.0.1:8080"  # 既定は http://{restaurant.host}:{maitre-d.port}
+# maitre-d-socket = ".alhalte/sockets/maitre-d.sock"  # 指定時は url より優先
+# allow-all-sessions = false              # ローカル開発専用。true で全 session を許可
 
 [banquette]
 chunk-size-exponent = 8
@@ -81,6 +84,9 @@ enabled = true
 | `maitre-d.socket-dir` | `{socket_dir}` |
 | `cellar.storage-path` | `{data_dir}/cellar/tin` |
 | `cellar.db-path` | `{data_dir}/cellar/cellar.sqlite3` |
+| `cellar.maitre-d-url` | `http://{restaurant.host}:{maitre-d.port}`（`0.0.0.0` / `::` は `127.0.0.1`） |
+| `cellar.maitre-d-socket` | なし（指定時は `maitre-d-url` より優先） |
+| `cellar.allow-all-sessions` | `false` |
 | `banquette.socket-dir` | `{socket_dir}` |
 
 ## 内部フロー
@@ -95,7 +101,7 @@ enabled = true
 ### 引数生成
 
 - `generate_maitre_d_args`: host、port、db-path、client-id、client-secret、salt、socket-dir、cellar-url。`banquette-bin` があれば追加。
-- `generate_cellar_args`: host、port、storage-path、db-path。`anti-oracle` が true のときだけ `--anti-oracle`。
+- `generate_cellar_args`: host、port、storage-path、db-path、session verifier（`cellar.maitre-d-socket` があれば `--maitre-d-socket <path>`、なければ `--maitre-d-url <url>`）、`allow-all-sessions` が true のとき `--allow-all-sessions`、`anti-oracle` が true のとき `--anti-oracle`。既定の URL は `http://{restaurant.host}:{maitre-d.port}`。
 - `generate_banquette_args`: chunk-size-exponent と socket-dir。
 
 すべて副作用なし。`generate_module_args` はモジュール名を正規化して振り分ける。
@@ -109,7 +115,7 @@ enabled = true
 - `alhalte-argenterie.service`（`pnpm run dev` または `argenterie_cmd`）
 - `alhalte-bistrot.target`（3 service を `Wants=`）
 
-`ExecStart` の引数は空白・引用符・バックスラッシュをエスケープする。
+`ExecStart` の引数は空白・引用符・バックスラッシュをエスケープする。`alhalte-cellar.service` と `flake.nix` の直接起動 fallback は、どちらも `generate_cellar_args` と同じ引数（fallback は `alhalte-bistrot args cellar` の出力）を使う。
 
 ### 拡張機能 staging
 
@@ -125,4 +131,5 @@ enabled = true
 - `nix run .#bistrot` は systemd が使えない環境ではバックグラウンドプロセスへフォールバックする。この処理は `flake.nix` の `bistrot-runner` 側にある。
 - argenterie は開発サーバー（Vite）として起動する。本番配信の unit は未定義。
 - `Bistrot.toml` の `maitre-d` と `cellar` は必須。`restaurant`、`banquette`、`argenterie`、`extensions` は既定値を持つ。
+- `cellar.allow-all-sessions` はローカル開発専用。有効時は `alhalte-cellar` が警告を出し、session 検証をすべて許可する。verifier が未設定でこのフラグも false の場合、`alhalte-cellar` は全拒否の verifier に落ちず起動エラーになる。
 - rops の鍵はファイルに保存せず、`ROPS_AGE` か CLI 引数で渡す前提。

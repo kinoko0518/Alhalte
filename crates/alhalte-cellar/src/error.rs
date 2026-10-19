@@ -33,6 +33,10 @@ pub enum CellarError {
     #[error("Session verifier error: {0}")]
     Verifier(String),
 
+    /// Invalid or incomplete service configuration detected at startup.
+    #[error("Configuration error: {0}")]
+    Configuration(String),
+
     /// Requested tin was not found in storage or database.
     #[error("Tin with ID {0} was not found")]
     NotFound(String),
