@@ -256,10 +256,7 @@ impl BanquetteServer {
         let (persisted, default_permission) = {
             let mut room = self.room.write().await;
             let default_permission = room.default_permission;
-            (
-                room.persist(self.cellar.as_ref()).await,
-                default_permission,
-            )
+            (room.persist(self.cellar.as_ref()).await, default_permission)
         };
 
         match persisted {

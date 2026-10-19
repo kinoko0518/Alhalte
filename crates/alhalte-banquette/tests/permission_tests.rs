@@ -221,7 +221,7 @@ async fn test_permission_table_survives_persist_and_restore() {
     room.set_default_permission(1, RoomPermissionLevel::Viewer)
         .unwrap();
 
-    let head = room.persist(&cellar, 1).await.unwrap();
+    let head = room.persist(&cellar).await.unwrap();
     let restored = Room::load_from_cellar(&cellar, &head, room.room_id)
         .await
         .unwrap();
