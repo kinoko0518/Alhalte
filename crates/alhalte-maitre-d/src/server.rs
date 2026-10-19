@@ -2296,10 +2296,11 @@ fn normalize_tin_id(raw: &str) -> Option<String> {
 
 /// Sends one request to `alhalte-cellar` and mirrors the response back.
 ///
-/// The upstream status and body are preserved verbatim (including the
-/// non-standard `210` / `211` / `212` store codes). Only the headers listed in
-/// [`FORWARDED_RESPONSE_HEADERS`] are copied; transport failures become `502`
-/// / `504`.
+/// The upstream status and body are preserved verbatim: the store check's
+/// `200 OK` + `{"result": ...}` body and ordinary error statuses (`400` /
+/// `401` / `404` / `5xx`) reach the caller unchanged. Only the headers listed
+/// in [`FORWARDED_RESPONSE_HEADERS`] are copied; transport failures become
+/// `502` / `504`.
 async fn forward_cellar_request(
     proxy: &CellarProxy,
     method: reqwest::Method,
@@ -2342,8 +2343,9 @@ async fn forward_cellar_request(
 /// Handles `POST /api/cellar/store` (cellar `POST /store`).
 ///
 /// The JSON body is forwarded with `owner` / `session_id` overwritten by the
-/// authenticated values, so the 210 / 211 / 212 handshake always runs against
-/// the caller's own account.
+/// authenticated values, so the store check always runs against the caller's
+/// own account. The upstream `200 OK` + `{"result": ...}` answer is passed
+/// through verbatim.
 async fn cellar_store_check_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

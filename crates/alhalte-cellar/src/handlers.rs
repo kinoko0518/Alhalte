@@ -122,28 +122,20 @@ async fn health_check() -> impl IntoResponse {
 
 /// Store metadata check handler.
 ///
-/// Returns 210 (UploadRequired), 211 (Deduplicated), or 212 (AlreadyOwned).
-/// Authorization is either the internal service token (see
-/// [`SERVICE_TOKEN_HEADER`]) or the owner's user session.
+/// Always returns `200 OK` with a [`StoreResponse`] body whose `result` is
+/// `upload_required`, `deduplicated`, or `already_owned`; errors keep their
+/// usual status (401 / 400 / 5xx). Authorization is either the internal service
+/// token (see [`SERVICE_TOKEN_HEADER`]) or the owner's user session.
 async fn handle_store_check(
     State(service): State<Arc<CellarService>>,
     headers: HeaderMap,
     Json(payload): Json<StoreRequest>,
 ) -> std::result::Result<Response, CellarError> {
-    let tin_id = payload.tin_id;
-    let service_token = service_token_from_headers(&headers);
-    let status = service
-        .store_check_with_token(&payload, service_token)
+    let result = service
+        .store_check_with_token(&payload, service_token_from_headers(&headers))
         .await?;
 
-    let response_body = StoreResponse {
-        code: status.as_u16(),
-        tin_id,
-        message: status.message().to_string(),
-    };
-
-    let http_status = status.to_status_code();
-    Ok((http_status, Json(response_body)).into_response())
+    Ok((StatusCode::OK, Json(StoreResponse { result })).into_response())
 }
 
 /// Tin payload upload handler.

@@ -1,6 +1,5 @@
 //! Data models and protocol types for `alhalte-cellar`.
 
-use http::StatusCode;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tin::TinId;
 
@@ -146,51 +145,30 @@ pub struct StoreRequest {
     pub wrapped_key: Option<Vec<u8>>,
 }
 
-/// Response status returned from the initial store metadata handshake.
+/// Result of the initial store metadata handshake (`POST /store`).
+///
+/// Serialized as a snake_case string by [`StoreResponse`]. The handshake
+/// always answers `200 OK`; only the body distinguishes these outcomes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StoreStatus {
-    /// Status 210: Client must upload the tin body data.
-    UploadRequired = 210,
-    /// Status 211: Entity already stored by another owner; deduplicated and DB reference added.
-    Deduplicated = 211,
-    /// Status 212: Already owned by this owner.
-    AlreadyOwned = 212,
+    /// Client must upload the tin body data.
+    UploadRequired,
+    /// Entity already stored by another owner; deduplicated and DB reference added.
+    Deduplicated,
+    /// Already owned by this owner.
+    AlreadyOwned,
 }
 
-impl StoreStatus {
-    /// Converts this status to its numerical u16 HTTP status code.
-    #[must_use]
-    pub const fn as_u16(self) -> u16 {
-        self as u16
-    }
-
-    /// Converts this status to an `http::StatusCode`.
-    #[must_use]
-    pub fn to_status_code(self) -> StatusCode {
-        StatusCode::from_u16(self.as_u16()).unwrap_or(StatusCode::OK)
-    }
-
-    /// Human-readable explanation.
-    #[must_use]
-    pub const fn message(self) -> &'static str {
-        match self {
-            Self::UploadRequired => "Upload required (tin data must be transmitted)",
-            Self::Deduplicated => "Deduplicated (reference registered without re-transmission)",
-            Self::AlreadyOwned => "Already owned by requesting account",
-        }
-    }
-}
-
-/// JSON body returned from the store metadata endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// JSON body returned by the store metadata endpoint (`POST /store`).
+///
+/// The endpoint always answers `200 OK`; `result` carries the handshake
+/// outcome, e.g. `{"result":"upload_required"}`. This is unrelated to
+/// [`StoreResult`], which is the payload upload response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreResponse {
-    /// Numeric HTTP status code (210, 211, or 212).
-    pub code: u16,
-    /// 256-bit tin ID in hex.
-    #[serde(with = "hex_tin_id")]
-    pub tin_id: TinId,
-    /// Descriptive status message.
-    pub message: String,
+    /// Store check outcome.
+    pub result: StoreStatus,
 }
 
 /// Result of storing a tin payload after upload.
