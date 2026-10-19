@@ -299,6 +299,7 @@ fn test_generate_maitre_d_args() {
             socket_dir: None,
             banquette_bin: None,
             cellar_url: None,
+            public_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -331,6 +332,8 @@ fn test_generate_maitre_d_args() {
             "google-secret",
             "--salt",
             "instancesalt",
+            "--public-url",
+            "https://vtt.example.com",
             "--socket-dir",
             "/run/sockets",
             "--cellar-url",
@@ -371,6 +374,67 @@ fn test_generate_maitre_d_args() {
     assert!(custom_args.contains(&"/usr/bin/alhalte-banquette".to_string()));
 }
 
+// spec: alhalte-maitre-d/oauth-public-url
+#[test]
+fn test_maitre_d_public_url_derivation() {
+    // spec: alhalte-bistrot/oauth-public-url 0001 an explicit public-url wins
+    let mut config = BistrotConfig {
+        restaurant: RestaurantConfig {
+            domain: "vtt.example.com".to_string(),
+            host: "127.0.0.1".to_string(),
+            data_dir: PathBuf::from("/data"),
+            socket_dir: PathBuf::from("/run/sockets"),
+        },
+        maitre_d: MaitreDConfig {
+            port: 8080,
+            db_path: None,
+            client_id: "id".to_string(),
+            client_secret: "secret".to_string(),
+            salt: "salt".to_string(),
+            socket_dir: None,
+            banquette_bin: None,
+            cellar_url: None,
+            public_url: Some("https://auth.example.com/".to_string()),
+        },
+        cellar: CellarConfig {
+            port: 8081,
+            storage_path: None,
+            db_path: None,
+            anti_oracle: false,
+            maitre_d_url: None,
+            maitre_d_socket: None,
+            allow_all_sessions: false,
+            service_token: None,
+        },
+        banquette: BanquetteConfig::default(),
+        argenterie: ArgenterieConfig::default(),
+        extensions: vec![],
+    };
+
+    assert_eq!(config.maitre_d_public_url(), "https://auth.example.com");
+    let args = generate_maitre_d_args(&config);
+    let index = args
+        .iter()
+        .position(|arg| arg == "--public-url")
+        .expect("maitre-d must receive --public-url");
+    assert_eq!(args[index + 1], "https://auth.example.com");
+
+    // spec: alhalte-bistrot/oauth-public-url 0002 a real domain uses https
+    config.maitre_d.public_url = None;
+    assert_eq!(config.maitre_d_public_url(), "https://vtt.example.com");
+
+    // spec: alhalte-bistrot/oauth-public-url 0003 loopback development uses the
+    // argenterie origin so the Vite /auth proxy receives the callback.
+    config.restaurant.domain = "localhost".to_string();
+    assert_eq!(config.maitre_d_public_url(), "http://127.0.0.1:5173");
+    config.restaurant.domain = "[::1]".to_string();
+    assert_eq!(config.maitre_d_public_url(), "http://127.0.0.1:5173");
+
+    // An explicitly empty value is rejected by validation.
+    config.maitre_d.public_url = Some("  ".to_string());
+    assert!(config.validate().is_err());
+}
+
 // spec: alhalte-cellar/anti-oracle
 #[test]
 fn test_generate_cellar_args_with_and_without_anti_oracle() {
@@ -385,6 +449,7 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             socket_dir: None,
             banquette_bin: None,
             cellar_url: None,
+            public_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -555,6 +620,7 @@ fn test_generate_all_args_and_module_args() {
             socket_dir: None,
             banquette_bin: None,
             cellar_url: None,
+            public_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -608,6 +674,7 @@ fn test_systemd_generator() {
             socket_dir: None,
             banquette_bin: None,
             cellar_url: None,
+            public_url: None,
         },
         cellar: CellarConfig {
             port: 8081,
@@ -746,6 +813,7 @@ chunk-size-exponent = 8
     assert!(stdout.contains("--client-id cli-client"));
     assert!(stdout.contains("--client-secret cli-secret-oauth"));
     assert!(stdout.contains("--chunk-size-exponent 8"));
+    assert!(stdout.contains("--public-url https://cli.example.com"));
 
     // 3. Test args command for all
     let output = std::process::Command::new(bin_path)

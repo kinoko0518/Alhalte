@@ -44,6 +44,10 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         config.maitre_d.client_secret.clone(),
         "--salt".to_string(),
         config.maitre_d.salt.clone(),
+        // Fixed Google OAuth redirect base; the argenterie origin is not part
+        // of the redirect URI.
+        "--public-url".to_string(),
+        config.maitre_d_public_url(),
         "--socket-dir".to_string(),
         config.maitre_d_socket_dir().display().to_string(),
         "--cellar-url".to_string(),

@@ -9,6 +9,12 @@ use serde::{Deserialize, Serialize};
 use crate::crypto::DEBUG_SUB_CIPHERTEXT;
 use crate::error::{MaitreDError, Result};
 
+/// Lifetime of a pending Google OAuth state, in seconds.
+///
+/// A state older than this is rejected by `GET /auth/google/callback` even when
+/// it was never redeemed.
+pub const OAUTH_STATE_TTL_SECS: i64 = 10 * 60;
+
 /// Account entity stored in SQLite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
@@ -193,6 +199,13 @@ impl Database {
                 tin_id BLOB NOT NULL,
                 updated_at INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS oauth_states (
+                state TEXT PRIMARY KEY,
+                return_to TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oauth_states_created ON oauth_states(created_at);
             ",
         )?;
 
@@ -686,6 +699,70 @@ impl Database {
         )?;
 
         Ok(affected)
+    }
+
+    /// Stores a single-use Google OAuth state bound to its post-login return URL.
+    ///
+    /// Expired rows are pruned opportunistically so a login cannot grow the
+    /// table without bound. `ttl_secs` also bounds how long a state may be
+    /// presented to the callback.
+    pub fn create_oauth_state(
+        &self,
+        state: &str,
+        return_to: &str,
+        now: i64,
+        ttl_secs: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        conn.execute(
+            "DELETE FROM oauth_states WHERE created_at < ?1",
+            params![now - ttl_secs],
+        )?;
+        conn.execute(
+            "INSERT INTO oauth_states (state, return_to, created_at) VALUES (?1, ?2, ?3)",
+            params![state, return_to, now],
+        )?;
+
+        Ok(())
+    }
+
+    /// Consumes a pending OAuth state and returns its bound `return_to`.
+    ///
+    /// The row is deleted in the same transaction that reads it, so a state is
+    /// single-use even when it has already expired. Returns `None` for unknown,
+    /// already-used, or expired states.
+    pub fn consume_oauth_state(
+        &self,
+        state: &str,
+        now: i64,
+        ttl_secs: i64,
+    ) -> Result<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let tx = conn.unchecked_transaction()?;
+        let row: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT return_to, created_at FROM oauth_states WHERE state = ?1",
+                params![state],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        tx.execute("DELETE FROM oauth_states WHERE state = ?1", params![state])?;
+        tx.commit()?;
+
+        match row {
+            Some((return_to, created_at)) if created_at >= now - ttl_secs => Ok(Some(return_to)),
+            _ => Ok(None),
+        }
     }
 
     /// Registers a room and inserts `creator_account` as its initial `gm`.

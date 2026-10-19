@@ -37,6 +37,21 @@ pub struct CliArgs {
     #[arg(long, default_value = "alhalte-salt", env = "ALHALTE_SALT")]
     pub salt: String,
 
+    /// Public base URL of this service as seen by browsers.
+    ///
+    /// Google OAuth redirects back to `{public-url}/auth/google/callback`, so
+    /// this value is the single fixed redirect URI registered with Google. It
+    /// must be the origin where `/auth` reaches `maitre-d` (normally the
+    /// reverse-proxied argenterie origin or the restaurant domain). Bistrot
+    /// derives it from `maitre-d.public-url`, the restaurant domain, or the
+    /// argenterie URL.
+    #[arg(
+        long,
+        default_value = "http://127.0.0.1:8080",
+        env = "ALHALTE_PUBLIC_URL"
+    )]
+    pub public_url: String,
+
     /// Directory for banquette UNIX domain sockets.
     #[arg(long, default_value = "/run/alhalte", env = "ALHALTE_SOCKET_DIR")]
     pub socket_dir: PathBuf,

@@ -48,7 +48,7 @@
 
     isBusy = true;
     try {
-      await beginGoogleSignIn({ baseUrl, fetchFn, navigate, prompt: 'select_account' });
+      await beginGoogleSignIn({ baseUrl, navigate, prompt: 'select_account' });
     } catch {
       authError = 'サインインを開始できませんでした';
       isBusy = false;

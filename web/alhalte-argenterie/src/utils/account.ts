@@ -2,17 +2,23 @@
  * Account profile retrieval, Google sign-in flow, and sign-out helpers for
  * `@alhalte/argenterie`.
  *
- * The browser starts Google OAuth through `alhalte-maitre-d`'s
- * `GET /auth/google/url` endpoint. The authorization code is returned to the
- * current application URL (without its query string or fragment); the app then
- * exchanges it with `POST /auth/google/callback`. The room key fragment and any
- * room query are parked in `sessionStorage` while Google is open and restored
- * after the exchange, so signing in never loses an invitation URL.
+ * Authentication is owned by `alhalte-maitre-d`. The browser navigates to
+ * `GET /auth/login?return_to=<absolute-url>`; maitre-d issues a single-use
+ * state, sends Google the fixed `{public_url}/auth/google/callback` redirect
+ * URI (never the argenterie origin / port), and redirects back to `return_to`
+ * with a `session_id` cookie. The app then calls `GET /api/session` to learn the
+ * account and stores it in the same places the room socket reads.
+ *
+ * Browsers cannot send a URL fragment to the server, so the complete return URL
+ * (room key fragment included) is parked in `sessionStorage` before leaving and
+ * restored with `history.replaceState` after the redirect, so signing in never
+ * loses an invitation URL.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### アカウントUI / Googleサインイン`
  * - crates/alhalte-maitre-d/ARCHITECTURE.md: `### Google 認証`
  * - GitHub Issue #116: アカウントに関するUIを追加
+ * - GitHub Issue #188: Google サインインを maitre-d 経由にする
  */
 
 import {
@@ -23,14 +29,8 @@ import {
   saveSessionId,
 } from './session.js';
 
-/** sessionStorage key holding the OAuth CSRF state. */
-export const OAUTH_STATE_STORAGE_KEY = 'alhalte:oauth-state';
-
-/** sessionStorage key holding the application path to restore after OAuth. */
-export const OAUTH_RETURN_PATH_STORAGE_KEY = 'alhalte:oauth-return-path';
-
-/** sessionStorage key holding the exact redirect URI used for OAuth. */
-export const OAUTH_REDIRECT_URI_STORAGE_KEY = 'alhalte:oauth-redirect-uri';
+/** sessionStorage key holding the full URL (fragment included) to restore after OAuth. */
+export const OAUTH_RETURN_URL_STORAGE_KEY = 'alhalte:oauth-return-url';
 
 /** Account profile returned by `GET /api/account/{account_id}`. */
 export interface AccountProfile {
@@ -44,11 +44,11 @@ export interface AccountProfile {
   icon_url?: string | null;
 }
 
-/** Response payload of `POST /auth/google/callback`. */
-export interface AuthResponse {
-  /** Created or existing account. */
+/** Response payload of `GET /api/session`. */
+export interface SessionResponse {
+  /** Public account profile for the session owner. */
   account: AccountProfile;
-  /** Newly issued 64-bit session ID. */
+  /** Session ID resolved from the `session_id` cookie. */
   session_id: number;
 }
 
@@ -146,34 +146,14 @@ export async function getAccountProfile(
 
 /** Options for starting Google OAuth. */
 export interface BeginGoogleSignInOptions {
-  /** Optional API base URL. */
+  /** Optional API base URL (the origin that proxies `/auth` to maitre-d). */
   baseUrl?: string;
-  /** Injectable fetch implementation for tests. */
-  fetchFn?: typeof fetch;
   /** Injectable navigation function for tests. */
   navigate?: (url: string) => void;
   /** Google `prompt` parameter. `select_account` is used when switching. */
   prompt?: 'select_account' | 'consent' | 'none' | null;
   /** Injectable storage for tests. */
   storage?: Storage;
-  /** Injectable redirect URI for tests. */
-  redirectUri?: string;
-}
-
-/**
- * Creates a random, URL-safe OAuth state value.
- */
-export function createOAuthState(): string {
-  const cryptoObj = typeof globalThis !== 'undefined' ? globalThis.crypto : undefined;
-  if (cryptoObj && typeof cryptoObj.randomUUID === 'function') {
-    return cryptoObj.randomUUID();
-  }
-  if (cryptoObj && typeof cryptoObj.getRandomValues === 'function') {
-    const bytes = new Uint8Array(16);
-    cryptoObj.getRandomValues(bytes);
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-  }
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
 }
 
 function getSessionStorage(storage?: Storage): Storage | null {
@@ -187,7 +167,7 @@ function safeSessionSet(storage: Storage | null, key: string, value: string): vo
     storage?.setItem(key, value);
   } catch {
     // Storage may be unavailable in private browsing; OAuth still works
-    // without state persistence, but restore-path support is best-effort.
+    // without the return-URL restore, which is best-effort.
   }
 }
 
@@ -200,81 +180,66 @@ function safeSessionRemove(storage: Storage | null, key: string): void {
 }
 
 /**
- * Returns the current application path (query and fragment included) without
- * OAuth callback parameters.
+ * Returns the current application URL (origin, query and fragment included)
+ * without OAuth callback parameters.
+ *
+ * The fragment is included because the room key lives there; maitre-d only
+ * receives the fragment-free part as `return_to`.
  */
-export function currentReturnPath(location: Pick<Location, 'pathname' | 'search' | 'hash'>): string {
+export function currentReturnUrl(
+  location: Pick<Location, 'origin' | 'pathname' | 'search' | 'hash'>,
+): string {
   const params = new URLSearchParams(location.search);
   params.delete('code');
   params.delete('state');
+  params.delete('error');
   const query = params.toString();
-  return `${location.pathname}${query ? `?${query}` : ''}${location.hash}`;
+  return `${location.origin}${location.pathname}${query ? `?${query}` : ''}${location.hash}`;
 }
 
+/** Removes the URL fragment before handing a URL to the server. */
+function withoutFragment(url: string): string {
+  const index = url.indexOf('#');
+  return index === -1 ? url : url.slice(0, index);
+}
 
 /**
- * Starts the Google OAuth redirect flow.
+ * Starts the Google OAuth redirect flow through `maitre-d`.
  *
- * The state, return path, and redirect URI are stored in `sessionStorage`
- * before navigating to Google. The redirect URI deliberately excludes the
- * query string and fragment; [`completeGoogleSignIn`] restores them.
+ * The complete return URL (fragment included) is stored in `sessionStorage`,
+ * then the browser navigates to `GET /auth/login?return_to=<fragment-free URL>`.
+ * maitre-d owns the OAuth state and sends Google its fixed callback URL, so the
+ * argenterie origin / port is never part of the redirect URI.
  *
- * @returns The Google authorization URL that was navigated to.
+ * @returns The maitre-d login URL that was navigated to.
  */
 export async function beginGoogleSignIn(
   options: BeginGoogleSignInOptions = {},
 ): Promise<string> {
-  const fetchFn = options.fetchFn ?? (typeof fetch !== 'undefined' ? fetch : undefined);
-  if (!fetchFn) {
-    throw new Error('fetch is not available');
-  }
   if (typeof window === 'undefined') {
     throw new Error('window is not available');
   }
 
   const storage = getSessionStorage(options.storage);
-  const location = window.location;
-  const returnPath = currentReturnPath(location);
-  const redirectUri = options.redirectUri ?? `${location.origin}${location.pathname}`;
-  const state = createOAuthState();
+  const returnUrl = currentReturnUrl(window.location);
+  safeSessionSet(storage, OAUTH_RETURN_URL_STORAGE_KEY, returnUrl);
 
-  safeSessionSet(storage, OAUTH_STATE_STORAGE_KEY, state);
-  safeSessionSet(storage, OAUTH_RETURN_PATH_STORAGE_KEY, returnPath);
-  safeSessionSet(storage, OAUTH_REDIRECT_URI_STORAGE_KEY, redirectUri);
+  const params = new URLSearchParams({ return_to: withoutFragment(returnUrl) });
+  if (options.prompt) {
+    params.set('prompt', options.prompt);
+  }
 
   const base = (options.baseUrl || '').replace(/\/+$/, '');
-  const query = new URLSearchParams({ redirect_uri: redirectUri, state });
-  const res = await fetchFn(`${base}/auth/google/url?${query.toString()}`, {
-    method: 'GET',
-    credentials: 'include',
-  });
-
-  if (!res.ok) {
-    safeSessionRemove(storage, OAUTH_STATE_STORAGE_KEY);
-    safeSessionRemove(storage, OAUTH_RETURN_PATH_STORAGE_KEY);
-    safeSessionRemove(storage, OAUTH_REDIRECT_URI_STORAGE_KEY);
-    throw new Error(`Failed to start Google sign-in: ${res.status} ${res.statusText}`);
-  }
-
-  const data = (await res.json()) as { url?: string };
-  if (!data.url) {
-    throw new Error('Google authorization URL was not returned');
-  }
-
-  const authUrl = new URL(data.url);
-  if (options.prompt) {
-    authUrl.searchParams.set('prompt', options.prompt);
-  }
+  const loginUrl = `${base}/auth/login?${params.toString()}`;
 
   const navigate =
     options.navigate ??
     ((url: string) => {
       window.location.assign(url);
     });
-  navigate(authUrl.toString());
-  return authUrl.toString();
+  navigate(loginUrl);
+  return loginUrl;
 }
-
 
 /** Options for completing Google OAuth. */
 export interface CompleteGoogleSignInOptions {
@@ -286,18 +251,35 @@ export interface CompleteGoogleSignInOptions {
   storage?: Storage;
 }
 
+/** Converts a stored absolute URL into a same-origin path for `replaceState`. */
+function restoreTarget(stored: string, origin: string): string | null {
+  try {
+    const url = new URL(stored, origin);
+    if (url.origin !== origin) {
+      return null;
+    }
+    return `${url.pathname}${url.search}${url.hash}`;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Completes Google OAuth when the current URL carries `code` and `state`.
+ * Completes Google OAuth after maitre-d redirects back to the app.
  *
- * Stores the returned account and session in the same locations used by the
- * room socket, restores the pre-OAuth path (including the room key fragment),
- * and returns the account profile. Returns `null` when the URL has no callback
- * parameters.
+ * The callback sets the `session_id` cookie, so this calls `GET /api/session`
+ * (cookie only; a stale `X-Alhalte-Session` header must not win) to resolve the
+ * account. It then stores the account and session in the same locations used by
+ * the room socket, restores the pre-OAuth URL (including the room key fragment)
+ * and returns the account profile.
+ *
+ * Returns `null` when no sign-in is pending or the callback left no valid
+ * session. Never throws for an unsigned user.
  *
  * # Errors
  *
- * Throws when the state does not match, the exchange fails, or the response is
- * missing the account/session.
+ * Throws when `/api/session` fails for a reason other than 401, or when the
+ * response is missing the account/session.
  */
 export async function completeGoogleSignIn(
   options: CompleteGoogleSignInOptions = {},
@@ -306,32 +288,16 @@ export async function completeGoogleSignIn(
     return null;
   }
 
-  const location = window.location;
-  const params = new URLSearchParams(location.search);
-  const code = params.get('code');
-  if (!code) {
-    return null;
-  }
-
   const storage = getSessionStorage(options.storage);
-  const state = params.get('state');
-  let expectedState: string | null = null;
-  let storedRedirectUri: string | null = null;
-  let returnPath: string | null = null;
+  let returnUrl: string | null = null;
   try {
-    expectedState = storage?.getItem(OAUTH_STATE_STORAGE_KEY) ?? null;
-    storedRedirectUri = storage?.getItem(OAUTH_REDIRECT_URI_STORAGE_KEY) ?? null;
-    returnPath = storage?.getItem(OAUTH_RETURN_PATH_STORAGE_KEY) ?? null;
+    returnUrl = storage?.getItem(OAUTH_RETURN_URL_STORAGE_KEY) ?? null;
   } catch {
-    // Ignore storage read errors; validation below still prevents an
-    // unchecked exchange when a state was expected.
+    // Ignore storage read errors; without a pending sign-in there is nothing
+    // to complete.
   }
-
-  if (expectedState && state !== expectedState) {
-    safeSessionRemove(storage, OAUTH_STATE_STORAGE_KEY);
-    safeSessionRemove(storage, OAUTH_RETURN_PATH_STORAGE_KEY);
-    safeSessionRemove(storage, OAUTH_REDIRECT_URI_STORAGE_KEY);
-    throw new Error('Google sign-in state mismatch');
+  if (!returnUrl) {
+    return null;
   }
 
   const fetchFn = options.fetchFn ?? (typeof fetch !== 'undefined' ? fetch : undefined);
@@ -340,20 +306,20 @@ export async function completeGoogleSignIn(
   }
 
   const base = (options.baseUrl || '').replace(/\/+$/, '');
-  const redirectUri = storedRedirectUri ?? `${location.origin}${location.pathname}`;
-
-  const res = await fetchFn(`${base}/auth/google/callback`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+  const res = await fetchFn(`${base}/api/session`, {
+    method: 'GET',
     credentials: 'include',
-    body: JSON.stringify({ code, redirect_uri: redirectUri }),
   });
 
+  if (res.status === 401) {
+    safeSessionRemove(storage, OAUTH_RETURN_URL_STORAGE_KEY);
+    return null;
+  }
   if (!res.ok) {
     throw new Error(`Failed to complete Google sign-in: ${res.status} ${res.statusText}`);
   }
 
-  const data = (await res.json()) as AuthResponse;
+  const data = (await res.json()) as SessionResponse;
   if (!data.account || data.session_id === undefined || data.session_id === null) {
     throw new Error('Google sign-in response is missing account or session');
   }
@@ -361,23 +327,22 @@ export async function completeGoogleSignIn(
   saveAccountId(data.account.account_id);
   saveSessionId(data.session_id);
 
-  const restoredPath =
-    returnPath && returnPath.startsWith('/') ? returnPath : currentReturnPath(location);
-  try {
-    window.history.replaceState(window.history.state, '', restoredPath);
-  } catch {
-    // Ignore history errors in restricted environments.
+  const target = restoreTarget(returnUrl, window.location.origin);
+  if (target) {
+    try {
+      window.history.replaceState(window.history.state, '', target);
+    } catch {
+      // Ignore history errors in restricted environments.
+    }
   }
 
-  safeSessionRemove(storage, OAUTH_STATE_STORAGE_KEY);
-  safeSessionRemove(storage, OAUTH_RETURN_PATH_STORAGE_KEY);
-  safeSessionRemove(storage, OAUTH_REDIRECT_URI_STORAGE_KEY);
+  safeSessionRemove(storage, OAUTH_RETURN_URL_STORAGE_KEY);
 
   return normalizeAccountProfile(data.account);
 }
 
 /**
- * Removes the stored account, session, and OAuth state.
+ * Removes the stored account, session, and pending OAuth return URL.
  *
  * The room key fragment is intentionally untouched; signing out must not lose
  * an invitation URL.
@@ -395,8 +360,6 @@ export function signOut(): void {
     document.cookie = 'session_id=; path=/; max-age=0; SameSite=Lax';
   }
   if (typeof sessionStorage !== 'undefined') {
-    safeSessionRemove(sessionStorage, OAUTH_STATE_STORAGE_KEY);
-    safeSessionRemove(sessionStorage, OAUTH_RETURN_PATH_STORAGE_KEY);
-    safeSessionRemove(sessionStorage, OAUTH_REDIRECT_URI_STORAGE_KEY);
+    safeSessionRemove(sessionStorage, OAUTH_RETURN_URL_STORAGE_KEY);
   }
 }

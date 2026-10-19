@@ -61,6 +61,19 @@ fn default_extension_enabled() -> bool {
     true
 }
 
+/// Returns true when `domain` addresses the local machine.
+///
+/// Loopback development serves argenterie over HTTP on a dev port, so it must
+/// not be upgraded to `https://{domain}` when deriving the public URL.
+fn is_loopback_domain(domain: &str) -> bool {
+    let trimmed = domain.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") || trimmed == "::1" || trimmed == "[::1]" {
+        return true;
+    }
+    let host = trimmed.split(':').next().unwrap_or(trimmed);
+    host.eq_ignore_ascii_case("localhost") || host.starts_with("127.")
+}
+
 /// Root configuration for the entire Alhalte restaurant instance (`Bistrot.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -111,6 +124,13 @@ impl BistrotConfig {
                 "maitre-d instance salt must not be empty".to_string(),
             ));
         }
+        if let Some(url) = &self.maitre_d.public_url
+            && url.trim().is_empty()
+        {
+            return Err(BistrotError::ConfigValidation(
+                "maitre-d public-url must not be empty when set".to_string(),
+            ));
+        }
         if self.banquette.chunk_size_exponent == 0 || self.banquette.chunk_size_exponent > 30 {
             return Err(BistrotError::ConfigValidation(
                 "banquette chunk-size-exponent must be between 1 and 30".to_string(),
@@ -152,6 +172,34 @@ impl BistrotConfig {
     /// Resolves the URL for the `alhalte-argenterie` web frontend in a browser.
     pub fn argenterie_url(&self) -> String {
         format!("http://{}:{}/", self.connect_host(), self.argenterie.port)
+    }
+
+    /// Public base URL of `alhalte-maitre-d` as seen by browsers.
+    ///
+    /// This is the origin Google redirects back to
+    /// (`{public-url}/auth/google/callback`) and must be the origin where
+    /// `/auth` reaches maitre-d.
+    ///
+    /// Resolution order:
+    /// 1. `maitre-d.public-url` when configured.
+    /// 2. `https://{restaurant.domain}` when the domain is a real host (the
+    ///    production reverse proxy serves argenterie and maitre-d together).
+    /// 3. The argenterie URL for loopback development, so the Vite `/auth`
+    ///    proxy receives the callback and the cookie lands on the UI origin.
+    pub fn maitre_d_public_url(&self) -> String {
+        if let Some(url) = &self.maitre_d.public_url {
+            let trimmed = url.trim().trim_end_matches('/');
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+
+        let domain = self.restaurant.domain.trim().trim_end_matches('/');
+        if !domain.is_empty() && !is_loopback_domain(domain) {
+            return format!("https://{domain}");
+        }
+
+        self.argenterie_url().trim_end_matches('/').to_string()
     }
 
     /// Browser origins `alhalte-maitre-d` should allow through CORS.
@@ -406,6 +454,15 @@ pub struct MaitreDConfig {
     /// Optional explicit URL for the cellar storage service. Defaults to cellar port on restaurant host.
     #[serde(default, alias = "cellar_url")]
     pub cellar_url: Option<String>,
+
+    /// Optional public base URL of `maitre-d` as seen by browsers.
+    ///
+    /// Google OAuth redirects back to `{public-url}/auth/google/callback`. When
+    /// omitted it is derived from `restaurant.domain` (production) or the
+    /// argenterie URL (loopback development); see
+    /// [`BistrotConfig::maitre_d_public_url`].
+    #[serde(default, alias = "public_url")]
+    pub public_url: Option<String>,
 }
 
 /// Configuration for `alhalte-cellar` (file storage and tin deduplication).

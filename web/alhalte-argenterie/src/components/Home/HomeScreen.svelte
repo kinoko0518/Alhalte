@@ -111,7 +111,7 @@
     isStartingSignIn = true;
     createError = '';
     try {
-      await beginGoogleSignIn({ baseUrl, ...(fetchFn ? { fetchFn } : {}) });
+      await beginGoogleSignIn({ baseUrl });
     } catch {
       createError = 'サインインを開始できませんでした。右上のアカウントメニューから再試行してください。';
       isStartingSignIn = false;

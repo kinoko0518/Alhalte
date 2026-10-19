@@ -56,7 +56,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let room_manager = RoomBridgeManager::new(spawner, db.clone());
 
     let mut state = AppState::new(db, args.salt, oauth, room_manager)
+        .with_public_url(&args.public_url)
         .with_cellar_proxy(CellarProxy::new(&args.cellar_url)?);
+    tracing::info!("Google OAuth redirect URI: {}", state.oauth_redirect_uri());
     if !args.cors_origins.is_empty() {
         tracing::info!("CORS allowed origins: {}", args.cors_origins.join(", "));
         state = state.with_allowed_origins(args.cors_origins);

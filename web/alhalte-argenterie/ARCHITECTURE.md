@@ -19,11 +19,12 @@
 | `maitre-d` `/api/room/{room_id}/permissions` | 部屋権限の取得・設定・削除（`utils/session.ts`）。`room_id` は 16 hex。 |
 | `maitre-d` `/api/accounts/search` | account 検索。 |
 | `maitre-d` `/api/account/{account_id}` | account 取得・更新。アカウントメニューの表示名・アイコン取得に使う（`utils/account.ts`）。 |
-| `maitre-d` `/auth/google/url` | Google 認可 URL の取得（`utils/account.ts`）。 |
-| `maitre-d` `/auth/google/callback` | 認可コードを session に交換（POST、`utils/account.ts`）。 |
+| `maitre-d` `GET /auth/login?return_to=...&prompt=...` | Google サインインの入口。絶対 URL の `return_to`（fragment を除く）へ遷移する（`utils/account.ts`）。state と `redirect_uri` は maitre-d が持つ。 |
+| `maitre-d` `GET /auth/google/callback` | Google からの固定 callback。ブラウザが直接踏む。maitre-d が `session_id` Cookie を設定して `return_to` へ 302 する。アプリは関与しない。 |
+| `maitre-d` `GET /api/session` | OAuth 後に Cookie から `account`（`AccountResponse`）と `session_id` を取得する（`utils/account.ts`）。 |
 | `maitre-d` `/api/room/{room_id}/export/zip?type=full|logs` | ZIP ダウンロード（`CommonHeader.svelte`）。 |
 | `maitre-d` `/api/cellar/store`、`/api/cellar/store/{tin_id}`、`/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。アセット・拡張 wasm の Tin を XHR で送受信する（`utils/cellarTransfer.ts`）。store check は `200 OK` + body の `result`（`upload_required` / `deduplicated` / `already_owned`）で判定し、`upload_required` のときだけ本体を PUT する。進捗は `upload.onprogress`、失敗は型付き `CellarTransferError`。 |
-| Vite dev proxy | `/api`、`/auth`、`/room` を `http://127.0.0.1:8080`、`/ws` を `ws://127.0.0.1:8080` へ転送。`/auth` は Google サインインの URL 取得と callback に必要。 |
+| Vite dev proxy | `/api`、`/auth`、`/room` を `http://127.0.0.1:8080`、`/ws` を `ws://127.0.0.1:8080` へ転送。`/auth` はサインイン開始（`/auth/login`）と Google callback の両方に必要で、maitre-d の `--public-url` がこの dev origin を指すことで Cookie が UI と同一 origin に付く。 |
 
 ### WebSocket
 
@@ -83,7 +84,7 @@
 - `localStorage`: account ID、session ID、訪問済み部屋、最近の部屋、アセット（`alhalte_pantry_assets`）、部屋ログのキャッシュ（`alhalte:room-logs:<roomId>`）。部屋ログは `kind` / `event` / `contentTin` を含めて保存し、復元時は cache-origin として扱う。オフライン表示専用で、サーバーの biblio / chunk snapshot が届いた scene はキャッシュではなくサーバーを正とする。
 - IndexedDB `alhalte-argenterie-outbox`（store `outbox`）: 送信できなかった message / character（拡張用に state / asset も型として許容）を `{ id, roomId, kind, createdAt, payload }` で保存する。`createdAt` から `OUTBOX_TTL_MS = 30 日` を超えたエントリは読み出し時に prune する。IndexedDB が無い環境ではメモリ実装へフォールバックする。
 - Cookie: `session_id`（`SameSite=Lax`）。
-- `sessionStorage`: OAuth の `state`、認可後の戻り先 URL（クエリと部屋鍵フラグメントを含む）、OAuth の `redirect_uri`。サインイン中だけ保持し、完了時に削除する。
+- `sessionStorage`: サインイン前の完全な戻り先 URL（クエリと部屋鍵フラグメントを含む）。サインイン中だけ保持し、`/api/session` 完了時に削除する。OAuth の `state` と `redirect_uri` は maitre-d が保持するためアプリは持たない。
 - URL フラグメント: 部屋鍵。`generateRoomUrl` は `/rooms/<roomId>#<roomKey>` を作る。
 
 ## 内部フロー
@@ -122,8 +123,8 @@
 2. サインイン済みなら `GET /api/account/{account_id}` で表示名とアイコン Tin ID を取得し、32 byte の Tin ID から `/api/cellar/tin/<hex>` を組み立ててアバターにする。取得中・取得失敗時はイニシャルまたは `account_circle` を表示する。
 3. アバター押下で M3 Menu を開き、「別のアカウントでログイン」「サインアウト」を出す。サインアウトは localStorage / Cookie / OAuth 用 sessionStorage を消す。部屋鍵フラグメントは保持する。
 4. 未サインインなら Filled tonal の「サインイン」を出す。
-5. サインインは `GET /auth/google/url` で認可 URL を取得し、現在のページ（クエリ・フラグメントを除く URL）へ戻るようリダイレクトする。Google へ遷移する前に、戻り先 URL（部屋鍵を含む）・`state`・`redirect_uri` を sessionStorage に保存する。
-6. アプリ起動時（`main.ts`）に URL の `code` / `state` を検出し、`POST /auth/google/callback` で session に交換する。成功後は account / session を保存し、sessionStorage の戻り先 URL を `history.replaceState` で復元してから `App` を mount する。
+5. サインインは現在の完全な URL（クエリ・部屋鍵フラグメントを含む）を sessionStorage に保存し、fragment を除いた絶対 URL を `return_to` にして `GET /auth/login` へ遷移する。`prompt=select_account` はアカウント切り替え時に付ける。`return_to` の origin 検証・state 発行・Google への `redirect_uri` はすべて maitre-d の責務で、Google に argenterie の origin / port は渡らない。
+6. callback は maitre-d が処理し、`session_id` Cookie を設定して同じ `return_to` へ 302 する。アプリ起動時（`main.ts`）に sessionStorage の戻り先 URL があれば `GET /api/session` を Cookie 付きで呼び、account / session を保存して `history.replaceState` で元の URL（fragment 含む）を復元する。401 なら未サインインのまま戻り先の保存を消す。
 7. 配置はホーム画面の AppBar trailing、フィールド画面の右上、門前払い画面の右上。ホーム画面のテーマ設定 UI は削除し、テーマ選択はコントロールパネル共通ヘッダーの gear menu に集約する。
 
 ### 発言とログ表示
@@ -226,6 +227,6 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 - 入室 preflight のネットワーク / 5xx 失敗は 2 秒間隔・最大 5 回で打ち切り、`OfflineIndicator` の再試行導線に合流する。403 / 401 / 404 は再試行しない。401 は `GateScreen`（サインイン導線）として扱う。
 - 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。`App` は `roomKey` prop → `currentRoom.url` のフラグメント → `window.location.hash` の順に解決し、64 hex を検証する。鍵が無い場合、アセット・拡張 wasm の cellar upload は試行せずエラーを表示する。
 - ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
-- OAuth の `redirect_uri` は現在のパス（クエリ・フラグメントを除く）を使う。Google Cloud Console 側でこの URL を登録する必要がある。`state` は sessionStorage に保存した値と照合し、一致しない交換は行わない。
+- Google OAuth の `redirect_uri` は maitre-d の固定 URL（`{public_url}/auth/google/callback`）だけを Google Cloud Console に登録する。argenterie の origin / port は登録しない。`return_to` は maitre-d が CORS allow-list と照合する。`/api/session` を Cookie 付きで呼ぶため、開発では `public_url` を argenterie の dev origin（Vite の `/auth` proxy）に合わせる必要がある。
 - `AccountMenu` は account ごとに `GET /api/account/{id}` を呼ぶ。プロフィール取得に失敗してもサインイン状態は維持し、イニシャル表示にフォールバックする。
 - 入室可否は `GET /api/rooms/{id}` の preflight を正とする。`isForbidden` は WebSocket の `Error` frame / close code でもフォールバックとして立つが、権限一覧 API の結果からは導出しない（権限一覧は `RoomPermissionModal` の表示にだけ使う）。`room_permissions` に行があり `done` が true の部屋でも、preflight が `viewer` を返せば入室できる。
