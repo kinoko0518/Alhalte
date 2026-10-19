@@ -18,7 +18,8 @@ use serde::{Deserialize, Serialize};
 use alhalte_banquette::{ClientFrame, ServerFrame};
 
 use crate::crypto;
-use crate::db::{Account, Database, RoomRole};
+use crate::db::{Account, Database, Room, RoomRole};
+use crate::error::MaitreDError;
 use crate::gateway::RoomBridgeManager;
 use crate::oauth::OAuthProvider;
 use crate::room_id::RoomId;
@@ -108,6 +109,70 @@ pub fn parse_session_id_from_cookie_str(cookie_str: &str) -> Option<u64> {
         }
     }
     None
+}
+
+/// Resolves and verifies the caller account for an authenticated HTTP request.
+///
+/// The session is taken from the query, the `X-Alhalte-Session` header, or the
+/// `session_id` cookie. When the account is not claimed explicitly it is derived
+/// from the session. Both values must agree with an active session row.
+fn resolve_authenticated_account(
+    state: &AppState,
+    headers: &HeaderMap,
+    claimed_account_id: Option<u64>,
+    claimed_session_id: Option<u64>,
+) -> std::result::Result<u64, (StatusCode, Json<serde_json::Value>)> {
+    let session_id = claimed_session_id
+        .or_else(|| {
+            headers
+                .get("X-Alhalte-Session")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .or_else(|| extract_session_id_from_cookie(headers));
+
+    let Some(session_id) = session_id else {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Missing session ID" })),
+        ));
+    };
+
+    let account_id = match claimed_account_id.or_else(|| {
+        headers
+            .get("X-Alhalte-Account")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+    }) {
+        Some(account_id) => account_id,
+        None => match state.db.get_session(session_id) {
+            Ok(Some(session)) => session.account_id,
+            Ok(None) => {
+                return Err((
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({ "error": "Invalid session or account" })),
+                ));
+            }
+            Err(error) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                ));
+            }
+        },
+    };
+
+    match state.db.is_session_valid(account_id, session_id) {
+        Ok(true) => Ok(account_id),
+        Ok(false) => Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Invalid session or account" })),
+        )),
+        Err(error) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )),
+    }
 }
 
 /// Query parameters for session verification.
@@ -247,6 +312,43 @@ pub struct ExportZipQuery {
     pub session_id: Option<u64>,
 }
 
+/// Maximum accepted room name length, in Unicode scalar values.
+pub const MAX_ROOM_NAME_LEN: usize = 100;
+
+/// Query parameters carrying the caller session for room registry routes.
+#[derive(Debug, Deserialize, Default)]
+pub struct RoomSessionQuery {
+    /// Optional authenticated account ID.
+    pub account_id: Option<u64>,
+    /// Optional authenticated session ID.
+    pub session_id: Option<u64>,
+}
+
+/// Request payload for `POST /api/rooms`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateRoomRequest {
+    /// Optional canonical 16-hex room ID. Generated server-side when omitted.
+    pub room_id: Option<String>,
+    /// Human-readable room name.
+    pub name: String,
+}
+
+/// Room metadata returned by the registry routes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RoomInfoResponse {
+    /// Canonical 16-hex room ID.
+    pub room_id: String,
+    /// Human-readable room name.
+    pub name: String,
+    /// Caller role in the room (`gm`, `pl`, or `viewer`).
+    pub role: RoomRole,
+    /// Whether the room has been marked as done (fully public).
+    pub done: bool,
+}
+
+/// Maximum number of random room IDs tried when the caller omits `room_id`.
+const MAX_ROOM_ID_GENERATION_ATTEMPTS: usize = 16;
+
 /// Maximum accepted request body for cellar transfer routes (64 MiB).
 ///
 /// Tin payloads (room assets, extension wasm, log chunks) exceed Axum's 2 MiB
@@ -272,6 +374,9 @@ pub fn create_router(state: AppState) -> Router {
         // Account search
         .route("/api/accounts/search", get(search_accounts_handler))
         .route("/accounts/search", get(search_accounts_handler))
+        // Room registry
+        .route("/api/rooms", post(create_room_handler))
+        .route("/api/rooms/{room_id}", get(get_room_info_handler))
         // Room permissions
         .route(
             "/api/room/{room_id}/permissions",
@@ -786,6 +891,203 @@ async fn search_accounts_handler(
     }
 }
 
+/// Validates and normalizes a room name supplied to `POST /api/rooms`.
+fn validate_room_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    if name.is_empty()
+        || name.chars().count() > MAX_ROOM_NAME_LEN
+        || name.chars().any(char::is_control)
+    {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Generates a non-zero random room ID for `POST /api/rooms` when omitted.
+fn generate_room_id() -> RoomId {
+    loop {
+        let value = rand::random::<u64>();
+        if value != 0 {
+            return RoomId::new(value);
+        }
+    }
+}
+
+/// Builds the success response for a newly registered room.
+fn room_created_response(room: Room) -> Response {
+    (
+        StatusCode::OK,
+        Json(RoomInfoResponse {
+            room_id: room.room_id,
+            name: room.name,
+            role: RoomRole::Gm,
+            done: false,
+        }),
+    )
+        .into_response()
+}
+
+/// Registers a caller-supplied room ID, mapping a duplicate to `409 Conflict`.
+fn create_requested_room(
+    state: &AppState,
+    room_id: RoomId,
+    name: &str,
+    creator_account: u64,
+    now: i64,
+) -> Response {
+    match state
+        .db
+        .create_room(&room_id.to_string(), name, creator_account, now)
+    {
+        Ok(room) => room_created_response(room),
+        Err(MaitreDError::RoomAlreadyExists(_)) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "Room already exists" })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": error.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Handles `POST /api/rooms`.
+///
+/// Requires an authenticated session. Registers the room and the caller as its
+/// initial `gm`; no banquette process is spawned until the room is joined.
+async fn create_room_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RoomSessionQuery>,
+    Json(req): Json<CreateRoomRequest>,
+) -> Response {
+    let caller =
+        match resolve_authenticated_account(&state, &headers, query.account_id, query.session_id) {
+            Ok(account_id) => account_id,
+            Err(response) => return response.into_response(),
+        };
+
+    let Some(name) = validate_room_name(&req.name) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!(
+                    "Room name must be non-empty, at most {MAX_ROOM_NAME_LEN} characters, and contain no control characters"
+                )
+            })),
+        )
+            .into_response();
+    };
+
+    let now = chrono::Utc::now().timestamp();
+
+    if let Some(raw) = req.room_id.as_deref() {
+        let Ok(room_id) = raw.trim().parse::<RoomId>() else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "room_id must be a 16-hex room ID"
+                })),
+            )
+                .into_response();
+        };
+        return create_requested_room(&state, room_id, &name, caller, now);
+    }
+
+    for _ in 0..MAX_ROOM_ID_GENERATION_ATTEMPTS {
+        let room_id = generate_room_id();
+        match state
+            .db
+            .create_room(&room_id.to_string(), &name, caller, now)
+        {
+            Ok(room) => return room_created_response(room),
+            Err(MaitreDError::RoomAlreadyExists(_)) => continue,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": error.to_string() })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(serde_json::json!({ "error": "Failed to allocate a unique room ID" })),
+    )
+        .into_response()
+}
+
+/// Handles `GET /api/rooms/{room_id}`.
+///
+/// Returns the room metadata for members. Non-members may read a room that is
+/// marked done (`role = "viewer"`); otherwise the response is `403 Forbidden`.
+async fn get_room_info_handler(
+    State(state): State<AppState>,
+    AxumPath(room_id): AxumPath<RoomId>,
+    headers: HeaderMap,
+    Query(query): Query<RoomSessionQuery>,
+) -> Response {
+    let caller =
+        match resolve_authenticated_account(&state, &headers, query.account_id, query.session_id) {
+            Ok(account_id) => account_id,
+            Err(response) => return response.into_response(),
+        };
+
+    let room_id_str = room_id.to_string();
+    let room = match state.db.get_room(&room_id_str) {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Room not found" })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let done = state.room_manager.is_room_done(room_id.as_u64()).await;
+    let role = match state.db.get_room_role(&room_id_str, caller) {
+        Ok(Some(role)) => role,
+        Ok(None) if done => RoomRole::Viewer,
+        Ok(None) => {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    Json(RoomInfoResponse {
+        room_id: room.room_id,
+        name: room.name,
+        role,
+        done,
+    })
+    .into_response()
+}
+
 /// Handles `GET /api/room/{room_id}/permissions`.
 async fn get_room_permissions_handler(
     State(state): State<AppState>,
@@ -993,12 +1295,20 @@ async fn handle_ws_upgrade(
     let auth_account = account_id.unwrap_or(0);
     let auth_session = session_id.unwrap_or(0);
 
-    // Check room permissions and done flag. Permission rows use the canonical
-    // 16-hex form, matching the room ID in invitation URLs.
+    // A room must be registered in the room registry before it can be joined.
+    // Permission rows alone do not create a room, and an unknown room never
+    // causes a banquette process to be spawned.
     let room_id_str = room_id.to_string();
     let room_id_u64 = room_id.as_u64();
-    let has_permissions = match state.db.has_room_permissions(&room_id_str) {
-        Ok(has) => has,
+    let room = match state.db.get_room(&room_id_str) {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Room not found" })),
+            )
+                .into_response();
+        }
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1008,6 +1318,7 @@ async fn handle_ws_upgrade(
         }
     };
 
+    let is_done = state.room_manager.is_room_done(room_id_u64).await;
     let user_role = if auth_account != 0 {
         match state.db.get_room_role(&room_id_str, auth_account) {
             Ok(r) => r,
@@ -1023,34 +1334,34 @@ async fn handle_ws_upgrade(
         None
     };
 
-    if has_permissions && user_role.is_none() {
-        let is_done = state.room_manager.is_room_done(room_id_u64).await;
-        if !is_done {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください"
-                })),
-            )
-                .into_response();
-        }
+    if user_role.is_none() && !is_done {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください"
+            })),
+        )
+            .into_response();
     }
 
     let is_viewer = match user_role {
         Some(RoomRole::Viewer) => true,
-        None if has_permissions => true,
-        _ => false,
+        Some(_) => false,
+        None => true,
     };
 
     let client_id = state.next_client_id();
+    // The bridge administrator is the room creator / database GM, never the
+    // account that happens to connect first.
     let admin_account = match state.db.get_room_gm(&room_id_str) {
         Ok(Some(gm_id)) => gm_id,
-        _ => {
-            if auth_account != 0 {
-                auth_account
-            } else {
-                1
-            }
+        Ok(None) => room.creator_account,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
         }
     };
 
@@ -1308,7 +1619,64 @@ async fn export_room_zip_handler(
         }
     };
 
-    let admin_account = caller_account.unwrap_or(1);
+    // Export never creates a room implicitly. Unknown rooms are rejected before
+    // a banquette process is considered, and private rooms require membership.
+    let room_id_str = room_id.to_string();
+    let room = match state.db.get_room(&room_id_str) {
+        Ok(Some(room)) => room,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Room not found" })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
+    let is_done = state.room_manager.is_room_done(room_id.as_u64()).await;
+    let caller_role = match caller_account {
+        Some(account_id) => match state.db.get_room_role(&room_id_str, account_id) {
+            Ok(role) => role,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
+
+    if caller_role.is_none() && !is_done {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください"
+            })),
+        )
+            .into_response();
+    }
+
+    let admin_account = match state.db.get_room_gm(&room_id_str) {
+        Ok(Some(gm_id)) => gm_id,
+        Ok(None) => room.creator_account,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e.to_string() })),
+            )
+                .into_response();
+        }
+    };
+
     let bridge = state
         .room_manager
         .get_or_create_room(room_id.as_u64(), admin_account)

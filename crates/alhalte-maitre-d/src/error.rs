@@ -50,6 +50,10 @@ pub enum MaitreDError {
     #[error("Invalid room role: {0}")]
     InvalidRole(String),
 
+    /// A room with this ID is already registered.
+    #[error("Room already exists: {0}")]
+    RoomAlreadyExists(String),
+
     /// Invalid request parameters.
     #[error("Bad request: {0}")]
     BadRequest(String),

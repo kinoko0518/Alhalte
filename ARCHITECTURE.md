@@ -89,12 +89,18 @@ client 総体 = cutlery
 
 ## 主要なデータフロー
 
+### 部屋作成
+
+1. クライアントは `maitre-d` の `POST /api/rooms` に `{ room_id?, name }` を送る（要 session）。`room_id` を省略するとサーバーが 16 hex を生成する。
+2. `maitre-d` は SQLite の `rooms` に部屋を登録し、同じ transaction で作成者を `room_permissions` の `gm` にする。banquette はまだ起動しない。
+3. `GET /api/rooms/{room_id}` が名前・caller の role・done を返す。部屋は WS / export で参照されるまでプロセスを持たない。
+
 ### 入室
 
 1. ブラウザは部屋 URL `/rooms/<roomId>#<roomKey>` を開く。`roomKey` はフラグメントにだけ存在し、サーバーへ送らない。
 2. `argenterie` は `maitre-d` の `/ws/room/<roomId>?account_id=...&session_id=...` へ WebSocket 接続する。
-3. `maitre-d` はセッションを検証し、部屋の権限を確認する。未許可なら 403 で拒否する。
-4. 許可された接続は `banquette` の UNIX ソケットへ `ClientConnected` として流し込む。banquette が未起動なら起動し、接続待ちのフレームはキューに積む。
+3. `maitre-d` はセッションを検証し、`rooms` に登録済みか確認する。未登録は 404、権限がなく `done=false` なら 403 で拒否する。
+4. 許可された接続は `banquette` の UNIX ソケットへ `ClientConnected` として流し込む。bridge の `admin_account` は部屋の作成者 / DB の GM で、接続順には依存しない。banquette が未起動なら起動し、接続待ちのフレームはキューに積む。
 5. banquette はクライアントをルートシーン `/` に入室させる。
 
 ### 発言
@@ -114,17 +120,18 @@ client 総体 = cutlery
 
 ### エクスポート
 
-1. `maitre-d` の `GET /api/room/<roomId>/export/zip?type=full|logs` が `banquette` に `ExportRoom` を送る。
-2. banquette は権限のある scene と log chunk を `RoomData` にまとめて返す。
-3. `maitre-d` は `alhalte-kitchen` で ZIP を組み立てて返す。
-4. `alhalte-kitchen` CLI は ZIP / tar.gz を読み、`RoomGraph` を作り、HTML5 または EPUB に変換する。
+1. `maitre-d` の `GET /api/room/<roomId>/export/zip?type=full|logs` は `rooms` を引き、未登録は 404、非メンバーかつ `done=false` は 403 で拒否する。空の部屋を暗黙作成しない。
+2. 許可された場合、`banquette` に `ExportRoom` を送る。bridge が未起動なら作成者 / DB GM を admin として起動する。
+3. banquette は権限のある scene と log chunk を `RoomData` にまとめて返す。
+4. `maitre-d` は `alhalte-kitchen` で ZIP を組み立てて返す。
+5. `alhalte-kitchen` CLI は ZIP / tar.gz を読み、`RoomGraph` を作り、HTML5 または EPUB に変換する。
 
 ### 起動
 
 1. `alhalte-bistrot` が `Bistrot.toml` を読み、rops で秘密情報を復号する。
 2. 各モジュールの引数と systemd unit を純粋関数で生成する。
 3. `nix run .#bistrot` はビルド、unit 登録、maitre-d / cellar / argenterie の起動、ブラウザ起動を行う。
-4. `banquette` は `maitre-d` が部屋ごとに起動する。
+4. `banquette` は `maitre-d` が、`rooms` に登録済みの部屋を最初に WS / export で参照したときに部屋ごとに起動する。
 
 
 ## 横断的規約
@@ -147,7 +154,7 @@ client 総体 = cutlery
 
 ### 権限
 
-現行 main では、`maitre-d` が SQLite の `room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保持し、WebSocket 接続時の入場可否と viewer の mutate 遮断を行う。`banquette` 側は `done` フラグと `std::admins` による scene アクセス制御を持つ。
+現行 main では、`maitre-d` が SQLite の `rooms(room_id, name, creator_account, created_at)` で部屋を管理し、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保持する。WebSocket 接続時の入場可否と viewer の mutate 遮断を行う。部屋は `POST /api/rooms` で明示的に作成し、未登録の部屋への WS / export は 404 で拒否する。`banquette` 側は `done` フラグと `std::admins` による scene アクセス制御を持つ。
 
 Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせる構成へ、`banquette` は `Denied` / `Viewer` / `Participant` / `Admin` の 4 段階へ移行中である。移行の詳細と現時点の未接続点は [banquette](crates/alhalte-banquette/ARCHITECTURE.md) と [maitre-d](crates/alhalte-maitre-d/ARCHITECTURE.md) に記す。
 
@@ -184,7 +191,6 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 | canner | クライアント側 wasm の `encode-*` / `encrypt-*` | Rust ライブラリとして実装済み。WASM ABI は未エクスポート。ブラウザでは `pantry` の TS 実装が暗号・展開を担う。 |
 | アセット | `pantry` が cellar から取得・復号・キャッシュ | `argenterie` は `pantry` の `encodeTin` で RoomKey 暗号化した Tin を maitre-d の `/api/cellar/*` proxy 経由で cellar へ保存し、進捗・失敗・再試行をカードに出す。room アセットのメタデータは `/` の state、personal は localStorage のみ。拡張 wasm も同じ経路で `tinId` だけを state に持つ。 |
 | kitchen の room key | ランダム 96bit nonce | `export_room_to_zip` / `export_room_to_tar_gz` は Zero Nonce で room-key 暗号化する。 |
-| bistrot の banquette 引数 | `--socket <path>` | `generate_banquette_args` は `--socket-dir <dir>` を出力する。banquette CLI は `--socket` を取るため不一致。 |
 | saignant の WASM 実行 | キャラクター名を解決 | `render_generast_abi` は `NoopCharacterResolver` を使うため、メンションは `Anonymous` になる。 |
 | Markdown | 打ち消し線 `~~` を含む | パーサは `~~` を実装していない（自己紹介文には記載がある）。 |
 | ディレクトリ名 | `generast-rs` | package 名は `generast`。文書内ではディレクトリ名と package 名を併記する。 |

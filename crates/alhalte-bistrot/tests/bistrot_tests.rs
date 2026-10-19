@@ -3,8 +3,7 @@
 use age::secrecy::ExposeSecret;
 use age::x25519::Identity;
 use alhalte_bistrot::args::{
-    generate_all_args, generate_banquette_args, generate_cellar_args, generate_maitre_d_args,
-    generate_module_args,
+    generate_all_args, generate_cellar_args, generate_maitre_d_args, generate_module_args,
 };
 use alhalte_bistrot::config::{
     ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, ExtensionManifestEntry,
@@ -335,8 +334,20 @@ fn test_generate_maitre_d_args() {
             "/run/sockets",
             "--cellar-url",
             "http://127.0.0.1:8081",
+            "--chunk-size-exponent",
+            "8",
         ]
     );
+
+    // The chunk size exponent comes from `[banquette]` in `Bistrot.toml`.
+    let mut custom_exponent = config.clone();
+    custom_exponent.banquette.chunk_size_exponent = 12;
+    let custom_args = generate_maitre_d_args(&custom_exponent);
+    let exponent_index = custom_args
+        .iter()
+        .position(|arg| arg == "--chunk-size-exponent")
+        .expect("--chunk-size-exponent must be emitted");
+    assert_eq!(custom_args[exponent_index + 1], "12");
 
     // With explicit banquette_bin and cellar_url overrides
     let mut custom_config = config.clone();
@@ -518,55 +529,6 @@ allow_all_sessions = false
     assert!(!args.contains(&"--allow-all-sessions".to_string()));
 }
 
-// spec: alhalte-banquette/chunk-size-exponent
-#[test]
-fn test_generate_banquette_args() {
-    let config = BistrotConfig {
-        restaurant: RestaurantConfig {
-            domain: "localhost".to_string(),
-            host: "127.0.0.1".to_string(),
-            data_dir: PathBuf::from("/var/lib/alhalte"),
-            socket_dir: PathBuf::from("/run/alhalte/sockets"),
-        },
-        maitre_d: MaitreDConfig {
-            port: 8080,
-            db_path: None,
-            client_id: "id".to_string(),
-            client_secret: "sec".to_string(),
-            salt: "salt".to_string(),
-            socket_dir: None,
-            banquette_bin: None,
-            cellar_url: None,
-        },
-        cellar: CellarConfig {
-            port: 8081,
-            storage_path: None,
-            db_path: None,
-            anti_oracle: false,
-            maitre_d_url: None,
-            maitre_d_socket: None,
-            allow_all_sessions: false,
-        },
-        banquette: BanquetteConfig {
-            chunk_size_exponent: 8,
-            socket_dir: None,
-        },
-        argenterie: ArgenterieConfig::default(),
-        extensions: vec![],
-    };
-
-    let args = generate_banquette_args(&config);
-    assert_eq!(
-        args,
-        vec![
-            "--chunk-size-exponent",
-            "8",
-            "--socket-dir",
-            "/run/alhalte/sockets",
-        ]
-    );
-}
-
 // spec: alhalte-bistrot/module-args
 #[test]
 fn test_generate_all_args_and_module_args() {
@@ -599,7 +561,6 @@ fn test_generate_all_args_and_module_args() {
     let all = generate_all_args(&config);
     assert_eq!(all.maitre_d, generate_maitre_d_args(&config));
     assert_eq!(all.cellar, generate_cellar_args(&config));
-    assert_eq!(all.banquette, generate_banquette_args(&config));
 
     assert_eq!(
         generate_module_args(&config, "maitre-d").unwrap(),
@@ -610,10 +571,8 @@ fn test_generate_all_args_and_module_args() {
         all.maitre_d
     );
     assert_eq!(generate_module_args(&config, "cellar").unwrap(), all.cellar);
-    assert_eq!(
-        generate_module_args(&config, "banquette").unwrap(),
-        all.banquette
-    );
+    // Banquette is spawned per room by maitre-d and has no static argument list.
+    assert!(generate_module_args(&config, "banquette").is_err());
     assert!(generate_module_args(&config, "unknown").is_err());
 }
 
@@ -772,6 +731,7 @@ chunk-size-exponent = 8
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--client-id cli-client"));
     assert!(stdout.contains("--client-secret cli-secret-oauth"));
+    assert!(stdout.contains("--chunk-size-exponent 8"));
 
     // 3. Test args command for all
     let output = std::process::Command::new(bin_path)
@@ -785,7 +745,8 @@ chunk-size-exponent = 8
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("[alhalte-maitre-d]"));
     assert!(stdout.contains("[alhalte-cellar]"));
-    assert!(stdout.contains("[alhalte-banquette]"));
+    // banquette is spawned per room by maitre-d, not by a static bistrot command.
+    assert!(!stdout.contains("[alhalte-banquette]"));
     assert!(stdout.contains("--anti-oracle"));
     assert!(stdout.contains("--maitre-d-url http://127.0.0.1:8080"));
     assert!(!stdout.contains("--allow-all-sessions"));

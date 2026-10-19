@@ -5,7 +5,9 @@
 //! `alhalte-bistrot` serves as the orchestration and configuration manager for an Alhalte restaurant instance:
 //! - Parses and validates `Bistrot.toml` configuration files.
 //! - Decrypts encrypted secrets (Google OAuth secrets, instance salt, etc.) using `rops` (SOPS-compatible age encryption).
-//! - Generates command-line arguments for `alhalte-maitre-d`, `alhalte-cellar`, and `alhalte-banquette` as pure, deterministic functions.
+//! - Generates command-line arguments for `alhalte-maitre-d` and `alhalte-cellar` as pure, deterministic functions.
+//!   (`alhalte-banquette` is spawned per room by `alhalte-maitre-d`, which passes the room ID,
+//!   administrator, socket path, and chunk size exponent itself.)
 //! - Generates systemd unit configuration files (`alhalte-maitre-d.service`, `alhalte-cellar.service`, `alhalte-bistrot.target`) as pure functions.
 //!
 //! # Example
@@ -52,8 +54,8 @@ pub mod systemd;
 
 // Re-exports for convenience
 pub use args::{
-    ModuleArgs, generate_all_args, generate_banquette_args, generate_cellar_args,
-    generate_maitre_d_args, generate_module_args,
+    ModuleArgs, generate_all_args, generate_cellar_args, generate_maitre_d_args,
+    generate_module_args,
 };
 pub use config::{
     ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, DEFAULT_ARGENTERIE_PORT,

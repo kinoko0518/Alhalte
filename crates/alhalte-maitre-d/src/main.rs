@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.banquette_bin,
         &args.socket_dir,
         &args.cellar_url,
-        8,
+        args.chunk_size_exponent,
     ));
 
     let room_manager = RoomBridgeManager::new(spawner);
