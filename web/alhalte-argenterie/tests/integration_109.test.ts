@@ -294,8 +294,8 @@ describe('Issue #109 cross-feature integration (#146)', () => {
     expect(footer().getAttribute('aria-busy')).toBe('false');
   });
 
-  // spec: alhalte-argenterie/内部フロー 送信タイムアウト→outbox→再接続 flush→echo (Issue #109 / #146)
-  it('queues a timed-out message and renders it only after the reconnect flush echo', async () => {
+  // spec: alhalte-argenterie/内部フロー 送信タイムアウト→ログ内キュー→再接続 flush→echo (Issue #109 / #146, #148)
+  it('queues a timed-out message inline and replaces it with the reconnect echo exactly once', async () => {
     const socket = new FakeRoomSocket();
     const { connectionManager } = mountApp(socket);
     await waitFor(() => socket.queryLogBiblioCalls.length === 1);
@@ -306,7 +306,9 @@ describe('Issue #109 cross-feature integration (#146)', () => {
     socket.rejectPending(new OperationTimeoutError('appendLog', 8000));
     await waitFor(() => messageQueueCount() === '1 件を蓄積中');
     expect(messageQueueCount()).toBe('1 件を蓄積中');
-    expect(messagesText()).not.toContain('再接続で送る統合メッセージ');
+    // The message is rendered inline as a queued preview (Issue #148).
+    expect(messagesText()).toContain('再接続で送る統合メッセージ');
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(1);
 
     const queued = await getOutbox().list(ROOM.id!, 'message');
     expect(queued).toHaveLength(1);
@@ -314,18 +316,25 @@ describe('Issue #109 cross-feature integration (#146)', () => {
       '再接続で送る統合メッセージ',
     );
 
-    // Reconnect flushes the outbox; the message still waits for its echo.
+    // Reconnect flushes the outbox; the queued preview stays until its echo.
     socket.isConnected = true;
     connectionManager.setState('disconnected');
     await tick(20);
     connectionManager.setState('connected');
     await waitFor(() => socket.requestAppendLogCalls.length === 2);
     expect(socket.requestAppendLogCalls[1].record.content).toBe('再接続で送る統合メッセージ');
-    expect(messagesText()).not.toContain('再接続で送る統合メッセージ');
+    expect(messagesText()).toContain('再接続で送る統合メッセージ');
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(1);
 
     socket.deliverEcho();
-    await waitFor(() => messagesText().includes('再接続で送る統合メッセージ'));
+    await waitFor(
+      () => target.querySelector('[data-queued="true"]') === null,
+    );
     expect(messagesText()).toContain('再接続で送る統合メッセージ');
+    // The echo replaced the queued copy: one row, not two.
+    expect(
+      target.querySelectorAll('[data-testid^="log-record-"]'),
+    ).toHaveLength(1);
     await waitFor(
       () => target.querySelector('[data-testid="offline-queue-notice"]') === null,
     );

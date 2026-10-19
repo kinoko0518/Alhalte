@@ -5,6 +5,7 @@ import SceneSettingsTab from '../src/components/Control/tabs/SceneSettingsTab.sv
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 import { clearAssets } from '../src/utils/assets.js';
 import { ChunkLogManager, parseLogRecord } from '../src/utils/log.js';
+import { resetOutbox } from '../src/utils/outbox.js';
 import { OperationTimeoutError, ServerOperationError } from '../src/utils/roomSocket.js';
 import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
 import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
@@ -49,6 +50,7 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
 
   beforeEach(() => {
     clearAssets();
+    resetOutbox();
   });
 
   // spec: alhalte-argenterie/scene-settings メンバー移動UIのインライン埋め込みと移動実行 (Issue #92)
@@ -309,11 +311,16 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
     await new Promise((r) => setTimeout(r, 30));
     expect(target.querySelector('[data-testid="root-delete-logs-dialog"]')).toBeNull();
 
-    // Verify logs were cleared by switching to LogTab
+    // Verify logs were cleared by switching to LogTab. This App has no socket,
+    // so the message lives in the durable offline queue (Issue #148): rewinding
+    // the server log must not discard an unsent message, and the only remaining
+    // row is therefore the queued preview.
     const logTabBtn = target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-log"]');
     logTabBtn?.click();
     await new Promise((r) => setTimeout(r, 30));
-    expect(target.textContent).not.toContain('消去予定のテストメッセージ');
+    const remainingRows = target.querySelectorAll('[data-testid^="log-record-"]');
+    expect(remainingRows).toHaveLength(1);
+    expect(remainingRows[0].getAttribute('data-queued')).toBe('true');
 
     // 2. Switch back to Scene Settings tab to test "シーンを削除"
     settingsTabBtn?.click();

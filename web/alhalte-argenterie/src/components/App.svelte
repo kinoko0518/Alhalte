@@ -13,7 +13,16 @@
   import 'noph-ui/defaultTheme';
   import { Button, IconButton, Sheet } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { BgmSlot, Character, ExtensionItem, LogRecord, Scene, ViewTransform, VisitedRoom } from '../types/index.js';
+  import type {
+    BgmSlot,
+    Character,
+    ExtensionItem,
+    LogRecord,
+    QueuedLogMessage,
+    Scene,
+    ViewTransform,
+    VisitedRoom,
+  } from '../types/index.js';
   import { saveRecentRoom, type RecentRoom } from '../utils/recentRooms.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../utils/assets.js';
   import { fetchRoomInfo, resolveRoomFromLocation, RoomApiError } from '../utils/home.js';
@@ -686,8 +695,14 @@
    * message was stored with its raw `content` only (Issue #161).
    */
   let pipelineWarning = $state<string | null>(null);
-  /** Number of messages waiting in the durable outbox for the active room. */
-  let pendingMessageCount = $state(0);
+  /**
+   * `kind: 'message'` entries of the active room's durable outbox, projected for
+   * inline rendering in `LogTab` (Issue #148).
+   *
+   * Every scene of the room is kept here; `LogTab` selects the active scene and
+   * dedupes against the records the server has already echoed.
+   */
+  let queuedMessages = $state<QueuedLogMessage[]>([]);
   /** Guards against overlapping outbox flushes (reconnect can fire repeatedly). */
   let isFlushingOutbox = false;
 
@@ -700,21 +715,46 @@
   }
 
   /**
-   * Re-reads the outbox and republishes the queue notice count.
+   * Re-reads the active room's queued messages into {@link queuedMessages}.
    *
-   * Called after every outbox mutation (enqueue / flush / room switch) so the
-   * `OfflineQueueNotice` count always reflects IndexedDB rather than an
-   * optimistic in-memory counter.
+   * Called after every outbox mutation (enqueue / flush / room switch) and on
+   * mount, so `LogTab` renders IndexedDB's view of the queue rather than an
+   * optimistic in-memory counter (Issue #148).
+   *
+   * Malformed payloads (an old entry without `{ sceneId, record }`) are skipped
+   * but left in the outbox: the flush path is responsible for dropping them.
    */
-  async function refreshPendingMessageCount() {
+  async function refreshQueuedMessages() {
     const roomId = getActiveRoomId();
     if (!roomId) {
-      pendingMessageCount = 0;
+      queuedMessages = [];
       return;
     }
     try {
       const pending = await getOutbox().list(roomId, 'message');
-      pendingMessageCount = pending.length;
+      const next: QueuedLogMessage[] = [];
+      for (const entry of pending) {
+        const payload = entry.payload as
+          | { sceneId?: unknown; record?: LogRecord }
+          | null
+          | undefined;
+        const record = payload?.record;
+        if (!record || typeof record !== 'object' || typeof record.id !== 'string') {
+          console.warn('Skipping a malformed outbox message entry:', entry.id);
+          continue;
+        }
+        const sceneId =
+          typeof payload?.sceneId === 'string' ? payload.sceneId : record.sceneId;
+        if (typeof sceneId !== 'string' || sceneId.length === 0) {
+          console.warn('Skipping an outbox message entry without a scene:', entry.id);
+          continue;
+        }
+        next.push({ entryId: entry.id, sceneId, record });
+      }
+      // The room may have changed while IndexedDB was read; never publish one
+      // room's queue into another room's log.
+      if (getActiveRoomId() !== roomId) return;
+      queuedMessages = next;
     } catch (err) {
       console.warn('Failed to read the offline outbox:', err);
     }
@@ -722,11 +762,10 @@
 
   /**
    * Persists a message that could not be delivered into the durable outbox
-   * (30-day TTL, see `outbox.ts`) and refreshes the notice count.
+   * (30-day TTL, see `outbox.ts`) and refreshes the inline queue view.
    *
-   * The payload keeps the `LogRecord` (including its `id`) so the flushed copy
-   * and a late echo of the same record dedupe on `LogRecord.id` inside
-   * `ChunkLogManager` instead of rendering twice.
+   * The payload keeps the `LogRecord` (including its `id`) so a late echo of the
+   * same record dedupes on `LogRecord.id` instead of rendering twice.
    */
   async function enqueueOfflineMessage(roomId: string, sceneId: string, record: LogRecord) {
     try {
@@ -740,7 +779,7 @@
       console.error('Failed to queue the offline message:', err);
       chunkManager.appendRecord(record);
     }
-    await refreshPendingMessageCount();
+    await refreshQueuedMessages();
   }
 
   /**
@@ -791,7 +830,7 @@
       console.warn('Failed to flush the offline outbox:', err);
     } finally {
       isFlushingOutbox = false;
-      await refreshPendingMessageCount();
+      await refreshQueuedMessages();
       await refreshPendingCharacterCount();
     }
   }
@@ -807,14 +846,16 @@
     void flushOutbox();
   });
 
-  // Keep the queue notice count in sync with the active room.
+  // Keep the inline queued-message view in sync with the active room. This
+  // effect also covers the initial mount (a previous offline session may have
+  // left entries queued, Issue #148).
   $effect(() => {
     const roomId = currentRoom?.id || (currentRoom as any)?.roomId;
     if (!roomId) {
-      pendingMessageCount = 0;
+      queuedMessages = [];
       return;
     }
-    void refreshPendingMessageCount();
+    void refreshQueuedMessages();
   });
 
   // ---------------------------------------------------------------------------
@@ -2847,7 +2888,7 @@
                   {isAdmin}
                   {isViewer}
                   sending={isSending}
-                  {pendingMessageCount}
+                  {queuedMessages}
                   {sceneActionPending}
                   {sceneActionError}
                   {chunkManager}
@@ -2941,7 +2982,7 @@
                 {isAdmin}
                 {isViewer}
                 sending={isSending}
-                {pendingMessageCount}
+                {queuedMessages}
                 {sceneActionPending}
                 {sceneActionError}
                 {chunkManager}

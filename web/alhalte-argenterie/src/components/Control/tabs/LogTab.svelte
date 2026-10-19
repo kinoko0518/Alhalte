@@ -10,7 +10,7 @@
    */
   import { tick, untrack } from 'svelte';
   import { LoadingIndicator } from 'noph-ui';
-  import type { Character, ExtensionItem, LogRecord, Scene } from '../../../types/index.js';
+  import type { Character, ExtensionItem, LogRecord, QueuedLogMessage, Scene } from '../../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../../utils/assets.js';
   import type { ConnectionState } from '../../../utils/connection.js';
   import {
@@ -52,6 +52,7 @@
     hideHeader = false,
     roomSocket = null,
     connectionState,
+    queuedMessages = [],
   }: {
     scene: Scene;
     allScenes?: Scene[];
@@ -86,6 +87,12 @@
      * retries a load that ended in the queueing (wave notice) state.
      */
     connectionState?: ConnectionState;
+    /**
+     * `kind: 'message'` outbox entries for the active room (Issue #148). Entries
+     * for other scenes are ignored, and an entry whose `record.id` is already in
+     * the loaded messages is dropped so an echo never renders twice.
+     */
+    queuedMessages?: QueuedLogMessage[];
   } = $props();
 
   // Messages, animation tracking, & WASM rendering cache
@@ -124,6 +131,26 @@
     connectionState === 'disconnected' || connectionState === 'reconnecting',
   );
   let showsCachedRecords = $derived(messages.some((record) => record.cached === true));
+
+  /**
+   * Queued offline messages visible in this scene (Issue #148).
+   *
+   * Only the active scene is shown, and an entry is dropped as soon as a loaded
+   * message carries the same `LogRecord.id` (the server echo, or a snapshot that
+   * already contains it). The outbox entry may still exist for one flush tick,
+   * so this is the primary duplicate guard.
+   */
+  let currentQueuedMessages = $derived.by(() => {
+    const loadedIds = new Set(messages.map((record) => record.id));
+    return queuedMessages.filter(
+      (entry) => entry.sceneId === scene.id && !loadedIds.has(entry.record.id),
+    );
+  });
+
+  /** Every record `updateRenderedHtml` must produce HTML for, loaded first. */
+  function renderableRecords(): LogRecord[] {
+    return [...messages, ...currentQueuedMessages.map((entry) => entry.record)];
+  }
 
   /**
    * Loads the newest chunk of `targetSceneId`:
@@ -208,7 +235,18 @@
     }
   }
 
-  void updateRenderedHtml(messages);
+  void updateRenderedHtml(renderableRecords());
+
+  // A queued entry appearing / disappearing and a newly echoed record both need
+  // fresh HTML. The chunk-manager subscription covers echoes; this effect covers
+  // the outbox side (Issue #148).
+  $effect(() => {
+    const queued = currentQueuedMessages;
+    const loaded = messages;
+    untrack(() => {
+      void updateRenderedHtml([...loaded, ...queued.map((entry) => entry.record)]);
+    });
+  });
 
   let currentSceneId = scene.id;
   let currentManager = chunkManager;
@@ -318,7 +356,7 @@
       untrack(() => {
         clearSaignantCache();
         renderedContentMap = {};
-        void updateRenderedHtml(messages);
+        void updateRenderedHtml(renderableRecords());
       });
     }
   });
@@ -337,7 +375,7 @@
     untrack(() => {
       clearSaignantCache();
       renderedContentMap = {};
-      void updateRenderedHtml(messages);
+      void updateRenderedHtml(renderableRecords());
     });
   });
 
@@ -363,7 +401,7 @@
       }
     }
     messages = currentRecords;
-    void updateRenderedHtml(messages);
+    void updateRenderedHtml(renderableRecords());
     queueMicrotask(() => {
       // Prepending an older chunk must not jump the reader to the bottom.
       if (listElement && stickToBottom) {
@@ -397,7 +435,7 @@
       initialRecordIds = new Set(records.map((r) => r.id));
       newRecordIds = new Set();
       messages = records;
-      void updateRenderedHtml(messages);
+      void updateRenderedHtml(renderableRecords());
     });
   });
 
@@ -527,6 +565,95 @@
   }
 </script>
 
+{#snippet logEntry(record: LogRecord, isNew: boolean, queued: boolean)}
+  {#if record.kind === 'system'}
+    <!-- Banquette system event: a quiet M3 status row. The postcard
+         payload is decoded into `record.event` upstream, so no binary
+         bytes are ever rendered as chat text (Issue #161). -->
+    <div
+      class="system-log-entry"
+      class:message-entry-new={isNew}
+      data-testid="log-record-{record.id}"
+      data-kind="system"
+      data-is-new={isNew ? 'true' : undefined}
+      data-queued={queued ? 'true' : undefined}
+      onanimationend={(e) => handleAnimationEnd(record.id, e)}
+    >
+      <span class="system-log-glyph" aria-hidden="true">
+        {systemEventGlyph(record)}
+      </span>
+      <div class="system-log-body">
+        <span
+          class="system-log-text"
+          data-testid="log-system-text-{record.id}"
+        >
+          {systemEventLabel(record)}
+        </span>
+        <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
+          {formatTime(record.timestamp)}
+        </span>
+      </div>
+    </div>
+  {:else}
+    {@const char = findCharacter(record.speakerId, record.speaker)}
+    {@const charColor = char?.color}
+    <div
+      class="message-entry"
+      class:message-entry-new={isNew}
+      data-testid="log-record-{record.id}"
+      data-kind="chat"
+      data-is-new={isNew ? 'true' : undefined}
+      data-queued={queued ? 'true' : undefined}
+      onanimationend={(e) => handleAnimationEnd(record.id, e)}
+    >
+      <!-- Character Avatar / Icon -->
+      <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
+        {#if char?.iconUrl}
+          <IconImagePicker
+            src={char.iconUrl}
+            alt={record.speaker}
+            size={36}
+            shape="circle"
+            dataTestId="msg-avatar-{record.id}"
+            {onRequestAssetPicker}
+          />
+        {:else}
+          <div
+            class="msg-avatar-placeholder"
+            data-testid="msg-avatar-{record.id}"
+            style={charColor
+              ? `background-color: color-mix(in srgb, ${charColor} 18%, transparent); color: ${charColor}; border-color: ${charColor};`
+              : ''}
+          >
+            {record.speaker ? record.speaker.slice(0, 2) : '👤'}
+          </div>
+        {/if}
+      </div>
+
+      <div class="msg-body">
+        <!-- 1st Row: Character Color Pill Badge & Timestamp -->
+        <div class="msg-header-row">
+          <span
+            class="msg-speaker-pill"
+            style={charColor ? `--char-color: ${charColor};` : ''}
+            data-testid="msg-speaker-{record.id}"
+          >
+            {record.speaker}
+          </span>
+          <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
+            {formatTime(record.timestamp)}
+          </span>
+        </div>
+
+        <!-- 2nd Row: Generast rendered HTML via Saignant WASM -->
+        <div class="msg-content saignant-content" data-testid="msg-content-{record.id}">
+          {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content, characters)}
+        </div>
+      </div>
+    </div>
+  {/if}
+{/snippet}
+
 <div class="log-tab-container" data-testid="log-tab">
   {#if !hideHeader}
     <CommonHeader
@@ -574,98 +701,27 @@
       data-testid="messages-list"
       aria-busy={isLoading}
     >
-      {#if messages.length === 0 && !isLoading && !isQueueing}
+      {#if messages.length === 0 && currentQueuedMessages.length === 0 && !isLoading && !isQueueing}
         <div class="empty-log-notice" data-testid="empty-log-notice">
           ログはありません
         </div>
       {:else}
         {#each messages as record (record.id)}
           {@const isNew = newRecordIds.has(record.id)}
-          {#if record.kind === 'system'}
-            <!-- Banquette system event: a quiet M3 status row. The postcard
-                 payload is decoded into `record.event` upstream, so no binary
-                 bytes are ever rendered as chat text (Issue #161). -->
-            <div
-              class="system-log-entry"
-              class:message-entry-new={isNew}
-              data-testid="log-record-{record.id}"
-              data-kind="system"
-              data-is-new={isNew ? 'true' : undefined}
-              onanimationend={(e) => handleAnimationEnd(record.id, e)}
-            >
-              <span class="system-log-glyph" aria-hidden="true">
-                {systemEventGlyph(record)}
-              </span>
-              <div class="system-log-body">
-                <span
-                  class="system-log-text"
-                  data-testid="log-system-text-{record.id}"
-                >
-                  {systemEventLabel(record)}
-                </span>
-                <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
-                  {formatTime(record.timestamp)}
-                </span>
-              </div>
-            </div>
-          {:else}
-            {@const char = findCharacter(record.speakerId, record.speaker)}
-            {@const charColor = char?.color}
-            <div
-              class="message-entry"
-              class:message-entry-new={isNew}
-              data-testid="log-record-{record.id}"
-              data-kind="chat"
-              data-is-new={isNew ? 'true' : undefined}
-              onanimationend={(e) => handleAnimationEnd(record.id, e)}
-            >
-              <!-- Character Avatar / Icon -->
-              <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
-                {#if char?.iconUrl}
-                  <IconImagePicker
-                    src={char.iconUrl}
-                    alt={record.speaker}
-                    size={36}
-                    shape="circle"
-                    dataTestId="msg-avatar-{record.id}"
-                    {onRequestAssetPicker}
-                  />
-                {:else}
-                  <div
-                    class="msg-avatar-placeholder"
-                    data-testid="msg-avatar-{record.id}"
-                    style={charColor
-                      ? `background-color: color-mix(in srgb, ${charColor} 18%, transparent); color: ${charColor}; border-color: ${charColor};`
-                      : ''}
-                  >
-                    {record.speaker ? record.speaker.slice(0, 2) : '👤'}
-                  </div>
-                {/if}
-              </div>
-
-              <div class="msg-body">
-                <!-- 1st Row: Character Color Pill Badge & Timestamp -->
-                <div class="msg-header-row">
-                  <span
-                    class="msg-speaker-pill"
-                    style={charColor ? `--char-color: ${charColor};` : ''}
-                    data-testid="msg-speaker-{record.id}"
-                  >
-                    {record.speaker}
-                  </span>
-                  <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
-                    {formatTime(record.timestamp)}
-                  </span>
-                </div>
-
-                <!-- 2nd Row: Generast rendered HTML via Saignant WASM -->
-                <div class="msg-content saignant-content" data-testid="msg-content-{record.id}">
-                  {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content, characters)}
-                </div>
-              </div>
-            </div>
-          {/if}
+          {@render logEntry(record, isNew, false)}
         {/each}
+
+        {#if currentQueuedMessages.length > 0}
+          <!-- Offline queue (Issue #148): the wavy divider separates the loaded
+               log from messages that will be sent on the next connection. Each
+               record renders through the same Saignant / contentTin path. -->
+          <div class="queued-log-divider" data-testid="queued-log-divider">
+            <OfflineQueueNotice kind="message" count={currentQueuedMessages.length} />
+          </div>
+          {#each currentQueuedMessages as queued (queued.entryId)}
+            {@render logEntry(queued.record, false, true)}
+          {/each}
+        {/if}
       {/if}
     </div>
 
@@ -719,6 +775,17 @@
     text-align: center;
     color: var(--np-color-on-surface-variant, #49454f);
     font-size: 0.9rem;
+  }
+
+  /*
+   * Inline offline queue (Issue #148). The divider and the queued records sit at
+   * the end of the list, after the loaded log; `OfflineQueueNotice` supplies the
+   * wavy lines, the canonical copy and the count. Queued records keep the normal
+   * message styling so they read as the same conversation.
+   */
+  .queued-log-divider {
+    flex: none;
+    width: 100%;
   }
 
   /*

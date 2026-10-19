@@ -199,6 +199,23 @@ export interface LogRecord {
 }
 
 /**
+ * A durable `kind: 'message'` outbox entry projected for inline rendering.
+ *
+ * While the server is unreachable the record is rendered below the loaded
+ * messages instead of being dropped (Issue #148). Once the flush succeeds the
+ * outbox entry disappears and the server echo takes over; `record.id` is the
+ * dedupe key between the two representations.
+ */
+export interface QueuedLogMessage {
+  /** Outbox entry id. Distinct from {@link LogRecord.id}, which dedupes echoes. */
+  entryId: string;
+  /** Scene the message was queued for; only the active scene is rendered. */
+  sceneId: string;
+  /** Record to render until the matching server echo arrives. */
+  record: LogRecord;
+}
+
+/**
  * Chunk containing multiple log records.
  */
 export interface LogChunk {
