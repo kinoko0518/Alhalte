@@ -27,7 +27,7 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | `GET` / `POST` | `/api/room/{room_id}/permissions` | GET は認証 + メンバー、POST は認証 + GM。 |
 | `DELETE` | `/api/room/{room_id}/permissions/{account_id}` | 認証 + GM。 |
 | `GET` | `/api/room/{room_id}/export/zip?type=full|logs` | 部屋またはログの ZIP。persisted head から復元できなければ 5xx。 |
-| `POST` | `/api/cellar/store` | 認証付き cellar proxy。cellar の `POST /store`（210/211/212 の store check）へ転送する。 |
+| `POST` | `/api/cellar/store` | 認証付き cellar proxy。cellar の `POST /store`（store check）へ転送し、`200 OK` + `{"result": ...}` の status / body をそのまま返す。 |
 | `POST` / `PUT` | `/api/cellar/store/{tin_id}` | 認証付き cellar proxy。Tin 本体を cellar の `POST` / `PUT /store/{tin_id}` へ転送する。 |
 | `GET` | `/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。本体と `X-Alhalte-Wrapped-Key` を返す。 |
 | `POST` | `/api/debug/account` | debug ビルドのみ。`sub = "0"` の account を作る。 |
@@ -119,7 +119,7 @@ Google から継承するのは `sub` のみ。handle name は初回の既定値
 10. banquette からの `RoomPersisted { tin_id, done }` は `room_heads` と `rooms.done` に記録する。head が次回 spawn 時の復元点になり、`done` が pre-spawn の入場判定に使われる。
 11. banquette からの `DoneUpdated { done }` を受けたときだけ `rooms.done` と bridge の in-memory `done` を更新し、そのままクライアントへ転送する。`SetDone` のリクエスト時点では DB / shadow を更新しない。
 
-`is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetDone`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter`、`ChangeBgm` を mutate とみなす。
+`is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetDone`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter` を mutate とみなす。
 
 ### cellar proxy
 

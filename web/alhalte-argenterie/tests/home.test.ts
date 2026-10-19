@@ -426,6 +426,64 @@ describe('Home Screen & Room URL', () => {
     target.remove();
   });
 
+  // spec: alhalte-argenterie/home サーバーが採番した room_id が正 (Issue #151)
+  it('uses the server-issued room_id instead of the client-generated preview', async () => {
+    signIn();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const SERVER_ROOM_ID = 'ffffffffffffffff';
+    const requestedRoomIds: Array<string | undefined> = [];
+    const fetchFn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+      requestedRoomIds.push(
+        (JSON.parse(String(init?.body)) as { room_id?: string }).room_id,
+      );
+      // The registry answers with a different canonical ID than the preview.
+      return jsonResponse({
+        room_id: SERVER_ROOM_ID,
+        name: 'サーバー命名の部屋',
+        role: 'gm',
+        done: false,
+      });
+    });
+
+    let enteredRoom: VisitedRoom | null = null;
+    const instance = mount(HomeScreen, {
+      target,
+      props: {
+        baseUrl: 'https://alhalte.example',
+        fetchFn: fetchFn as unknown as typeof fetch,
+        onEnterRoom: (r) => {
+          enteredRoom = r;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="create-room-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The dialog previews a client-generated 16-hex ID before the server answers.
+    const previewUrl = target.querySelector<HTMLInputElement>('[data-testid="room-url-input"]')?.value;
+    expect(previewUrl).toMatch(/^https:\/\/alhalte\.example\/rooms\/[0-9a-f]{16}#[0-9a-f]{64}$/);
+    const previewRoomId = previewUrl?.match(/\/rooms\/([0-9a-f]{16})#/)?.[1];
+    expect(previewRoomId).not.toBe(SERVER_ROOM_ID);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]')?.click();
+
+    await vi.waitFor(() => expect(enteredRoom).toBeTruthy());
+    expect(requestedRoomIds).toEqual([previewRoomId]);
+    expect(enteredRoom?.id).toBe(SERVER_ROOM_ID);
+    expect(enteredRoom?.url).toMatch(
+      new RegExp(`^https://alhalte\\.example/rooms/${SERVER_ROOM_ID}#[0-9a-f]{64}$`),
+    );
+    expect(getRecentRooms().some((room) => room.roomId === SERVER_ROOM_ID)).toBe(true);
+    expect(getRecentRooms().some((room) => room.roomId === previewRoomId)).toBe(false);
+    expect(window.location.pathname).toContain(`/rooms/${SERVER_ROOM_ID}`);
+
+    unmount(instance);
+    target.remove();
+  });
+
   // spec: alhalte-argenterie/home 招待リンク直接アクセスで部屋へ直接入室 (#34 / #156 preflight)
   it('directly enters the room after the server preflight when App is mounted at a room invitation URL', async () => {
     const key = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';

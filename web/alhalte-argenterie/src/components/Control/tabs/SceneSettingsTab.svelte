@@ -354,7 +354,6 @@
   // - playing: `bgm::<slot>::playing` boolean, written by play / stop and
   //   committed locally only after the ack.
   // - volume: `bgm::<slot>::volume` as a number in 0..1, sent on commit only.
-  // - the BGM change log is sent through `requestChangeBgm` alongside the state.
   let bgmSlots = $state<BgmSlot[]>(getNormalizedBgmSlots(currentScene.juices));
   let activeBgmSlotPicking = $state<number | null>(null);
   /** Slots with an in-flight server operation; reassigned so Svelte sees the change. */
@@ -608,7 +607,6 @@
 
       const requests: Promise<unknown>[] = [
         socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), true),
-        socket.requestChangeBgm(sceneId, slotNum, track.tinId),
       ];
       if (trackChanged) {
         requests.push(
@@ -664,7 +662,6 @@
 
       await throwIfBgmFailure([
         socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
-        socket.requestChangeBgm(sceneId, slotNum, null),
       ]);
       if (currentScene.id !== sceneId) return;
       applyBgmSlotState(slotNum, track, false);
@@ -698,7 +695,6 @@
       await throwIfBgmFailure([
         socket.requestDeleteState(sceneId, bgmTrackStateKey(slotNum)),
         socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
-        socket.requestChangeBgm(sceneId, slotNum, null),
       ]);
       if (currentScene.id !== sceneId) return;
       applyBgmSlotState(slotNum, null, false);

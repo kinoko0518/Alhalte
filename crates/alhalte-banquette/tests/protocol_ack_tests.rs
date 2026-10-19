@@ -1,6 +1,6 @@
 //! Protocol-level regression tests for the client <-> banquette JSON contract
 //! and for the success acknowledgements added by Issue #136 (scene create/delete,
-//! character move, and BGM change logging).
+//! character move, and log append).
 //!
 //! Each test references the corresponding section of `ARCHITECTURE.md`.
 
@@ -17,7 +17,6 @@ use tokio_util::codec::Framed;
 
 use alhalte_banquette::cellar_sink::InMemoryCellarSink;
 use alhalte_banquette::character::{Character, get_character_name, set_character_name};
-use alhalte_banquette::log::ChangeBgmEvent;
 use alhalte_banquette::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
 };
@@ -31,45 +30,6 @@ type ClientSink = Framed<OwnedWriteHalf, ProtocolCodec<MaitreDToBanquette>>;
 /// Builds a 64 hexadecimal character tin id whose 32 bytes are all `byte`.
 fn tin_id_hex(byte: u8) -> String {
     format!("{byte:02x}").repeat(32)
-}
-
-#[test]
-// spec: alhalte-banquette/protocol ChangeBgm frame JSON/postcard roundtrip
-fn test_change_bgm_frame_serde_roundtrip() {
-    let tin_id = tin_id_hex(0x07);
-    let frame = ClientFrame::ChangeBgm {
-        scene_id: "tavern".to_string(),
-        slot: 2,
-        tin_id: Some(tin_id.clone()),
-    };
-
-    // JSON (client -> maitre-d -> banquette) uses the externally tagged form.
-    let json = serde_json::to_string(&frame).unwrap();
-    assert_eq!(
-        json,
-        format!(r#"{{"ChangeBgm":{{"scene_id":"tavern","slot":2,"tin_id":"{tin_id}"}}}}"#)
-    );
-    assert_eq!(serde_json::from_str::<ClientFrame>(&json).unwrap(), frame);
-
-    // `None` tin id encodes as JSON null and round-trips.
-    let stop = ClientFrame::ChangeBgm {
-        scene_id: "/".to_string(),
-        slot: 1,
-        tin_id: None,
-    };
-    let stop_json = serde_json::to_string(&stop).unwrap();
-    assert_eq!(
-        stop_json,
-        r#"{"ChangeBgm":{"scene_id":"/","slot":1,"tin_id":null}}"#
-    );
-    assert_eq!(
-        serde_json::from_str::<ClientFrame>(&stop_json).unwrap(),
-        stop
-    );
-
-    // postcard (maitre-d <-> banquette) round-trips as well.
-    let bytes = postcard::to_allocvec(&frame).unwrap();
-    assert_eq!(postcard::from_bytes::<ClientFrame>(&bytes).unwrap(), frame);
 }
 
 #[test]
@@ -122,16 +82,6 @@ fn test_new_frames_are_appended_and_roundtrip() {
             .unwrap()
             .first(),
         Some(&23u8)
-    );
-    assert_eq!(
-        postcard::to_allocvec(&ClientFrame::ChangeBgm {
-            scene_id: String::new(),
-            slot: 1,
-            tin_id: None,
-        })
-        .unwrap()
-        .first(),
-        Some(&24u8)
     );
     assert_eq!(
         postcard::to_allocvec(&ServerFrame::Error {
@@ -763,8 +713,8 @@ async fn test_character_crud_broadcasts_and_scene_membership() {
 }
 
 #[tokio::test]
-// spec: alhalte-banquette/log append position and ChangeBgm ack (Issue #136)
-async fn test_append_log_and_change_bgm_acks() {
+// spec: alhalte-banquette/log append position and ack (Issue #136)
+async fn test_append_log_ack() {
     let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
 
     // A JSON payload carrying `clientOpId` must survive the roundtrip unchanged.
@@ -805,143 +755,6 @@ async fn test_append_log_and_change_bgm_acks() {
             assert_eq!(entry, Some(log_tin));
         }
         other => panic!("expected LogEventAppended, got {other:?}"),
-    }
-
-    // ChangeBgm appends a ChangeBgmEvent and announces it with LogEventAppended.
-    let hex_id = tin_id_hex(0x07);
-    send_frame(
-        &mut sink,
-        100,
-        ClientFrame::ChangeBgm {
-            scene_id: "/".to_string(),
-            slot: 2,
-            tin_id: Some(hex_id),
-        },
-    )
-    .await;
-
-    let (scene_id, frame) = expect_broadcast_to_scene(
-        wait_for_frame(&mut stream, |f| {
-            matches!(
-                f,
-                BanquetteToMaitreD::BroadcastToScene {
-                    frame: ServerFrame::LogEventAppended { .. },
-                    ..
-                }
-            )
-        })
-        .await,
-    );
-    assert_eq!(scene_id, "/");
-    match frame {
-        ServerFrame::LogEventAppended {
-            entry,
-            chunk_index,
-            position,
-            ..
-        } => {
-            assert_eq!((chunk_index, position), (0, 1));
-            let entry = entry.expect("ChangeBgm must append an entry");
-            let event = ChangeBgmEvent::from_tin(&entry).unwrap();
-            assert_eq!(event.slot, 2);
-            assert_eq!(event.bgm_tin_id, Some([7u8; 32]));
-            assert_eq!(event.volume, None);
-            assert_eq!(event.track_index, None);
-        }
-        other => panic!("expected LogEventAppended, got {other:?}"),
-    }
-
-    // Stopping a slot uses `tin_id: None` and appends an event with no tin id.
-    send_frame(
-        &mut sink,
-        100,
-        ClientFrame::ChangeBgm {
-            scene_id: "/".to_string(),
-            slot: 2,
-            tin_id: None,
-        },
-    )
-    .await;
-
-    let (_, frame) = expect_broadcast_to_scene(
-        wait_for_frame(&mut stream, |f| {
-            matches!(
-                f,
-                BanquetteToMaitreD::BroadcastToScene {
-                    frame: ServerFrame::LogEventAppended { .. },
-                    ..
-                }
-            )
-        })
-        .await,
-    );
-    match frame {
-        ServerFrame::LogEventAppended { entry, .. } => {
-            let entry = entry.expect("ChangeBgm must append an entry");
-            let event = ChangeBgmEvent::from_tin(&entry).unwrap();
-            assert_eq!(event.slot, 2);
-            assert_eq!(event.bgm_tin_id, None);
-        }
-        other => panic!("expected LogEventAppended, got {other:?}"),
-    }
-
-    // An invalid hex tin id is rejected without touching the log.
-    send_frame(
-        &mut sink,
-        100,
-        ClientFrame::ChangeBgm {
-            scene_id: "/".to_string(),
-            slot: 1,
-            tin_id: Some("not-hex".to_string()),
-        },
-    )
-    .await;
-
-    let (client_id, frame) = expect_send_to_client(
-        wait_for_frame(&mut stream, |f| {
-            matches!(
-                f,
-                BanquetteToMaitreD::SendToClient {
-                    frame: ServerFrame::Error { .. },
-                    ..
-                }
-            )
-        })
-        .await,
-    );
-    assert_eq!(client_id, 100);
-    match frame {
-        ServerFrame::Error { code, .. } => assert_eq!(code, "ChangeBgmFailed"),
-        other => panic!("expected Error, got {other:?}"),
-    }
-
-    // A missing scene is reported as ChangeBgmFailed too.
-    send_frame(
-        &mut sink,
-        100,
-        ClientFrame::ChangeBgm {
-            scene_id: "missing".to_string(),
-            slot: 1,
-            tin_id: None,
-        },
-    )
-    .await;
-
-    let (_, frame) = expect_send_to_client(
-        wait_for_frame(&mut stream, |f| {
-            matches!(
-                f,
-                BanquetteToMaitreD::SendToClient {
-                    frame: ServerFrame::Error { .. },
-                    ..
-                }
-            )
-        })
-        .await,
-    );
-    match frame {
-        ServerFrame::Error { code, .. } => assert_eq!(code, "ChangeBgmFailed"),
-        other => panic!("expected Error, got {other:?}"),
     }
 
     server_task.abort();
@@ -1203,11 +1016,11 @@ async fn test_enter_scene_sends_state_snapshot() {
     // Populate the root scene state with the keys the client hydrates.
     let states = [
         ("std::name", Tin::from_string("広間")),
-        ("std::bgm", Tin::from_string(&tin_id_hex(0x11))),
-        ("std::bgm4", Tin::from_string(&tin_id_hex(0x44))),
-        ("std::b-img", Tin::from_string(r#"{"tinId":"deadbeef"}"#)),
-        ("std::b-img::width", Tin::from_u64(1280)),
-        ("std::b-img::height", Tin::from_u64(720)),
+        ("std::custom", Tin::from_string(&tin_id_hex(0x11))),
+        ("std::custom4", Tin::from_string(&tin_id_hex(0x44))),
+        ("std::asset", Tin::from_string(r#"{"tinId":"deadbeef"}"#)),
+        ("std::asset::width", Tin::from_u64(1280)),
+        ("std::asset::height", Tin::from_u64(720)),
         (
             "view::transform",
             Tin::from_string(r#"{"x":1,"y":2,"scale":1.5}"#),
@@ -1269,12 +1082,14 @@ async fn test_enter_scene_sends_state_snapshot() {
                 Some("広間")
             );
             assert_eq!(
-                states.get("std::bgm4").and_then(|tin| tin.as_string().ok()),
+                states
+                    .get("std::custom4")
+                    .and_then(|tin| tin.as_string().ok()),
                 Some(tin_id_hex(0x44).as_str())
             );
-            assert!(states.contains_key("std::b-img"));
-            assert!(states.contains_key("std::b-img::width"));
-            assert!(states.contains_key("std::b-img::height"));
+            assert!(states.contains_key("std::asset"));
+            assert!(states.contains_key("std::asset::width"));
+            assert!(states.contains_key("std::asset::height"));
             assert!(states.contains_key("view::transform"));
             assert!(states.contains_key("piece::7::placed"));
         }

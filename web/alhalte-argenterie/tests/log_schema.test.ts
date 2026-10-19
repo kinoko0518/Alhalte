@@ -17,8 +17,6 @@ import { ChunkLogManager, contentTinToBytes } from '../src/utils/log.js';
 import { encodeExtIoTin, LABEL_ALHALTE_GENERAST } from '../src/utils/generast.js';
 import { encodeGenerastAstToTin } from '../src/utils/saignant.js';
 import {
-  LABEL_BANQUETTE_LOG_CHANGE_BG_IMG,
-  LABEL_BANQUETTE_LOG_CHANGE_BGM,
   LABEL_BANQUETTE_LOG_CHARACTER_CAME,
   LABEL_BANQUETTE_LOG_CHARACTER_GONE,
   entryToLogRecord,
@@ -77,7 +75,7 @@ describe('shared log schema (Issue #161)', () => {
   });
 
   // spec: alhalte-argenterie/内部フロー system event decode by label
-  it('decodes all four banquette event labels without producing chat garbage', () => {
+  it('decodes banquette character event labels without producing chat garbage', () => {
     const came = systemRecord(LABEL_BANQUETTE_LOG_CHARACTER_CAME, [7], 'came');
     expect(came.kind).toBe('system');
     expect(came.event).toEqual({ type: 'character-came', characterId: '7' });
@@ -87,24 +85,6 @@ describe('shared log schema (Issue #161)', () => {
     expect(gone.kind).toBe('system');
     expect(gone.event).toEqual({ type: 'character-gone', characterId: '9' });
     expect(gone.content).toBe('');
-
-    const bgmTinId = 'ab'.repeat(32);
-    const bgm = systemRecord(
-      LABEL_BANQUETTE_LOG_CHANGE_BGM,
-      [1, ...Array.from({ length: 32 }, () => 0xab), 1, 0, 0, 0, 0x3f, 1, 0],
-      'bgm',
-    );
-    expect(bgm.kind).toBe('system');
-    expect(bgm.event).toEqual({
-      type: 'change-bgm',
-      bgmTinId,
-      volume: 0.5,
-      slot: 1,
-    });
-
-    const bgImg = systemRecord(LABEL_BANQUETTE_LOG_CHANGE_BG_IMG, [0, 0, 0], 'bg-img');
-    expect(bgImg.kind).toBe('system');
-    expect(bgImg.event).toEqual({ type: 'change-bg-img' });
 
     // Unknown labels must still fall back to text, never throw.
     const unknown = entryToLogRecord(
@@ -161,7 +141,7 @@ describe('shared log schema (Issue #161)', () => {
   });
 
   // spec: alhalte-argenterie/log-tab system rows render M3 status + timestamp
-  it('renders all four system events as status rows without binary garbage', async () => {
+  it('renders character system events as status rows without binary garbage', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -185,12 +165,6 @@ describe('shared log schema (Issue #161)', () => {
     });
 
     const records = [
-      systemRecord(
-        LABEL_BANQUETTE_LOG_CHANGE_BGM,
-        [1, ...Array.from({ length: 32 }, () => 0xab), 0, 1, 0],
-        'sys-bgm',
-      ),
-      systemRecord(LABEL_BANQUETTE_LOG_CHANGE_BG_IMG, [0, 0, 0], 'sys-bg-img'),
       systemRecord(LABEL_BANQUETTE_LOG_CHARACTER_CAME, [7], 'sys-came'),
       systemRecord(LABEL_BANQUETTE_LOG_CHARACTER_GONE, [7], 'sys-gone'),
     ];
@@ -199,21 +173,19 @@ describe('shared log schema (Issue #161)', () => {
     }
 
     await waitFor(
-      () => target.querySelectorAll('[data-testid^="log-system-text-"]').length === 4,
+      () => target.querySelectorAll('[data-testid^="log-system-text-"]').length === 2,
     );
 
     const list = target.querySelector('[data-testid="messages-list"]');
     expect(list).toBeTruthy();
     const text = list!.textContent ?? '';
-    expect(text).toContain('BGM スロット 1 を変更しました');
-    expect(text).toContain('背景画像を解除しました');
     expect(text).toContain('入退場テスト が入室しました');
     expect(text).toContain('入退場テスト が退室しました');
     // No event payload bytes may be decoded as chat text.
     expect(text).not.toContain('\uFFFD');
     expect(text).not.toContain('[object');
     expect(target.querySelectorAll('[data-testid^="msg-content-"]')).toHaveLength(0);
-    expect(target.querySelectorAll('[data-testid^="log-system-text-"]')).toHaveLength(4);
+    expect(target.querySelectorAll('[data-testid^="log-system-text-"]')).toHaveLength(2);
     for (const record of records) {
       expect(
         target.querySelector(`[data-testid="msg-timestamp-${record.id}"]`),

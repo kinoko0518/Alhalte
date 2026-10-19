@@ -56,7 +56,7 @@ CLI（`CliArgs`）:
 
 `SetDone` は `Room::set_done` が成功したときだけ `ServerFrame::DoneUpdated { done }` を要求元へ返す。失敗時は `SetDoneFailed` のみで、`maitre-d` は成功 frame を観測するまで `rooms.done` を更新しない。
 
-`ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答、BGM 変更を持つ。`ServerFrame` はその結果と broadcast を返す。
+`ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答を持つ。`ServerFrame` はその結果と broadcast を返す。
 
 - `ListScenes` / `CreateScene` / `DeleteScene` / `MoveCharacter` の scene 一覧は `SceneSummary`（`id`、`name`、`present_character_count`、`present_characters`、`active_client_count`、`is_loaded`）の列 `SceneList` として返す。`present_characters` は scene に在籍する character id の昇順リストで、クライアントはこれで `scene.members` を再構築する。`name` は scene state `std::name` の UTF-8 文字列で、未設定なら scene id、`/` は作成時に `メインシーン` が入る。`SceneSummary` は protocol 上の summary であり、`RoomData` / `SceneData` の wire schema は変えず、永続化は従来どおり `SceneData.present_characters` が持つ。
 - `CreateScene { scene_id, inherit_juices, name }` は `name` を `std::name` へ作成と同時に書き、`SceneCreated` を要求元へ返し、`SceneList` と新 scene の `SceneInfo` を room 全体へ broadcast する。`std::name` は juice 継承の対象外。
@@ -65,7 +65,6 @@ CLI（`CliArgs`）:
 - `CreateScene` / `DeleteScene` の成功時は要求元へ `SceneCreated` / `SceneDeleted` を返し、更新後の scene 一覧を `SceneList` として room 全体へ broadcast する。`MoveCharacter` の成功時は要求元への `CharacterMoved` ack に加えて room 全体へも `CharacterMoved` を broadcast し、移動元・移動先の `SceneInfo` を broadcast する。移動先 scene が暗黙に作られた場合は `SceneList` も broadcast する。ack と broadcast が重複してもクライアント側は冪等に適用する。
 - character の CRUD は room 全体へ同期する（#160）。`CreateCharacter` 成功時は要求元へ `CharacterCreated`（採番 id）を返し、room 全体へ `CharacterInfo { character_id, data }` と、新しい character が入った scene の `SceneInfo` を broadcast する。新規 character は要求元が現在入室している scene（不明なら `/`）に所属する。`UpdateCharacter` 成功時は `CharacterUpdated` ack と room 全体への `CharacterInfo`（保存後の属性）を送る。`DeleteCharacter` 成功時は `CharacterDeleted` を room 全体へ broadcast し、全 scene の `present_characters` から除去したうえで `SceneInfo` を、残っている `piece::<id>::placed` / `piece::<id>::pos` を削除して `StateDeleted` を broadcast する。scene membership は `Scene.present_characters` が正で、`character::<id>::scene` mirror は書かない。
 - state の `UpdateState` / `DeleteState` 成功時は、要求元への直接 ack と対象 scene への broadcast の両方を行う。ルート scene `/` の state は他 scene から編集される（アセット・拡張機能）ため、要求元が対象 scene に居なくても ack が届く。両方を受け取ったクライアントは同じ frame を 2 回適用するが、state 更新・削除は冪等。
-- `ClientFrame::ChangeBgm { scene_id, slot, tin_id }` は `tin_id` の 64 hex 文字列を `TinId` に復元し、`ChangeBgmEvent` を log に append する。成功は既存の `LogEventAppended` broadcast で観測できる。BGM の現在値は `std::bgm` / `std::bgm<N>` の state が持つ（slot 番号は任意）。
 
 ## データ形式
 
@@ -75,15 +74,12 @@ CLI（`CliArgs`）:
 | `alhalte/banquette/scene` | scene の state と log biblio（`SceneData`）。 |
 | `alhalte/banquette/log/chunk` | `Vec<Option<Tin>>` の log chunk。 |
 | `alhalte/banquette/log/biblio` | 封入済み chunk の tin id 列と head `(u32, u32)`。 |
-| `alhalte/banquette/log/change-bg-img` | 背景画像変更イベント。 |
-| `alhalte/banquette/log/change-bgm` | BGM 変更イベント。`slot: u32` と `Option<TinId>`。 |
 | `alhalte/banquette/log/character-came` | scene への入室イベント。 |
 | `alhalte/banquette/log/character-gone` | scene からの退場イベント。 |
 
 予約 state キー:
 
 - `std::admins`（`/` の state。account-id の postcard リスト）
-- `std::bgm`、`std::bgm<N>`（BGM slot 1 / 任意 slot N の Tin ID）、`bgm::<slot>::volume`（音量）、`std::b-img`（背景画像の `{ tinId, mimeType }` JSON）、`std::b-img::width` / `std::b-img::height`（背景の表示寸法、数値）
 - scene 名の `std::name`（scene state の UTF-8 文字列。character 属性にも同名キーがある）
 - character 属性の `std::name`、`std::owner_account`
 - cutlery 予約: `asset::<id>`（`/` のアセットメタデータ）、`extension::<id>`（`/` の拡張機能メタデータ）
@@ -181,7 +177,6 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 - Issue #114 のブランチでは変更が未完了で、`cargo check` が `room.rs` のパターンで失敗する状態。main には未反映。
 - 権限同期は GM 集合（`std::admins`）の push のみで、`pl` / `viewer` の差分を banquette に送る専用 frame は持たない。viewer の mutate 遮断は引き続き `maitre-d` が行う。
 - `RoomData` の `done` から `default_permission` への変更に伴い、`alhalte-kitchen` の `RoomArchive` がまだ `room_data.done` を参照している。
-- `ChangeBgmEvent` は `slot: u32` を主とし、旧 `track_index: Option<u8>` をフォールバックとして受け付ける。
 - log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。
 - WebRTC の DataChannel は signaling の中継までを実装し、state の DataChannel 経路そのものは未実装。
 - `RoomData` は `HashMap` を含むため、内容が同じでも postcard の map 順序が変わり tin id が変わることがある。heartbeat ごとに head が作り直されるが、旧 head の unregister と GC で回収される。wire schema は変更していない。

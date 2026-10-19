@@ -180,9 +180,11 @@ impl CellarService {
     /// Performs the initial store metadata handshake.
     ///
     /// Evaluates storage rights and checks whether upload is needed:
-    /// - Returns `210` (UploadRequired) if file must be uploaded or if `anti_oracle` is enabled.
-    /// - Returns `211` (Deduplicated) if already stored by another owner (adding a DB reference row).
-    /// - Returns `212` (AlreadyOwned) if already owned by this owner.
+    /// - Returns [`StoreStatus::UploadRequired`] if the file must be uploaded or
+    ///   if `anti_oracle` is enabled.
+    /// - Returns [`StoreStatus::Deduplicated`] if already stored by another owner
+    ///   (adding a DB reference row).
+    /// - Returns [`StoreStatus::AlreadyOwned`] if already owned by this owner.
     pub async fn store_check(&self, req: &StoreRequest) -> Result<StoreStatus> {
         self.store_check_with_token(req, None).await
     }
@@ -203,7 +205,7 @@ impl CellarService {
         let file_exists = self.storage.has_tin_file(&req.tin_id);
 
         if self.anti_oracle {
-            // Anti-oracle mode: always return 210 to avoid revealing existence.
+            // Anti-oracle mode: always report upload_required to avoid revealing existence.
             Ok(StoreStatus::UploadRequired)
         } else if already_owned {
             // Already owned by this owner

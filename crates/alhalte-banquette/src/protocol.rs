@@ -176,22 +176,6 @@ pub enum ClientFrame {
     },
     /// Response confirming client liveness to a heartbeat ping.
     HeartbeatResponse,
-    /// Change a BGM slot of a scene.
-    ///
-    /// The server appends a [`crate::log::ChangeBgmEvent`] entry to the scene log.
-    /// Success is observed as a [`ServerFrame::LogEventAppended`] broadcast whose
-    /// entry carries the `alhalte/banquette/log/change-bgm` label.
-    ///
-    /// Declared last so that the postcard variant indices of pre-existing frames
-    /// stay stable (backward compatibility).
-    ChangeBgm {
-        /// Target scene ID.
-        scene_id: String,
-        /// 1-based BGM slot index (e.g. 1, 2, 3).
-        slot: u32,
-        /// 64 hexadecimal characters of the audio asset tin ID, or `None` to stop the slot.
-        tin_id: Option<String>,
-    },
 }
 
 /// Messages emitted from `banquette` to a client WebSocket.

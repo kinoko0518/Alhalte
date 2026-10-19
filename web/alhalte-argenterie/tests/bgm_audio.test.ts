@@ -399,7 +399,6 @@ describe('BGM audio playback (Issue #164)', () => {
     expect(error?.getAttribute('role')).toBe('status');
     expect(error?.textContent).toContain(BGM_AUDIO_LOAD_ERROR);
     expect(socket.requestUpdateStateCalls).toHaveLength(0);
-    expect(socket.requestChangeBgmCalls).toHaveLength(0);
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 2)?.isPlaying).toBe(false);
     expect(audio.elements).toHaveLength(0);
 

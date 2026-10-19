@@ -65,7 +65,7 @@ room key が与えられた場合は `0010` で暗号化する。現状は Zero 
 
 `ArchiveScene::parse_all_events` は chunk の各 entry を `SceneEvent` に変換する。
 
-- `character-came` / `character-gone` / `change-bg-img` / `change-bgm` は専用 Tin。
+- `character-came` / `character-gone` は専用 Tin。
 - `alhalte/argenterie/log-record` の JSON Tin は `contentTin`（extension 適用後の `alhalte/generast` Tin bytes）を優先して decode し、無ければ `content` を Generast string として使う。`speakerId` は room の character 名に解決し、`speaker` しか無い旧レコードは名前から character ID を引く。
 - `contentTin` は byte array / base64 / Tin JSON（`{label, payload}`）を受理し、`Generast` / `(Generast, speaker_id)` / 生 postcard の順に decode を試す。
 - duck-typed map の `type` が `character-came` / `came` / `character-gone` / `gone` なら対応するイベント。

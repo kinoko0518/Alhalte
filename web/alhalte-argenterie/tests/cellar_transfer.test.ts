@@ -8,9 +8,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   CELLAR_PROXY_BASE_PATH,
-  CELLAR_STATUS_ALREADY_OWNED,
-  CELLAR_STATUS_DEDUPLICATED,
-  CELLAR_STATUS_UPLOAD_REQUIRED,
+  CELLAR_RESULT_ALREADY_OWNED,
+  CELLAR_RESULT_DEDUPLICATED,
+  CELLAR_RESULT_UPLOAD_REQUIRED,
   CellarTransferError,
   DEFAULT_OPERATION_TIMEOUT_MS,
   downloadTin,
@@ -250,11 +250,16 @@ describe('encodeRoomTin', () => {
   });
 });
 
-// spec: alhalte-argenterie/cellar-transfer uploadTin (210 → PUT, 211/212 skip)
+/** A `POST /api/cellar/store` answer for `result`. */
+function storeCheckStep(result: string): XhrStep {
+  return { status: 200, responseText: JSON.stringify({ result }) };
+}
+
+// spec: alhalte-argenterie/cellar-transfer uploadTin (200 + result → PUT / skip)
 describe('uploadTin', () => {
-  it('POSTs the handshake then PUTs the body on 210', async () => {
+  it('POSTs the handshake then PUTs the body on upload_required', async () => {
     const { factory, xhrs } = scriptedFactory([
-      { status: CELLAR_STATUS_UPLOAD_REQUIRED, responseText: '{"code":210}' },
+      storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED),
       { status: 201, progress: [[0, 4], [2, 4], [4, 4]] },
     ]);
     const progress: number[] = [];
@@ -284,22 +289,52 @@ describe('uploadTin', () => {
     expect(progress.every((p) => p >= 0 && p <= 1)).toBe(true);
   });
 
-  it('skips the PUT for 211 and 212', async () => {
-    for (const status of [CELLAR_STATUS_DEDUPLICATED, CELLAR_STATUS_ALREADY_OWNED]) {
-      const { factory, xhrs } = scriptedFactory([{ status, responseText: '{}' }]);
+  it('skips the PUT for deduplicated and already_owned', async () => {
+    for (const result of [CELLAR_RESULT_DEDUPLICATED, CELLAR_RESULT_ALREADY_OWNED]) {
+      const { factory, xhrs } = scriptedFactory([storeCheckStep(result)]);
       const progress: number[] = [];
-      const result = await uploadTin(new Uint8Array([1, 2]), {
+      const result2 = await uploadTin(new Uint8Array([1, 2]), {
         xhrFactory: factory,
         onProgress: (p) => progress.push(p),
       });
       expect(xhrs).toHaveLength(1);
-      expect(result.tinId).toMatch(/^[0-9a-f]{64}$/);
+      expect(result2.tinId).toMatch(/^[0-9a-f]{64}$/);
       expect(progress).toEqual([1]);
     }
   });
 
+  it('rejects the legacy 210 handshake status', async () => {
+    const { factory, xhrs } = scriptedFactory([
+      { status: 210, responseText: '{"code":210}' },
+    ]);
+    await expect(uploadTin(new Uint8Array([1]), { xhrFactory: factory })).rejects.toMatchObject({
+      code: 'http-error',
+      status: 210,
+    });
+    expect(xhrs).toHaveLength(1);
+  });
+
+  it('rejects a 200 handshake with an unknown result', async () => {
+    const { factory } = scriptedFactory([
+      { status: 200, responseText: '{"result":"mystery"}' },
+    ]);
+    await expect(uploadTin(new Uint8Array([1]), { xhrFactory: factory })).rejects.toMatchObject({
+      code: 'invalid-response',
+    });
+  });
+
+  it('rejects a 200 handshake with a non-JSON body', async () => {
+    const { factory } = scriptedFactory([{ status: 200, responseText: 'not json' }]);
+    await expect(uploadTin(new Uint8Array([1]), { xhrFactory: factory })).rejects.toMatchObject({
+      code: 'invalid-response',
+    });
+  });
+
   it('derives the tin id from the wire bytes with BLAKE3', async () => {
-    const { factory } = scriptedFactory([{ status: CELLAR_STATUS_UPLOAD_REQUIRED }, { status: 201 }]);
+    const { factory } = scriptedFactory([
+      storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED),
+      { status: 201 },
+    ]);
     const wireBytes = new Uint8Array([5, 6, 7]);
     const result = await uploadTin(wireBytes, { xhrFactory: factory });
     expect(result.tinId).toBe(bytesToHex(computeBlake3Hash(wireBytes)));
@@ -307,7 +342,7 @@ describe('uploadTin', () => {
 
   it('accepts a pre-computed tin id and a wrapped key', async () => {
     const { factory, xhrs } = scriptedFactory([
-      { status: CELLAR_STATUS_UPLOAD_REQUIRED },
+      storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED),
       { status: 201 },
     ]);
     const tinId = 'ab'.repeat(32);
@@ -327,7 +362,7 @@ describe('uploadTin', () => {
   });
 
   it('rejects a malformed pre-computed tin id', async () => {
-    const { factory } = scriptedFactory([{ status: CELLAR_STATUS_UPLOAD_REQUIRED }]);
+    const { factory } = scriptedFactory([storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED)]);
     await expect(
       uploadTin(new Uint8Array([1]), { xhrFactory: factory, tinId: 'nope' }),
     ).rejects.toMatchObject({ code: 'invalid-tin-id' });
@@ -346,7 +381,7 @@ describe('uploadTin', () => {
 
   it('surfaces upload HTTP errors', async () => {
     const { factory } = scriptedFactory([
-      { status: CELLAR_STATUS_UPLOAD_REQUIRED },
+      storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED),
       { status: 502, responseText: '{"error":"cellar upstream request failed"}' },
     ]);
     await expect(uploadTin(new Uint8Array([1]), { xhrFactory: factory })).rejects.toMatchObject({
@@ -386,7 +421,7 @@ describe('uploadTin', () => {
   });
 
   it('rejects immediately when the signal is already aborted', async () => {
-    const { factory, xhrs } = scriptedFactory([{ status: CELLAR_STATUS_UPLOAD_REQUIRED }]);
+    const { factory, xhrs } = scriptedFactory([storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED)]);
     const controller = new AbortController();
     controller.abort();
     await expect(
@@ -403,7 +438,7 @@ describe('uploadTin', () => {
   });
 
   it('rejects empty wire bytes', async () => {
-    const { factory } = scriptedFactory([{ status: CELLAR_STATUS_UPLOAD_REQUIRED }]);
+    const { factory } = scriptedFactory([storeCheckStep(CELLAR_RESULT_UPLOAD_REQUIRED)]);
     await expect(
       uploadTin(new Uint8Array(0), { xhrFactory: factory }),
     ).rejects.toMatchObject({ code: 'invalid-argument' });

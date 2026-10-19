@@ -23,6 +23,14 @@ fn create_test_tin(text: &str) -> (Vec<u8>, tin::TinId) {
     t.encode_plaintext(tin::Compression::Zstd).unwrap()
 }
 
+/// Asserts a `POST /store` answer is `200 OK` with exactly `{"result": <expected>}`.
+async fn assert_store_check_result(resp: axum::response::Response, expected: &str) {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(payload, serde_json::json!({ "result": expected }));
+}
+
 // spec: alhalte-cellar/model
 #[tokio::test]
 async fn test_sqlite_and_file_entity_model() {
@@ -199,7 +207,7 @@ fn test_verifier_mode_resolution() {
     );
 }
 
-// spec: alhalte-cellar/session-verifier + store-210-upload-required (Issue #153)
+// spec: alhalte-cellar/session-verifier + store-upload-required (Issue #153)
 #[tokio::test]
 async fn test_store_with_maitre_d_verifier_mock() {
     // Loopback-only mock of maitre-d's /api/verify-session endpoint.
@@ -293,15 +301,15 @@ async fn test_store_with_maitre_d_verifier_mock() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
-// spec: alhalte-cellar/store-210-upload-required
+// spec: alhalte-cellar/store-upload-required
 #[tokio::test]
-async fn test_store_status_210_upload_required() {
+async fn test_store_result_upload_required() {
     let dir = tempdir().unwrap();
     let verifier = Arc::new(InMemorySessionVerifier::new());
     verifier.allow(10, 100);
 
     let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false).unwrap();
-    let (tin_bytes, tin_id) = create_test_tin("content for 210");
+    let (tin_bytes, tin_id) = create_test_tin("content for upload_required");
 
     let req = StoreRequest {
         owner: 10,
@@ -311,10 +319,9 @@ async fn test_store_status_210_upload_required() {
         wrapped_key: None,
     };
 
-    // Store check returns 210 (UploadRequired)
+    // Store check reports upload_required through the service API.
     let status = service.store_check(&req).await.unwrap();
     assert_eq!(status, StoreStatus::UploadRequired);
-    assert_eq!(status.as_u16(), 210);
 
     // Client uploads payload
     let res = service
@@ -328,9 +335,9 @@ async fn test_store_status_210_upload_required() {
     assert!(service.storage().has_tin_file(&tin_id));
 }
 
-// spec: alhalte-cellar/store-211-deduplicated
+// spec: alhalte-cellar/store-deduplicated
 #[tokio::test]
-async fn test_store_status_211_deduplicated() {
+async fn test_store_result_deduplicated() {
     let dir = tempdir().unwrap();
     let verifier = Arc::new(InMemorySessionVerifier::new());
     verifier.allow(10, 100);
@@ -356,9 +363,8 @@ async fn test_store_status_211_deduplicated() {
     };
 
     let status = service.store_check(&req2).await.unwrap();
-    // Must return 211 (Deduplicated)
+    // Must report deduplicated.
     assert_eq!(status, StoreStatus::Deduplicated);
-    assert_eq!(status.as_u16(), 211);
 
     // Verify only ONE file exists in storage
     let files = service.storage().list_tin_files().unwrap();
@@ -374,15 +380,15 @@ async fn test_store_status_211_deduplicated() {
     assert_eq!(key20, Some(vec![0xAA, 0xBB]));
 }
 
-// spec: alhalte-cellar/store-212-already-owned
+// spec: alhalte-cellar/store-already-owned
 #[tokio::test]
-async fn test_store_status_212_already_owned() {
+async fn test_store_result_already_owned() {
     let dir = tempdir().unwrap();
     let verifier = Arc::new(InMemorySessionVerifier::new());
     verifier.allow(10, 100);
 
     let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false).unwrap();
-    let (tin_bytes, tin_id) = create_test_tin("content for 212");
+    let (tin_bytes, tin_id) = create_test_tin("content for already_owned");
 
     // Owner 10 stores the tin
     service
@@ -400,9 +406,8 @@ async fn test_store_status_212_already_owned() {
     };
 
     let status = service.store_check(&req).await.unwrap();
-    // Must return 212 (AlreadyOwned)
+    // Must report already_owned.
     assert_eq!(status, StoreStatus::AlreadyOwned);
-    assert_eq!(status.as_u16(), 212);
 }
 
 // spec: alhalte-cellar/anti-oracle
@@ -424,7 +429,7 @@ async fn test_anti_oracle_mode() {
         .unwrap();
     assert!(res10.written_to_disk);
 
-    // Owner 20 checks store: Even though file exists, anti_oracle returns 210!
+    // Owner 20 checks store: Even though file exists, anti_oracle reports upload_required!
     let req20 = StoreRequest {
         owner: 20,
         session_id: 200,
@@ -435,7 +440,6 @@ async fn test_anti_oracle_mode() {
 
     let status = service.store_check(&req20).await.unwrap();
     assert_eq!(status, StoreStatus::UploadRequired);
-    assert_eq!(status.as_u16(), 210);
 
     // Owner 20 sends payload: It should be discarded into /dev/null (written_to_disk: false),
     // but reference_added should still be true!
@@ -565,7 +569,7 @@ async fn test_http_api_flow() {
     let (tin_bytes, tin_id) = create_test_tin("HTTP API test payload");
     let hex_id = format_tin_id(&tin_id);
 
-    // 1. POST /store -> Should return 210
+    // 1. POST /store -> 200 with result "upload_required"
     let store_req = StoreRequest {
         owner: 100,
         session_id: 1000,
@@ -582,7 +586,7 @@ async fn test_http_api_flow() {
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status().as_u16(), 210);
+    assert_store_check_result(resp, "upload_required").await;
 
     // 2. PUT /store/{tin_id} -> Upload body
     let req = Request::builder()
@@ -614,7 +618,7 @@ async fn test_http_api_flow() {
     let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
     assert_eq!(body_bytes.as_ref(), &tin_bytes);
 
-    // 4. POST /store by second owner 200 -> Deduplication (status 211)
+    // 4. POST /store by second owner -> 200 with result "deduplicated"
     let store_req2 = StoreRequest {
         owner: 200,
         session_id: 2000,
@@ -631,9 +635,9 @@ async fn test_http_api_flow() {
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status().as_u16(), 211);
+    assert_store_check_result(resp, "deduplicated").await;
 
-    // 5. POST /store by owner 100 again -> Already owned (status 212)
+    // 5. POST /store by owner 100 again -> 200 with result "already_owned"
     let req = Request::builder()
         .method("POST")
         .uri("/store")
@@ -642,7 +646,7 @@ async fn test_http_api_flow() {
         .unwrap();
 
     let resp = app.clone().oneshot(req).await.unwrap();
-    assert_eq!(resp.status().as_u16(), 212);
+    assert_store_check_result(resp, "already_owned").await;
 
     // 6. POST /unregister by owner 100
     let unreg = UnregisterRequest {
@@ -954,7 +958,7 @@ async fn test_service_token_header_is_accepted_by_the_router() {
         .body(Body::from(serde_json::to_vec(&req_body).unwrap()))
         .unwrap();
     let resp = app.clone().oneshot(request).await.unwrap();
-    assert_eq!(resp.status().as_u16(), 210);
+    assert_store_check_result(resp, "upload_required").await;
 
     let upload = Request::builder()
         .method("POST")
