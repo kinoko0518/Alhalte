@@ -80,6 +80,7 @@ impl RoomBridge {
         let bridge_clients = Arc::clone(&clients);
         let bridge_scenes = Arc::clone(&client_scenes);
         let bridge_exports = Arc::clone(&pending_exports);
+        let bridge_done = Arc::clone(&is_done);
 
         tracing::info!("Launching banquette for room {room_id}...");
         let socket_path = spawner
@@ -120,6 +121,7 @@ impl RoomBridge {
                             &bridge_clients,
                             &bridge_scenes,
                             &bridge_exports,
+                            &bridge_done,
                         )
                         .await;
                     }
@@ -180,21 +182,47 @@ impl RoomBridge {
         clients: &Arc<RwLock<HashMap<u64, mpsc::Sender<ServerFrame>>>>,
         client_scenes: &Arc<RwLock<HashMap<u64, String>>>,
         pending_exports: &Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
+        is_done: &Arc<AtomicBool>,
     ) {
+        /// Persists a `DoneUpdated` acknowledgement before it is forwarded.
+        fn record_done(db: &Database, room_id: u64, done: bool, is_done: &Arc<AtomicBool>) {
+            let room_id_hex = format!("{room_id:016x}");
+            // The success frame is the only trigger: a rejected `SetDone` never
+            // reaches this point, so `rooms.done` cannot be raised by a
+            // non-admin request.
+            match db.set_room_done(&room_id_hex, done) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::warn!("room {room_id_hex} reported done={done} but is not registered")
+                }
+                Err(e) => tracing::error!("Failed to record done for {room_id_hex}: {e}"),
+            }
+            is_done.store(done, Ordering::Relaxed);
+        }
+
         match frame {
             BanquetteToMaitreD::SendToClient { client_id, frame } => {
+                if let ServerFrame::DoneUpdated { done } = &frame {
+                    record_done(db, room_id, *done, is_done);
+                }
                 let cl = clients.read().await;
                 if let Some(tx) = cl.get(&client_id) {
                     let _ = tx.send(frame).await;
                 }
             }
             BanquetteToMaitreD::BroadcastToRoom { frame } => {
+                if let ServerFrame::DoneUpdated { done } = &frame {
+                    record_done(db, room_id, *done, is_done);
+                }
                 let cl = clients.read().await;
                 for tx in cl.values() {
                     let _ = tx.send(frame.clone()).await;
                 }
             }
             BanquetteToMaitreD::BroadcastToScene { scene_id, frame } => {
+                if let ServerFrame::DoneUpdated { done } = &frame {
+                    record_done(db, room_id, *done, is_done);
+                }
                 let cl = clients.read().await;
                 let scenes = client_scenes.read().await;
                 for (cid, tx) in cl.iter() {
@@ -227,6 +255,13 @@ impl RoomBridge {
                 if let Some(tx) = pending.remove(&request_id) {
                     let _ = tx.send(result);
                 }
+            }
+            BanquetteToMaitreD::AdminsUpdated { admins } => {
+                tracing::debug!(
+                    "room {} applied administrator set of {} account(s)",
+                    format!("{room_id:016x}"),
+                    admins.len()
+                );
             }
             // spec: alhalte-maitre-d/room-head 0001 persist RoomData head pointer
             // spec: alhalte-maitre-d/room-done 0001 persist the public flag with the head
@@ -317,9 +352,25 @@ impl RoomBridge {
         self.is_done.load(Ordering::Relaxed)
     }
 
-    /// Sets the done flag for this room.
+    /// Seeds or updates the in-memory done flag for this room.
+    ///
+    /// Used when a bridge is created (from `rooms.done`) and as the fallback
+    /// when the database row is missing. A live `SetDone` becomes authoritative
+    /// only after banquette acknowledges it with `DoneUpdated`.
     pub fn set_done(&self, done: bool) {
         self.is_done.store(done, Ordering::Relaxed);
+    }
+
+    /// Pushes a complete administrator set to the room's `banquette` process.
+    ///
+    /// The database `room_permissions` rows are the source of truth; this
+    /// internal control frame makes a running room observe a runtime permission
+    /// change without a restart. When no bridge is live the call is a no-op and
+    /// the set is applied at the next spawn.
+    pub fn set_admins(&self, admins: Vec<u64>) {
+        let _ = self
+            .to_banquette_tx
+            .send(MaitreDToBanquette::SetAdmins { admins });
     }
 
     /// Sends a ServerFrame to a specific connected client.
@@ -347,9 +398,8 @@ impl RoomBridge {
                     scenes.write().await.remove(&client_id);
                 });
             }
-            ClientFrame::SetDone { done } => {
-                self.is_done.store(*done, Ordering::Relaxed);
-            }
+            // `SetDone` is intentionally not applied here: the in-memory / DB
+            // `done` flag changes only when banquette sends `DoneUpdated`.
             _ => {}
         }
 
@@ -466,8 +516,36 @@ impl RoomBridgeManager {
         );
         bridge.set_done(initial_done);
 
+        // The database `gm` rows are the source of truth. Push the whole set
+        // into the freshly started room so a permission changed while no bridge
+        // existed is in effect immediately; fall back to the spawn-time admin so
+        // a room without a GM row still has an administrator.
+        let admins = match self.db.get_room_admin_ids(&room_id_hex) {
+            Ok(admins) if !admins.is_empty() => admins,
+            Ok(_) => vec![admin_account],
+            Err(e) => {
+                tracing::error!(
+                    "Failed to read administrators for room {room_id_hex}: {e}; using {admin_account}"
+                );
+                vec![admin_account]
+            }
+        };
+        bridge.set_admins(admins);
+
         rooms.insert(room_id, Arc::clone(&bridge));
         Ok(bridge)
+    }
+
+    /// Pushes the current database administrator set to a running room.
+    ///
+    /// Does nothing when the room has no live bridge: the set is read again and
+    /// applied at the next spawn. This is called after every permission change
+    /// so role updates take effect without restarting `banquette`.
+    pub async fn sync_room_admins(&self, room_id: u64, admins: Vec<u64>) {
+        let rooms = self.rooms.read().await;
+        if let Some(bridge) = rooms.get(&room_id) {
+            bridge.set_admins(admins);
+        }
     }
 
     /// Explicitly removes a room from management.

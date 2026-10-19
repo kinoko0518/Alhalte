@@ -815,3 +815,49 @@ describe('RoomSocket - WebSocket Synchronization (Issue #56)', () => {
     });
   });
 });
+
+// spec: alhalte-argenterie/roomSocket SetDone resolves only after the banquette ack
+describe('RoomSocket - SetDone acknowledgement', () => {
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+  });
+
+  it('resolves requestSetDone on DoneUpdated and rejects on SetDoneFailed', async () => {
+    const socket = new RoomSocket({
+      roomId: 'aabbccddeeff0011',
+      webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+    });
+    socket.connect();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    ws.open();
+    ws.sentMessages = [];
+
+    const pending = socket.requestSetDone(true, 500);
+    expect(socket.getPendingOperationCount()).toBe(1);
+    expect(JSON.parse(ws.sentMessages[0])).toEqual({ SetDone: { done: true } });
+
+    ws.receive({ DoneUpdated: { done: true } });
+    await expect(pending).resolves.toEqual({ done: true });
+    expect(socket.getPendingOperationCount()).toBe(0);
+
+    const denied = socket.requestSetDone(true, 500);
+    ws.receive({ Error: { code: 'SetDoneFailed', message: 'not an admin' } });
+    await expect(denied).rejects.toMatchObject({ code: 'SetDoneFailed' });
+    expect(socket.getPendingOperationCount()).toBe(0);
+  });
+
+  it('rejects requestSetDone when the server reports PermissionDenied', async () => {
+    const socket = new RoomSocket({
+      roomId: 'aabbccddeeff0011',
+      webSocketFactory: (u) => new MockWebSocket(u) as unknown as WebSocket,
+    });
+    socket.connect();
+    const ws = MockWebSocket.instances[MockWebSocket.instances.length - 1];
+    ws.open();
+    ws.sentMessages = [];
+
+    const pending = socket.requestSetDone(true, 500);
+    ws.receive({ Error: { code: 'PermissionDenied', message: 'viewer' } });
+    await expect(pending).rejects.toMatchObject({ code: 'PermissionDenied' });
+  });
+});

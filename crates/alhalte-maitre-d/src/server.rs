@@ -8,12 +8,14 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use tower_http::cors::CorsLayer;
 
 use alhalte_banquette::{ClientFrame, ServerFrame};
 
@@ -23,6 +25,13 @@ use crate::error::MaitreDError;
 use crate::gateway::RoomBridgeManager;
 use crate::oauth::OAuthProvider;
 use crate::room_id::RoomId;
+
+/// Default browser origins allowed by CORS in local development.
+///
+/// Production deployments should pass explicit `--cors-origin` values derived
+/// from the restaurant's argenterie URL / domain. CORS never defaults to
+/// `permissive()`.
+pub const DEFAULT_ALLOWED_ORIGINS: [&str; 2] = ["http://127.0.0.1:5173", "http://localhost:5173"];
 
 /// Application shared state.
 #[derive(Clone)]
@@ -40,6 +49,11 @@ pub struct AppState {
     /// When `None`, the proxied routes answer `503 Service Unavailable`; no other
     /// route is affected.
     pub cellar: Option<CellarProxy>,
+    /// Browser origins allowed by the CORS layer.
+    ///
+    /// Defaults to [`DEFAULT_ALLOWED_ORIGINS`]; an empty list disables
+    /// cross-origin access entirely (same-origin only).
+    pub allowed_origins: Vec<String>,
     /// Client ID monotonic counter.
     client_counter: Arc<AtomicU64>,
 }
@@ -48,7 +62,9 @@ impl AppState {
     /// Creates a new [`AppState`] without a cellar proxy.
     ///
     /// Use [`AppState::with_cellar_proxy`] (or [`AppState::with_cellar_url`]) to
-    /// enable the `/api/cellar/*` routes.
+    /// enable the `/api/cellar/*` routes, and
+    /// [`AppState::with_allowed_origins`] to replace the local-development CORS
+    /// allow-list.
     pub fn new(
         db: Database,
         salt: impl Into<String>,
@@ -61,8 +77,25 @@ impl AppState {
             oauth,
             room_manager,
             cellar: None,
+            allowed_origins: DEFAULT_ALLOWED_ORIGINS
+                .iter()
+                .map(|origin| (*origin).to_string())
+                .collect(),
             client_counter: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    /// Replaces the CORS origin allow-list.
+    ///
+    /// An empty iterator disables cross-origin access (same-origin requests keep
+    /// working). Invalid origins are ignored when the layer is built.
+    #[must_use]
+    pub fn with_allowed_origins(
+        mut self,
+        origins: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.allowed_origins = origins.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Attaches an authenticated cellar reverse proxy configuration.
@@ -209,6 +242,10 @@ pub struct HeartbeatRequest {
 pub struct SearchAccountsQuery {
     /// Search keyword (handle name or numeric account ID).
     pub q: Option<String>,
+    /// Optional claimed account ID (must agree with the session).
+    pub account_id: Option<u64>,
+    /// Optional session ID; a cookie / `X-Alhalte-Session` header also works.
+    pub session_id: Option<u64>,
 }
 
 /// Search result item for accounts.
@@ -220,6 +257,33 @@ pub struct AccountSearchItem {
     pub username: String,
     /// Avatar icon URL if present.
     pub icon_url: Option<String>,
+}
+
+/// Public account profile returned by `GET /api/account/{account_id}`.
+///
+/// This is a response DTO: the stored [`Account::encrypted_sub`] (the encrypted
+/// Google identifier) is never serialized to clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountResponse {
+    /// 64-bit account ID.
+    pub account_id: u64,
+    /// Handle name / nickname.
+    pub handle_name: String,
+    /// Optional 32-byte Tin ID pointing to the user's avatar icon.
+    pub icon_tin_id: Option<[u8; 32]>,
+    /// Creation timestamp (seconds since Unix epoch).
+    pub created_at: i64,
+}
+
+impl From<Account> for AccountResponse {
+    fn from(account: Account) -> Self {
+        Self {
+            account_id: account.account_id,
+            handle_name: account.handle_name,
+            icon_tin_id: account.icon_tin_id,
+            created_at: account.created_at,
+        }
+    }
 }
 
 /// Request payload for setting room permission.
@@ -429,8 +493,51 @@ pub fn create_router(state: AppState) -> Router {
     }
 
     router
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .layer(build_cors_layer(&state.allowed_origins))
         .with_state(state)
+}
+
+/// Builds the CORS layer from an explicit origin allow-list.
+///
+/// Credentials (session cookies / `X-Alhalte-*` headers) are allowed, so the
+/// origin list must be explicit: [`CorsLayer::permissive`] is never used. An
+/// empty list keeps the layer same-origin only.
+fn build_cors_layer(origins: &[String]) -> CorsLayer {
+    // `allow_credentials` is required for the session cookie, and browsers
+    // reject `Access-Control-Allow-Headers: *` together with credentials, so
+    // the headers the gateways actually use are listed explicitly.
+    let allowed_headers = [
+        ACCEPT,
+        CONTENT_TYPE,
+        AUTHORIZATION,
+        HeaderName::from_static("x-alhalte-account"),
+        HeaderName::from_static("x-alhalte-session"),
+        HeaderName::from_static("x-alhalte-room"),
+        HeaderName::from_static("x-alhalte-wrapped-key"),
+        HeaderName::from_static("x-alhalte-service-token"),
+    ];
+    let layer = CorsLayer::new()
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers(allowed_headers)
+        .allow_credentials(true);
+
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|origin| origin.trim().parse::<HeaderValue>().ok())
+        .collect();
+
+    if parsed.is_empty() {
+        layer
+    } else {
+        layer.allow_origin(parsed)
+    }
 }
 
 /// Handles `GET /api/verify-session`.
@@ -711,12 +818,23 @@ async fn oauth_token_handler(
 }
 
 /// Handles `GET /api/account/{account_id}`.
+///
+/// Requires a valid session. The response is [`AccountResponse`], which omits
+/// the stored `encrypted_sub`.
 async fn get_account_handler(
     State(state): State<AppState>,
     AxumPath(account_id): AxumPath<u64>,
+    headers: HeaderMap,
+    Query(query): Query<RoomSessionQuery>,
 ) -> Response {
+    if let Err(response) =
+        resolve_authenticated_account(&state, &headers, query.account_id, query.session_id)
+    {
+        return response.into_response();
+    }
+
     match state.db.get_account(account_id) {
-        Ok(Some(account)) => Json(account).into_response(),
+        Ok(Some(account)) => Json(AccountResponse::from(account)).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({ "error": "Account not found" })),
@@ -860,10 +978,19 @@ async fn create_debug_account_handler(
 }
 
 /// Handles `GET /api/accounts/search?q={query}`.
+///
+/// Requires a valid session; anonymous account enumeration is rejected.
 async fn search_accounts_handler(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Query(query): Query<SearchAccountsQuery>,
 ) -> Response {
+    if let Err(response) =
+        resolve_authenticated_account(&state, &headers, query.account_id, query.session_id)
+    {
+        return response.into_response();
+    }
+
     let q = query.q.as_deref().unwrap_or("").trim();
     if q.is_empty() {
         return (StatusCode::OK, Json(Vec::<AccountSearchItem>::new())).into_response();
@@ -1088,11 +1215,105 @@ async fn get_room_info_handler(
     .into_response()
 }
 
+/// Rejects callers without an explicit membership row.
+// `Response` is axum's handler return type; boxing it here would only move the
+// allocation to every caller without reducing a real hot-path cost.
+#[allow(clippy::result_large_err)]
+fn require_room_member(role: Option<RoomRole>) -> std::result::Result<(), Response> {
+    if role.is_none() {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Room membership is required" })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Rejects callers that are not a `gm`.
+#[allow(clippy::result_large_err)]
+fn require_room_gm(role: Option<RoomRole>) -> std::result::Result<(), Response> {
+    if role != Some(RoomRole::Gm) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "Only a room GM may change permissions" })),
+        )
+            .into_response());
+    }
+    Ok(())
+}
+
+/// Resolves a valid session plus the registered room and caller role.
+#[allow(clippy::result_large_err)]
+fn resolve_room_role(
+    state: &AppState,
+    headers: &HeaderMap,
+    query: &RoomSessionQuery,
+    room_id: &RoomId,
+) -> std::result::Result<Option<RoomRole>, Response> {
+    let account_id =
+        resolve_authenticated_account(state, headers, query.account_id, query.session_id)
+            .map_err(IntoResponse::into_response)?;
+
+    let room_id_str = room_id.to_string();
+    match state.db.get_room(&room_id_str) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "Room not found" })),
+            )
+                .into_response());
+        }
+        Err(error) => {
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response());
+        }
+    }
+
+    state
+        .db
+        .get_room_role(&room_id_str, account_id)
+        .map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": error.to_string() })),
+            )
+                .into_response()
+        })
+}
+
+/// Pushes the current database `gm` set to a live room without restarting it.
+async fn sync_room_admin_set(state: &AppState, room_id: &RoomId) {
+    match state.db.get_room_admin_ids(&room_id.to_string()) {
+        Ok(admins) => {
+            state
+                .room_manager
+                .sync_room_admins(room_id.as_u64(), admins)
+                .await;
+        }
+        Err(e) => tracing::error!("Failed to read administrators for room {room_id}: {e}"),
+    }
+}
+
 /// Handles `GET /api/room/{room_id}/permissions`.
+///
+/// Requires a valid session and room membership.
 async fn get_room_permissions_handler(
     State(state): State<AppState>,
     AxumPath(room_id): AxumPath<RoomId>,
+    headers: HeaderMap,
+    Query(query): Query<RoomSessionQuery>,
 ) -> Response {
+    if let Err(response) =
+        resolve_room_role(&state, &headers, &query, &room_id).and_then(require_room_member)
+    {
+        return response;
+    }
+
     match state.db.get_room_permissions(&room_id.to_string()) {
         Ok(perms) => (StatusCode::OK, Json(perms)).into_response(),
         Err(e) => (
@@ -1104,11 +1325,24 @@ async fn get_room_permissions_handler(
 }
 
 /// Handles `POST /api/room/{room_id}/permissions`.
+///
+/// Requires a valid session and GM role. After the database update the full
+/// `gm` set is pushed to a running room through
+/// [`RoomBridgeManager::sync_room_admins`], so role changes take effect without
+/// a restart.
 async fn set_room_permission_handler(
     State(state): State<AppState>,
     AxumPath(room_id): AxumPath<RoomId>,
+    headers: HeaderMap,
+    Query(query): Query<RoomSessionQuery>,
     Json(req): Json<SetRoomPermissionRequest>,
 ) -> Response {
+    if let Err(response) =
+        resolve_room_role(&state, &headers, &query, &room_id).and_then(require_room_gm)
+    {
+        return response;
+    }
+
     match state.db.get_account(req.account_id) {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1133,16 +1367,19 @@ async fn set_room_permission_handler(
         .db
         .set_room_permission(&room_id_str, req.account_id, req.role, now)
     {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "ok",
-                "room_id": room_id_str,
-                "account_id": req.account_id,
-                "role": req.role
-            })),
-        )
-            .into_response(),
+        Ok(()) => {
+            sync_room_admin_set(&state, &room_id).await;
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "room_id": room_id_str,
+                    "account_id": req.account_id,
+                    "role": req.role
+                })),
+            )
+                .into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -1152,15 +1389,28 @@ async fn set_room_permission_handler(
 }
 
 /// Handles `DELETE /api/room/{room_id}/permissions/{account_id}`.
+///
+/// Requires a valid session and GM role.
 async fn delete_room_permission_handler(
     State(state): State<AppState>,
     AxumPath((room_id, account_id)): AxumPath<(RoomId, u64)>,
+    headers: HeaderMap,
+    Query(query): Query<RoomSessionQuery>,
 ) -> Response {
+    if let Err(response) =
+        resolve_room_role(&state, &headers, &query, &room_id).and_then(require_room_gm)
+    {
+        return response;
+    }
+
     match state
         .db
         .delete_room_permission(&room_id.to_string(), account_id)
     {
-        Ok(_) => (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response(),
+        Ok(_) => {
+            sync_room_admin_set(&state, &room_id).await;
+            (StatusCode::OK, Json(serde_json::json!({ "status": "ok" }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -1236,64 +1486,76 @@ async fn handle_ws_upgrade(
     room_id: RoomId,
     ws: WebSocketUpgrade,
 ) -> Response {
+    let claimed_account_id = query
+        .account_id
+        .or_else(|| header_as_u64(&headers, "X-Alhalte-Account"));
     let session_id = query
         .session_id
-        .or_else(|| {
-            headers
-                .get("X-Alhalte-Session")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-        })
+        .or_else(|| header_as_u64(&headers, "X-Alhalte-Session"))
         .or_else(|| extract_session_id_from_cookie(&headers));
 
-    let account_id = query
-        .account_id
-        .or_else(|| {
-            headers
-                .get("X-Alhalte-Account")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|s| s.parse::<u64>().ok())
-        })
-        .or_else(|| {
-            session_id.and_then(|sid| {
-                state
-                    .db
-                    .get_session(sid)
-                    .ok()
-                    .flatten()
-                    .map(|s| s.account_id)
-            })
-        });
+    // spec: alhalte-maitre-d/websocket-identity
+    // - `account_id` alone is never proof of identity (401).
+    // - `account_id` + a valid session is accepted when both agree.
+    // - a session alone derives its account (no 401).
+    // - neither is an anonymous connection, allowed only for a public room.
+    let (auth_account, auth_session) = match (claimed_account_id, session_id) {
+        (Some(_), None) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({ "error": "A valid session is required with account_id" })),
+            )
+                .into_response();
+        }
+        (None, None) => (0, 0),
+        (claimed_account, Some(session_id)) => {
+            let session = match state.db.get_session(session_id) {
+                Ok(Some(session)) => session,
+                Ok(None) => {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({ "error": "Invalid session credentials" })),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
+            };
 
-    // If credentials provided, verify validity
-    if let (Some(aid), Some(sid)) = (account_id, session_id) {
-        match state.db.is_session_valid(aid, sid) {
-            Ok(true) => {}
-            Ok(false) => {
+            if let Some(claimed) = claimed_account
+                && claimed != session.account_id
+            {
                 return (
                     StatusCode::UNAUTHORIZED,
                     Json(serde_json::json!({ "error": "Invalid session credentials" })),
                 )
                     .into_response();
             }
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({ "error": e.to_string() })),
-                )
-                    .into_response();
+
+            match state.db.is_session_valid(session.account_id, session_id) {
+                Ok(true) => (session.account_id, session_id),
+                Ok(false) => {
+                    return (
+                        StatusCode::UNAUTHORIZED,
+                        Json(serde_json::json!({ "error": "Invalid session credentials" })),
+                    )
+                        .into_response();
+                }
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({ "error": e.to_string() })),
+                    )
+                        .into_response();
+                }
             }
         }
-    } else if session_id.is_some() && account_id.is_none() {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "Invalid session credentials" })),
-        )
-            .into_response();
-    }
-
-    let auth_account = account_id.unwrap_or(0);
-    let auth_session = session_id.unwrap_or(0);
+    };
 
     // A room must be registered in the room registry before it can be joined.
     // Permission rows alone do not create a room, and an unknown room never
@@ -1336,6 +1598,19 @@ async fn handle_ws_upgrade(
     } else {
         None
     };
+
+    // Anonymous callers (no account / no session) are only accepted for a
+    // public room, where they behave as a read-only viewer. A private room is
+    // rejected before banquette is spawned.
+    if auth_account == 0 && !is_done {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "匿名接続は全体公開された部屋でのみ許可されます"
+            })),
+        )
+            .into_response();
+    }
 
     if user_role.is_none() && !is_done {
         return (
@@ -1418,7 +1693,6 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
     let account_id = ctx.account_id;
     let session_id = ctx.session_id;
     let room_id = ctx.room_id;
-    let room_id_u64 = room_id.as_u64();
     let state = ctx.state;
     let bridge = ctx.bridge;
     let is_viewer_initial = ctx.is_viewer_initial;
@@ -1489,11 +1763,9 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
                         }
                     }
 
-                    if let ClientFrame::SetDone { done } = &frame {
-                        // Persists `rooms.done` and updates the live bridge.
-                        state.room_manager.set_room_done(room_id_u64, *done).await;
-                    }
-
+                    // `SetDone` is forwarded unchanged: `rooms.done` and the
+                    // bridge's in-memory flag are updated only when banquette
+                    // acknowledges the request with `DoneUpdated`.
                     bridge_ref.send_client_frame(client_id, frame);
                 }
                 Err(e) => {
@@ -1532,11 +1804,8 @@ async fn handle_websocket(socket: WebSocket, ctx: WsClientContext) {
                             }
                         }
 
-                        if let ClientFrame::SetDone { done } = &f {
-                            // Persists `rooms.done` and updates the live bridge.
-                            state.room_manager.set_room_done(room_id_u64, *done).await;
-                        }
-
+                        // See the text branch: the DB is updated only from the
+                        // banquette `DoneUpdated` acknowledgement.
                         bridge_ref.send_client_frame(client_id, f);
                     }
                     Err(e) => {

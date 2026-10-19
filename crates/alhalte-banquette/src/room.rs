@@ -135,6 +135,18 @@ impl Room {
         if !self.is_admin(caller_account) {
             return Err(BanquetteError::PermissionDenied);
         }
+        self.apply_admin_set(admins)
+    }
+
+    /// Replaces the administrator set from an internal control frame.
+    ///
+    /// This is the `maitre-d` control path used by
+    /// [`crate::protocol::MaitreDToBanquette::SetAdmins`]. Authorization already
+    /// happened against the database `room_permissions` rows, so no room-client
+    /// caller check is performed here. It is intentionally unreachable from a
+    /// [`crate::protocol::ClientFrame`]; clients keep using
+    /// [`Room::set_admins`], which enforces the admin check.
+    pub fn apply_admin_set(&mut self, admins: Vec<u64>) -> Result<()> {
         let root = self
             .scene_biblio
             .get_mut("/")

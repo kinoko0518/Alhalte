@@ -63,10 +63,11 @@ pub use labels::{
 pub use oauth::{GoogleOAuthProvider, GoogleUserInfo, MockOAuthProvider, OAuthProvider};
 pub use room_id::{RoomId, RoomIdParseError, parse_room_id};
 pub use server::{
-    AccountSearchItem, AppState, AuthResponse, CreateRoomRequest, MAX_ROOM_NAME_LEN,
-    RoomInfoResponse, RoomSessionQuery, SearchAccountsQuery, SetRoomPermissionRequest,
-    VerifySessionQuery, VerifySessionResponse, create_router, extract_session_id_from_cookie,
-    is_mutate_frame, parse_session_id_from_cookie_str,
+    AccountResponse, AccountSearchItem, AppState, AuthResponse, CreateRoomRequest,
+    DEFAULT_ALLOWED_ORIGINS, MAX_ROOM_NAME_LEN, RoomInfoResponse, RoomSessionQuery,
+    SearchAccountsQuery, SetRoomPermissionRequest, VerifySessionQuery, VerifySessionResponse,
+    create_router, extract_session_id_from_cookie, is_mutate_frame,
+    parse_session_id_from_cookie_str,
 };
 pub use session::{
     cleanup_sessions_at, cleanup_sessions_with_cutoff, duration_until_next_4am, previous_4am_local,

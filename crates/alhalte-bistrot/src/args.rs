@@ -63,6 +63,13 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         args.push(token.clone());
     }
 
+    // CORS is an explicit allow-list in maitre-d; derive it from the
+    // argenterie URL / restaurant domain instead of defaulting to permissive.
+    for origin in config.cors_origins() {
+        args.push("--cors-origin".to_string());
+        args.push(origin);
+    }
+
     args
 }
 

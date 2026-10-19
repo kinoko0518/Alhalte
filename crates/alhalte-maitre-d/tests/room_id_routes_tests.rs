@@ -133,13 +133,23 @@ async fn websocket_query_accepts_canonical_hex_room_id() {
 // spec: alhalte-maitre-d/room-id permission routes use the canonical hex form
 #[tokio::test]
 async fn permission_routes_accept_canonical_hex_room_id() {
-    let (addr, _temp_dir, _db) = spawn_router().await;
+    let (addr, _temp_dir, db) = spawn_router().await;
     let room_id = "deadbeefcafebabe";
-
-    let resp = reqwest::get(format!("http://{addr}/api/room/{room_id}/permissions"))
-        .await
+    let account = db
+        .get_or_create_account("perm-room-sub", "PermUser", None, 1000)
         .unwrap();
+    let session = db.create_session(account.account_id, 1000).unwrap();
+    db.create_room(room_id, "Permission room", account.account_id, 1000)
+        .unwrap();
+
+    let resp = reqwest::get(format!(
+        "http://{addr}/api/room/{room_id}/permissions?account_id={}&session_id={}",
+        account.account_id, session.session_id
+    ))
+    .await
+    .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::OK);
     let permissions: Vec<alhalte_maitre_d::RoomPermissionItem> = resp.json().await.unwrap();
-    assert!(permissions.is_empty());
+    assert_eq!(permissions.len(), 1);
+    assert_eq!(permissions[0].account_id, account.account_id);
 }

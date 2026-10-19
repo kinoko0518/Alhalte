@@ -154,6 +154,35 @@ impl BistrotConfig {
         format!("http://{}:{}/", self.connect_host(), self.argenterie.port)
     }
 
+    /// Browser origins `alhalte-maitre-d` should allow through CORS.
+    ///
+    /// Derived from the argenterie URL and the restaurant domain so the web UI
+    /// keeps working in local development and behind the production domain.
+    /// Unlike the old permissive default, this is an explicit allow-list.
+    pub fn cors_origins(&self) -> Vec<String> {
+        let mut origins = Vec::new();
+        let mut push = |origin: String| {
+            if !origin.is_empty() && !origins.contains(&origin) {
+                origins.push(origin);
+            }
+        };
+
+        push(self.argenterie_url().trim_end_matches('/').to_string());
+
+        let domain = self.restaurant.domain.trim().trim_end_matches('/');
+        if !domain.is_empty() {
+            // The argenterie dev server is usually hosted on the restaurant
+            // domain rather than the bind host, and production serves the UI on
+            // the bare domain.
+            push(format!("http://{domain}:{}", self.argenterie.port));
+            push(format!("https://{domain}:{}", self.argenterie.port));
+            push(format!("http://{domain}"));
+            push(format!("https://{domain}"));
+        }
+
+        origins
+    }
+
     /// Resolves the HTTP URL for `cellar`.
     pub fn cellar_url(&self) -> String {
         format!("http://{}:{}", self.connect_host(), self.cellar.port)

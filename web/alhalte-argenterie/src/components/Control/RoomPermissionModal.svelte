@@ -54,6 +54,13 @@
   let searchResults = $state<AccountSearchItem[]>([]);
   let isSearching = $state(false);
   let searchDebounceTimer: any = null;
+  let permissionError = $state<string | null>(null);
+
+  /** Formats a failed permission mutation for the error banner. */
+  function permissionErrorMessage(action: string, err: unknown): string {
+    const detail = err instanceof Error ? err.message : String(err);
+    return `${action}に失敗しました: ${detail}`;
+  }
 
   // Active warning dialog state
   type PendingWarning =
@@ -121,7 +128,10 @@
     };
   });
 
-  // Select account from search candidate to add to permissions
+  // Select account from search candidate to add to permissions.
+  //
+  // The list is only updated after `setRoomPermission` succeeds; on failure the
+  // previous list is restored (unchanged) and an error banner is shown.
   async function handleSelectAccount(account: AccountSearchItem) {
     // If account already exists in permissions, ignore or focus
     if (permissions.some((p) => p.account_id === account.account_id)) {
@@ -130,6 +140,7 @@
       return;
     }
 
+    const previous = permissions;
     const defaultRole: RoomRole = 'pl';
     const newItem: RoomPermissionItem = {
       account_id: account.account_id,
@@ -138,16 +149,18 @@
       role: defaultRole,
     };
 
-    permissions = [...permissions, newItem];
-    searchQuery = '';
-    isSearchExpanded = false;
-
+    permissionError = null;
     try {
       await setRoomPermission(roomId, account.account_id, defaultRole, { baseUrl, fetchFn });
+      permissions = [...previous, newItem];
+      searchQuery = '';
+      isSearchExpanded = false;
+      onPermissionsChange?.(permissions);
     } catch (err) {
+      permissions = previous;
+      permissionError = permissionErrorMessage('権限の追加', err);
       console.warn('Failed to persist room permission:', err);
     }
-    onPermissionsChange?.(permissions);
   }
 
   // Role button clicked in connected button group
@@ -169,13 +182,19 @@
   }
 
   async function applyRoleChange(accountId: number, role: RoomRole) {
-    permissions = permissions.map((p) => (p.account_id === accountId ? { ...p, role } : p));
+    const previous = permissions;
+    permissionError = null;
     try {
       await setRoomPermission(roomId, accountId, role, { baseUrl, fetchFn });
+      permissions = previous.map((p) =>
+        p.account_id === accountId ? { ...p, role } : p,
+      );
+      onPermissionsChange?.(permissions);
     } catch (err) {
+      permissions = previous;
+      permissionError = permissionErrorMessage('ロールの変更', err);
       console.warn('Failed to update room permission:', err);
     }
-    onPermissionsChange?.(permissions);
   }
 
   // Delete button clicked
@@ -190,13 +209,17 @@
     if (!activeWarning) return;
     if (activeWarning.type === 'delete') {
       const aid = activeWarning.account.account_id;
-      permissions = permissions.filter((p) => p.account_id !== aid);
+      const previous = permissions;
+      permissionError = null;
       try {
         await deleteRoomPermission(roomId, aid, { baseUrl, fetchFn });
+        permissions = previous.filter((p) => p.account_id !== aid);
+        onPermissionsChange?.(permissions);
       } catch (err) {
+        permissions = previous;
+        permissionError = permissionErrorMessage('権限の削除', err);
         console.warn('Failed to delete room permission:', err);
       }
-      onPermissionsChange?.(permissions);
     } else if (activeWarning.type === 'role-change') {
       await applyRoleChange(activeWarning.account.account_id, activeWarning.targetRole);
     }
@@ -303,6 +326,18 @@
         </Search>
       </div>
 
+      <!-- Persistence failure banner (the list is rolled back on failure) -->
+      {#if permissionError}
+        <div
+          class="permission-error-banner"
+          data-testid="permission-error"
+          role="alert"
+        >
+          <Icon>error</Icon>
+          <span>{permissionError}</span>
+        </div>
+      {/if}
+
       <!-- Divider-separated Permissions List -->
       <div class="permissions-list-container" data-testid="permissions-list">
         {#if permissions.length === 0}
@@ -316,7 +351,11 @@
             {#if index > 0}
               <Divider />
             {/if}
-            <div class="permission-row" data-testid={`permission-row-${perm.account_id}`}>
+            <div
+              class="permission-row"
+              data-testid={`permission-row-${perm.account_id}`}
+              data-role={perm.role}
+            >
               <!-- Left: Avatar, Username, #(account_id) -->
               <div class="user-info-col">
                 <div class="user-avatar" aria-hidden="true">
@@ -591,6 +630,18 @@
     text-align: center;
     font-size: 0.85rem;
     color: var(--np-color-on-surface-variant);
+  }
+  .permission-error-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 8px 24px 0;
+    padding: 10px 12px;
+    border-radius: var(--np-shape-corner-small, 8px);
+    background: var(--np-color-error-container);
+    color: var(--np-color-on-error-container);
+    font-size: 0.85rem;
+    line-height: 1.4;
   }
   .permissions-list-container {
     flex: 1;

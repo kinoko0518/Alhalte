@@ -55,8 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let room_manager = RoomBridgeManager::new(spawner, db.clone());
 
-    let state = AppState::new(db, args.salt, oauth, room_manager)
+    let mut state = AppState::new(db, args.salt, oauth, room_manager)
         .with_cellar_proxy(CellarProxy::new(&args.cellar_url)?);
+    if !args.cors_origins.is_empty() {
+        tracing::info!("CORS allowed origins: {}", args.cors_origins.join(", "));
+        state = state.with_allowed_origins(args.cors_origins);
+    }
     let app = create_router(state);
 
     // If an optional UNIX domain socket is specified, also serve on it

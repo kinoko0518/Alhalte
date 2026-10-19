@@ -72,6 +72,21 @@ pub struct CliArgs {
     /// must be configured with the same token. The value is never logged.
     #[arg(long, env = "ALHALTE_CELLAR_SERVICE_TOKEN", hide_env_values = true)]
     pub service_token: Option<String>,
+
+    /// Browser origin allowed by CORS. Repeat the flag or use a comma-separated
+    /// value / `ALHALTE_CORS_ORIGINS`.
+    ///
+    /// When omitted, only the local development origins
+    /// (`http://127.0.0.1:5173`, `http://localhost:5173`) are accepted. CORS
+    /// never falls back to `permissive()`; production deployments should pass
+    /// the restaurant's argenterie URL / domain here.
+    #[arg(
+        long = "cors-origin",
+        env = "ALHALTE_CORS_ORIGINS",
+        value_delimiter = ',',
+        value_name = "ORIGIN"
+    )]
+    pub cors_origins: Vec<String>,
 }
 
 /// Parses CLI arguments from an arbitrary iterator of strings (useful for unit tests).

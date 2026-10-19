@@ -15,9 +15,13 @@ use alhalte_maitre_d::{
     AppState, Database, InProcessBanquetteSpawner, MockOAuthProvider, ProcessBanquetteSpawner,
     RoomBridgeManager, create_router,
 };
-use futures_util::SinkExt;
+use futures_util::{SinkExt, StreamExt};
 use tempfile::tempdir;
 use tin::Tin;
+
+/// Concrete WebSocket client type used by the full-stack tests.
+type TestWs =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 /// Room ID used by the persistence tests (canonical 16-hex form).
 const ROOM_ID_HEX: &str = "9f3a7c1e5b2d8046";
@@ -91,6 +95,28 @@ async fn wait_for_room_head(db: &Database) -> [u8; 32] {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("maitre-d did not record a room head");
+}
+
+/// Reads WebSocket frames until `pred` matches or the timeout expires.
+async fn wait_for_ws_frame(
+    ws: &mut TestWs,
+    mut pred: impl FnMut(&ServerFrame) -> bool,
+) -> ServerFrame {
+    for _ in 0..60 {
+        match tokio::time::timeout(Duration::from_millis(200), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(frame) = serde_json::from_str::<ServerFrame>(&text)
+                    && pred(&frame)
+                {
+                    return frame;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => continue,
+        }
+    }
+    panic!("expected server frame was not received");
 }
 
 /// Returns the value following `flag` in an argument vector.
@@ -788,6 +814,142 @@ async fn test_restored_room_data_done_is_reflected_in_the_database() {
     assert!(manager.is_room_done(ROOM_ID).await);
 
     spawner.shutdown_room(ROOM_ID).await;
+}
+
+// spec: alhalte-maitre-d/permissions 0001 runtime GM changes reach a running banquette
+// spec: alhalte-maitre-d/room-done 0004 SetDone persists only after the banquette ack
+#[tokio::test]
+async fn test_runtime_gm_sync_and_set_done_ack_ordering() {
+    let temp_dir = tempdir().unwrap();
+    let db = Database::new_in_memory().unwrap();
+    let room_id = "0a1b2c3d4e5f6071";
+
+    let (gm, gm_session) = account_with_session(&db, "sub-sync-gm", "GM");
+    let (player, player_session) = account_with_session(&db, "sub-sync-player", "Player");
+
+    db.create_room(room_id, "Sync room", gm, 1000).unwrap();
+    db.set_room_permission(room_id, player, alhalte_maitre_d::RoomRole::Pl, 1010)
+        .unwrap();
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
+        temp_dir.path().to_path_buf(),
+        8,
+    ));
+    let manager = RoomBridgeManager::new(spawner.clone(), db.clone());
+    let state = AppState::new(
+        db.clone(),
+        "salt",
+        Arc::new(MockOAuthProvider::new()),
+        manager,
+    );
+    let (addr, server) = serve_app(state).await;
+
+    // The GM connects first and starts the room process.
+    let (mut gm_ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={gm}&session_id={gm_session}"
+    ))
+    .await
+    .expect("GM WebSocket");
+    gm_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientFrame::ListScenes)
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    wait_for_ws_frame(&mut gm_ws, |frame| {
+        matches!(frame, ServerFrame::SceneList { .. })
+    })
+    .await;
+
+    // A participant (PL) connects to the same running room.
+    let (mut player_ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={player}&session_id={player_session}"
+    ))
+    .await
+    .expect("player WebSocket");
+
+    // A non-admin SetDone is rejected and must not touch `rooms.done`.
+    player_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientFrame::SetDone { done: true })
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    wait_for_ws_frame(
+        &mut player_ws,
+        |frame| matches!(frame, ServerFrame::Error { code, .. } if code == "SetDoneFailed"),
+    )
+    .await;
+    assert_ne!(db.get_room_done(room_id).unwrap(), Some(true));
+
+    // Promote the already-connected player through the GM API: no restart.
+    let client = reqwest::Client::new();
+    let promote = client
+        .post(format!(
+            "http://{addr}/api/room/{room_id}/permissions?account_id={gm}&session_id={gm_session}"
+        ))
+        .json(&serde_json::json!({ "account_id": player, "role": "gm" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(promote.status(), reqwest::StatusCode::OK);
+
+    // The running room now accepts the admin-only operation. The database is
+    // updated only once the DoneUpdated acknowledgement is observed.
+    player_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientFrame::SetDone { done: true })
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    let ack = wait_for_ws_frame(
+        &mut player_ws,
+        |frame| matches!(frame, ServerFrame::DoneUpdated { done } if *done),
+    )
+    .await;
+    assert_eq!(ack, ServerFrame::DoneUpdated { done: true });
+    assert_eq!(db.get_room_done(room_id).unwrap(), Some(true));
+
+    // Removing the GM role drops admin rights on the same live connection.
+    let demote = client
+        .delete(format!(
+            "http://{addr}/api/room/{room_id}/permissions/{player}?account_id={gm}&session_id={gm_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(demote.status(), reqwest::StatusCode::OK);
+
+    player_ws
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientFrame::SetDone { done: false })
+                .unwrap()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    wait_for_ws_frame(
+        &mut player_ws,
+        |frame| matches!(frame, ServerFrame::Error { code, .. } if code == "SetDoneFailed"),
+    )
+    .await;
+    assert_eq!(
+        db.get_room_done(room_id).unwrap(),
+        Some(true),
+        "a denied SetDone must not change rooms.done"
+    );
+
+    let _ = gm_ws.close(None).await;
+    let _ = player_ws.close(None).await;
+    server.abort();
+    let _ = server.await;
+    spawner.shutdown_all().await;
 }
 
 // spec: alhalte-maitre-d/room-done 0001 a legacy rooms table gains the done column

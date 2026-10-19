@@ -52,7 +52,7 @@
     onDeleteScene?: () => void;
     onManageMembers?: () => void;
     onManagePermissions?: () => void;
-    onSetDone?: (done: boolean) => void;
+    onSetDone?: (done: boolean) => void | Promise<unknown>;
   } = $props();
 
   // Search state
@@ -78,6 +78,30 @@
 
   // Fullscreen Dialogs state
   let isDoneWarningOpen = $state(false);
+  let isDoneSubmitting = $state(false);
+  let doneError = $state<string | null>(null);
+
+  /**
+   * Confirms the public-room change.
+   *
+   * The dialog stays open until the server acknowledges the `SetDone` with
+   * `DoneUpdated`. A rejection (`SetDoneFailed` / `PermissionDenied` / timeout)
+   * keeps the dialog open and shows the error, so the UI never reports success
+   * for a change that did not happen.
+   */
+  async function confirmSetDone() {
+    if (isDoneSubmitting) return;
+    isDoneSubmitting = true;
+    doneError = null;
+    try {
+      await onSetDone?.(true);
+      isDoneWarningOpen = false;
+    } catch (err) {
+      doneError = err instanceof Error ? err.message : String(err);
+    } finally {
+      isDoneSubmitting = false;
+    }
+  }
 
   let availableScenes = $derived(allScenes.length > 0 ? allScenes : [scene]);
 
@@ -273,6 +297,7 @@
           <MenuItem
             onclick={() => {
               isGearMenuOpen = false;
+              doneError = null;
               isDoneWarningOpen = true;
             }}
             data-testid="set-done-item"
@@ -323,7 +348,7 @@
     class="fullscreen-dialog-overlay"
     data-testid="set-done-warning-dialog"
     onclick={(e) => {
-      if (e.target === e.currentTarget) isDoneWarningOpen = false;
+      if (e.target === e.currentTarget && !isDoneSubmitting) isDoneWarningOpen = false;
     }}
   >
     <div
@@ -341,10 +366,21 @@
         この操作を実行してよろしいですか？
       </p>
 
+      {#if doneError}
+        <p class="warning-error" data-testid="done-error-message" role="alert">
+          公開に失敗しました: {doneError}
+        </p>
+      {/if}
+
       <div class="dialog-footer-right">
         <Button
           variant="text"
-          onclick={() => (isDoneWarningOpen = false)}
+          onclick={() => {
+            if (isDoneSubmitting) return;
+            doneError = null;
+            isDoneWarningOpen = false;
+          }}
+          disabled={isDoneSubmitting}
           data-testid="cancel-done-btn"
         >
           キャンセル
@@ -353,13 +389,11 @@
           <Button
             variant="filled"
             class="confirm-done-btn"
-            onclick={() => {
-              isDoneWarningOpen = false;
-              onSetDone?.(true);
-            }}
+            onclick={confirmSetDone}
+            disabled={isDoneSubmitting}
             data-testid="confirm-done-button"
           >
-            公開する
+            {isDoneSubmitting ? '公開中...' : '公開する'}
           </Button>
         </div>
       </div>
@@ -522,6 +556,13 @@
     font-size: 0.92rem;
     color: var(--np-color-on-surface-variant, #49454f);
     line-height: 1.5;
+  }
+  .warning-error {
+    margin: 0;
+    text-align: center;
+    font-size: 0.88rem;
+    color: var(--np-color-error, #b3261e);
+    line-height: 1.4;
   }
   .dialog-footer-right {
     display: flex;
