@@ -8,7 +8,6 @@ import {
   RoomSocket,
   buildRoomWebSocketUrl,
   entryToLogRecord,
-  parseCharacter,
   createRoomSocket,
   type ClientFrame,
   type ServerFrame,

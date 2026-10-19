@@ -279,6 +279,9 @@ async fn test_room_state_restored_after_banquette_restart() {
         "rain"
     );
     assert_eq!(tavern.biblio.head, (0, 1));
+    // The character was created in `/` and then moved to `tavern`, so the root
+    // log holds the `character-gone` event followed by the appended "hello"
+    // (Issue #160: creation assigns a scene membership).
     assert_eq!(
         room_data
             .scenes
@@ -286,7 +289,7 @@ async fn test_room_state_restored_after_banquette_restart() {
             .expect("root scene restored")
             .biblio
             .head,
-        (0, 1)
+        (0, 2)
     );
     assert!(tavern.present_characters.contains(&character_id));
     assert_eq!(room_data.character_biblio.len(), 1);

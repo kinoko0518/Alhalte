@@ -781,12 +781,9 @@ describe('Scene management actions — server acknowledgement (Issue #109 / #143
     expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeNull();
     expect(memberSceneText(target)).toContain('現在: 森');
     expect(sceneNameValue(target)).toBe('森');
-    expect(socket.requestUpdateStateCalls).toHaveLength(1);
-    expect(socket.requestUpdateStateCalls[0]).toMatchObject({
-      sceneId: 'scene-b',
-      key: 'character::42::scene',
-      value: 'scene-b',
-    });
+    // Scene membership is server-authoritative (`SceneInfo`); since Issue #160 no
+    // `character::<id>::scene` state mirror is written after the move.
+    expect(socket.requestUpdateStateCalls).toHaveLength(0);
     expect(target.querySelector('[data-testid="scene-action-error"]')).toBeNull();
 
     unmount(instance);

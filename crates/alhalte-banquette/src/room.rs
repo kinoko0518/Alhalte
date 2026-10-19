@@ -54,6 +54,11 @@ pub struct RoomData {
 }
 
 /// Summary information for a scene returned to permitted callers.
+///
+/// This is a protocol summary (broadcast as `SceneList` / `SceneInfo`), not a
+/// persisted structure: `RoomData` / `SceneData` keep their existing wire
+/// schema and continue to persist membership as
+/// [`crate::scene::SceneData::present_characters`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SceneSummary {
     /// Scene identifier string.
@@ -66,6 +71,11 @@ pub struct SceneSummary {
     pub active_client_count: usize,
     /// Whether the scene is currently loaded in memory.
     pub is_loaded: bool,
+    /// IDs of the characters currently present in this scene, sorted ascending.
+    ///
+    /// Clients use this to rebuild `scene.members` on reload / reconnect instead
+    /// of guessing membership from the character list.
+    pub present_characters: Vec<u64>,
 }
 
 /// Default human-readable name of the root virtual scene `"/"`.
@@ -243,12 +253,15 @@ impl Room {
     /// the `std::name` value, and presence counts) and are broadcast as
     /// `SceneList` / `SceneInfo`.
     fn summary_of(scene: &Scene) -> SceneSummary {
+        let mut present_characters: Vec<u64> = scene.present_characters.iter().copied().collect();
+        present_characters.sort_unstable();
         SceneSummary {
             id: scene.id.clone(),
             name: scene_name_or_id(scene),
-            present_character_count: scene.present_characters.len(),
+            present_character_count: present_characters.len(),
             active_client_count: scene.active_clients.len(),
             is_loaded: scene.is_loaded,
+            present_characters,
         }
     }
 
@@ -462,6 +475,11 @@ impl Room {
     }
 
     /// Moves a character to a target scene.
+    ///
+    /// The destination scene is created implicitly when missing. Membership is
+    /// stored on [`Scene::present_characters`] (persisted through `SceneData`),
+    /// so the room itself is the source of truth; no `character::<id>::scene`
+    /// mirror is needed.
     pub fn move_character(
         &mut self,
         caller_account: u64,
@@ -482,17 +500,79 @@ impl Room {
             self.create_scene(caller_account, to_scene_id, Some("/"))?;
         }
 
-        // Remove from any current scenes
-        for scene in self.scene_biblio.values_mut() {
-            scene.present_characters.remove(&character_id);
+        self.assign_character_to_scene(character_id, to_scene_id)?;
+        Ok(())
+    }
+
+    /// Places a character in `scene_id`, removing it from every other scene.
+    ///
+    /// Returns the affected scene IDs sorted ascending (source scenes that lost
+    /// the character plus the destination). Used by character creation and
+    /// movement so callers can broadcast the corresponding `SceneInfo` frames.
+    pub fn assign_character_to_scene(
+        &mut self,
+        character_id: u64,
+        scene_id: &str,
+    ) -> Result<Vec<String>> {
+        if !self.scene_biblio.contains_key(scene_id) {
+            return Err(BanquetteError::SceneNotFound(scene_id.to_string()));
         }
 
-        // Add to new scene
-        if let Some(target) = self.scene_biblio.get_mut(to_scene_id) {
+        let mut affected = Vec::new();
+        for (sid, scene) in &mut self.scene_biblio {
+            if sid == scene_id {
+                continue;
+            }
+            if scene.present_characters.remove(&character_id) {
+                affected.push(sid.clone());
+            }
+        }
+
+        if let Some(target) = self.scene_biblio.get_mut(scene_id) {
             target.present_characters.insert(character_id);
         }
+        affected.push(scene_id.to_string());
+        affected.sort();
+        affected.dedup();
+        Ok(affected)
+    }
 
-        Ok(())
+    /// Removes a character from every scene and returns the affected scene IDs.
+    ///
+    /// Called when a character is deleted so no scene keeps a stale member.
+    pub fn remove_character_from_scenes(&mut self, character_id: u64) -> Vec<String> {
+        let mut affected = Vec::new();
+        for (sid, scene) in &mut self.scene_biblio {
+            if scene.present_characters.remove(&character_id) {
+                affected.push(sid.clone());
+            }
+        }
+        affected.sort();
+        affected
+    }
+
+    /// Removes the piece state (`piece::<id>::placed` / `piece::<id>::pos`) of a
+    /// character from every scene.
+    ///
+    /// Called on deletion so no client keeps an interactive stale piece. The
+    /// removal is an internal cleanup and bypasses the caller check (it cannot
+    /// touch `std::admins`). Returns the `(scene_id, key)` pairs that were
+    /// actually present, sorted, so the server can announce `StateDeleted`.
+    pub fn clear_character_piece_state(&mut self, character_id: u64) -> Vec<(String, String)> {
+        let keys = [
+            format!("piece::{character_id}::placed"),
+            format!("piece::{character_id}::pos"),
+        ];
+        let mut removed = Vec::new();
+        for (sid, scene) in &mut self.scene_biblio {
+            for key in &keys {
+                if let Ok(Some(_)) = scene.state.delete(key, true) {
+                    removed.push((sid.clone(), key.clone()));
+                }
+            }
+        }
+        removed.sort();
+        removed
     }
 
     /// Handles client entering a scene.

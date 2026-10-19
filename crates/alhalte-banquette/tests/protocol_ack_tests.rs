@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 
 use alhalte_banquette::cellar_sink::InMemoryCellarSink;
-use alhalte_banquette::character::{Character, set_character_name};
+use alhalte_banquette::character::{Character, get_character_name, set_character_name};
 use alhalte_banquette::log::ChangeBgmEvent;
 use alhalte_banquette::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
@@ -440,10 +440,15 @@ async fn test_character_move_ack() {
     }
 
     // `MoveCharacter` implicitly creates the destination scene, so the room's scene list
-    // is re-broadcast.
+    // is re-broadcast (the room-wide `CharacterMoved` broadcast comes first).
     match expect_broadcast_to_room(
         wait_for_frame(&mut stream, |f| {
-            matches!(f, BanquetteToMaitreD::BroadcastToRoom { .. })
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::SceneList { .. }
+                }
+            )
         })
         .await,
     ) {
@@ -478,6 +483,281 @@ async fn test_character_move_ack() {
         ServerFrame::Error { code, .. } => assert_eq!(code, "MoveCharacterFailed"),
         other => panic!("expected Error, got {other:?}"),
     }
+
+    server_task.abort();
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/character room-wide CRUD + scene membership (Issue #160)
+async fn test_character_crud_broadcasts_and_scene_membership() {
+    let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
+
+    // A second client joins the room: broadcasts are room-wide, not just an
+    // echo to the requester.
+    sink.send(MaitreDToBanquette::ClientConnected {
+        client_id: 200,
+        account_id: 20,
+        session_id: 2,
+    })
+    .await
+    .unwrap();
+
+    // Create -> `CharacterCreated` ack (server id) + `CharacterInfo` / `SceneInfo`
+    // broadcasts carrying the full attribute map and the new membership.
+    let mut data: Character = HashMap::new();
+    set_character_name(&mut data, "Hero");
+    send_frame(&mut sink, 100, ClientFrame::CreateCharacter { data }).await;
+
+    let (_, created) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::CharacterCreated { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    let character_id = match created {
+        ServerFrame::CharacterCreated { character_id } => character_id,
+        other => panic!("expected CharacterCreated, got {other:?}"),
+    };
+
+    match expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::CharacterInfo { .. }
+                }
+            )
+        })
+        .await,
+    ) {
+        ServerFrame::CharacterInfo {
+            character_id: id,
+            data,
+        } => {
+            assert_eq!(id, character_id);
+            assert_eq!(get_character_name(&data).as_deref(), Some("Hero"));
+        }
+        other => panic!("expected CharacterInfo, got {other:?}"),
+    }
+
+    match expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::SceneInfo(_)
+                }
+            )
+        })
+        .await,
+    ) {
+        ServerFrame::SceneInfo(summary) => {
+            assert_eq!(summary.id, "/");
+            assert_eq!(summary.present_character_count, 1);
+            assert_eq!(summary.present_characters, vec![character_id]);
+        }
+        other => panic!("expected SceneInfo, got {other:?}"),
+    }
+
+    // Update -> `CharacterUpdated` ack + a `CharacterInfo` broadcast with the
+    // stored attributes (so the character tab and the field agree).
+    let mut updated: Character = HashMap::new();
+    set_character_name(&mut updated, "Hero II");
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::UpdateCharacter {
+            character_id,
+            data: updated,
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::CharacterUpdated { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    match expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::CharacterInfo { .. }
+                }
+            )
+        })
+        .await,
+    ) {
+        ServerFrame::CharacterInfo {
+            character_id: id,
+            data,
+        } => {
+            assert_eq!(id, character_id);
+            assert_eq!(get_character_name(&data).as_deref(), Some("Hero II"));
+        }
+        other => panic!("expected CharacterInfo, got {other:?}"),
+    }
+
+    // Store a piece placement so deletion can prove the cleanup path.
+    let placed_key = format!("piece::{character_id}::placed");
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::UpdateState {
+            scene_id: "/".to_string(),
+            key: placed_key.clone(),
+            value: Tin::from_bool(true),
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::StateUpdated { .. },
+                ..
+            }
+        )
+    })
+    .await;
+
+    // Move -> direct ack + room-wide `CharacterMoved`, and a summary for both the
+    // source and the destination scene.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::MoveCharacter {
+            character_id,
+            to_scene_id: "tavern".to_string(),
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::CharacterMoved { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    match expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::CharacterMoved { .. }
+                }
+            )
+        })
+        .await,
+    ) {
+        ServerFrame::CharacterMoved {
+            character_id: id,
+            to_scene_id,
+        } => {
+            assert_eq!(id, character_id);
+            assert_eq!(to_scene_id, "tavern");
+        }
+        other => panic!("expected CharacterMoved, got {other:?}"),
+    }
+
+    let mut root_membership = None;
+    let mut tavern_membership = None;
+    for _ in 0..12 {
+        let frame = next_frame(&mut stream).await;
+        if let BanquetteToMaitreD::BroadcastToRoom {
+            frame: ServerFrame::SceneInfo(summary),
+        } = frame
+        {
+            match summary.id.as_str() {
+                "/" => root_membership = Some(summary.present_characters),
+                "tavern" => tavern_membership = Some(summary.present_characters),
+                _ => {}
+            }
+        }
+        if root_membership.is_some() && tavern_membership.is_some() {
+            break;
+        }
+    }
+    assert_eq!(root_membership, Some(Vec::new()));
+    assert_eq!(tavern_membership, Some(vec![character_id]));
+
+    // Delete -> direct ack + room-wide `CharacterDeleted`, the stale piece state
+    // is deleted, and the membership summary drops the character.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::DeleteCharacter { character_id },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::CharacterDeleted { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    match expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::CharacterDeleted { .. }
+                }
+            )
+        })
+        .await,
+    ) {
+        ServerFrame::CharacterDeleted { character_id: id } => assert_eq!(id, character_id),
+        other => panic!("expected CharacterDeleted, got {other:?}"),
+    }
+
+    wait_for_frame(&mut stream, |f| match f {
+        BanquetteToMaitreD::SendToClient {
+            frame: ServerFrame::StateDeleted { key, .. },
+            ..
+        }
+        | BanquetteToMaitreD::BroadcastToScene {
+            frame: ServerFrame::StateDeleted { key, .. },
+            ..
+        } => key == &placed_key,
+        _ => false,
+    })
+    .await;
+
+    let mut tavern_empty = false;
+    for _ in 0..8 {
+        let frame = next_frame(&mut stream).await;
+        if let BanquetteToMaitreD::BroadcastToRoom {
+            frame: ServerFrame::SceneInfo(summary),
+        } = frame
+            && summary.id == "tavern"
+        {
+            tavern_empty =
+                summary.present_characters.is_empty() && summary.present_character_count == 0;
+            break;
+        }
+    }
+    assert!(
+        tavern_empty,
+        "deletion must remove the character from the destination scene"
+    );
 
     server_task.abort();
 }

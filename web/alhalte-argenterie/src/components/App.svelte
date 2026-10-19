@@ -55,8 +55,8 @@
     RoomSocket,
     OperationTimeoutError,
     ServerOperationError,
-    parseCharacter,
     sceneListEntrySummary,
+    tinMapToCharacter,
     tinToJson,
     type SceneSummary,
   } from '../utils/roomSocket.js';
@@ -882,8 +882,9 @@
     if (!selectedCharacterId || selectedCharacterId === draft.id) {
       selectedCharacterId = serverId;
     }
-    // Legacy `handleCreateCharacter` also joined the current scene; keep parity
-    // now that the membership change happens only after the ack.
+    // The server places a newly created character in the requester's current
+    // scene and broadcasts the authoritative `SceneInfo`; join locally right away
+    // so the field does not wait a round-trip.
     if (!currentScene.members.includes(serverId)) {
       currentScene.members.push(serverId);
     }
@@ -910,6 +911,52 @@
     if (selectedCharacterId === characterId) {
       selectedCharacterId = characters[0]?.id;
     }
+    // Drop any pending piece state so a re-created id cannot inherit a ghost.
+    for (const states of pieceStatesByScene.values()) {
+      states.delete(characterId);
+    }
+  }
+
+  /**
+   * Applies a room-wide `CharacterInfo` broadcast (create / update, Issue #160).
+   *
+   * The payload is the banquette Tin attribute map, so the same full decoder as
+   * `CharacterList` is used. Create and update acknowledgements may both reach
+   * the requester; replacing by id keeps application idempotent.
+   */
+  function applyCharacterInfo(characterId: string | number, rawData: unknown): void {
+    const decoded = tinMapToCharacter(characterId, rawData as Record<string, any>);
+    const index = characters.findIndex((character) => character.id === decoded.id);
+    if (index >= 0) {
+      characters = characters.map((character, i) => (i === index ? decoded : character));
+    } else {
+      characters = [...characters, decoded];
+    }
+    if (!selectedCharacterId) selectedCharacterId = decoded.id;
+    // The per-scene piece state (`piece::<id>::placed` / `pos`) stays
+    // authoritative for placement; re-apply it after the character attributes.
+    applyPieceStatesToCharacters(currentSceneId);
+  }
+
+  /**
+   * Applies a room-wide `CharacterMoved` broadcast (Issue #160).
+   *
+   * `SceneInfo` carries the authoritative membership and is applied as well;
+   * this handler keeps a client that receives the move first consistent without
+   * waiting for the summary.
+   */
+  function applyCharacterMoved(characterId: string | number, toSceneId: string): void {
+    const id = String(characterId);
+    for (const scene of scenes) {
+      if (scene.members.includes(id)) {
+        scene.members = scene.members.filter((member) => member !== id);
+      }
+    }
+    const target = scenes.find((scene) => scene.id === toSceneId);
+    if (target && !target.members.includes(id)) {
+      target.members = [...target.members, id];
+    }
+    if (currentSceneId === toSceneId) applyPieceStatesToCharacters(currentSceneId);
   }
 
   /**
@@ -1284,8 +1331,30 @@
     placed?: boolean;
     pos?: { x: number; y: number };
   }
+  /**
+   * Position used when a character is placed as a piece but no
+   * `piece::<id>::pos` state exists yet. Both clients use the same default so a
+   * freshly placed piece appears at the same spot everywhere.
+   */
+  const DEFAULT_PIECE_POSITION = { x: 200, y: 200 };
   /** Piece state per scene, applied to `characters` for the current scene. */
   const pieceStatesByScene = new Map<string, Map<string, PieceState>>();
+  /**
+   * Piece placement / position writes are acknowledged before they are committed
+   * locally. One entry per character while a write (or a coalesced burst of
+   * drags) is in flight.
+   */
+  const pendingPieceMoves = new Map<
+    string,
+    { latest: { sceneId: string; position: { x: number; y: number } } | null }
+  >();
+  const pendingPieceToggles = new Set<string>();
+  /** Position of a piece when its current drag started, used to revert a failed move. */
+  const pieceDragStartPositions = new Map<string, { x: number; y: number } | undefined>();
+  /** Failure text for a piece placement / position write (Issue #160). */
+  let pieceActionError = $state<string | null>(null);
+  const PIECE_OFFLINE_ERROR_MESSAGE = 'ルームに接続していないため、駒を操作できません';
+  const PIECE_SAVE_FAILED_MESSAGE = 'サーバーと通信できませんでした';
 
   function parsePieceStateKey(key: string): { characterId: string; kind: 'placed' | 'pos' } | null {
     const placed = PIECE_PLACED_STATE_KEY.exec(key);
@@ -1315,12 +1384,59 @@
           ? character
           : { ...character, placedAsPiece: false };
       }
+      const placed = state.placed === true;
+      const position = state.pos ?? (placed ? DEFAULT_PIECE_POSITION : undefined);
       return {
         ...character,
-        placedAsPiece: state.placed === true,
-        ...(state.pos ? { piecePosition: { ...state.pos } } : {}),
+        placedAsPiece: placed,
+        ...(position ? { piecePosition: { ...position } } : {}),
       };
     });
+  }
+
+  /**
+   * Commits a confirmed piece state (after a `StateUpdated` ack / broadcast) and
+   * mirrors it into the per-scene hydrate map.
+   */
+  function commitPieceState(sceneId: string, characterId: string, patch: PieceState) {
+    let states = pieceStatesByScene.get(sceneId);
+    if (!states) {
+      states = new Map();
+      pieceStatesByScene.set(sceneId, states);
+    }
+    states.set(characterId, { ...(states.get(characterId) ?? {}), ...patch });
+    if (sceneId === currentSceneId) applyPieceStatesToCharacters(sceneId);
+  }
+
+  /** Restores a character's local piece state to the last confirmed one. */
+  function revertPieceState(sceneId: string, characterId: string) {
+    const state = pieceStatesByScene.get(sceneId)?.get(characterId);
+    const dragStart = pieceDragStartPositions.get(characterId);
+    pieceDragStartPositions.delete(characterId);
+    characters = characters.map((character) => {
+      if (character.id !== characterId) return character;
+      // Without a confirmed state fall back to the position the drag started
+      // from (captured on pointerdown) so an offline / failed drag is undone.
+      const placed = state?.placed ?? character.placedAsPiece;
+      const position =
+        state?.pos ??
+        dragStart ??
+        (placed ? DEFAULT_PIECE_POSITION : character.piecePosition);
+      return {
+        ...character,
+        placedAsPiece: placed,
+        ...(position ? { piecePosition: { ...position } } : {}),
+      };
+    });
+  }
+
+  /** Captures the piece position before a drag so a failed write can revert it. */
+  function handlePieceDragStart(characterId: string) {
+    const character = characters.find((candidate) => candidate.id === characterId);
+    pieceDragStartPositions.set(
+      characterId,
+      character?.piecePosition ? { ...character.piecePosition } : undefined,
+    );
   }
 
   function applyPieceStateEntry(sceneId: string, key: string, rawValue: unknown) {
@@ -1461,6 +1577,18 @@
   }
 
   /**
+   * Replaces a scene's member list from a server `SceneSummary`.
+   *
+   * `present_characters` is authoritative (Issue #160): it survives reload and
+   * reconnect because banquette derives it from the persisted scene state. An
+   * older server that omits the field leaves the local list untouched.
+   */
+  function applySceneMembers(scene: Scene, presentCharacters: number[] | undefined): void {
+    if (!Array.isArray(presentCharacters)) return;
+    scene.members = presentCharacters.map((id) => String(id));
+  }
+
+  /**
    * Applies a `SceneInfo` summary (create / rename broadcast).
    *
    * The name is server-authoritative: placeholders created from a `SceneList`
@@ -1477,10 +1605,12 @@
     if (!scene) {
       const placeholder = createPlaceholderScene(summary.id);
       if (name) placeholder.name = name;
+      applySceneMembers(placeholder, summary.present_characters);
       scenes = [...scenes, placeholder];
       return;
     }
     if (name && scene.name !== name) scene.name = name;
+    applySceneMembers(scene, summary.present_characters);
   }
 
   /**
@@ -1622,6 +1752,9 @@
             ? summary.name
             : undefined;
         if (name && scene.name !== name) scene.name = name;
+        // Membership is server-authoritative (Issue #160): rebuilding it from
+        // `present_characters` restores `scene.members` after reload / reconnect.
+        applySceneMembers(scene, summary?.present_characters);
         next.push(scene);
         continue;
       }
@@ -1640,6 +1773,7 @@
       if (typeof summary.name === 'string' && summary.name.trim().length > 0) {
         placeholder.name = summary.name;
       }
+      applySceneMembers(placeholder, summary.present_characters);
       next.push(placeholder);
       changed = true;
     }
@@ -1678,7 +1812,9 @@
         const charList: Character[] = [];
         if (frame.CharacterList?.characters) {
           for (const [id, raw] of Object.entries(frame.CharacterList.characters)) {
-            charList.push(parseCharacter(id, raw));
+            // Full Tin attribute decode (Issue #160): statuses, parameters,
+            // chat palette, icon, color, piece placement, ...
+            charList.push(tinMapToCharacter(id, raw as Record<string, any>));
           }
         }
         // The server list is authoritative: replace even when it is empty
@@ -1686,8 +1822,17 @@
         applyCharacterList(charList);
         applyPieceStatesToCharacters(currentSceneId);
       }
+      if ('CharacterInfo' in frame) {
+        applyCharacterInfo(frame.CharacterInfo.character_id, frame.CharacterInfo.data);
+      }
       if ('CharacterDeleted' in frame) {
         removeCharacterLocally(String(frame.CharacterDeleted.character_id));
+      }
+      if ('CharacterMoved' in frame) {
+        applyCharacterMoved(
+          frame.CharacterMoved.character_id,
+          frame.CharacterMoved.to_scene_id,
+        );
       }
       // Snapshot application is registered both as the `onStateSnapshot`
       // callback (real socket) and here (custom / test sockets). Every supported
@@ -1892,9 +2037,9 @@
    * The target scene id (and the implicitly created scene for an unknown name)
    * is computed before the request because `MoveCharacter` carries it, but the
    * local model is only replaced after the ack. Without a connected socket the
-   * move fails instead of mutating the local model. The room-state mirror
-   * `character::<id>::scene` is kept and is best effort: the `CharacterMoved`
-   * ack is authoritative, so a rejected state write only logs a warning.
+   * move fails instead of mutating the local model. Scene membership is
+   * authoritative on the server (`SceneInfo`) since Issue #160, so no
+   * `character::<id>::scene` state mirror is written.
    */
   async function handleMoveMember(
     characterId: string,
@@ -1917,15 +2062,6 @@
       if (!Number.isNaN(numericCharId)) {
         await socket.requestMoveCharacter(numericCharId, result.targetScene.id);
       }
-      try {
-        await socket.requestUpdateState(
-          result.targetScene.id,
-          `character::${characterId}::scene`,
-          result.targetScene.id,
-        );
-      } catch (stateError) {
-        console.warn('[App] Failed to mirror the member move into the room state:', stateError);
-      }
 
       commitMemberMove(characterId, fromSceneId, result);
       return true;
@@ -1936,75 +2072,97 @@
     }
   }
 
-  function handleTogglePiece(characterId: string) {
+  /**
+   * Toggles a character's piece placement (Issue #160).
+   *
+   * The local model is committed only after `piece::<id>::placed` is
+   * acknowledged. Without a connected socket the toggle fails visibly instead of
+   * pretending it succeeded and losing the change on the next reload.
+   */
+  async function handleTogglePiece(characterId: string) {
     if (isViewer) return;
-    characters = characters.map((c) => {
-      if (c.id === characterId) {
-        const nextPlaced = !c.placedAsPiece;
-        // Keep the per-scene hydrate map in sync so a later `CharacterList`
-        // re-application does not undo this toggle.
-        const sceneId = currentScene.id;
-        let states = pieceStatesByScene.get(sceneId);
-        if (!states) {
-          states = new Map();
-          pieceStatesByScene.set(sceneId, states);
-        }
-        states.set(characterId, { ...(states.get(characterId) ?? {}), placed: nextPlaced });
-        // RoomSocket de-duplicates state frames and replays the final value on
-        // reconnect; without a socket the change stays local only.
-        roomSocket?.updateState(currentScene.id, `piece::${characterId}::placed`, nextPlaced);
-        return {
-          ...c,
-          placedAsPiece: nextPlaced,
-          piecePosition: c.piecePosition || { x: 200, y: 200 },
-        };
-      }
-      return c;
-    });
-  }
+    if (pendingPieceToggles.has(characterId)) return;
 
-  function handlePieceMove(characterId: string, position: { x: number; y: number }) {
-    if (isViewer) return;
-    characters = characters.map((c) => {
-      if (c.id === characterId) {
-        return {
-          ...c,
-          piecePosition: { ...position },
-        };
-      }
-      return c;
-    });
-    const sceneId = currentScene.id;
-    let states = pieceStatesByScene.get(sceneId);
-    if (!states) {
-      states = new Map();
-      pieceStatesByScene.set(sceneId, states);
+    const socket = roomSocket;
+    if (!socket || !socket.isConnected) {
+      pieceActionError = PIECE_OFFLINE_ERROR_MESSAGE;
+      return;
     }
-    states.set(characterId, { ...(states.get(characterId) ?? {}), pos: { ...position } });
-    roomSocket?.updateState(currentScene.id, `piece::${characterId}::pos`, position);
+
+    const character = characters.find((candidate) => candidate.id === characterId);
+    if (!character) return;
+    const sceneId = currentScene.id;
+    const nextPlaced = !character.placedAsPiece;
+
+    pieceActionError = null;
+    pendingPieceToggles.add(characterId);
+    try {
+      await socket.requestUpdateState(
+        sceneId,
+        `piece::${characterId}::placed`,
+        nextPlaced,
+      );
+      commitPieceState(sceneId, characterId, { placed: nextPlaced });
+    } catch (err) {
+      console.warn('[App] Failed to persist the piece placement:', err);
+      pieceActionError = PIECE_SAVE_FAILED_MESSAGE;
+    } finally {
+      pendingPieceToggles.delete(characterId);
+    }
   }
 
   /**
-   * Legacy optimistic create (no server ack), kept for the tab's standalone
-   * inline editor fallback. The hoisted editor goes through
-   * {@link handleSaveCharacter} instead.
+   * Persists a dragged piece position (Issue #160).
+   *
+   * Dragging updates the field immediately for responsiveness, but the final
+   * position is only confirmed after `piece::<id>::pos` is acknowledged. Rapid
+   * drags of the same piece are coalesced: only the latest position of an
+   * in-flight write is sent next, so the client never fires-and-forgets a burst.
+   * A failed or offline write reverts the local position and reports an error.
    */
-  function handleCreateCharacter(char: Character) {
+  async function handlePieceMove(characterId: string, position: { x: number; y: number }) {
     if (isViewer) return;
-    characters.push(char);
-    if (!currentScene.members.includes(char.id)) {
-      currentScene.members.push(char.id);
-    }
-    const numId = Number(char.id);
-    roomSocket?.createCharacter(Number.isNaN(numId) ? Date.now() : numId, char);
-  }
 
-  /** Legacy optimistic update, kept for the tab's standalone inline editor fallback. */
-  function handleUpdateCharacter(char: Character) {
-    if (isViewer) return;
-    characters = characters.map((c) => (c.id === char.id ? char : c));
-    const numId = Number(char.id);
-    roomSocket?.updateCharacter(Number.isNaN(numId) ? 0 : numId, char);
+    const sceneId = currentScene.id;
+    const socket = roomSocket;
+    if (!socket || !socket.isConnected) {
+      pieceActionError = PIECE_OFFLINE_ERROR_MESSAGE;
+      revertPieceState(sceneId, characterId);
+      return;
+    }
+
+    const inFlight = pendingPieceMoves.get(characterId);
+    if (inFlight) {
+      // Keep the newest position; the running loop sends it next.
+      inFlight.latest = { sceneId, position: { ...position } };
+      return;
+    }
+
+    pieceActionError = null;
+    const pending: {
+      latest: { sceneId: string; position: { x: number; y: number } } | null;
+    } = { latest: { sceneId, position: { ...position } } };
+    pendingPieceMoves.set(characterId, pending);
+
+    try {
+      while (pending.latest) {
+        const next = pending.latest;
+        pending.latest = null;
+        await socket.requestUpdateState(
+          next.sceneId,
+          `piece::${characterId}::pos`,
+          next.position,
+        );
+        commitPieceState(next.sceneId, characterId, { pos: { ...next.position } });
+      }
+    } catch (err) {
+      console.warn('[App] Failed to persist the piece position:', err);
+      pieceActionError = PIECE_SAVE_FAILED_MESSAGE;
+      revertPieceState(sceneId, characterId);
+    } finally {
+      pendingPieceMoves.delete(characterId);
+      pieceDragStartPositions.delete(characterId);
+    }
   }
 
   /**
@@ -2288,6 +2446,16 @@
     onReconnect={handleReconnectFromIndicator}
   />
 
+  {#if pieceActionError}
+    <div
+      class="piece-action-error"
+      role="alert"
+      data-testid="piece-action-error"
+    >
+      {pieceActionError}
+    </div>
+  {/if}
+
   {#if isForbidden}
     <GateScreen onReturnHome={returnHome} />
   {:else if preflightStatus === 'not-found'}
@@ -2339,6 +2507,7 @@
             {characters}
             onTransformChange={handleTransformChange}
             onPieceMove={handlePieceMove}
+            onPieceDragStart={handlePieceDragStart}
           />
         </div>
 
@@ -2395,8 +2564,6 @@
                   onCreateScene={handleCreateScene}
                   onDeleteScene={handleDeleteScene}
                   onMoveMember={handleMoveMember}
-                  onUpdateCharacter={handleUpdateCharacter}
-                  onCreateCharacter={handleCreateCharacter}
                   onDeleteCharacter={handleDeleteCharacter}
                   onTogglePiece={handleTogglePiece}
                   onUpdateExtensions={handleUpdateExtensions}
@@ -2444,6 +2611,7 @@
             {characters}
             onTransformChange={handleTransformChange}
             onPieceMove={handlePieceMove}
+            onPieceDragStart={handlePieceDragStart}
           />
         </div>
 
@@ -2489,8 +2657,6 @@
                 onCreateScene={handleCreateScene}
                 onDeleteScene={handleDeleteScene}
                 onMoveMember={handleMoveMember}
-                onUpdateCharacter={handleUpdateCharacter}
-                onCreateCharacter={handleCreateCharacter}
                 onDeleteCharacter={handleDeleteCharacter}
                 onTogglePiece={handleTogglePiece}
                 onUpdateExtensions={handleUpdateExtensions}
@@ -2762,6 +2928,22 @@
     text-align: center;
     background-color: var(--np-color-background);
     color: var(--np-color-on-background);
+  }
+  .piece-action-error {
+    position: absolute;
+    top: 16px;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 80;
+    max-width: min(90vw, 480px);
+    padding: 10px 18px;
+    border-radius: var(--np-shape-corner-medium, 12px);
+    background: var(--np-color-error-container, #f9dedc);
+    color: var(--np-color-on-error-container, #410e0b);
+    box-shadow: var(--np-elevation-2, 0 1px 3px rgba(0, 0, 0, 0.2));
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-align: center;
   }
   .room-state-title {
     margin: 0;

@@ -890,6 +890,71 @@ async fn test_persist_and_restore_whole_room() {
     assert_eq!(data.character_biblio.len(), 1);
 }
 
+// spec: alhalte-banquette/persistence 0003 scene membership survives reload (Issue #160)
+#[tokio::test]
+async fn test_character_scene_membership_survives_persist_and_restore() {
+    let cellar = InMemoryCellarSink::new();
+    let mut room = Room::new(4242, 42, 8).unwrap();
+
+    let mut data: HashMap<String, Tin> = HashMap::new();
+    set_character_name(&mut data, "Alice");
+    let character_id = room.character_biblio.create_character(42, data);
+    let affected = room
+        .assign_character_to_scene(character_id, "/")
+        .expect("root scene exists");
+    assert_eq!(affected, vec!["/".to_string()]);
+
+    // The protocol summary exposes the full membership list, not only a count.
+    let summary = room.scene_summary("/").unwrap();
+    assert_eq!(summary.present_character_count, 1);
+    assert_eq!(summary.present_characters, vec![character_id]);
+
+    let head = room.persist(&cellar, 42).await.unwrap();
+    let restored = Room::load_from_cellar(&cellar, &head, 4242).await.unwrap();
+
+    let root = restored.scene_biblio.get("/").expect("root restored");
+    assert!(root.present_characters.contains(&character_id));
+    assert_eq!(
+        restored.scene_summary("/").unwrap().present_characters,
+        vec![character_id]
+    );
+
+    // Deleting the character removes the membership and the piece state.
+    let mut room = restored;
+    room.update_scene_state(
+        42,
+        "/",
+        format!("piece::{character_id}::placed"),
+        Tin::from_bool(true),
+    )
+    .unwrap();
+    room.character_biblio
+        .delete(character_id, 42, true)
+        .unwrap();
+    assert_eq!(
+        room.remove_character_from_scenes(character_id),
+        vec!["/".to_string()]
+    );
+    assert!(
+        room.scene_summary("/")
+            .unwrap()
+            .present_characters
+            .is_empty()
+    );
+    assert_eq!(
+        room.clear_character_piece_state(character_id),
+        vec![("/".to_string(), format!("piece::{character_id}::placed"))]
+    );
+    assert!(
+        room.scene_biblio
+            .get("/")
+            .unwrap()
+            .state
+            .get(&format!("piece::{character_id}::placed"))
+            .is_none()
+    );
+}
+
 // spec: alhalte-banquette/persistence 0002 superseded head is unregistered (retention)
 #[tokio::test]
 async fn test_superseded_head_is_unregistered() {
@@ -1022,18 +1087,44 @@ async fn test_heartbeat_reports_room_persisted_frame() {
     );
     let server_task = tokio::spawn(async move { server.run().await });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Connect as soon as the listener exists: the heartbeat interval is short and
+    // a room with no connected client exits after three missed beats, which would
+    // otherwise race the first `RoomPersisted` frame under a loaded test runner.
+    for _ in 0..400 {
+        if sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (read_half, _write_half) = stream.into_split();
+    let (read_half, write_half) = stream.into_split();
     let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+    let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+
+    // Register a client so the room is not considered idle and shut down before
+    // it has emitted a `RoomPersisted` frame. Waiting for the `Pong` also proves
+    // the connection (and its persistence subscription) is active.
+    writer
+        .send(MaitreDToBanquette::ClientConnected {
+            client_id: 1,
+            account_id: 10,
+            session_id: 1,
+        })
+        .await
+        .unwrap();
+    writer.send(MaitreDToBanquette::Ping).await.unwrap();
 
     let mut persisted = None;
-    for _ in 0..20 {
-        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done: _ }))) =
-            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
-        {
-            persisted = Some(tin_id);
-            break;
+    for _ in 0..40 {
+        match tokio::time::timeout(Duration::from_millis(500), reader.next()).await {
+            Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done: _ }))) => {
+                persisted = Some(tin_id);
+                break;
+            }
+            Ok(Some(Ok(_))) => continue,
+            Ok(Some(Err(e))) => panic!("protocol error before RoomPersisted: {e:?}"),
+            Ok(None) => panic!("connection closed before RoomPersisted"),
+            Err(_) => continue,
         }
     }
     let tin_id = persisted.expect("heartbeat must report the stored room tin");

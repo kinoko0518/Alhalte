@@ -27,6 +27,7 @@
     origH: propOrigH,
     onTransformChange,
     onPieceMove,
+    onPieceDragStart,
   }: {
     roomName?: string;
     scene: Scene;
@@ -35,6 +36,8 @@
     origH?: number;
     onTransformChange?: (sceneId: string, transform: ViewTransform) => void;
     onPieceMove?: (characterId: string, position: { x: number; y: number }) => void;
+    /** Called on pointerdown of a piece, before its position changes. */
+    onPieceDragStart?: (characterId: string) => void;
   } = $props();
 
   function handlePieceMove(characterId: string, position: { x: number; y: number }) {
@@ -225,6 +228,7 @@
           character={char}
           scale={scene.viewTransform.scale}
           onMove={(pos) => handlePieceMove(char.id, pos)}
+          onDragStart={() => onPieceDragStart?.(char.id)}
         />
       {/if}
     {/each}

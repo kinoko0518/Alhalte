@@ -422,11 +422,11 @@ impl BanquetteServer {
         clients: &Arc<RwLock<HashMap<u64, ConnectedClient>>>,
         out_tx: &mpsc::Sender<BanquetteToMaitreD>,
     ) -> Result<()> {
-        let (account_id, session_id) = {
+        let (account_id, session_id, current_scene) = {
             let cl = clients.read().await;
             match cl.get(&client_id) {
-                Some(c) => (c.account_id, c.session_id),
-                None => (0, 0),
+                Some(c) => (c.account_id, c.session_id, c.current_scene.clone()),
+                None => (0, 0, None),
             }
         };
 
@@ -892,14 +892,40 @@ impl BanquetteServer {
             ClientFrame::CreateCharacter { data } => {
                 let mut r = room.write().await;
                 let char_id = r.character_biblio.create_character(account_id, data);
-                let _ = out_tx
-                    .send(BanquetteToMaitreD::SendToClient {
-                        client_id,
-                        frame: ServerFrame::CharacterCreated {
+                // A new character joins the scene the requester is currently in
+                // (falling back to the root scene). Membership lives on the
+                // scene itself so it survives reload / reconnect.
+                let scene_id = current_scene
+                    .filter(|sid| r.scene_biblio.contains_key(sid))
+                    .unwrap_or_else(|| "/".to_string());
+                let _ = r.assign_character_to_scene(char_id, &scene_id);
+                let character = r.character_biblio.get(char_id).cloned();
+
+                // The requester still receives the `CharacterCreated` ack (which
+                // carries the server-allocated id); every client, including the
+                // requester, also receives the full attribute map as
+                // `CharacterInfo`. Applying both is idempotent.
+                send_to_client(
+                    out_tx,
+                    client_id,
+                    ServerFrame::CharacterCreated {
+                        character_id: char_id,
+                    },
+                )
+                .await;
+                if let Some(data) = character {
+                    broadcast_to_room(
+                        out_tx,
+                        ServerFrame::CharacterInfo {
                             character_id: char_id,
+                            data,
                         },
-                    })
+                    )
                     .await;
+                }
+                if let Some(summary) = r.scene_summary(&scene_id) {
+                    broadcast_to_room(out_tx, ServerFrame::SceneInfo(summary)).await;
+                }
             }
             ClientFrame::UpdateCharacter { character_id, data } => {
                 let mut r = room.write().await;
@@ -909,23 +935,32 @@ impl BanquetteServer {
                     .update(character_id, account_id, is_admin, data)
                 {
                     Ok(()) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::CharacterUpdated { character_id },
-                            })
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::CharacterUpdated { character_id },
+                        )
+                        .await;
+                        // Broadcast the stored attributes (the biblio may have
+                        // preserved the owner) so all clients and tabs agree.
+                        if let Some(data) = r.character_biblio.get(character_id).cloned() {
+                            broadcast_to_room(
+                                out_tx,
+                                ServerFrame::CharacterInfo { character_id, data },
+                            )
                             .await;
+                        }
                     }
                     Err(e) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::Error {
-                                    code: "UpdateCharacterFailed".to_string(),
-                                    message: e.to_string(),
-                                },
-                            })
-                            .await;
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "UpdateCharacterFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -937,23 +972,43 @@ impl BanquetteServer {
                     .delete(character_id, account_id, is_admin)
                 {
                     Ok(_) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::CharacterDeleted { character_id },
-                            })
-                            .await;
+                        // Removal is room-wide: drop the scene memberships and
+                        // any piece state so no client keeps a stale member or an
+                        // interactive ghost piece.
+                        let affected = r.remove_character_from_scenes(character_id);
+                        let removed_piece_state = r.clear_character_piece_state(character_id);
+
+                        let deleted = ServerFrame::CharacterDeleted { character_id };
+                        send_to_client(out_tx, client_id, deleted.clone()).await;
+                        broadcast_to_room(out_tx, deleted).await;
+
+                        for (scene_id, key) in removed_piece_state {
+                            let frame = ServerFrame::StateDeleted {
+                                scene_id: scene_id.clone(),
+                                key,
+                            };
+                            // Direct ack for a requester outside the scene plus
+                            // the scene broadcast for everyone in it.
+                            send_to_client(out_tx, client_id, frame.clone()).await;
+                            broadcast_to_scene(out_tx, &scene_id, frame).await;
+                        }
+
+                        for scene_id in affected {
+                            if let Some(summary) = r.scene_summary(&scene_id) {
+                                broadcast_to_room(out_tx, ServerFrame::SceneInfo(summary)).await;
+                            }
+                        }
                     }
                     Err(e) => {
-                        let _ = out_tx
-                            .send(BanquetteToMaitreD::SendToClient {
-                                client_id,
-                                frame: ServerFrame::Error {
-                                    code: "DeleteCharacterFailed".to_string(),
-                                    message: e.to_string(),
-                                },
-                            })
-                            .await;
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "DeleteCharacterFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
                     }
                 }
             }
@@ -962,27 +1017,29 @@ impl BanquetteServer {
                 to_scene_id,
             } => {
                 let mut r = room.write().await;
-                // Find former scene if any
-                let former_scene = r
+                // Find every scene currently holding the character (normally one,
+                // but a legacy room may list it in more than one).
+                let former_scenes: Vec<String> = r
                     .scene_biblio
                     .iter()
-                    .find(|(_, s)| s.present_characters.contains(&character_id))
-                    .map(|(id, _)| id.clone());
+                    .filter(|(_, s)| s.present_characters.contains(&character_id))
+                    .map(|(id, _)| id.clone())
+                    .collect();
                 // `move_character` implicitly creates the destination scene when missing,
                 // so the room's scene list must be re-broadcast in that case.
                 let destination_created = !r.scene_biblio.contains_key(&to_scene_id);
 
                 match r.move_character(account_id, character_id, &to_scene_id) {
                     Ok(()) => {
-                        // Append gone log in former scene
-                        if let Some(fs) = former_scene {
+                        // Append gone log in each former scene
+                        for fs in &former_scenes {
                             let gone_event = CharacterGoneEvent { character_id };
                             if let Ok(tin) = gone_event.to_tin() {
                                 let _ = r
                                     .append_log(
                                         account_id,
                                         session_id,
-                                        &fs,
+                                        fs,
                                         Some(tin),
                                         cellar.as_ref(),
                                     )
@@ -1003,19 +1060,30 @@ impl BanquetteServer {
                                 .await;
                         }
 
-                        send_to_client(
-                            out_tx,
-                            client_id,
-                            ServerFrame::CharacterMoved {
-                                character_id,
-                                to_scene_id: to_scene_id.clone(),
-                            },
-                        )
-                        .await;
+                        let moved = ServerFrame::CharacterMoved {
+                            character_id,
+                            to_scene_id: to_scene_id.clone(),
+                        };
+                        // The requester's ack and the room-wide broadcast are the
+                        // same frame; applying it twice is idempotent.
+                        send_to_client(out_tx, client_id, moved.clone()).await;
+                        broadcast_to_room(out_tx, moved).await;
 
                         if destination_created {
                             let scenes = r.list_scene_summaries();
                             broadcast_to_room(out_tx, ServerFrame::SceneList { scenes }).await;
+                        }
+
+                        // Re-announce the source and destination summaries so all
+                        // clients rebuild `scene.members` from the server state.
+                        let mut affected = former_scenes;
+                        affected.push(to_scene_id.clone());
+                        affected.sort();
+                        affected.dedup();
+                        for scene_id in affected {
+                            if let Some(summary) = r.scene_summary(&scene_id) {
+                                broadcast_to_room(out_tx, ServerFrame::SceneInfo(summary)).await;
+                            }
                         }
                     }
                     Err(e) => {
