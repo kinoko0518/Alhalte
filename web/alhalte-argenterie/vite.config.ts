@@ -10,7 +10,9 @@ export default defineConfig({
         target: 'http://127.0.0.1:8080',
         changeOrigin: true,
       },
-      // Google OAuth endpoints (`/auth/google/url`, `/auth/google/callback`).
+      // Google OAuth entry / callback (`/auth/login`, `/auth/google/callback`).
+      // maitre-d's --public-url points at this dev origin so the session cookie
+      // is set on the same origin the UI and /api/session use.
       '/auth': {
         target: 'http://127.0.0.1:8080',
         changeOrigin: true,

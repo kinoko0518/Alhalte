@@ -106,7 +106,7 @@
 
     isBusy = true;
     try {
-      await beginGoogleSignIn({ baseUrl, fetchFn, prompt: 'select_account' });
+      await beginGoogleSignIn({ baseUrl, prompt: 'select_account' });
     } catch {
       authError = 'サインインを開始できませんでした';
       isBusy = false;
@@ -127,7 +127,7 @@
 
     isBusy = true;
     try {
-      await beginGoogleSignIn({ baseUrl, fetchFn, prompt: 'select_account' });
+      await beginGoogleSignIn({ baseUrl, prompt: 'select_account' });
     } catch {
       authError = 'アカウントを切り替えできませんでした';
       isBusy = false;

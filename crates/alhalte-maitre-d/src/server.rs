@@ -8,7 +8,7 @@ use std::time::Duration;
 use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{DefaultBodyLimit, Path as AxumPath, Query, State};
-use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue};
+use axum::http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderValue, LOCATION, SET_COOKIE};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -33,6 +33,19 @@ use crate::room_id::RoomId;
 /// `permissive()`.
 pub const DEFAULT_ALLOWED_ORIGINS: [&str; 2] = ["http://127.0.0.1:5173", "http://localhost:5173"];
 
+/// Default public base URL used to build the Google OAuth redirect URI.
+///
+/// Bistrot overrides this with `--public-url` derived from the restaurant
+/// domain / argenterie URL. The redirect URI must stay fixed: Google rejects a
+/// redirect URI that carries the argenterie origin or port.
+pub const DEFAULT_PUBLIC_URL: &str = "http://127.0.0.1:8080";
+
+/// Lifetime of the `session_id` cookie set by the OAuth callback (30 days).
+///
+/// The server-side session itself is still purged at 4:00 local time when it
+/// has no recent heartbeat.
+pub const SESSION_COOKIE_MAX_AGE_SECS: i64 = 30 * 24 * 60 * 60;
+
 /// Application shared state.
 #[derive(Clone)]
 pub struct AppState {
@@ -52,8 +65,13 @@ pub struct AppState {
     /// Browser origins allowed by the CORS layer.
     ///
     /// Defaults to [`DEFAULT_ALLOWED_ORIGINS`]; an empty list disables
-    /// cross-origin access entirely (same-origin only).
+    /// cross-origin access entirely (same-origin only). The same allow-list
+    /// gates OAuth `return_to` values.
     pub allowed_origins: Vec<String>,
+    /// Public base URL used to build the fixed Google OAuth redirect URI.
+    ///
+    /// Defaults to [`DEFAULT_PUBLIC_URL`]; `--public-url` replaces it.
+    pub public_url: String,
     /// Client ID monotonic counter.
     client_counter: Arc<AtomicU64>,
 }
@@ -62,9 +80,10 @@ impl AppState {
     /// Creates a new [`AppState`] without a cellar proxy.
     ///
     /// Use [`AppState::with_cellar_proxy`] (or [`AppState::with_cellar_url`]) to
-    /// enable the `/api/cellar/*` routes, and
+    /// enable the `/api/cellar/*` routes,
     /// [`AppState::with_allowed_origins`] to replace the local-development CORS
-    /// allow-list.
+    /// allow-list, and [`AppState::with_public_url`] to replace the OAuth
+    /// redirect base.
     pub fn new(
         db: Database,
         salt: impl Into<String>,
@@ -81,6 +100,7 @@ impl AppState {
                 .iter()
                 .map(|origin| (*origin).to_string())
                 .collect(),
+            public_url: DEFAULT_PUBLIC_URL.to_string(),
             client_counter: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -88,7 +108,8 @@ impl AppState {
     /// Replaces the CORS origin allow-list.
     ///
     /// An empty iterator disables cross-origin access (same-origin requests keep
-    /// working). Invalid origins are ignored when the layer is built.
+    /// working). Invalid origins are ignored when the layer is built. The same
+    /// list is used to validate OAuth `return_to` origins.
     #[must_use]
     pub fn with_allowed_origins(
         mut self,
@@ -96,6 +117,24 @@ impl AppState {
     ) -> Self {
         self.allowed_origins = origins.into_iter().map(Into::into).collect();
         self
+    }
+
+    /// Replaces the public base URL used for the Google OAuth redirect URI.
+    #[must_use]
+    pub fn with_public_url(mut self, public_url: impl Into<String>) -> Self {
+        self.public_url = public_url.into();
+        self
+    }
+
+    /// Returns the fixed Google OAuth redirect URI (`{public_url}/auth/google/callback`).
+    ///
+    /// The argenterie origin / port is never part of this URL; it is the value
+    /// registered in Google Cloud Console.
+    pub fn oauth_redirect_uri(&self) -> String {
+        format!(
+            "{}/auth/google/callback",
+            self.public_url.trim().trim_end_matches('/')
+        )
     }
 
     /// Attaches an authenticated cellar reverse proxy configuration.
@@ -295,24 +334,16 @@ pub struct SetRoomPermissionRequest {
     pub role: crate::db::RoomRole,
 }
 
-/// Query parameters for OAuth redirect URL generation.
-#[derive(Debug, Deserialize)]
-pub struct OAuthUrlQuery {
-    /// OAuth redirect URI.
-    pub redirect_uri: String,
-    /// Random CSRF state string.
-    pub state: String,
-}
-
-/// Request payload for OAuth callback exchange.
-#[derive(Debug, Deserialize)]
-pub struct OAuthCallbackRequest {
-    /// Authorization code returned from Google.
-    pub code: String,
-    /// Redirect URI matching the authorization request.
-    pub redirect_uri: String,
-    /// Optional default handle name.
-    pub handle_name: Option<String>,
+/// Query parameters for `GET /auth/login`.
+#[derive(Debug, Default, Deserialize)]
+pub struct OAuthLoginQuery {
+    /// Absolute URL to return to after Google authentication.
+    ///
+    /// Only origins in the CORS allow-list are accepted; the browser cannot
+    /// send a fragment, so argenterie restores it from `sessionStorage`.
+    pub return_to: Option<String>,
+    /// Optional Google `prompt` value (`select_account` / `consent` / `none`).
+    pub prompt: Option<String>,
 }
 
 /// Request payload for OAuth ID token verification.
@@ -330,6 +361,19 @@ pub struct AuthResponse {
     /// Account entity.
     pub account: Account,
     /// Issued 64-bit session ID.
+    pub session_id: u64,
+}
+
+/// Response payload of `GET /api/session`.
+///
+/// The callback sets the `session_id` cookie; argenterie calls this endpoint
+/// after the redirect to learn the account ID and persist the session in the
+/// same places the room socket reads. `encrypted_sub` is never exposed.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SessionResponse {
+    /// Public account profile for the session owner.
+    pub account: AccountResponse,
+    /// Session ID resolved from the cookie / header / query.
     pub session_id: u64,
 }
 
@@ -424,12 +468,11 @@ pub const MAX_CELLAR_TRANSFER_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub fn create_router(state: AppState) -> Router {
     let mut router = Router::new()
         .route("/api/verify-session", get(verify_session_handler))
+        .route("/api/session", get(session_handler))
         .route("/api/heartbeat", post(heartbeat_handler))
-        .route("/auth/google/url", get(oauth_url_handler))
-        .route(
-            "/auth/google/callback",
-            get(oauth_callback_get_handler).post(oauth_callback_post_handler),
-        )
+        // OAuth entry point: maitre-d owns the state and the fixed redirect URI.
+        .route("/auth/login", get(oauth_login_handler))
+        .route("/auth/google/callback", get(oauth_callback_handler))
         .route("/auth/google/token", post(oauth_token_handler))
         .route(
             "/api/account/{account_id}",
@@ -648,109 +691,272 @@ async fn heartbeat_handler(
     }
 }
 
-/// Handles `GET /auth/google/url`.
-async fn oauth_url_handler(
+/// Builds an error response with the shared JSON error shape.
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(serde_json::json!({ "error": message.into() }))).into_response()
+}
+
+/// Returns a `302 Found` response that sends the browser to `location`.
+fn redirect_response(location: &str) -> Response {
+    match HeaderValue::from_str(location) {
+        Ok(value) => {
+            let mut response = StatusCode::FOUND.into_response();
+            response.headers_mut().insert(LOCATION, value);
+            response
+        }
+        Err(_) => error_response(StatusCode::BAD_REQUEST, "Invalid redirect target"),
+    }
+}
+
+/// Builds the `Set-Cookie` value for an authenticated browser session.
+///
+/// `SameSite=Lax` covers the top-level OAuth callback redirect. `Secure` is
+/// added when the public URL is HTTPS.
+pub fn session_cookie_header(session_id: u64, secure: bool, max_age_secs: i64) -> String {
+    let mut cookie =
+        format!("session_id={session_id}; Path=/; Max-Age={max_age_secs}; SameSite=Lax");
+    if secure {
+        cookie.push_str("; Secure");
+    }
+    cookie
+}
+
+/// Returns the normalized `scheme://host[:port]` origin of an absolute HTTP(S) URL.
+///
+/// Fragments are ignored because `http::Uri` has no fragment component; query
+/// strings do not affect the origin. Relative URLs, non-HTTP schemes, and URLs
+/// with userinfo are rejected.
+fn normalized_origin(value: &str) -> Option<String> {
+    let without_fragment = value.split('#').next().unwrap_or(value);
+    let uri: http::Uri = without_fragment.parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let authority = uri.authority()?;
+    // `http://allowed.example@evil.example` must not inherit the allowed origin.
+    if authority.as_str().contains('@') {
+        return None;
+    }
+    let host = authority.host().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let default_port = if scheme == "http" { 80 } else { 443 };
+    match authority.port_u16().filter(|port| *port != default_port) {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
+}
+
+/// Returns true when `return_to` is an absolute URL on an allowed origin.
+///
+/// The allow-list is the same explicit origin list used for CORS. This is the
+/// open-redirect guard for `GET /auth/login`: `//evil.example`, another origin,
+/// and `javascript:` / `data:` URLs are all rejected.
+pub fn is_allowed_return_to(return_to: &str, allowed_origins: &[String]) -> bool {
+    let Some(origin) = normalized_origin(return_to) else {
+        return false;
+    };
+    allowed_origins
+        .iter()
+        .any(|allowed| normalized_origin(allowed).as_deref() == Some(origin.as_str()))
+}
+
+/// Returns true for the Google `prompt` values argenterie may request.
+fn is_allowed_prompt(prompt: Option<&str>) -> bool {
+    matches!(prompt, Some("select_account" | "consent" | "none"))
+}
+
+/// Creates a random, URL-safe OAuth state (32 bytes, hex encoded).
+fn generate_oauth_state() -> String {
+    hex::encode(rand::random::<[u8; 32]>())
+}
+
+/// Handles `GET /auth/login`.
+///
+/// The browser navigates here with an absolute `return_to`. maitre-d issues a
+/// single-use state, binds it to `return_to`, and redirects to Google with the
+/// fixed `{public_url}/auth/google/callback` redirect URI. The argenterie
+/// origin / port is never sent to Google.
+async fn oauth_login_handler(
     State(state): State<AppState>,
-    Query(q): Query<OAuthUrlQuery>,
+    Query(q): Query<OAuthLoginQuery>,
 ) -> Response {
-    let url = state.oauth.authorization_url(&q.redirect_uri, &q.state);
-    Json(serde_json::json!({ "url": url })).into_response()
+    let Some(return_to) = q
+        .return_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return error_response(StatusCode::BAD_REQUEST, "Missing return_to");
+    };
+
+    if !is_allowed_return_to(return_to, &state.allowed_origins) {
+        return error_response(StatusCode::BAD_REQUEST, "return_to origin is not allowed");
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    let oauth_state = generate_oauth_state();
+    if let Err(error) = state.db.create_oauth_state(
+        &oauth_state,
+        return_to,
+        now,
+        crate::db::OAUTH_STATE_TTL_SECS,
+    ) {
+        return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+    }
+
+    let redirect_uri = state.oauth_redirect_uri();
+    let mut url = state.oauth.authorization_url(&redirect_uri, &oauth_state);
+    if let Some(prompt) = q.prompt.as_deref().filter(|p| is_allowed_prompt(Some(p))) {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str("prompt=");
+        url.push_str(prompt);
+    }
+
+    redirect_response(&url)
 }
 
 /// Handles `GET /auth/google/callback`.
-async fn oauth_callback_get_handler(
+///
+/// Google calls this fixed URL. The state is consumed (single-use, 10 minute
+/// TTL), the code is exchanged, the account / session are created, and the
+/// browser is sent back to the `return_to` bound to the state with a
+/// `session_id` cookie.
+async fn oauth_callback_handler(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let code = match params.get("code") {
-        Some(c) => c,
-        None => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Missing code" })),
-            )
-                .into_response();
-        }
+    if let Some(error) = params.get("error") {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!("Google OAuth error: {error}"),
+        );
+    }
+
+    let Some(code) = params.get("code").map(String::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "Missing code");
     };
-    let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
-    let handle_name = params.get("handle_name").cloned();
-
-    handle_oauth_exchange(&state, code, &redirect_uri, handle_name.as_deref()).await
-}
-
-/// Handles `POST /auth/google/callback`.
-async fn oauth_callback_post_handler(
-    State(state): State<AppState>,
-    Json(req): Json<OAuthCallbackRequest>,
-) -> Response {
-    handle_oauth_exchange(
-        &state,
-        &req.code,
-        &req.redirect_uri,
-        req.handle_name.as_deref(),
-    )
-    .await
-}
-
-async fn handle_oauth_exchange(
-    state: &AppState,
-    code: &str,
-    redirect_uri: &str,
-    handle_name: Option<&str>,
-) -> Response {
-    let user_info = match state.oauth.exchange_code(code, redirect_uri).await {
-        Ok(info) => info,
-        Err(e) => {
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    let encrypted_sub = match crypto::encrypt_sub(&state.salt, &user_info.sub) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
+    let Some(oauth_state) = params.get("state").map(String::as_str) else {
+        return error_response(StatusCode::BAD_REQUEST, "Missing state");
     };
 
     let now = chrono::Utc::now().timestamp();
-    let default_name = handle_name.unwrap_or("Anonymous");
+    let return_to =
+        match state
+            .db
+            .consume_oauth_state(oauth_state, now, crate::db::OAUTH_STATE_TTL_SECS)
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Unknown, expired, or already used OAuth state",
+                );
+            }
+            Err(error) => {
+                return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
+            }
+        };
 
-    let account = match state
+    // Defense in depth: the allow-list may have changed between login and callback.
+    if !is_allowed_return_to(&return_to, &state.allowed_origins) {
+        return error_response(StatusCode::BAD_REQUEST, "return_to origin is not allowed");
+    }
+
+    let redirect_uri = state.oauth_redirect_uri();
+    let user_info = match state.oauth.exchange_code(code, &redirect_uri).await {
+        Ok(info) => info,
+        Err(error) => return error_response(StatusCode::UNAUTHORIZED, error.to_string()),
+    };
+
+    let (_account, session) = match issue_account_session(&state, &user_info.sub, "Anonymous", now)
+    {
+        Ok(values) => values,
+        Err((status, message)) => return error_response(status, message),
+    };
+
+    let secure = state.public_url.trim().starts_with("https://");
+    let cookie = session_cookie_header(session.session_id, secure, SESSION_COOKIE_MAX_AGE_SECS);
+
+    let mut response = redirect_response(&return_to);
+    match HeaderValue::from_str(&cookie) {
+        Ok(value) => {
+            response.headers_mut().append(SET_COOKIE, value);
+            response
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to build session cookie",
+        ),
+    }
+}
+
+/// Looks up or creates the account for `sub` and issues a fresh session.
+fn issue_account_session(
+    state: &AppState,
+    sub: &str,
+    default_name: &str,
+    now: i64,
+) -> std::result::Result<(Account, crate::db::Session), (StatusCode, String)> {
+    let encrypted_sub = crypto::encrypt_sub(&state.salt, sub)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let account = state
         .db
         .get_or_create_account(&encrypted_sub, default_name, None, now)
-    {
-        Ok(acc) => acc,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let session = state
+        .db
+        .create_session(account.account_id, now)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok((account, session))
+}
+
+/// Handles `GET /api/session`.
+///
+/// Resolves the caller from the `session_id` cookie / header / query and
+/// returns the public account profile plus the session ID. argenterie calls
+/// this after the OAuth redirect to store the account and session in the same
+/// places the room socket reads.
+async fn session_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<RoomSessionQuery>,
+) -> Response {
+    let session_id = query
+        .session_id
+        .or_else(|| {
+            headers
+                .get("X-Alhalte-Session")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+        .or_else(|| extract_session_id_from_cookie(&headers));
+
+    let Some(session_id) = session_id else {
+        return error_response(StatusCode::UNAUTHORIZED, "Missing session ID");
+    };
+
+    let session = match state.db.get_session(session_id) {
+        Ok(Some(session)) => session,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "Invalid session"),
+        Err(error) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
         }
     };
 
-    let session = match state.db.create_session(account.account_id, now) {
-        Ok(s) => s,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
+    let account = match state.db.get_account(session.account_id) {
+        Ok(Some(account)) => account,
+        Ok(None) => return error_response(StatusCode::UNAUTHORIZED, "Invalid session"),
+        Err(error) => {
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
         }
     };
 
-    Json(AuthResponse {
-        account,
-        session_id: session.session_id,
+    Json(SessionResponse {
+        account: AccountResponse::from(account),
+        session_id,
     })
     .into_response()
 }

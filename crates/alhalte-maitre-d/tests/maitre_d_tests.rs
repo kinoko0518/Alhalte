@@ -558,7 +558,7 @@ async fn test_interoperability_with_cellar_maitre_d_verifier() {
 
 // spec: alhalte-maitre-d/oauth-exchange
 #[tokio::test]
-async fn test_oauth_flow_and_account_linkage() {
+async fn test_oauth_login_and_callback_flow() {
     let db = Database::new_in_memory().unwrap();
     let mock_oauth = Arc::new(MockOAuthProvider::new());
     mock_oauth.register_code("auth-code-123", "google-sub-frank");
@@ -568,7 +568,9 @@ async fn test_oauth_flow_and_account_linkage() {
         Arc::new(alhalte_maitre_d::InProcessBanquetteSpawner::new_with_in_memory_cellar("/tmp", 8));
     let room_manager = RoomBridgeManager::new(spawner, db.clone());
     let salt = "my-test-salt";
-    let state = AppState::new(db.clone(), salt, mock_oauth, room_manager);
+    let state = AppState::new(db.clone(), salt, mock_oauth, room_manager)
+        .with_public_url("http://maitre-d.test/")
+        .with_allowed_origins(["http://app.test"]);
     let app = create_router(state);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -577,58 +579,266 @@ async fn test_oauth_flow_and_account_linkage() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    let client = reqwest::Client::new();
+    // OAuth is a browser navigation flow: never follow redirects in tests.
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
 
-    // 1. Authorization URL
-    let url_resp = client
-        .get(format!(
-            "http://{addr}/auth/google/url?redirect_uri=http://app.com/cb&state=xyz"
-        ))
+    // spec: alhalte-maitre-d/oauth-return-to 0001 disallowed return_to origins are rejected
+    for bad_return_to in [
+        "http://evil.example/callback",
+        "//evil.example",
+        "javascript:alert(1)",
+        "http://app.test@evil.example/",
+        "/relative",
+        "",
+    ] {
+        let resp = client
+            .get(format!("http://{addr}/auth/login"))
+            .query(&[("return_to", bad_return_to)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "return_to {bad_return_to:?} must be rejected"
+        );
+    }
+
+    // 1. `/auth/login` redirects to Google with the fixed maitre-d redirect URI.
+    let login = client
+        .get(format!("http://{addr}/auth/login"))
+        .query(&[
+            ("return_to", "http://app.test/rooms/abc?invite=1"),
+            ("prompt", "select_account"),
+        ])
         .send()
         .await
         .unwrap();
-    assert_eq!(url_resp.status(), reqwest::StatusCode::OK);
+    assert_eq!(login.status(), reqwest::StatusCode::FOUND);
 
-    // 2. Code exchange via POST /auth/google/callback
-    let cb_resp = client
-        .post(format!("http://{addr}/auth/google/callback"))
-        .json(&serde_json::json!({
-            "code": "auth-code-123",
-            "redirect_uri": "http://app.com/cb",
-            "handle_name": "Frank"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(cb_resp.status(), reqwest::StatusCode::OK);
-    let auth_data: alhalte_maitre_d::AuthResponse = cb_resp.json().await.unwrap();
-    assert_eq!(auth_data.account.handle_name, "Frank");
-
-    // The sub stored in DB is encrypted with instance salt
-    let expected_enc_sub = encrypt_sub(salt, "google-sub-frank").unwrap();
-    assert_eq!(auth_data.account.encrypted_sub, expected_enc_sub);
+    let location = login
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let auth_url = reqwest::Url::parse(&location).unwrap();
+    assert_eq!(auth_url.host_str(), Some("mock-google-oauth.example.com"));
+    let params: std::collections::HashMap<String, String> =
+        auth_url.query_pairs().into_owned().collect();
+    // The argenterie origin / port is never sent to Google.
     assert_eq!(
-        decrypt_sub(salt, &auth_data.account.encrypted_sub).unwrap(),
+        params.get("redirect_uri").map(String::as_str),
+        Some("http://maitre-d.test/auth/google/callback")
+    );
+    assert_eq!(
+        params.get("prompt").map(String::as_str),
+        Some("select_account")
+    );
+    let oauth_state = params.get("state").cloned().expect("state must be issued");
+    assert_eq!(oauth_state.len(), 64, "state is 32 random bytes as hex");
+
+    // 2. The callback consumes the state, creates the session, sets the cookie,
+    //    and redirects to the absolute return_to.
+    let callback = client
+        .get(format!("http://{addr}/auth/google/callback"))
+        .query(&[("code", "auth-code-123"), ("state", oauth_state.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(callback.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        callback
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "http://app.test/rooms/abc?invite=1"
+    );
+    let set_cookie = callback
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .find_map(|value| value.to_str().ok())
+        .expect("callback must set the session cookie");
+    assert!(set_cookie.contains("session_id="));
+    assert!(set_cookie.contains("SameSite=Lax"));
+    assert!(
+        !set_cookie.contains("Secure"),
+        "http public URL has no Secure"
+    );
+    let session_id = set_cookie
+        .split(';')
+        .next()
+        .unwrap()
+        .trim_start_matches("session_id=")
+        .parse::<u64>()
+        .unwrap();
+
+    // 3. `/api/session` resolves the account from the cookie for argenterie.
+    let session_resp = client
+        .get(format!("http://{addr}/api/session"))
+        .header(reqwest::header::COOKIE, format!("session_id={session_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session_resp.status(), reqwest::StatusCode::OK);
+    let session_data: alhalte_maitre_d::SessionResponse = session_resp.json().await.unwrap();
+    assert_eq!(session_data.session_id, session_id);
+    assert_eq!(session_data.account.handle_name, "Anonymous");
+
+    // The sub is encrypted with the instance salt and never exposed by /api/session.
+    let stored = db
+        .get_account(session_data.account.account_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.encrypted_sub,
+        encrypt_sub(salt, "google-sub-frank").unwrap()
+    );
+    assert_eq!(
+        decrypt_sub(salt, &stored.encrypted_sub).unwrap(),
         "google-sub-frank"
     );
 
-    // 3. Repeated login with ID token returns the same account ID with a fresh session ID
+    // spec: alhalte-maitre-d/oauth-state 0001 states are single-use
+    let replay = client
+        .get(format!("http://{addr}/auth/google/callback"))
+        .query(&[("code", "auth-code-123"), ("state", oauth_state.as_str())])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 4. `/auth/google/token` still issues a fresh session for the same account.
     let token_resp = client
         .post(format!("http://{addr}/auth/google/token"))
-        .json(&serde_json::json!({
-            "id_token": "id-token-abc"
-        }))
+        .json(&serde_json::json!({ "id_token": "id-token-abc" }))
         .send()
         .await
         .unwrap();
     assert_eq!(token_resp.status(), reqwest::StatusCode::OK);
     let auth_data2: alhalte_maitre_d::AuthResponse = token_resp.json().await.unwrap();
-
-    assert_eq!(auth_data2.account.account_id, auth_data.account.account_id);
-    assert_ne!(auth_data2.session_id, auth_data.session_id);
+    assert_eq!(
+        auth_data2.account.account_id,
+        session_data.account.account_id
+    );
+    assert_ne!(auth_data2.session_id, session_id);
     assert!(
         db.is_session_valid(auth_data2.account.account_id, auth_data2.session_id)
             .unwrap()
+    );
+
+    // 5. The old client-driven endpoints are gone.
+    let old_url = client
+        .get(format!(
+            "http://{addr}/auth/google/url?redirect_uri=http://app.test/&state=xyz"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_url.status(), reqwest::StatusCode::NOT_FOUND);
+    let old_post = client
+        .post(format!("http://{addr}/auth/google/callback"))
+        .json(&serde_json::json!({
+            "code": "auth-code-123",
+            "redirect_uri": "http://app.test/",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_post.status(), reqwest::StatusCode::METHOD_NOT_ALLOWED);
+}
+
+// spec: alhalte-maitre-d/oauth-state 0002 expired states are rejected
+#[test]
+fn test_oauth_state_single_use_and_expiry() {
+    let db = Database::new_in_memory().unwrap();
+    let ttl = alhalte_maitre_d::OAUTH_STATE_TTL_SECS;
+
+    db.create_oauth_state("state-1", "http://app.test/", 1000, ttl)
+        .unwrap();
+    assert_eq!(
+        db.consume_oauth_state("state-1", 1000, ttl).unwrap(),
+        Some("http://app.test/".to_string())
+    );
+    assert_eq!(db.consume_oauth_state("state-1", 1000, ttl).unwrap(), None);
+
+    db.create_oauth_state("state-2", "http://app.test/", 1000, ttl)
+        .unwrap();
+    assert_eq!(
+        db.consume_oauth_state("state-2", 1000 + ttl + 1, ttl)
+            .unwrap(),
+        None
+    );
+
+    // Unknown states are rejected without leaking whether they existed.
+    assert_eq!(
+        db.consume_oauth_state("never-issued", 1000, ttl).unwrap(),
+        None
+    );
+}
+
+// spec: alhalte-maitre-d/oauth-return-to 0002 open redirects are rejected
+#[test]
+fn test_oauth_return_to_origin_validation() {
+    let allowed = vec![
+        "http://127.0.0.1:5173".to_string(),
+        "https://app.example".to_string(),
+    ];
+
+    assert!(alhalte_maitre_d::is_allowed_return_to(
+        "http://127.0.0.1:5173/rooms/1?invite=1#room-key",
+        &allowed
+    ));
+    assert!(alhalte_maitre_d::is_allowed_return_to(
+        "https://app.example",
+        &allowed
+    ));
+    // Default ports normalize to the bare origin.
+    assert!(alhalte_maitre_d::is_allowed_return_to(
+        "https://app.example:443/rooms/1",
+        &allowed
+    ));
+
+    for rejected in [
+        "http://127.0.0.1:5174/",
+        "http://127.0.0.1:5173.evil.example/",
+        "//evil.example/",
+        "/relative/path",
+        "javascript:alert(1)",
+        "data:text/html,hi",
+        "http://app.example@evil.example/",
+        "https://app.example.evil.example/",
+        "",
+    ] {
+        assert!(
+            !alhalte_maitre_d::is_allowed_return_to(rejected, &allowed),
+            "{rejected:?} must not be accepted as return_to"
+        );
+    }
+
+    assert!(!alhalte_maitre_d::is_allowed_return_to(
+        "https://app.example/",
+        &[]
+    ));
+}
+
+// spec: alhalte-maitre-d/oauth-cookie
+#[test]
+fn test_session_cookie_header_attributes() {
+    assert_eq!(
+        alhalte_maitre_d::session_cookie_header(42, false, 60),
+        "session_id=42; Path=/; Max-Age=60; SameSite=Lax"
+    );
+    assert_eq!(
+        alhalte_maitre_d::session_cookie_header(42, true, 60),
+        "session_id=42; Path=/; Max-Age=60; SameSite=Lax; Secure"
     );
 }
 
@@ -649,6 +859,8 @@ fn test_cli_bistrot_argument_compatibility() {
         "super-secret-oauth",
         "--salt",
         "instance-salt-67890",
+        "--public-url",
+        "https://auth.example.com",
         "--socket-dir",
         "/run/alhalte",
     ];
@@ -663,6 +875,7 @@ fn test_cli_bistrot_argument_compatibility() {
     assert_eq!(parsed.client_id, "google-client-12345");
     assert_eq!(parsed.client_secret, "super-secret-oauth");
     assert_eq!(parsed.salt, "instance-salt-67890");
+    assert_eq!(parsed.public_url, "https://auth.example.com");
     assert_eq!(parsed.socket_dir, std::path::PathBuf::from("/run/alhalte"));
 }
 

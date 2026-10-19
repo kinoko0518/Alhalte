@@ -15,9 +15,10 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | メソッド | パス | 内容 |
 | --- | --- | --- |
 | `GET` | `/api/verify-session` | `owner` / `account_id` と `session_id` の有効性を返す。cellar の `MaitreDVerifier` と互換。 |
+| `GET` | `/api/session` | `session_id`（Cookie / ヘッダ / クエリ）から `account`（`AccountResponse`）と `session_id` を返す。argenterie が OAuth 後に account を得るための軽量 API。 |
 | `POST` | `/api/heartbeat` | `session_id` の `last_heartbeat` を更新する。 |
-| `GET` | `/auth/google/url` | Google OAuth の認可 URL を返す。 |
-| `GET` / `POST` | `/auth/google/callback` | 認可コードを交換し、account と session を返す。 |
+| `GET` | `/auth/login` | 絶対 URL の `return_to` を受け、state を発行して Google へ 302 する。`return_to` の origin は CORS allow-list のみ許可（オープンリダイレクト禁止）。`prompt` も任意で透過する。 |
+| `GET` | `/auth/google/callback` | Google からの固定 callback。state を単回消費し、コードを交換して account / session を作り、`session_id` Cookie を設定して `return_to` へ 302 する。 |
 | `POST` | `/auth/google/token` | ID token を検証し、account と session を返す。 |
 | `GET` / `PATCH` | `/api/account/{account_id}` | 認証必須。account の取得（`encrypted_sub` を含まない `AccountResponse`）・handle name / icon の更新。 |
 | `GET` | `/api/accounts/search?q=...` | 認証必須。handle name / ID で account を検索。 |
@@ -31,7 +32,7 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | `GET` | `/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。本体と `X-Alhalte-Wrapped-Key` を返す。 |
 | `POST` | `/api/debug/account` | debug ビルドのみ。`sub = "0"` の account を作る。 |
 
-`/accounts/search`、`/room/{room_id}/permissions`、`/room/{room_id}/export/zip` など、`/api` なしの別名も登録されている。CORS は明示的な origin allow-list で、`permissive()` は使わない。既定はローカル開発用の `http://127.0.0.1:5173` / `http://localhost:5173` で、`--cors-origin`（または `ALHALTE_CORS_ORIGINS`）で置き換える。Bistrot は `argenterie_url()` と `restaurant.domain` から origin を生成して渡す。`allow_credentials` を使うため `Allow-Headers: *` は使わず、`X-Alhalte-*` を明示する。
+`/accounts/search`、`/room/{room_id}/permissions`、`/room/{room_id}/export/zip` など、`/api` なしの別名も登録されている。CORS は明示的な origin allow-list で、`permissive()` は使わない。既定はローカル開発用の `http://127.0.0.1:5173` / `http://localhost:5173` で、`--cors-origin`（または `ALHALTE_CORS_ORIGINS`）で置き換える。Bistrot は `argenterie_url()` と `restaurant.domain` から origin を生成して渡す。`allow_credentials` を使うため `Allow-Headers: *` は使わず、`X-Alhalte-*` を明示する。同じ allow-list が `GET /auth/login` の `return_to` 検証にも使われる。
 
 #### room ID 契約
 
@@ -66,17 +67,17 @@ room-scoped route の `{room_id}` は `RoomId`（`crates/alhalte-maitre-d/src/ro
 
 `/api/cellar/store`、`/api/cellar/store/{tin_id}` は Axum 既定の 2 MiB を超える Tin（アセット・拡張 wasm）を通すため、`DefaultBodyLimit::max(64 MiB)` を route 単位で設定する。他の route は既定のまま。
 
-CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`、`--service-token`（`ALHALTE_CELLAR_SERVICE_TOKEN`）、`--cors-origin`（繰り返し / カンマ区切り、`ALHALTE_CORS_ORIGINS`）。
+CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--public-url`（`ALHALTE_PUBLIC_URL`、既定 `http://127.0.0.1:8080`）、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`、`--service-token`（`ALHALTE_CELLAR_SERVICE_TOKEN`）、`--cors-origin`（繰り返し / カンマ区切り、`ALHALTE_CORS_ORIGINS`）。`--public-url` は OAuth の `redirect_uri`（`{public_url}/auth/google/callback`）と Cookie の `Secure` 判定に使う。Bistrot は `maitre-d.public-url` があればそれを、なければ `restaurant.domain` が非ループバックなら `https://{domain}`、ループバック開発なら argenterie URL を渡す。
 
 ### 主な公開型
 
 - `RoomId`、`RoomIdParseError`、`parse_room_id`
-- `Database`、`Account`、`Session`、`Room`、`RoomRole`、`RoomPermissionItem`（`Database::get_room_head` / `set_room_head` / `get_room_admin_ids` を含む）
+- `Database`、`Account`、`Session`、`Room`、`RoomRole`、`RoomPermissionItem`（`Database::get_room_head` / `set_room_head` / `get_room_admin_ids` / `create_oauth_state` / `consume_oauth_state` を含む）、`OAUTH_STATE_TTL_SECS`
 - `CreateRoomRequest`、`RoomInfoResponse`、`RoomSessionQuery`、`MAX_ROOM_NAME_LEN`
-- `AccountResponse`（`encrypted_sub` を含まない account 応答 DTO）、`DEFAULT_ALLOWED_ORIGINS`
-- `OAuthProvider`、`GoogleOAuthProvider`、`MockOAuthProvider`、`GoogleUserInfo`
+- `AccountResponse`（`encrypted_sub` を含まない account 応答 DTO）、`SessionResponse`、`DEFAULT_ALLOWED_ORIGINS`、`DEFAULT_PUBLIC_URL`、`SESSION_COOKIE_MAX_AGE_SECS`
+- `OAuthProvider`、`GoogleOAuthProvider`、`MockOAuthProvider`、`GoogleUserInfo`、`OAuthLoginQuery`
 - `RoomBridge`、`RoomBridgeManager`、`BanquetteSpawner`、`ProcessBanquetteSpawner`、`InProcessBanquetteSpawner`
-- `AppState`、`create_router`、`extract_session_id_from_cookie`
+- `AppState`、`create_router`、`extract_session_id_from_cookie`、`is_allowed_return_to`、`session_cookie_header`
 - `encrypt_sub` / `decrypt_sub`、`DEBUG_SUB_CIPHERTEXT`
 - session cleanup: `previous_4am_local`、`cleanup_sessions_at`、`spawn_session_cleanup_task`
 
@@ -86,14 +87,17 @@ CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--clien
 
 ### Google 認証
 
-1. `/auth/google/url` が client ID、redirect URI、state を含む認可 URL を返す。
-2. callback または `/auth/google/token` が Google から `sub` を取得する。
-3. `encrypt_sub(salt, sub)` が salt から鍵を導出し、AES-256-GCM-SIV（Zero Nonce）で暗号化する。
-4. `get_or_create_account(encrypted_sub, handle_name, icon, now)` が account を引くか作る。
-5. `create_session(account_id, now)` が 0 以外のランダムな 64bit session ID を発行する。
-6. 応答は `Account` と `session_id`。ブラウザ側は Cookie と localStorage に保存する。
+OAuth の `redirect_uri` は常に `{public_url}/auth/google/callback` で、Google Cloud Console に登録する値もこれだけ。argenterie の origin / port は Google に渡さない。
 
-`argenterie` は `GET /auth/google/url` で認可 URL を取得し、現在のページ（クエリ・フラグメントを除く `redirect_uri`）へ戻る。戻り URL の `code` / `state` を検証し、`POST /auth/google/callback` で session に交換する。`GET /auth/google/callback` はサーバー単体で認可コードを確認するための経路で、ブラウザ UI は POST を使う。認可前のクエリと部屋鍵フラグメントは `argenterie` が sessionStorage に退避し、交換後に復元する。
+1. argenterie は現在の URL（クエリ・部屋鍵フラグメントを含む）を sessionStorage に退避し、fragment を除いた絶対 URL を `return_to` として `GET /auth/login` へ遷移する。
+2. `/auth/login` は `return_to` の origin を CORS allow-list と照合する。`//evil`、別 origin、`javascript:` / `data:`、userinfo 付き URL は 400。問題なければ 32 byte の state を発行し、`oauth_states(state, return_to, created_at)` に保存して Google の認可 URL へ 302 する。`prompt` は `select_account` / `consent` / `none` のみ透過する。
+3. `GET /auth/google/callback` は `state` を `consume_oauth_state` で単回消費する（10 分 TTL。使用済み・期限切れ・未知は 400）。state に結びついた `return_to` で再度 allow-list を検証する。
+4. `exchange_code(code, redirect_uri)` が Google から `sub` を取得する。`redirect_uri` はリクエスト値ではなく固定の `{public_url}/auth/google/callback` を使う。
+5. `encrypt_sub(salt, sub)` → `get_or_create_account` → `create_session` の順で account と session を作る。
+6. callback は `session_id` Cookie（`Path=/; Max-Age=30 日; SameSite=Lax`、public_url が https なら `Secure`）を設定し、`return_to` へ 302 する。
+7. argenterie は `GET /api/session` を Cookie 付きで呼び、account と session を localStorage / Cookie に保存する。sessionStorage の完全な戻り先 URL を `history.replaceState` で復元し、部屋鍵フラグメントを戻す。
+
+`POST /auth/google/token` は ID token 用に残し、同じ account に新しい session を発行する。旧 `GET /auth/google/url` と、クライアントが `redirect_uri` を指定する `POST /auth/google/callback` は廃止した（既存アカウントがないため互換性は切っている）。
 
 Google から継承するのは `sub` のみ。handle name は初回の既定値で、後から `PATCH /api/account/{id}` で変更できる。
 
@@ -177,9 +181,12 @@ rooms(room_id TEXT PRIMARY KEY, name TEXT NOT NULL, creator_account INTEGER NOT 
 room_permissions(room_id TEXT, account_id INTEGER, role TEXT, created_at INTEGER,
                  PRIMARY KEY (room_id, account_id))
 room_heads(room_id TEXT PRIMARY KEY, tin_id BLOB NOT NULL, updated_at INTEGER NOT NULL)
+oauth_states(state TEXT PRIMARY KEY, return_to TEXT NOT NULL, created_at INTEGER NOT NULL)
 ```
 
 `encrypted_sub` には索引がある。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列（`RoomId` の 16 hex 正規形）。`rooms` が部屋の第一級エンティティで、`room_permissions` はその認可だけを持つ。`rooms.done` は部屋の公開フラグで、`RoomData` に依存せず `maitre-d` の再起動をまたぐ。`room_heads.tin_id` は 32 バイトで、banquette が最後に保存した `RoomData` tin を指す。部屋が一度も保存されていなければ行がない。
+
+`oauth_states` はログイン中の OAuth state を `return_to` と結びつけて保持する。`consume_oauth_state` は同じ transaction で SELECT と DELETE を行い、単回使用を保証する。`created_at` が 10 分（`OAUTH_STATE_TTL_SECS`）より古い state は削除して `None` を返す。`create_oauth_state` は期限切れ行を opportunistic に削除する。
 
 起動時の migration は次の 3 つを行う。
 
@@ -202,5 +209,8 @@ room_heads(room_id TEXT PRIMARY KEY, tin_id BLOB NOT NULL, updated_at INTEGER NO
 - `GET /api/rooms`（自分の role を持つ部屋一覧）は未実装。
 - debug account は `encrypted_sub = "0"` で作られ、`decrypt_sub` も `"0"` を特別扱いする。debug ビルド限定。
 - CORS は明示的な origin allow-list。`--cors-origin` 未指定時はローカル開発 origin のみで、本番では Bistrot が argenterie URL / domain から生成した値を渡す。reverse proxy 側での制限も併用できる。
+- OAuth の `redirect_uri` は `--public-url` から作る固定値だけで、argenterie の origin / port は Google に渡さない。旧 `GET /auth/google/url` / `POST /auth/google/callback` は削除した（互換性なし）。`GET /auth/login` の `return_to` は CORS allow-list の origin のみ許可し、`//evil`・別 origin・`javascript:` / `data:`・userinfo 付き URL は 400。
+- callback の `session_id` Cookie は `{public_url}` の origin に付く。ブラウザから `/api/session` を Cookie 付きで呼ぶには、`public_url` の origin と argenterie の origin が一致している必要がある。ローカル開発では Bistrot が `--public-url` に argenterie URL を渡し、Vite の `/auth` proxy 経由で callback を受ける。本番は reverse proxy で同一 origin に揃える。
+- `GET /api/session` は Cookie / `X-Alhalte-Session` / クエリのいずれかで session を解決し、未認証は 401。`account` は `AccountResponse` で `encrypted_sub` を含まない。
 - cellar proxy はリクエスト / レスポンスを全量メモリにバッファする（`reqwest` / `Bytes`、上限 64 MiB）。大きな Tin ほど maitre-d のメモリを消費する。
 

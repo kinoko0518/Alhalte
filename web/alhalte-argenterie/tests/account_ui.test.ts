@@ -15,9 +15,7 @@ import {
   completeGoogleSignIn,
   normalizeAccountProfile,
   signOut,
-  OAUTH_REDIRECT_URI_STORAGE_KEY,
-  OAUTH_RETURN_PATH_STORAGE_KEY,
-  OAUTH_STATE_STORAGE_KEY,
+  OAUTH_RETURN_URL_STORAGE_KEY,
 } from '../src/utils/account.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 import type { Scene, VisitedRoom } from '../src/types/index.js';
@@ -68,52 +66,42 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
     ).toBeNull();
   });
 
-  // spec: alhalte-argenterie/account 0020 OAuth開始時に戻り先URL・state・fragmentを保持
-  it('starts Google OAuth, preserving the room fragment and adding select_account', async () => {
+  // spec: alhalte-argenterie/account 0020 OAuth開始時に戻り先URLとfragmentを保持
+  it('starts Google OAuth through maitre-d, preserving the room fragment', async () => {
     window.history.replaceState(null, '', '/rooms/1122334455667788?invite=1#room-key');
-    const fetchFn = vi.fn(async () =>
-      jsonResponse({ url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=abc' }),
-    );
     const navigate = vi.fn();
 
     const result = await beginGoogleSignIn({
-      fetchFn: fetchFn as unknown as typeof fetch,
       navigate,
       prompt: 'select_account',
     });
 
-    const requested = new URL(String(fetchFn.mock.calls[0][0]), window.location.origin);
-    expect(requested.pathname).toBe('/auth/google/url');
-    expect(requested.searchParams.get('redirect_uri')).toBe(
-      `${window.location.origin}/rooms/1122334455667788`,
+    const requested = new URL(navigate.mock.calls[0][0], window.location.origin);
+    expect(requested.pathname).toBe('/auth/login');
+    // maitre-d receives an absolute return_to without the fragment.
+    expect(requested.searchParams.get('return_to')).toBe(
+      `${window.location.origin}/rooms/1122334455667788?invite=1`,
     );
-    const state = requested.searchParams.get('state');
-    expect(state).toBeTruthy();
-    expect(sessionStorage.getItem(OAUTH_STATE_STORAGE_KEY)).toBe(state);
-    expect(sessionStorage.getItem(OAUTH_RETURN_PATH_STORAGE_KEY)).toBe(
-      '/rooms/1122334455667788?invite=1#room-key',
+    expect(requested.searchParams.get('prompt')).toBe('select_account');
+    // The full URL (room key included) is parked for the return trip.
+    expect(sessionStorage.getItem(OAUTH_RETURN_URL_STORAGE_KEY)).toBe(
+      `${window.location.origin}/rooms/1122334455667788?invite=1#room-key`,
     );
-    expect(sessionStorage.getItem(OAUTH_REDIRECT_URI_STORAGE_KEY)).toBe(
-      `${window.location.origin}/rooms/1122334455667788`,
-    );
-
-    const navigated = new URL(navigate.mock.calls[0][0]);
-    expect(navigated.searchParams.get('prompt')).toBe('select_account');
-    expect(result).toContain('prompt=select_account');
+    expect(result).toContain('/auth/login?');
   });
 
   // spec: alhalte-argenterie/account 0021 OAuthコールバックでaccount/session保存・部屋URL復元
-  it('completes Google OAuth, stores account/session, and restores the room URL fragment', async () => {
-    window.history.replaceState(null, '', '/rooms/1122334455667788?code=code-1&state=state-1');
-    sessionStorage.setItem(OAUTH_STATE_STORAGE_KEY, 'state-1');
-    sessionStorage.setItem(OAUTH_REDIRECT_URI_STORAGE_KEY, `${window.location.origin}/rooms/1122334455667788`);
-    sessionStorage.setItem(OAUTH_RETURN_PATH_STORAGE_KEY, '/rooms/1122334455667788#room-key');
+  it('completes Google OAuth via GET /api/session and restores the room URL fragment', async () => {
+    window.history.replaceState(null, '', '/rooms/1122334455667788?invite=1');
+    sessionStorage.setItem(
+      OAUTH_RETURN_URL_STORAGE_KEY,
+      `${window.location.origin}/rooms/1122334455667788?invite=1#room-key`,
+    );
 
     const fetchFn = vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
-      expect(JSON.parse(String(init?.body))).toEqual({
-        code: 'code-1',
-        redirect_uri: `${window.location.origin}/rooms/1122334455667788`,
-      });
+      expect(init?.method).toBe('GET');
+      // Cookie-only: a stale X-Alhalte-Session header must not pick the account.
+      expect(init?.headers).toBeUndefined();
       return jsonResponse({
         account: { account_id: 42, handle_name: 'Alice', icon_tin_id: null },
         session_id: 123456789,
@@ -123,43 +111,60 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
     const profile = await completeGoogleSignIn({ fetchFn: fetchFn as unknown as typeof fetch });
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
+    const requested = new URL(String(fetchFn.mock.calls[0][0]), window.location.origin);
+    expect(requested.pathname).toBe('/api/session');
+
     expect(profile?.account_id).toBe(42);
     expect(localStorage.getItem('alhalte:account-id')).toBe('42');
     expect(localStorage.getItem('alhalte:session-id')).toBe('123456789');
     expect(document.cookie).toContain('session_id=123456789');
     expect(`${window.location.pathname}${window.location.search}${window.location.hash}`).toBe(
-      '/rooms/1122334455667788#room-key',
+      '/rooms/1122334455667788?invite=1#room-key',
     );
-    expect(sessionStorage.getItem(OAUTH_STATE_STORAGE_KEY)).toBeNull();
-    expect(sessionStorage.getItem(OAUTH_REDIRECT_URI_STORAGE_KEY)).toBeNull();
-    expect(sessionStorage.getItem(OAUTH_RETURN_PATH_STORAGE_KEY)).toBeNull();
+    expect(sessionStorage.getItem(OAUTH_RETURN_URL_STORAGE_KEY)).toBeNull();
   });
 
-  // spec: alhalte-argenterie/account 0022 OAuth state不一致時は交換しない
-  it('rejects a mismatched OAuth state without calling the callback endpoint', async () => {
-    window.history.replaceState(null, '', '/?code=code-1&state=attacker');
-    sessionStorage.setItem(OAUTH_STATE_STORAGE_KEY, 'expected');
+  // spec: alhalte-argenterie/account 0022 未サインインへの戻りは交換しない
+  it('does nothing when no sign-in is pending', async () => {
+    window.history.replaceState(null, '', '/?code=code-1&state=state-1');
     const fetchFn = vi.fn();
 
     await expect(
       completeGoogleSignIn({ fetchFn: fetchFn as unknown as typeof fetch }),
-    ).rejects.toThrow('state mismatch');
+    ).resolves.toBeNull();
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
+  // spec: alhalte-argenterie/account 0023 callback後にsessionが無ければ未サインインのまま
+  it('clears the pending sign-in when /api/session returns 401', async () => {
+    sessionStorage.setItem(
+      OAUTH_RETURN_URL_STORAGE_KEY,
+      `${window.location.origin}/rooms/1122334455667788`,
+    );
+    const fetchFn = vi.fn(async () => jsonResponse({ error: 'Invalid session' }, 401));
+
+    const profile = await completeGoogleSignIn({
+      fetchFn: fetchFn as unknown as typeof fetch,
+    });
+
+    expect(profile).toBeNull();
+    expect(localStorage.getItem('alhalte:account-id')).toBeNull();
+    expect(sessionStorage.getItem(OAUTH_RETURN_URL_STORAGE_KEY)).toBeNull();
+  });
+
   // spec: alhalte-argenterie/account 0031 サインアウトでaccount/session/cookieを削除
-  it('signs out by clearing the account, session, OAuth state, and cookie', async () => {
+  it('signs out by clearing the account, session, pending sign-in, and cookie', async () => {
     localStorage.setItem('alhalte:account-id', '42');
     localStorage.setItem('alhalte:session-id', '99');
     document.cookie = 'session_id=99; path=/; SameSite=Lax';
-    sessionStorage.setItem(OAUTH_STATE_STORAGE_KEY, 'state');
+    sessionStorage.setItem(OAUTH_RETURN_URL_STORAGE_KEY, `${window.location.origin}/#key`);
 
     signOut();
 
     expect(localStorage.getItem('alhalte:account-id')).toBeNull();
     expect(localStorage.getItem('alhalte:session-id')).toBeNull();
     expect(document.cookie).not.toContain('session_id=99');
-    expect(sessionStorage.getItem(OAUTH_STATE_STORAGE_KEY)).toBeNull();
+    expect(sessionStorage.getItem(OAUTH_RETURN_URL_STORAGE_KEY)).toBeNull();
   });
 
 

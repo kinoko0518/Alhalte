@@ -9,15 +9,6 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
 import GateScreen from '../src/components/Gate/GateScreen.svelte';
 
-function jsonResponse(payload: unknown): Response {
-  return {
-    ok: true,
-    status: 200,
-    statusText: 'OK',
-    json: async () => payload,
-  } as Response;
-}
-
 describe('Maître-d gate screen (Issue #115)', () => {
   let target: HTMLDivElement;
 
@@ -68,15 +59,11 @@ describe('Maître-d gate screen (Issue #115)', () => {
     localStorage.setItem('alhalte:account-id', '42');
     localStorage.setItem('alhalte:session-id', '99');
 
-    const fetchFn = vi.fn(async () =>
-      jsonResponse({ url: 'https://accounts.google.com/o/oauth2/v2/auth?client_id=abc' }),
-    );
     const navigate = vi.fn();
 
     const instance = mount(GateScreen, {
       target,
       props: {
-        fetchFn: fetchFn as unknown as typeof fetch,
         navigate,
       },
     });
@@ -88,14 +75,13 @@ describe('Maître-d gate screen (Issue #115)', () => {
     expect(localStorage.getItem('alhalte:account-id')).toBeNull();
     expect(localStorage.getItem('alhalte:session-id')).toBeNull();
 
-    const authCall = fetchFn.mock.calls.find((call) =>
-      String(call[0]).includes('/auth/google/url'),
-    );
-    expect(authCall).toBeTruthy();
-    const requested = new URL(String(authCall?.[0]), window.location.origin);
-    expect(requested.pathname).toBe('/auth/google/url');
+    // maitre-d owns the OAuth state / redirect URI; the browser only supplies
+    // the absolute return_to and the requested account chooser.
     expect(navigate).toHaveBeenCalledTimes(1);
-    expect(new URL(navigate.mock.calls[0][0]).searchParams.get('prompt')).toBe('select_account');
+    const requested = new URL(navigate.mock.calls[0][0], window.location.origin);
+    expect(requested.pathname).toBe('/auth/login');
+    expect(requested.searchParams.get('return_to')).toBe(`${window.location.origin}/`);
+    expect(requested.searchParams.get('prompt')).toBe('select_account');
 
     unmount(instance);
   });
