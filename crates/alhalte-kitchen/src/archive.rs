@@ -21,12 +21,21 @@ use flate2::Compression as GzCompression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use generast::LABEL_ALHALTE_GENERAST;
+use serde::Deserialize;
 use tar::{Archive as TarArchive, Builder as TarBuilder};
-use tin::{Compression, Tin, TinId};
+use tin::{Compression, Label, Tin, TinId};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::{KitchenError, Result};
+
+/// Format identifier of the argenterie log record JSON payload.
+const IDENT_ARGENTERIE_LOG_RECORD: &str = "alhalte/argenterie/log-record";
+
+/// Returns the 64-bit label of [`IDENT_ARGENTERIE_LOG_RECORD`].
+fn argenterie_log_record_label() -> Label {
+    tin::label_hash(IDENT_ARGENTERIE_LOG_RECORD)
+}
 
 /// An event occurring within a scene log sequence.
 #[derive(Debug, Clone, PartialEq)]
@@ -75,6 +84,11 @@ pub struct ArchiveScene {
     pub chunks: Vec<LogChunk>,
     /// Sealed chunk Tin IDs recorded in the scene's log biblio.
     pub biblio_chunks: Vec<TinId>,
+    /// Character ID to display name mapping used when an argenterie log record
+    /// only carries a `speaker` name.
+    pub character_names: HashMap<u64, String>,
+    /// Inverse of [`Self::character_names`] (`speaker` name to character ID).
+    pub character_ids_by_name: HashMap<String, u64>,
 }
 
 impl ArchiveScene {
@@ -90,7 +104,7 @@ impl ArchiveScene {
                     continue;
                 };
 
-                let (event, ts_opt) = parse_entry_tin(tin);
+                let (event, ts_opt) = parse_entry_tin(tin, &self.character_ids_by_name);
                 raw_events.push((event, ts_opt, order));
                 order += 1;
             }
@@ -130,8 +144,182 @@ impl ArchiveScene {
     }
 }
 
+/// JSON payload of an `alhalte/argenterie/log-record` Tin.
+///
+/// `contentTin` is the extension-processed `alhalte/generast` Tin plaintext
+/// bytes (byte array). `speakerId` is the authoritative speaker; `speaker` is
+/// the legacy name-only fallback.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ArgenterieLogRecord {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    speaker: Option<String>,
+    #[serde(default)]
+    speaker_id: Option<serde_json::Value>,
+    #[serde(default)]
+    timestamp: Option<serde_json::Value>,
+    #[serde(default)]
+    content_tin: Option<serde_json::Value>,
+}
+
+/// Decodes a JSON number/string into a `u64`.
+fn json_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number
+            .as_u64()
+            .or_else(|| number.as_i64().and_then(|n| u64::try_from(n).ok())),
+        serde_json::Value::String(text) => text.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+}
+
+/// Decodes a byte array (`number[]`) from JSON.
+fn json_byte_array(value: &serde_json::Value) -> Option<Vec<u8>> {
+    let items = value.as_array()?;
+    let mut bytes = Vec::with_capacity(items.len());
+    for item in items {
+        bytes.push(u8::try_from(item.as_u64()?).ok()?);
+    }
+    Some(bytes)
+}
+
+/// Decodes a [`Generast`](generast::Generast) from a plaintext / wire Tin.
+fn decode_generast_from_tin(tin: &Tin) -> Option<generast::Generast> {
+    if tin.label != LABEL_ALHALTE_GENERAST {
+        return None;
+    }
+    if let Ok(ast) = generast::Generast::from_tin(tin) {
+        return Some(ast);
+    }
+    generast::decode_ext_io(tin)
+        .ok()
+        .map(|(ast, _speaker_id)| ast)
+}
+
+/// Decodes `contentTin` bytes as an `alhalte/generast` Tin (plaintext or wire)
+/// or a raw postcard Generast / `(Generast, speaker_id)` pair.
+fn decode_content_tin_bytes(bytes: &[u8]) -> Option<generast::Generast> {
+    if let Ok(tin) = Tin::from_plaintext(bytes)
+        && let Some(ast) = decode_generast_from_tin(&tin)
+    {
+        return Some(ast);
+    }
+    if let Ok((tin, _, _)) = Tin::decode(bytes, None)
+        && let Some(ast) = decode_generast_from_tin(&tin)
+    {
+        return Some(ast);
+    }
+    if let Ok(ast) = postcard::from_bytes::<generast::Generast>(bytes) {
+        return Some(ast);
+    }
+    postcard::from_bytes::<(generast::Generast, u64)>(bytes)
+        .ok()
+        .map(|(ast, _speaker_id)| ast)
+}
+
+/// Maps one base64 character (standard or URL-safe alphabet) to its 6-bit value.
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' | b'-' => Some(62),
+        b'/' | b'_' => Some(63),
+        _ => None,
+    }
+}
+
+/// Decodes a padded or unpadded base64 / base64url string.
+///
+/// Used for the optional string form of `contentTin`; byte arrays are the
+/// canonical representation written by argenterie.
+fn decode_base64(text: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(text.len() * 3 / 4);
+    let mut accumulator: u32 = 0;
+    let mut bits = 0;
+    for byte in text.bytes() {
+        if byte == b'=' || byte.is_ascii_whitespace() {
+            continue;
+        }
+        let value = base64_value(byte)?;
+        accumulator = (accumulator << 6) | u32::from(value);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push(((accumulator >> bits) & 0xff) as u8);
+        }
+    }
+    Some(bytes)
+}
+
+/// Decodes the `contentTin` JSON value (byte array, base64 string or Tin JSON).
+fn decode_content_tin(value: &serde_json::Value) -> Option<generast::Generast> {
+    if let Some(bytes) = json_byte_array(value) {
+        return decode_content_tin_bytes(&bytes);
+    }
+    if let Some(text) = value.as_str() {
+        return decode_content_tin_bytes(&decode_base64(text)?);
+    }
+    let object = value.as_object()?;
+    let label = json_u64(object.get("label")?)?;
+    let payload = json_byte_array(object.get("payload")?)?;
+    decode_generast_from_tin(&Tin::new(label, payload))
+}
+
+/// Decodes an `alhalte/argenterie/log-record` JSON Tin into a speech event.
+fn decode_argenterie_log_record(
+    tin: &Tin,
+    character_ids_by_name: &HashMap<String, u64>,
+) -> Option<(LogEntry, Option<u64>)> {
+    let record: ArgenterieLogRecord = serde_json::from_slice(&tin.payload).ok()?;
+
+    let ast = record
+        .content_tin
+        .as_ref()
+        .and_then(decode_content_tin)
+        .or_else(|| record.content.as_deref().map(generast::Generast::string));
+
+    let mut entry = LogEntry::new();
+    if let Some(ref ast) = ast {
+        entry = entry.with_content_ast(ast);
+    }
+
+    let speaker_id = record.speaker_id.as_ref().and_then(json_u64).or_else(|| {
+        record
+            .speaker
+            .as_deref()
+            .and_then(|name| character_ids_by_name.get(name).copied())
+    });
+    if let Some(id) = speaker_id {
+        entry = entry.with_speaker_id(id);
+    }
+
+    let timestamp = record
+        .timestamp
+        .as_ref()
+        .and_then(json_u64)
+        .filter(|secs| *secs > 0);
+    if let Some(secs) = timestamp {
+        // Keep the timestamp on the entry itself (rendering) *and* on the
+        // parsed event (graph ordering / interpolation).
+        entry = entry.with_unix_time(secs);
+    }
+    Some((entry, timestamp))
+}
+
 /// Extracts a [`SceneEvent`] and optional timestamp from a `Tin` entry.
-fn parse_entry_tin(tin: &Tin) -> (SceneEvent, Option<u64>) {
+fn parse_entry_tin(
+    tin: &Tin,
+    character_ids_by_name: &HashMap<String, u64>,
+) -> (SceneEvent, Option<u64>) {
+    if tin.label == argenterie_log_record_label()
+        && let Some((entry, timestamp)) = decode_argenterie_log_record(tin, character_ids_by_name)
+    {
+        return (SceneEvent::Speech(entry), timestamp);
+    }
+
     if tin.label == LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME {
         if let Ok(ev) = CharacterCameEvent::from_tin(tin) {
             return (
@@ -315,6 +503,7 @@ impl RoomArchive {
                                     present_characters: sdata.present_characters,
                                     chunks: Vec::new(),
                                     biblio_chunks: sdata.biblio.chunks,
+                                    ..Default::default()
                                 });
                         }
                     }
@@ -329,6 +518,7 @@ impl RoomArchive {
                                 present_characters: sdata.present_characters,
                                 chunks: Vec::new(),
                                 biblio_chunks: sdata.biblio.chunks,
+                                ..Default::default()
                             });
                     }
                 } else if tin.label == LABEL_ALHALTE_BANQUETTE_LOG_CHUNK {
@@ -360,6 +550,7 @@ impl RoomArchive {
                                 present_characters: sdata.present_characters,
                                 chunks: Vec::new(),
                                 biblio_chunks: sdata.biblio.chunks,
+                                ..Default::default()
                             });
                     }
                 } else if let Ok(sdata) = serde_json::from_slice::<SceneData>(bytes) {
@@ -372,11 +563,30 @@ impl RoomArchive {
                             present_characters: sdata.present_characters,
                             chunks: Vec::new(),
                             biblio_chunks: sdata.biblio.chunks,
+                            ..Default::default()
                         });
                 } else if let Ok(chunk) = serde_json::from_slice::<LogChunk>(bytes) {
                     path_chunks.insert(filename.clone(), chunk);
                 }
             }
+        }
+
+        // Populate the per-scene character name maps used to resolve the
+        // legacy name-only `speaker` field of argenterie log records.
+        let character_names: HashMap<u64, String> = archive
+            .characters
+            .iter()
+            .filter_map(|(&id, character)| {
+                alhalte_banquette::get_character_name(character).map(|name| (id, name))
+            })
+            .collect();
+        let character_ids_by_name: HashMap<String, u64> = character_names
+            .iter()
+            .map(|(&id, name)| (name.clone(), id))
+            .collect();
+        for scene in archive.scenes.values_mut() {
+            scene.character_names = character_names.clone();
+            scene.character_ids_by_name = character_ids_by_name.clone();
         }
 
         // Pass 2: Associate log chunks with scenes

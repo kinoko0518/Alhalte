@@ -157,6 +157,47 @@ export function createTextGenerastAST(text: string): GenerastAST {
 }
 
 /**
+ * Returns true when `bytes` is a plaintext Tin whose label is `alhalte/generast`.
+ */
+export function isGenerastTinBytes(bytes: Uint8Array): boolean {
+  if (bytes.length < 8) return false;
+  return (
+    new DataView(bytes.buffer, bytes.byteOffset, 8).getBigUint64(0, true) ===
+    LABEL_ALHALTE_GENERAST
+  );
+}
+
+/**
+ * Runs the extension pipeline over the ext-io input Tin `(Generast, speaker_id)`
+ * and returns the resulting `alhalte/generast` Tin plaintext bytes.
+ *
+ * This is the send-time companion of {@link buildGenerastFromText}: the result
+ * is persisted in `LogRecord.contentTin` so every client (and `alhalte-kitchen`)
+ * renders the same output without re-running extensions. Returns `null` when no
+ * extension is enabled or when the pipeline output is not a valid Generast Tin;
+ * callers then keep the raw `content` fallback.
+ */
+export async function buildContentTinFromText(
+  text: string,
+  extensions: ExtensionItem[] = [],
+  pipeline: ExtensionPipeline = new ExtensionPipeline(),
+  characterId?: string | number | bigint,
+): Promise<Uint8Array | null> {
+  const speakerId = parseSpeakerId(characterId);
+  const initialBytes = encodeExtIoTin(text, speakerId);
+  const activeExtensions = extensions.filter((ext) => ext.enabled);
+  if (activeExtensions.length === 0) {
+    // No extension transforms the text, but the ext-io Tin is still a valid
+    // persisted `contentTin`: future clients render the same output regardless
+    // of their extension setup.
+    return initialBytes;
+  }
+
+  const resultBytes = await pipeline.executePipeline(activeExtensions, initialBytes);
+  return isGenerastTinBytes(resultBytes) ? resultBytes : null;
+}
+
+/**
  * Generates a Generast AST or Tin binary from input text and optional characterId.
  *
  * If active extensions are present, encodes `(Generast::String(text), speaker_id)` into a Tin

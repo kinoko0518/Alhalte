@@ -17,7 +17,7 @@
     buildGenerastFromText,
     type GenerastAST,
   } from '../../../utils/generast.js';
-  import { ChunkLogManager, readLogBiblioHead } from '../../../utils/log.js';
+  import { ChunkLogManager, logRecordContentTin, readLogBiblioHead } from '../../../utils/log.js';
   import type { RoomSocket } from '../../../utils/roomSocket.js';
   import {
     clearSaignantCache,
@@ -224,14 +224,23 @@
     const nextMap = { ...renderedContentMap };
     let changed = false;
     for (const r of recs) {
+      // System events are rendered as a dedicated status row, never through the
+      // chat HTML pipeline.
+      if (r.kind === 'system') continue;
       if (!nextMap[r.id]) {
         try {
-          const ast = await buildGenerastFromText(
-            r.content,
-            extensions,
-            extensionPipeline,
-            r.speakerId,
-          );
+          // `contentTin` is the extension result persisted at send time. Render
+          // it as-is: re-running the pipeline here would make the display depend
+          // on the local extension version / priority (Issue #161).
+          const contentTin = logRecordContentTin(r);
+          const ast = contentTin
+            ? contentTin
+            : await buildGenerastFromText(
+                r.content,
+                extensions,
+                extensionPipeline,
+                r.speakerId,
+              );
           if (renderVersion !== currentVersion) {
             return;
           }
@@ -403,6 +412,49 @@
     }
     return undefined;
   }
+
+  /**
+   * Human-readable label for a banquette system event.
+   *
+   * Only the decoded payload is used, so raw postcard bytes can never leak into
+   * the log as text (Issue #161).
+   */
+  function systemEventLabel(record: LogRecord): string {
+    const event = record.event;
+    if (!event) return 'システムイベント';
+    const characterName = (id: string): string =>
+      characters.find((c) => c.id === id)?.name || `キャラクター ${id}`;
+    switch (event.type) {
+      case 'change-bgm':
+        return event.bgmTinId
+          ? `BGM スロット ${event.slot} を変更しました`
+          : `BGM スロット ${event.slot} を停止しました`;
+      case 'change-bg-img':
+        return event.imageTinId ? '背景画像を変更しました' : '背景画像を解除しました';
+      case 'character-came':
+        return `${characterName(event.characterId)} が入室しました`;
+      case 'character-gone':
+        return `${characterName(event.characterId)} が退室しました`;
+      default:
+        return 'システムイベント';
+    }
+  }
+
+  /** Icon glyph shown at the start of a system row. */
+  function systemEventGlyph(record: LogRecord): string {
+    switch (record.event?.type) {
+      case 'change-bgm':
+        return '♪';
+      case 'change-bg-img':
+        return '▣';
+      case 'character-came':
+        return '→';
+      case 'character-gone':
+        return '←';
+      default:
+        return '•';
+    }
+  }
 </script>
 
 <div class="log-tab-container" data-testid="log-tab">
@@ -450,61 +502,91 @@
         </div>
       {:else}
         {#each messages as record (record.id)}
-          {@const char = findCharacter(record.speakerId, record.speaker)}
-          {@const charColor = char?.color}
           {@const isNew = newRecordIds.has(record.id)}
-          <div
-            class="message-entry"
-            class:message-entry-new={isNew}
-            data-testid="log-record-{record.id}"
-            data-is-new={isNew ? 'true' : undefined}
-            onanimationend={(e) => handleAnimationEnd(record.id, e)}
-          >
-            <!-- Character Avatar / Icon -->
-            <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
-              {#if char?.iconUrl}
-                <IconImagePicker
-                  src={char.iconUrl}
-                  alt={record.speaker}
-                  size={36}
-                  shape="circle"
-                  dataTestId="msg-avatar-{record.id}"
-                  {onRequestAssetPicker}
-                />
-              {:else}
-                <div
-                  class="msg-avatar-placeholder"
-                  data-testid="msg-avatar-{record.id}"
-                  style={charColor
-                    ? `background-color: color-mix(in srgb, ${charColor} 18%, transparent); color: ${charColor}; border-color: ${charColor};`
-                    : ''}
-                >
-                  {record.speaker ? record.speaker.slice(0, 2) : '👤'}
-                </div>
-              {/if}
-            </div>
-
-            <div class="msg-body">
-              <!-- 1st Row: Character Color Pill Badge & Timestamp -->
-              <div class="msg-header-row">
+          {#if record.kind === 'system'}
+            <!-- Banquette system event: a quiet M3 status row. The postcard
+                 payload is decoded into `record.event` upstream, so no binary
+                 bytes are ever rendered as chat text (Issue #161). -->
+            <div
+              class="system-log-entry"
+              class:message-entry-new={isNew}
+              data-testid="log-record-{record.id}"
+              data-kind="system"
+              data-is-new={isNew ? 'true' : undefined}
+              onanimationend={(e) => handleAnimationEnd(record.id, e)}
+            >
+              <span class="system-log-glyph" aria-hidden="true">
+                {systemEventGlyph(record)}
+              </span>
+              <div class="system-log-body">
                 <span
-                  class="msg-speaker-pill"
-                  style={charColor ? `--char-color: ${charColor};` : ''}
-                  data-testid="msg-speaker-{record.id}"
+                  class="system-log-text"
+                  data-testid="log-system-text-{record.id}"
                 >
-                  {record.speaker}
+                  {systemEventLabel(record)}
                 </span>
                 <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
                   {formatTime(record.timestamp)}
                 </span>
               </div>
+            </div>
+          {:else}
+            {@const char = findCharacter(record.speakerId, record.speaker)}
+            {@const charColor = char?.color}
+            <div
+              class="message-entry"
+              class:message-entry-new={isNew}
+              data-testid="log-record-{record.id}"
+              data-kind="chat"
+              data-is-new={isNew ? 'true' : undefined}
+              onanimationend={(e) => handleAnimationEnd(record.id, e)}
+            >
+              <!-- Character Avatar / Icon -->
+              <div class="msg-icon-col" data-testid="msg-avatar-col-{record.id}">
+                {#if char?.iconUrl}
+                  <IconImagePicker
+                    src={char.iconUrl}
+                    alt={record.speaker}
+                    size={36}
+                    shape="circle"
+                    dataTestId="msg-avatar-{record.id}"
+                    {onRequestAssetPicker}
+                  />
+                {:else}
+                  <div
+                    class="msg-avatar-placeholder"
+                    data-testid="msg-avatar-{record.id}"
+                    style={charColor
+                      ? `background-color: color-mix(in srgb, ${charColor} 18%, transparent); color: ${charColor}; border-color: ${charColor};`
+                      : ''}
+                  >
+                    {record.speaker ? record.speaker.slice(0, 2) : '👤'}
+                  </div>
+                {/if}
+              </div>
 
-              <!-- 2nd Row: Generast rendered HTML via Saignant WASM -->
-              <div class="msg-content saignant-content" data-testid="msg-content-{record.id}">
-                {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content)}
+              <div class="msg-body">
+                <!-- 1st Row: Character Color Pill Badge & Timestamp -->
+                <div class="msg-header-row">
+                  <span
+                    class="msg-speaker-pill"
+                    style={charColor ? `--char-color: ${charColor};` : ''}
+                    data-testid="msg-speaker-{record.id}"
+                  >
+                    {record.speaker}
+                  </span>
+                  <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
+                    {formatTime(record.timestamp)}
+                  </span>
+                </div>
+
+                <!-- 2nd Row: Generast rendered HTML via Saignant WASM -->
+                <div class="msg-content saignant-content" data-testid="msg-content-{record.id}">
+                  {@html renderedContentMap[record.id] ?? renderGenerastSync(record.content)}
+                </div>
               </div>
             </div>
-          </div>
+          {/if}
         {/each}
       {/if}
     </div>
@@ -596,6 +678,55 @@
       np-message-spring-spatial var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) both,
       np-message-fade-in var(--np-motion-expressive-fast-effects, 150ms cubic-bezier(0.31, 0.94, 0.34, 1)) both;
     will-change: transform, opacity;
+  }
+
+  /*
+   * Banquette system events (BGM / background / enter / leave). Rendered as a
+   * quiet M3 status row instead of a chat bubble so postcard event payloads
+   * never appear as message text (Issue #161).
+   */
+  .system-log-entry {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    align-self: center;
+    max-width: min(100%, 560px);
+    padding: 6px 12px;
+    border-radius: var(--np-shape-corner-full, 9999px);
+    background-color: var(--np-color-surface-container-low, #f5f2f7);
+    color: var(--np-color-on-surface-variant, #49454f);
+    border: 1px solid var(--np-color-outline-variant, #cac4d0);
+    font-size: 0.8rem;
+    line-height: 1.4;
+  }
+
+  .system-log-glyph {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    border-radius: 50%;
+    background-color: color-mix(
+      in srgb,
+      var(--np-color-primary, #6750a4) 14%,
+      transparent
+    );
+    color: var(--np-color-primary, #6750a4);
+    font-size: 0.75rem;
+    font-weight: 700;
+    flex-shrink: 0;
+  }
+
+  .system-log-body {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+
+  .system-log-text {
+    overflow-wrap: anywhere;
   }
 
   .msg-icon-col {

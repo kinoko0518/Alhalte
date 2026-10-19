@@ -74,7 +74,7 @@
 - `VisitedRoom` / `RecentRoom`
 - `Character`（`statuses`、`parameters`、`chatPalette`、`hideStatus`、`isNarrative`、`placedAsPiece`、`piecePosition`）
 - `Scene`（`juices`、`viewTransform`、`members`）
-- `LogRecord`（`content`、`speaker`、`speakerId`、`timestamp`、`chunkId`）
+- `LogRecord`（`content`、`speaker`、`speakerId`、`timestamp`、`chunkId`、任意の `contentTin` / `kind` / `event`）
 - `ExtensionItem`（`wasmBytes`、`priority`、`enabled`、`cellarTinId`）
 
 ### ローカル保存
@@ -127,11 +127,12 @@
 
 ### 発言とログ表示
 
-1. `handleSendMessage` は `LogRecord` を作るが、この時点では `ChunkLogManager` に追加しない。`isSending` を立てて `requestAppendLog` を await する（`CommonFooter` は送信ボタンを波線 `CircularProgress` に差し替え、フッターを `aria-busy` で暗転し、二重送信を防ぐ）。
+1. `handleSendMessage` は送信前に extension pipeline を実行し、入力 `(Generast::String, speaker_id)` の ext-io Tin から得た結果を `LogRecord.contentTin` に保存する。pipeline を実行できない場合は `content` のみ保存し、`pipeline-warning` を表示する。この時点では `ChunkLogManager` に追加しない。`isSending` を立てて `requestAppendLog` を await する（`CommonFooter` は送信ボタンを波線 `CircularProgress` に差し替え、フッターを `aria-busy` で暗転し、二重送信を防ぐ）。
 2. 成功時はサーバーの `LogEventAppended` echo を待つ。`RoomSocket` は echo を `ChunkLogManager` に追加してから購読者へ通知するため、`App` 側でローカル追加しない（二重追加しない）。`clientOpId` による照合で他クライアントの echo とは区別する。
 3. タイムアウト / 通信エラー時は `kind: 'message'` として IndexedDB outbox に積み、フッター上部の波線 `OfflineQueueNotice`（`kind="message"`）に件数を出す。入力欄へは復元しない。再接続で FIFO flush し、各メッセージは echo 後にのみ描画する。オフライン時は `RoomSocket` のメモリキューを使わず outbox へ直接積む（二重送信を避ける）。
-4. ログタブは `ChunkLogManager` の変更を購読し、未描画の record を処理する。`buildGenerastFromText` が有効な拡張機能を priority 昇順に適用し、`Generast` Tin を作る。
+4. ログタブは `ChunkLogManager` の変更を購読し、未描画の record を処理する。`contentTin`（送信時に保存した extension 適用後の `alhalte/generast` Tin）があれば extension pipeline を再実行せず Saignant に渡す。旧レコードだけ `buildGenerastFromText` で有効な拡張機能を priority 昇順に適用する。
 5. `renderGenerast` が Saignant WASM で HTML にし、`{@html}` で表示する。WASM 未初期化時は HTML エスケープしたテキストを返す。
+6. `change-bgm` / `change-bg-img` / `character-came` / `character-gone` の Tin は label で postcard payload を decode し、`kind: 'system'` の控えめな M3 行として時刻付きで表示する。postcard bytes を UTF-8 のチャット本文として decode しない。ラベル不明は従来どおりテキスト fallback にする。
 
 ### 最新 chunk の読み込み
 
@@ -195,7 +196,8 @@
 
 ## 既知の差分・制約
 
-- 送信時の `extensionPipeline.executePipeline` は結果を使わない。実質的な拡張機能適用はログ表示時（`LogTab.updateRenderedHtml`）に行われる。
+- `contentTin` は送信時に一度だけ生成する。pipeline を実行できない場合（wasm 欠落・実行エラー）は `content` のみを保存し、表示は従来どおり render 時 pipeline にフォールバックする。
+- システムイベント（BGM / 背景 / 入退場）は banquette の Tin に timestamp を持たないため、ログ上の時刻は 0（1970）になる。kitchen は前後の発言から補間する。
 - アセットは cellar へ実アップロードするが、`personal` のメタデータは localStorage のみで、他クライアントとは共有されない。アセット本体は RoomKey で暗号化して cellar に置くが、maitre-d proxy と cellar は `Bytes` でリクエストを全量メモリにバッファする（64 MiB 上限）。大きなファイルほどメモリを消費する。
 - アウトボックス flush は at-least-once。ack を受け取れずにタイムアウトした操作は再送されるため、サーバー側で適用済みの場合は重複する可能性がある（冪等キーは持たない）。
 - 拡張機能タブは開いた時点の `queryState('/')` を正とし、開いている間の `StateUpdated` broadcast は反映しない（再接続・再表示で取り直す）。

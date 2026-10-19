@@ -6,11 +6,115 @@
  * - ARCHITECTURE.md: `## alhalte-banquette -> #### log`
  */
 
-import type { LogChunk, LogRecord } from '../types/index.js';
+import type {
+  LogChunk,
+  LogRecord,
+  LogRecordKind,
+  LogSystemEvent,
+} from '../types/index.js';
 
 export const LOG_FALLBACK_CONTENT = '';
 export const LOG_FALLBACK_SPEAKER = 'Anonymous';
 export const LOG_FALLBACK_TIMESTAMP = 0; // 1970-01-01T00:00:00Z
+
+/**
+ * Normalizes the optional `contentTin` field of a log record to bytes.
+ *
+ * The canonical JSON representation is a byte array. Older / external producers
+ * may use a base64 string or a self-typed Tin JSON object (`{ label, payload }`);
+ * both are accepted so a record is never dropped only because its encoding
+ * differs. Returns `null` for missing or empty values.
+ */
+export function contentTinToBytes(value: unknown): Uint8Array | null {
+  if (value instanceof Uint8Array) {
+    return value.length > 0 ? value : null;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    const bytes = new Uint8Array(value.length);
+    for (let i = 0; i < value.length; i++) {
+      const byte = Number(value[i]);
+      if (!Number.isFinite(byte)) return null;
+      bytes[i] = byte & 0xff;
+    }
+    return bytes;
+  }
+  if (typeof value === 'string') {
+    if (value.length === 0) return null;
+    if (typeof atob !== 'function') return null;
+    try {
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes.length > 0 ? bytes : null;
+    } catch {
+      return null;
+    }
+  }
+  if (value && typeof value === 'object') {
+    const record = value as Record<string, unknown>;
+    const label = Number(record.label);
+    const payload = contentTinToBytes(record.payload);
+    if (!Number.isFinite(label) || !payload) return null;
+    const plaintext = new Uint8Array(8 + payload.length);
+    const view = new DataView(plaintext.buffer);
+    view.setBigUint64(0, BigInt.asUintN(64, BigInt(label)), true);
+    plaintext.set(payload, 8);
+    return plaintext;
+  }
+  return null;
+}
+
+/** Returns the byte-array form of a record's `contentTin`, when present. */
+export function logRecordContentTin(record: LogRecord): Uint8Array | null {
+  return contentTinToBytes(record.contentTin);
+}
+
+/**
+ * Normalizes a decoded {@link LogSystemEvent}; returns `undefined` for unknown
+ * or malformed payloads so rendering can fall back to a text row.
+ */
+export function normalizeLogSystemEvent(value: unknown): LogSystemEvent | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const event = value as Record<string, unknown>;
+  switch (event.type) {
+    case 'change-bgm': {
+      const slot = Number(event.slot);
+      return {
+        type: 'change-bgm',
+        slot: Number.isFinite(slot) ? slot : 1,
+        ...(typeof event.bgmTinId === 'string' ? { bgmTinId: event.bgmTinId } : {}),
+        ...(typeof event.volume === 'number' && Number.isFinite(event.volume)
+          ? { volume: event.volume }
+          : {}),
+        ...(typeof event.trackIndex === 'number' && Number.isFinite(event.trackIndex)
+          ? { trackIndex: event.trackIndex }
+          : {}),
+      };
+    }
+    case 'change-bg-img':
+      return {
+        type: 'change-bg-img',
+        ...(typeof event.imageTinId === 'string' ? { imageTinId: event.imageTinId } : {}),
+        ...(typeof event.width === 'number' && Number.isFinite(event.width)
+          ? { width: event.width }
+          : {}),
+        ...(typeof event.height === 'number' && Number.isFinite(event.height)
+          ? { height: event.height }
+          : {}),
+      };
+    case 'character-came':
+    case 'character-gone':
+      if (typeof event.characterId !== 'string' && typeof event.characterId !== 'number') {
+        return undefined;
+      }
+      return { type: event.type, characterId: String(event.characterId) };
+    default:
+      return undefined;
+  }
+}
 
 /**
  * Parses a raw log entry dictionary, applying specified fallback values.
@@ -19,6 +123,9 @@ export const LOG_FALLBACK_TIMESTAMP = 0; // 1970-01-01T00:00:00Z
  * - content: "" (empty string)
  * - speaker: "Anonymous"
  * - timestamp: 0 (1970-01-01 00:00:00)
+ *
+ * Shared schema fields (`contentTin`, `speakerId`, `kind`, `event`) are decoded
+ * here so the WebSocket, cache and archive paths all agree on one shape.
  */
 export function parseLogRecord(raw: Record<string, unknown>, idPrefix = 'log'): LogRecord {
   const content =
@@ -51,8 +158,17 @@ export function parseLogRecord(raw: Record<string, unknown>, idPrefix = 'log'): 
       : `${idPrefix}-${timestamp}-${Math.random().toString(36).slice(2, 8)}`;
 
   const sceneId = typeof raw.sceneId === 'string' ? raw.sceneId : '/';
-  const speakerId = typeof raw.speakerId === 'string' ? raw.speakerId : undefined;
+  const speakerId =
+    typeof raw.speakerId === 'string'
+      ? raw.speakerId
+      : typeof raw.speakerId === 'number'
+        ? String(raw.speakerId)
+        : undefined;
   const chunkId = typeof raw.chunkId === 'string' ? raw.chunkId : undefined;
+
+  const contentTinBytes = contentTinToBytes(raw.contentTin);
+  const kind: LogRecordKind = raw.kind === 'system' ? 'system' : 'chat';
+  const event = kind === 'system' ? normalizeLogSystemEvent(raw.event) : undefined;
 
   return {
     id,
@@ -62,6 +178,9 @@ export function parseLogRecord(raw: Record<string, unknown>, idPrefix = 'log'): 
     speakerId,
     timestamp,
     chunkId,
+    ...(contentTinBytes ? { contentTin: Array.from(contentTinBytes) } : {}),
+    kind,
+    ...(event ? { event } : {}),
   };
 }
 
