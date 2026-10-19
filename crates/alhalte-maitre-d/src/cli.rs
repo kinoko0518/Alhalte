@@ -7,6 +7,12 @@ use clap::Parser;
 
 use crate::secret_file::{SecretFileError, resolve_secret};
 
+/// File name of the isolated debug-login database created next to `--db-path`.
+///
+/// `maitre-d --debug-login` never opens the normal database; it opens
+/// `{db-path のディレクトリ}/maitre-d-debug.sqlite3` instead (Issue #150).
+pub const DEBUG_DB_FILE_NAME: &str = "maitre-d-debug.sqlite3";
+
 /// Command-line arguments for the `alhalte-maitre-d` service.
 #[derive(Parser, Debug, Clone)]
 #[command(
@@ -26,6 +32,32 @@ pub struct CliArgs {
     /// Path to SQLite database file.
     #[arg(long, default_value = "maitre-d.sqlite3", env = "ALHALTE_DB_PATH")]
     pub db_path: PathBuf,
+
+    /// Enables the isolated debug login (Issue #150).
+    ///
+    /// While this flag is set, `GET /auth/login` redirects to
+    /// `/auth/debug/login`, where an account name alone signs in (creating the
+    /// account on first use). Accounts and sessions live in a separate SQLite
+    /// file — this process never opens or touches the normal database — and
+    /// spawned banquette processes run with `--no-persist`, so no room state is
+    /// written to the shared cellar.
+    ///
+    /// Intended for local development only. Never enable it on a public
+    /// instance: anyone who can reach the port can create an account.
+    ///
+    /// `ALHALTE_DEBUG_LOGIN` is a value switch: set it to `true` (or `false`) to
+    /// enable / disable the flag, or omit it.
+    #[arg(long, env = "ALHALTE_DEBUG_LOGIN")]
+    pub debug_login: bool,
+
+    /// SQLite file used while `--debug-login` is active.
+    ///
+    /// Defaults to [`DEBUG_DB_FILE_NAME`] next to `--db-path`. The same schema is
+    /// applied, so the file is a normal account/session database, but it is a
+    /// different file: switching `--debug-login` on and off never mixes debug
+    /// accounts with real ones.
+    #[arg(long, env = "ALHALTE_DEBUG_DB_PATH")]
+    pub debug_db_path: Option<PathBuf>,
 
     /// Google OAuth Client ID.
     #[arg(long, default_value = "", env = "ALHALTE_CLIENT_ID")]
@@ -141,6 +173,26 @@ where
 }
 
 impl CliArgs {
+    /// Returns the SQLite file this process actually opens.
+    ///
+    /// Without `--debug-login` it is `--db-path`. With `--debug-login` it is
+    /// `--debug-db-path`, or [`DEBUG_DB_FILE_NAME`] in the `--db-path` directory,
+    /// so the normal database is never opened while debug login is active.
+    ///
+    /// spec: alhalte-maitre-d/debug-login 0001 debug login uses a separate SQLite file
+    pub fn active_db_path(&self) -> PathBuf {
+        if !self.debug_login {
+            return self.db_path.clone();
+        }
+        if let Some(path) = &self.debug_db_path {
+            return path.clone();
+        }
+        match self.db_path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(DEBUG_DB_FILE_NAME),
+            _ => PathBuf::from(DEBUG_DB_FILE_NAME),
+        }
+    }
+
     /// Resolves the Google OAuth client secret from the file or the inline value.
     ///
     /// The file (`--client-secret-file` / `ALHALTE_CLIENT_SECRET_FILE`) wins. An
@@ -175,6 +227,63 @@ impl CliArgs {
 /// Parses CLI arguments from `std::env::args_os()`.
 pub fn parse_cli_args() -> CliArgs {
     CliArgs::parse()
+}
+
+#[cfg(test)]
+mod debug_login_tests {
+    use super::*;
+
+    // spec: alhalte-maitre-d/debug-login 0001 debug login uses a separate SQLite file
+    #[test]
+    fn debug_login_selects_a_separate_database_file() {
+        // Normal mode keeps the configured path.
+        let args = CliArgs::try_parse_from([
+            "alhalte-maitre-d",
+            "--db-path",
+            "/var/lib/alhalte/maitre-d.sqlite3",
+        ])
+        .unwrap();
+        assert!(!args.debug_login);
+        assert_eq!(args.debug_db_path, None);
+        assert_eq!(
+            args.active_db_path(),
+            PathBuf::from("/var/lib/alhalte/maitre-d.sqlite3")
+        );
+
+        // Debug mode defaults to a sibling file and never the normal one.
+        let args = CliArgs::try_parse_from([
+            "alhalte-maitre-d",
+            "--db-path",
+            "/var/lib/alhalte/maitre-d.sqlite3",
+            "--debug-login",
+        ])
+        .unwrap();
+        assert!(args.debug_login);
+        assert_eq!(
+            args.active_db_path(),
+            PathBuf::from("/var/lib/alhalte/maitre-d-debug.sqlite3")
+        );
+        assert_ne!(args.active_db_path(), args.db_path);
+
+        // An explicit debug path wins.
+        let args = CliArgs::try_parse_from([
+            "alhalte-maitre-d",
+            "--db-path",
+            "/var/lib/alhalte/maitre-d.sqlite3",
+            "--debug-login",
+            "--debug-db-path",
+            "/tmp/alhalte-debug.sqlite3",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.active_db_path(),
+            PathBuf::from("/tmp/alhalte-debug.sqlite3")
+        );
+
+        // A bare relative --db-path keeps the debug file relative.
+        let args = CliArgs::try_parse_from(["alhalte-maitre-d", "--debug-login"]).unwrap();
+        assert_eq!(args.active_db_path(), PathBuf::from(DEBUG_DB_FILE_NAME));
+    }
 }
 
 #[cfg(test)]

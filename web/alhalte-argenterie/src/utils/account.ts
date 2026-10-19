@@ -52,6 +52,52 @@ export interface SessionResponse {
   session_id: number;
 }
 
+/** Response payload of `GET /api/server-info`. */
+export interface ServerInfo {
+  /**
+   * True when `alhalte-maitre-d` runs with `--debug-login` (Issue #150).
+   *
+   * The home screen shows a full-screen warning in that case, because anyone
+   * who can reach the instance can create an account by typing a name.
+   */
+  debug_login: boolean;
+}
+
+/** Options for {@link fetchServerInfo}. */
+export interface ServerInfoOptions {
+  /** Optional base URL (useful for tests / reverse-proxy prefixes). */
+  baseUrl?: string;
+  /** Injectable fetch implementation for tests. */
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Reads the public server metadata (`GET /api/server-info`).
+ *
+ * Returns `{ debug_login: false }` for every failure — an older `maitre-d`
+ * without the endpoint (`404`), a network error, or a malformed body — so the
+ * home screen never breaks because the warning could not be resolved. The
+ * endpoint is public, so no credentials are sent.
+ */
+export async function fetchServerInfo(options: ServerInfoOptions = {}): Promise<ServerInfo> {
+  const fetchFn = options.fetchFn ?? (typeof fetch !== 'undefined' ? fetch : undefined);
+  if (!fetchFn) {
+    return { debug_login: false };
+  }
+
+  const base = (options.baseUrl || '').replace(/\/+$/, '');
+  try {
+    const res = await fetchFn(`${base}/api/server-info`, { method: 'GET' });
+    if (!res.ok) {
+      return { debug_login: false };
+    }
+    const payload = (await res.json()) as { debug_login?: unknown } | null;
+    return { debug_login: payload?.debug_login === true };
+  } catch {
+    return { debug_login: false };
+  }
+}
+
 /** Options shared by the account API helpers. */
 export interface AccountRequestOptions {
   /** Optional base URL (useful for tests / reverse-proxy prefixes). */

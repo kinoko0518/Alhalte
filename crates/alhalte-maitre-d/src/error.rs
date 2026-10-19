@@ -18,6 +18,15 @@ pub enum MaitreDError {
     #[error("OAuth error: {0}")]
     OAuth(String),
 
+    /// The configured authentication provider does not serve this flow.
+    ///
+    /// `maitre-d --debug-login` installs the debug provider, which has no Google
+    /// code exchange or ID token verification. The HTTP layer maps this to
+    /// `401 Unauthorized`; the Google routes are not even registered while the
+    /// debug login is active.
+    #[error("Authentication flow is not available: {0}")]
+    AuthFlowUnavailable(&'static str),
+
     /// Cryptographic or encryption error.
     #[error("Cryptographic error: {0}")]
     Crypto(String),

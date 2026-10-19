@@ -472,6 +472,17 @@ pub struct MaitreDConfig {
     /// [`BistrotConfig::maitre_d_public_url`].
     #[serde(default, alias = "public_url")]
     pub public_url: Option<String>,
+
+    /// Enables `maitre-d --debug-login` (Issue #150).
+    ///
+    /// Local development only. Debug login accepts an account name alone, keeps
+    /// accounts and sessions in `<data-dir>/maitre-d-debug.sqlite3` (never the
+    /// normal database), and spawns banquette with `--no-persist`, so no room
+    /// state reaches the shared cellar. Never enable it on a public instance.
+    ///
+    /// `generate_maitre_d_args` emits `--debug-login` when this is true.
+    #[serde(default, alias = "debug_login")]
+    pub debug_login: bool,
 }
 
 /// Configuration for `alhalte-cellar` (file storage and tin deduplication).

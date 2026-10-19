@@ -26,7 +26,7 @@
     RoomApiError,
     saveVisitedRoom,
   } from '../../utils/home.js';
-  import { beginGoogleSignIn, isSignedIn } from '../../utils/account.js';
+  import { beginGoogleSignIn, fetchServerInfo, isSignedIn } from '../../utils/account.js';
   import AccountMenu from '../Control/AccountMenu.svelte';
 
   let {
@@ -56,6 +56,28 @@
   let createNeedsSignIn = $state(false);
   /** True while the OAuth redirect is being started from the dialog. */
   let isStartingSignIn = $state(false);
+  /**
+   * True when `maitre-d` runs with `--debug-login` (`GET /api/server-info`).
+   *
+   * A debug instance accepts an account name as the whole credential, so it must
+   * never be exposed publicly; the home screen covers itself with a full-screen
+   * warning while it is active (Issue #150).
+   */
+  let debugLogin = $state(false);
+
+  $effect(() => {
+    let cancelled = false;
+    fetchServerInfo({ baseUrl, ...(fetchFn ? { fetchFn } : {}) })
+      .then((info) => {
+        if (!cancelled) debugLogin = info.debug_login;
+      })
+      .catch(() => {
+        // `fetchServerInfo` never rejects; keep the home screen usable anyway.
+      });
+    return () => {
+      cancelled = true;
+    };
+  });
 
   function loadRooms() {
     recentRooms = getRecentRooms();
@@ -228,6 +250,26 @@
     leading={appBarLeading}
     trailing={appBarTrailing}
   />
+
+  {#if debugLogin}
+    <!-- Issue #150: `maitre-d --debug-login` is a development-only mode that
+         accepts a name as the whole credential. The warning is a full-screen
+         overlay on the home screen so it cannot be mistaken for normal
+         operation; it is deliberately not dismissible. -->
+    <div
+      class="debug-login-warning"
+      role="alert"
+      aria-live="assertive"
+      data-testid="debug-login-warning"
+    >
+      <div class="debug-login-warning-card">
+        <h1 class="debug-login-warning-title">管理者向けの警告</h1>
+        <p class="debug-login-warning-body">
+          現在デバッグログインが有効になっています。公開されるインスタンスでこの機能を利用するのは推奨されません。
+        </p>
+      </div>
+    </div>
+  {/if}
 
   <div class="home-content-wrapper">
     <!-- Expressive Hero Banner -->
@@ -454,6 +496,41 @@
     color: var(--np-color-on-background);
     font-family: Roboto, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     overflow-y: auto;
+  }
+  /* Issue #150: full-screen warning while `maitre-d --debug-login` is active.
+     It covers the home screen in every layout and cannot be dismissed: a
+     debug-login instance must not be mistaken for a normal one. */
+  .debug-login-warning {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    box-sizing: border-box;
+    background-color: var(--np-color-error-container, #410e0b);
+    color: var(--np-color-on-error-container, #f9dedc);
+  }
+  .debug-login-warning-card {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    max-width: 720px;
+    text-align: center;
+  }
+  .debug-login-warning-title {
+    margin: 0;
+    font-size: clamp(2rem, 6vw, 3.5rem);
+    font-weight: 700;
+    line-height: 1.15;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  .debug-login-warning-body {
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.7;
   }
   .brand-emblem {
     display: flex;

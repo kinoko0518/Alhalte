@@ -20,15 +20,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = parse_cli_args();
+    let debug_login = args.debug_login;
+    // `--debug-login` switches to the isolated debug SQLite file; the normal
+    // database is never opened while it is active (Issue #150).
+    let db_path = args.active_db_path();
     tracing::info!(
         "Starting alhalte-maitre-d on {}:{} (db: {:?})",
         args.host,
         args.port,
-        args.db_path
+        db_path
     );
+    if debug_login {
+        tracing::warn!(
+            "Debug login is ENABLED: accounts and sessions are stored in the isolated database \
+             {:?}, spawned banquettes run with --no-persist, and the normal database is not opened. \
+             Never enable this on a public instance",
+            db_path
+        );
+    }
 
-    let db = Database::open(&args.db_path)?;
-    tracing::info!("SQLite database opened at {:?}", args.db_path);
+    let db = Database::open(&db_path)?;
+    tracing::info!("SQLite database opened at {:?}", db_path);
 
     // Spawn periodic 4:00 AM session cleanup task
     spawn_session_cleanup_task(db.clone());
@@ -60,6 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              state unless cellar accepts the write through a user session"
         ),
     }
+    if debug_login {
+        // Debug rooms keep their state in process memory: no write reaches the
+        // shared cellar, and the room is discarded when the process exits.
+        spawner = spawner.with_no_persist();
+    }
     let spawner = Arc::new(spawner);
 
     let room_manager = RoomBridgeManager::new(spawner);
@@ -67,6 +84,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new(db, args.salt, oauth, room_manager)
         .with_public_url(&args.public_url)
         .with_cellar_proxy(CellarProxy::new(&args.cellar_url)?);
+    if debug_login {
+        state = state.with_debug_login();
+    }
     tracing::info!("Google OAuth redirect URI: {}", state.oauth_redirect_uri());
     if !args.cors_origins.is_empty() {
         tracing::info!("CORS allowed origins: {}", args.cors_origins.join(", "));

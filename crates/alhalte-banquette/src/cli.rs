@@ -72,6 +72,17 @@ pub struct CliArgs {
     /// `--service-token`.
     #[arg(long, env = "ALHALTE_SERVICE_TOKEN_FILE")]
     pub service_token_file: Option<PathBuf>,
+
+    /// Keeps room state and log chunks in process memory instead of cellar.
+    ///
+    /// `alhalte-maitre-d --debug-login` passes this so a debug instance never
+    /// writes to the shared `alhalte-cellar`: nothing is persisted, superseded
+    /// heads are not released, and the room disappears when the process exits.
+    /// The head normally comes from the cellar alias, so `--no-persist` starts
+    /// an empty in-memory room (Issue #150). `ALHALTE_NO_PERSIST` is a value
+    /// switch: set it to `true` (or `false`).
+    #[arg(long, env = "ALHALTE_NO_PERSIST")]
+    pub no_persist: bool,
 }
 
 impl CliArgs {
@@ -162,6 +173,27 @@ mod tests {
         );
         assert!(parse_room_id_arg("0x1234").is_err());
         assert!(parse_room_id_arg("18446744073709551616").is_err());
+    }
+
+    // spec: alhalte-banquette/persistence 0008 --no-persist disables cellar writes
+    #[test]
+    fn parses_no_persist() {
+        let args = CliArgs::try_parse_from([
+            "alhalte-banquette",
+            "--room-id",
+            "777",
+            "--admin",
+            "1",
+            "--no-persist",
+        ])
+        .unwrap();
+        assert!(args.no_persist);
+
+        // Persistence is on by default.
+        let args =
+            CliArgs::try_parse_from(["alhalte-banquette", "--room-id", "777", "--admin", "1"])
+                .unwrap();
+        assert!(!args.no_persist);
     }
 
     // spec: alhalte-banquette/persistence 0007 the room head comes from cellar, not argv

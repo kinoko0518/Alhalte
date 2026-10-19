@@ -8,6 +8,8 @@
 
 restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、インスタンス固有の salt を key にした BLAKE3 の 128bit hash（`sub_hash`）にして account を作る。生の `sub` は hash 計算後に zeroize し、DB・ログ・HTTP 応答のどこにも残さない（Issue #190）。64bit の session を発行・失効させる。HTTP API と WebSocket を提供し、部屋 ID ごとに通信を demultiplex して `alhalte-banquette` の UNIX ソケットへ流す。SQLite に部屋 registry（`rooms`）を持ち、部屋作成 API と ZIP export も持つ。部屋状態の head は持たない: banquette が cellar の `room/<room_id>/head` alias を読み書きする（Issue #192）。
 
+認証経路は trait（`AuthProvider`）で切り替える。通常は Google OAuth（`GoogleAuthProvider`）だけを使い、`--debug-login` を指定したときだけ、account 名の入力だけでサインインできる隔離されたデバッグログイン（`DebugAuthProvider`）に差し替わる。debug 有効時は **別の SQLite ファイル** を開き、通常 DB には一切触らない（Issue #150）。
+
 ## 公開 API / 外部接続点
 
 ### HTTP API
@@ -17,9 +19,12 @@ restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、�
 | `GET` | `/api/verify-session` | `owner` / `account_id` と `session_id` の有効性を返す。cellar の `MaitreDVerifier` と互換。 |
 | `GET` | `/api/session` | `session_id`（Cookie / ヘッダ / クエリ）から `account`（`AccountResponse`）と `session_id` を返す。argenterie が OAuth 後に account を得るための軽量 API。 |
 | `POST` | `/api/heartbeat` | `session_id` の `last_heartbeat` を更新する。 |
-| `GET` | `/auth/login` | 絶対 URL の `return_to` を受け、state を発行して Google へ 302 する。`return_to` の origin は CORS allow-list のみ許可（オープンリダイレクト禁止）。`prompt` も任意で透過する。 |
-| `GET` | `/auth/google/callback` | Google からの固定 callback。state を単回消費し、コードを交換して account / session を作り、`session_id` Cookie を設定して `return_to` へ 302 する。 |
-| `POST` | `/auth/google/token` | ID token を検証し、account と session を返す。 |
+| `GET` | `/auth/login` | 絶対 URL の `return_to` を受け、state を発行して Google へ 302 する。`return_to` の origin は CORS allow-list のみ許可（オープンリダイレクト禁止）。`prompt` も任意で透過する。debug 有効時は state を発行せず `/auth/debug/login?return_to=...` へ 302 する。 |
+| `GET` | `/auth/debug/login` | debug 有効時のみ登録。account 名だけを入力する最小の HTML フォームを返す。`return_to` は allow-list で検証し、`Cache-Control: no-store` を付ける。debug 無効時は 404。 |
+| `POST` | `/auth/debug/login` | debug 有効時のみ登録。account 名（`account_name`）を trim して account を get-or-create し、session を発行して `session_id` Cookie を設定、`return_to` へ 302 する。debug 無効時は 404。 |
+| `GET` | `/api/server-info` | 公開。`{ "debug_login": bool }` を返す。argenterie が起動時に読み、debug 有効なら警告を出す。 |
+| `GET` | `/auth/google/callback` | Google からの固定 callback。state を単回消費し、コードを交換して account / session を作り、`session_id` Cookie を設定して `return_to` へ 302 する。debug 有効時は登録されない（404）。 |
+| `POST` | `/auth/google/token` | ID token を検証し、account と session を返す。debug 有効時は登録されない（404）。 |
 | `GET` / `PATCH` | `/api/account/{account_id}` | 認証必須。account の取得（`sub_hash` を含まない `AccountResponse`）・handle name / icon の更新。 |
 | `GET` | `/api/accounts/search?q=...` | 認証必須。handle name / ID で account を検索。 |
 | `POST` | `/api/rooms` | 認証必須。部屋を `rooms` に登録し、作成者を `gm` にする。banquette は起動しない。 |
@@ -67,7 +72,9 @@ room-scoped route の `{room_id}` は `RoomId`（`crates/alhalte-maitre-d/src/ro
 
 `/api/cellar/store`、`/api/cellar/store/{tin_id}` は Axum 既定の 2 MiB を超える Tin（アセット・拡張 wasm）を通すため、`DefaultBodyLimit::max(64 MiB)` を route 単位で設定する。他の route は既定のまま。
 
-CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--public-url`（`ALHALTE_PUBLIC_URL`、既定 `http://127.0.0.1:8080`）、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`、`--client-secret-file`（`ALHALTE_CLIENT_SECRET_FILE`、0600 file から読む。`--client-secret` より優先）、`--service-token-file`（`ALHALTE_SERVICE_TOKEN_FILE`、0600 file から読む。各 banquette へ path を転送する）、`--service-token`（`ALHALTE_SERVICE_TOKEN`、後方互換）、`--cors-origin`（繰り返し / カンマ区切り、`ALHALTE_CORS_ORIGINS`）。`--public-url` は OAuth の `redirect_uri`（`{public_url}/auth/google/callback`）と Cookie の `Secure` 判定に使う。Bistrot は `maitre-d.public-url` があればそれを、なければ `restaurant.domain` が非ループバックなら `https://{domain}`、ループバック開発なら argenterie URL を渡す。
+CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--public-url`（`ALHALTE_PUBLIC_URL`、既定 `http://127.0.0.1:8080`）、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--unix-socket`、`--client-secret-file`（`ALHALTE_CLIENT_SECRET_FILE`、0600 file から読む。`--client-secret` より優先）、`--service-token-file`（`ALHALTE_SERVICE_TOKEN_FILE`、0600 file から読む。各 banquette へ path を転送する）、`--service-token`（`ALHALTE_SERVICE_TOKEN`、後方互換）、`--cors-origin`（繰り返し / カンマ区切り、`ALHALTE_CORS_ORIGINS`）、`--debug-login`（`ALHALTE_DEBUG_LOGIN`）、`--debug-db-path`（`ALHALTE_DEBUG_DB_PATH`）。`--public-url` は OAuth の `redirect_uri`（`{public_url}/auth/google/callback`）と Cookie の `Secure` 判定に使う。Bistrot は `maitre-d.public-url` があればそれを、なければ `restaurant.domain` が非ループバックなら `https://{domain}`、ループバック開発なら argenterie URL を渡す。
+
+`--debug-login` は開発専用。account 名だけでサインインでき、開く DB は `CliArgs::active_db_path()` が返す **別ファイル**（`--debug-db-path`、未指定なら `{--db-path のディレクトリ}/maitre-d-debug.sqlite3`、`DEBUG_DB_FILE_NAME`）で、スキーマは通常 DB と同一。通常 DB は開かない。起動時に警告ログを出し、spawn する banquette には `--no-persist` を渡し、`RoomBridgeManager::without_persistence()` で `room_heads` の読み書きも止める。
 
 秘密値（`--client-secret-file` / `--service-token-file`）は `alhalte_maitre_d::secret_file::read_secret_file` が 0600 file から読み、group/other に読める file は拒否する（Issue #194）。Bistrot は復号した秘密を `<data-dir>/secrets/` に 0600 で書き、引数には path だけを渡す。`--service-token-file` の path は spawner が各 banquette に `--service-token-file` として転送する。
 
@@ -78,6 +85,8 @@ CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--clien
 - `CreateRoomRequest`、`RoomInfoResponse`、`RoomSessionQuery`、`MAX_ROOM_NAME_LEN`
 - `AccountResponse`（`sub_hash` を含まない account 応答 DTO）、`SessionResponse`、`DEFAULT_ALLOWED_ORIGINS`、`DEFAULT_PUBLIC_URL`、`SESSION_COOKIE_MAX_AGE_SECS`
 - `OAuthProvider`、`GoogleOAuthProvider`、`MockOAuthProvider`、`GoogleUserInfo`、`OAuthLoginQuery`
+- `AuthProvider`、`AuthKind`、`AuthIdentity`、`GoogleAuthProvider`、`DebugAuthProvider`、`DEFAULT_HANDLE_NAME`、`DEBUG_SUBJECT_PREFIX`、`MAX_DEBUG_ACCOUNT_NAME_LEN`、`parse_debug_account_name`、`percent_encode`
+- `DebugLoginQuery`、`DebugLoginForm`、`ServerInfoResponse`、`DEBUG_DB_FILE_NAME`
 - `RoomBridge`、`RoomBridgeManager`、`BanquetteSpawner`、`ProcessBanquetteSpawner`、`InProcessBanquetteSpawner`
 - `AppState`、`create_router`、`extract_session_id_from_cookie`、`is_allowed_return_to`、`session_cookie_header`
 - `SubHash`、`hash_sub`、`SUB_HASH_BYTES`、`SUB_HASH_HEX_LEN`
@@ -102,6 +111,19 @@ OAuth の `redirect_uri` は常に `{public_url}/auth/google/callback` で、Goo
 `POST /auth/google/token` は ID token 用に残し、同じ account に新しい session を発行する。旧 `GET /auth/google/url` と、クライアントが `redirect_uri` を指定する `POST /auth/google/callback` は廃止した（既存アカウントがないため互換性は切っている）。
 
 Google から継承するのは `sub` のみ。`sub` はその場で hash 化・zeroize され、DB には `sub_hash` だけが残る。`sub_hash` は account を引くための key で、`Account`（DB エンティティ）は `Serialize` せず、HTTP 応答は `AccountResponse` を使う。`SubHash` の `Debug` は `SubHash(<redacted>)`、`GoogleUserInfo` の `Debug` も `sub` を伏せるので、ログ・エラー・`Debug` に生 `sub` も hash も出ない。handle name は初回の既定値で、後から `PATCH /api/account/{id}` で変更できる。
+
+### デバッグログイン（Issue #150）
+
+`--debug-login` を付けたプロセスだけが通る、Google とは別の認証経路。`AuthProvider` が Google と Debug を切り替え、`/auth/login` 以降の分岐は provider への問い合わせだけで決まる（`oauth_login_handler` は `login_redirect` が返ったらそこで 302 し、Google の state を発行しない）。
+
+1. 起動時に `CliArgs::active_db_path()` で DB を選ぶ。debug 有効なら `--debug-db-path`、未指定なら `{--db-path のディレクトリ}/maitre-d-debug.sqlite3`。通常 DB は開かない（同一スキーマを適用する）。
+2. `GET /api/server-info` が `{ "debug_login": true }` を返す。
+3. argenterie はサインイン導線から従来どおり `GET /auth/login?return_to=...` へ遷移する。`return_to` の allow-list 検証は Google と同じで、問題なければ `/auth/debug/login?return_to=<encoded>` へ 302 する。
+4. `GET /auth/debug/login` は account 名だけを入力する HTML フォームを返す（`return_to` は hidden field）。`Cache-Control: no-store`。
+5. `POST /auth/debug/login` は `account_name` を trim して `alhalte/debug-login/<name>` を合成 `sub` とし、`hash_sub` で `sub_hash` にして `get_or_create_account` → `create_session` する。同じ名前は同じ account（名前が identity の key）、未知の名前は新しい account になる。名前は 1〜100 文字（`MAX_DEBUG_ACCOUNT_NAME_LEN`）で制御文字を含まないこと。
+6. 応答は `session_id` Cookie を設定して `return_to` へ 302 する。以降は通常の session と同じ経路（`/api/session`、WS、cellar proxy）を使う。
+7. debug 有効時は `/auth/debug/login` だけを登録し、`/auth/google/callback` と `/auth/google/token` は登録しない（404）。debug 無効時は `/auth/debug/login` を登録せず 404 で、`/auth/login` は従来どおり Google へ 302 する。
+8. debug 有効時の banquette は `--no-persist` で起動し、`RoomBridgeManager::without_persistence()` が `room_heads` を読まない/書かない。部屋の状態は banquette プロセスのメモリにだけ存在し、再起動で失われる（通常 cellar には書き込まない）。
 
 ### session 失効
 
@@ -169,6 +191,8 @@ HTTP 権限 API は banquette への薄い proxy で、`QueryPermissions` / `Set
 - 復元失敗（tin 不在・復号不能・内容 hash 不一致・room_id 不一致・root scene 不在）は spawn の失敗として扱い、WS は 500、export は 5xx を返す。maitre-d は空部屋にフォールバックしない。
 - 旧 head の unregister は banquette が行う。`maitre-d` は head を記録しないので、置き換え前の tin id も知らない。
 
+- `--debug-login` の `RoomBridgeManager::without_persistence()` は `get_room_head` を呼ばず（spawn 時の head は常に `None`）、`RoomPersisted` も `room_heads` に書かない。banquette は `--no-persist` で起動するため、報告される tin はそのプロセスのメモリにしか存在しない。
+
 ## データベース
 
 SQLite のテーブル:
@@ -189,6 +213,8 @@ oauth_states(state TEXT PRIMARY KEY, return_to TEXT NOT NULL, created_at INTEGER
 
 `accounts` には migration がない。Issue #190 で復号可能な `encrypted_sub` を one-way な `sub_hash` に置き換えた際、既存 account は存在しない前提で互換性を切っている。旧 schema（`accounts.encrypted_sub` がある、または `sub_hash` がない `accounts`）を検出すると、起動時に `MaitreDError::LegacySubSchema` で明示的に失敗する（自動移行も破壊的な作り直しもしない）。
 
+`--debug-login` は同じスキーマを持つ **別の SQLite ファイル**（既定 `maitre-d-debug.sqlite3`）を開く。debug account は `sub_hash` に `alhalte/debug-login/<account 名>` の hash が入るだけで、通常 account と DB 上は区別がつかない。分離はファイル単位なので、debug と通常で account / session / room / `room_heads` が混ざることはない。
+
 起動時の schema 処理:
 
 1. `accounts` が旧 `encrypted_sub` schema、または `sub_hash` を持たない場合は `LegacySubSchema` で起動を拒否する。
@@ -208,7 +234,10 @@ oauth_states(state TEXT PRIMARY KEY, return_to TEXT NOT NULL, created_at INTEGER
 - `ProcessBanquetteSpawner` が起動した子プロセスは maitre-d 側で reap しない。maitre-d が再起動すると、古い banquette が残っていれば同じ socket path と head alias を奪い合う。systemd の cgroup（既定 `KillMode=control-group`）で一緒に停止する運用を前提とする。
 - `POST /api/rooms` は `rooms` に行を書くだけで、権限行も banquette も作らない。最初の WS / export で起動し、creator が初期 Admin になる。
 - `GET /api/rooms`（自分の role を持つ部屋一覧）は未実装。
-- debug account は debug ビルド限定で、`POST /api/debug/account` が「`alhalte/debug/` + 32 byte 乱数」を合成 `sub` として `hash_sub` し、通常の account と同じ経路で作る。旧 `encrypted_sub = "0"` の特別扱い（`decrypt_sub`）は #190 で撤去したので、`accounts.sub_hash` の `UNIQUE` 制約と両立し、DB 上は実 account と区別がつかない。debug account を専用 DB へ分離するのは #150。
+- debug account には 2 つの入口がある。debug ビルド限定の `POST /api/debug/account` は「`alhalte/debug/` + 32 byte 乱数」を合成 `sub` として `hash_sub` し、通常の account と同じ経路で作る（旧 `encrypted_sub = "0"` の特別扱い（`decrypt_sub`）は #190 で撤去）。`--debug-login` の `POST /auth/debug/login` は account 名から `alhalte/debug-login/<name>` を合成 `sub` にする。どちらも通常 DB とは別のファイル（`maitre-d-debug.sqlite3`）に書く。
+- `--debug-login` は **開発専用**。account 名だけでサインインでき、`/auth/debug/login` に CSRF token もレート制限もない。公開インスタンスで有効にしてはならない（起動時に警告ログを出し、argenterie はホーム画面に全画面警告を出す）。
+- debug 有効時、部屋の状態は banquette プロセスのメモリにだけ存在する（`--no-persist`）。maitre-d を再起動すると部屋は空から始まり、`room_heads` は読まれない。debug で作った部屋の状態を残したい場合はこの制約を外す設計変更が要る。
+- debug 有効時も cellar proxy（`/api/cellar/*`）は有効なままで、クライアントが明示的に保存した Tin（アセット・拡張 wasm）は通常 cellar に書かれる。禁止しているのは banquette による部屋状態の永続化だけ。
 - CORS は明示的な origin allow-list。`--cors-origin` 未指定時はローカル開発 origin のみで、本番では Bistrot が argenterie URL / domain から生成した値を渡す。reverse proxy 側での制限も併用できる。
 - OAuth の `redirect_uri` は `--public-url` から作る固定値だけで、argenterie の origin / port は Google に渡さない。旧 `GET /auth/google/url` / `POST /auth/google/callback` は削除した（互換性なし）。`GET /auth/login` の `return_to` は CORS allow-list の origin のみ許可し、`//evil`・別 origin・`javascript:` / `data:`・userinfo 付き URL は 400。
 - callback の `session_id` Cookie は `{public_url}` の origin に付く。ブラウザから `/api/session` を Cookie 付きで呼ぶには、`public_url` の origin と argenterie の origin が一致している必要がある。ローカル開発では Bistrot が `--public-url` に argenterie URL を渡し、Vite の `/auth` proxy 経由で callback を受ける。本番は reverse proxy で同一 origin に揃える。
