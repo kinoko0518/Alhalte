@@ -8,7 +8,7 @@
    */
   import { IconButton } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { Character, ExtensionItem, Scene } from '../../types/index.js';
+  import type { Character, ExtensionItem, QueuedLogMessage, Scene } from '../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
   import type { ConnectionState } from '../../utils/connection.js';
   import type { AudioManager } from '../../utils/audio.js';
@@ -54,7 +54,7 @@
     roomId,
     isViewer = false,
     sending = false,
-    pendingMessageCount = 0,
+    queuedMessages = [],
     onSetDone,
     onManagePermissions,
     onRequestDeleteScene,
@@ -104,8 +104,11 @@
     roomId?: string;
     /** Forwarded to `CommonFooter`: a message send is waiting for its echo (Issue #109). */
     sending?: boolean;
-    /** Forwarded to `CommonFooter`: messages waiting in the durable offline outbox (Issue #109). */
-    pendingMessageCount?: number;
+    /**
+     * Forwarded to `LogTab`: `kind: 'message'` outbox entries for the active
+     * room, rendered inline below the loaded messages (Issue #148).
+     */
+    queuedMessages?: QueuedLogMessage[];
     onSetDone?: (done: boolean) => void;
     onManagePermissions?: () => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
@@ -209,6 +212,7 @@
         {chunkManager}
         {roomSocket}
         {connectionState}
+        {queuedMessages}
         {onCollapse}
         {onSelectScene}
         {onExportZip}
@@ -294,7 +298,6 @@
     {selectedCharacterId}
     {isViewer}
     {sending}
-    {pendingMessageCount}
     onTabChange={handleTabChange}
     {onSelectCharacter}
     {onSendMessage}

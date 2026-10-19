@@ -806,8 +806,8 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     expect(FOOTER_SOURCE).toContain('wavy');
   });
 
-  // spec: alhalte-argenterie/common-footer オフラインキューの波線通知をフッター上部に表示する (Issue #109 / #139)
-  it('renders the offline queue notice above the footer contents only when messages are queued', async () => {
+  // spec: alhalte-argenterie/common-footer オフラインキューの通知はログ内へ集約する (Issue #148)
+  it('does not render the offline queue notice above the footer contents', () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -817,43 +817,18 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
         activeTab: 'log',
         characters: sampleCharacters,
         selectedCharacterId: 'char-1',
-        pendingMessageCount: 0,
       },
     });
 
+    // Queued messages are rendered inline in `LogTab`; the footer is input only
+    // and the connection indicator owns connection state (Issue #148).
     expect(target.querySelector('[data-testid="offline-queue-notice"]')).toBeNull();
+    expect(target.querySelector('[data-testid="footer-queue-notice"]')).toBeNull();
+    expect(FOOTER_SOURCE).not.toContain('OfflineQueueNotice');
+    expect(FOOTER_SOURCE).not.toContain('footer-queue-notice');
+    expect(FOOTER_SOURCE).not.toContain('pendingMessageCount');
 
     unmount(instance);
     target.remove();
-
-    const queuedTarget = document.createElement('div');
-    document.body.appendChild(queuedTarget);
-    const queuedInstance = mount(CommonFooter, {
-      target: queuedTarget,
-      props: {
-        activeTab: 'log',
-        characters: sampleCharacters,
-        selectedCharacterId: 'char-1',
-        pendingMessageCount: 2,
-      },
-    });
-
-    const footer = queuedTarget.querySelector<HTMLElement>('[data-testid="common-footer"]');
-    const notice = queuedTarget.querySelector<HTMLElement>('[data-testid="offline-queue-notice"]');
-    expect(notice).toBeTruthy();
-    // The notice sits above the input area, as the footer's first block.
-    const firstBlock = footer?.firstElementChild;
-    expect(firstBlock?.getAttribute('data-testid')).toBe('footer-queue-notice');
-    expect(notice?.getAttribute('data-kind')).toBe('message');
-    expect(notice?.getAttribute('role')).toBe('status');
-    expect(
-      notice?.querySelector('[data-testid="offline-queue-notice-description"]')?.textContent?.trim(),
-    ).toBe('メッセージは次回の接続時に送信されます');
-    expect(
-      notice?.querySelector('[data-testid="offline-queue-notice-count"]')?.textContent?.trim(),
-    ).toBe('2 件を蓄積中');
-
-    unmount(queuedInstance);
-    queuedTarget.remove();
   });
 });

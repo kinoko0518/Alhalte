@@ -106,8 +106,8 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     return target.querySelector('[data-testid="messages-list"]')?.textContent ?? '';
   }
 
-  // spec: alhalte-argenterie/発言とログ表示 送信中は echo まで描画せず、タイムアウトでアウトボックスへ積む
-  it('does not render a message until the echo arrives, and queues it on timeout', async () => {
+  // spec: alhalte-argenterie/発言とログ表示 タイムアウトしたメッセージはログ内のキュー区切りに描画する (Issue #148)
+  it('renders a timed-out message inline in the log queue instead of above the footer', async () => {
     const socket = new FakeRoomSocket();
     const { instance } = mountApp(socket);
     await tick(30);
@@ -132,7 +132,18 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     expect(payload.sceneId).toBe('/');
     expect(payload.record.content).toBe('タイムアウトするメッセージ');
 
-    // Wavy notice with the pending count, above the footer input area.
+    // The queue is rendered inline, below the wavy divider, not above the
+    // footer (Issue #148).
+    const queuedMessage = target.querySelector<HTMLElement>(
+      `[data-testid="log-record-${payload.record.id}"]`,
+    );
+    expect(queuedMessage).toBeTruthy();
+    expect(queuedMessage?.getAttribute('data-queued')).toBe('true');
+    expect(messagesText()).toContain('タイムアウトするメッセージ');
+    expect(
+      target.querySelector('[data-testid="messages-list"] [data-testid="queued-log-divider"]'),
+    ).toBeTruthy();
+
     const notice = target.querySelector<HTMLElement>('[data-testid="offline-queue-notice"]');
     expect(notice).toBeTruthy();
     expect(notice?.getAttribute('data-kind')).toBe('message');
@@ -140,13 +151,15 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     expect(notice?.getAttribute('aria-live')).toBe('polite');
     expect(noticeDescription()).toBe('メッセージは次回の接続時に送信されます');
     expect(noticeCount()).toBe('1 件を蓄積中');
-    expect(footer().firstElementChild?.getAttribute('data-testid')).toBe('footer-queue-notice');
     expect(notice?.querySelectorAll('.wavy-divider').length).toBe(2);
+    // The duplicated footer notice was removed (#148): connection state stays in
+    // `OfflineIndicator`, the queue count now lives in the log.
+    expect(footer().querySelector('[data-testid="offline-queue-notice"]')).toBeNull();
+    expect(target.querySelector('[data-testid="footer-queue-notice"]')).toBeNull();
 
-    // The failed message is NOT restored into the input and NOT rendered.
+    // The failed message is NOT restored into the input.
     const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
     expect(textarea?.value).toBe('');
-    expect(messagesText()).not.toContain('タイムアウトするメッセージ');
 
     // The sending state is cleared so the next message can be sent.
     expect(footer().getAttribute('aria-busy')).toBe('false');
@@ -212,8 +225,9 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
       'オフラインで送るメッセージ',
     );
     expect(noticeCount()).toBe('1 件を蓄積中');
-    // Nothing is rendered until the server confirms it.
-    expect(messagesText()).not.toContain('オフラインで送るメッセージ');
+    // The queued message is visible inline even before a reconnect.
+    expect(messagesText()).toContain('オフラインで送るメッセージ');
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(1);
 
     // A second offline message is appended FIFO to the same queue.
     await typeAndSend('オフラインで送るメッセージ2');
@@ -224,6 +238,8 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
       'オフラインで送るメッセージ2',
     );
     expect(noticeCount()).toBe('2 件を蓄積中');
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(2);
+    expect(messagesText()).toContain('オフラインで送るメッセージ2');
     expect(socket.requestAppendLogCalls).toHaveLength(0);
     expect(socket.appendLogCalls).toHaveLength(0);
 
@@ -269,9 +285,12 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     const { instance, connectionManager } = mountApp(socket, 'disconnected');
     await tick(30);
 
-    // The queue notice reflects the restored entries even before reconnecting.
+    // The restored entries are visible inline even before reconnecting.
     await waitFor(() => noticeCount() === '2 件を蓄積中');
     expect(noticeCount()).toBe('2 件を蓄積中');
+    expect(messagesText()).toContain('キューの1通目');
+    expect(messagesText()).toContain('キューの2通目');
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(2);
 
     // Reconnect: the outbox is flushed, one entry at a time.
     socket.isConnected = true;
@@ -283,12 +302,17 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     expect(socket.requestAppendLogCalls[0].record.content).toBe('キューの1通目');
     expect(socket.appendLogCalls).toHaveLength(0);
 
-    // Nothing rendered yet: the first entry is still waiting for its echo.
-    expect(messagesText()).not.toContain('キューの1通目');
+    // The first entry is still shown as queued until its echo arrives.
+    expect(messagesText()).toContain('キューの1通目');
+    expect(target.querySelectorAll('[data-testid="log-record-msg-queued-1"]')).toHaveLength(1);
 
     socket.deliverEcho();
-    await waitFor(() => messagesText().includes('キューの1通目'));
+    await waitFor(() => target.querySelector('[data-testid="log-record-msg-queued-1"][data-queued]') === null);
     expect(messagesText()).toContain('キューの1通目');
+    // The echo replaced the queued copy: exactly one row, never two.
+    expect(target.querySelectorAll('[data-testid="log-record-msg-queued-1"]')).toHaveLength(1);
+    expect(messagesText()).toContain('キューの2通目');
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(1);
 
     // The second entry follows only after the first one settled (FIFO).
     await waitFor(() => socket.requestAppendLogCalls.length > 1);
@@ -296,13 +320,19 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     expect(socket.requestAppendLogCalls[1].record.content).toBe('キューの2通目');
 
     socket.deliverEcho(1);
-    await waitFor(() => messagesText().includes('キューの2通目'));
+    await waitFor(
+      () => target.querySelector('[data-testid="log-record-msg-queued-2"][data-queued]') === null,
+    );
     expect(messagesText()).toContain('キューの2通目');
+    expect(target.querySelectorAll('[data-testid="log-record-msg-queued-2"]')).toHaveLength(1);
 
-    // The queue is drained and the notice disappears.
-    await waitFor(() => target.querySelector('[data-testid="offline-queue-notice"]') === null);
+    // The queue is drained and the inline notice disappears.
+    await waitFor(
+      () => target.querySelector('[data-testid="queued-log-divider"]') === null,
+    );
     expect(await getOutbox().list(ROOM.id!, 'message')).toHaveLength(0);
     expect(target.querySelector('[data-testid="offline-queue-notice"]')).toBeNull();
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(0);
 
     unmount(instance);
   });
@@ -340,7 +370,9 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
 
     expect(await getOutbox().list(ROOM.id!, 'message')).toHaveLength(1);
     expect(noticeCount()).toBe('1 件を蓄積中');
-    expect(messagesText()).not.toContain('再送されるメッセージ');
+    // The entry stayed queued, so its inline preview stays visible.
+    expect(messagesText()).toContain('再送されるメッセージ');
+    expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(1);
 
     unmount(instance);
   });

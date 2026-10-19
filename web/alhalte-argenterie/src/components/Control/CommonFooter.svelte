@@ -30,7 +30,9 @@
    * 5. Generast AST generation on message submission (via extension pipeline if active, or text node fallback).
    * 6. Send-in-flight state (`sending`): wavy indeterminate `CircularProgress`
    *    instead of the send icon, `aria-busy` + dimmed footer, disabled input.
-   * 7. Offline queue notice above the whole footer (`pendingMessageCount > 0`).
+   *
+   * Queued offline messages are rendered inline in `LogTab` (Issue #148), so the
+   * footer no longer duplicates that notice.
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> コントロールパネル共通フッター`
@@ -50,7 +52,6 @@
     Tooltip,
   } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import OfflineQueueNotice from '../OfflineQueueNotice.svelte';
   import type { Character, ExtensionItem } from '../../types/index.js';
   import {
     findChatPaletteMatches,
@@ -84,7 +85,6 @@
     showDicePicker = $bindable(true),
     isViewer = false,
     sending = false,
-    pendingMessageCount = 0,
     onTabChange,
     onSelectCharacter,
     onSendMessage,
@@ -105,13 +105,6 @@
      * @default false
      */
     sending?: boolean;
-    /**
-     * Number of messages waiting in the durable offline outbox. When greater
-     * than zero an `OfflineQueueNotice kind="message"` is rendered above the
-     * footer contents.
-     * @default 0
-     */
-    pendingMessageCount?: number;
     onTabChange?: (tab: ActiveTab) => void;
     onSelectCharacter?: (charId: string) => void;
     onSendMessage?: (text: string, characterId?: string, generast?: GenerastAST) => void;
@@ -346,13 +339,6 @@
   data-sending={sending ? 'true' : 'false'}
   aria-busy={sending ? 'true' : 'false'}
 >
-  <!-- Offline outbox notice: messages queued while the server was unreachable (Issue #109) -->
-  {#if pendingMessageCount > 0}
-    <div class="footer-queue-notice" data-testid="footer-queue-notice">
-      <OfflineQueueNotice kind="message" count={pendingMessageCount} />
-    </div>
-  {/if}
-
   <!-- 1. Tab Selection Button Group (smooth horizontal expand on select) -->
   <div class="tabs-row np-tabs" data-testid="tab-buttons-row">
     <ButtonGroup
@@ -613,10 +599,6 @@
     opacity: var(--np-footer-sending-opacity, 0.6);
     pointer-events: none;
     cursor: progress;
-  }
-
-  .footer-queue-notice {
-    margin-block-end: 4px;
   }
 
   /* Keep the spinner inside the S-sized send button's icon slot. */
