@@ -1250,8 +1250,7 @@ async fn test_load_or_create_fails_on_a_broken_head_alias() {
     cellar.set_alias(&alias, &[0xABu8; 32]).await.unwrap();
     let err = Room::load_or_create(&cellar, room_id, 42, 8)
         .await
-        .err()
-        .expect("a missing tin must fail startup");
+        .expect_err("a missing tin must fail startup");
     assert_restore_error(err);
 
     // 2. The alias points at a stored payload that is not a RoomData tin.
@@ -1265,8 +1264,7 @@ async fn test_load_or_create_fails_on_a_broken_head_alias() {
     cellar.set_alias(&alias, &wrong_label_id).await.unwrap();
     let err = Room::load_or_create(&cellar, room_id, 42, 8)
         .await
-        .err()
-        .expect("a wrong label must fail startup");
+        .expect_err("a wrong label must fail startup");
     assert_restore_error(err);
 
     // 3. The stored bytes do not hash to the aliased tin id.
@@ -1283,8 +1281,7 @@ async fn test_load_or_create_fails_on_a_broken_head_alias() {
     cellar.set_alias(&alias, &expected_id).await.unwrap();
     let err = Room::load_or_create(&cellar, room_id, 42, 8)
         .await
-        .err()
-        .expect("a content hash mismatch must fail startup");
+        .expect_err("a content hash mismatch must fail startup");
     assert_restore_error(err);
 
     // 4. A valid RoomData for another room ID is not opened as this room.
@@ -1293,8 +1290,7 @@ async fn test_load_or_create_fails_on_a_broken_head_alias() {
     cellar.set_alias(&alias, &other_head).await.unwrap();
     let err = Room::load_or_create(&cellar, room_id, 42, 8)
         .await
-        .err()
-        .expect("a room ID mismatch must fail startup");
+        .expect_err("a room ID mismatch must fail startup");
     assert_restore_error(err);
 
     // None of the failures replaced the alias, so the broken head is still the
