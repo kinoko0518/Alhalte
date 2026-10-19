@@ -289,6 +289,15 @@ impl BistrotConfig {
             .unwrap_or_else(|| self.restaurant.socket_dir.clone())
     }
 
+    /// Directory where decrypted secrets are materialized (`<data-dir>/secrets`).
+    ///
+    /// Bistrot writes the decrypted secrets there with mode `0600` and passes the
+    /// file paths to the services, so secrets never appear in `ps`, systemd
+    /// units, or logs (Issue #194). See [`crate::secrets::write_secret_files`].
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.restaurant.data_dir.join("secrets")
+    }
+
     /// Stages configured extensions into the specified target directory and generates `manifest.json`.
     ///
     /// Creates `output_dir` if it does not already exist.

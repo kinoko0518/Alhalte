@@ -9,7 +9,7 @@ use tempfile::tempdir;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use alhalte_banquette::{ClientFrame, ServerFrame};
+use alhalte_banquette::{ClientFrame, RoomPermissionLevel, ServerFrame};
 use alhalte_maitre_d::{
     AccountSearchItem, AppState, BanquetteSpawner, DEBUG_SUB_CIPHERTEXT, Database,
     IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID,
@@ -17,13 +17,15 @@ use alhalte_maitre_d::{
     LABEL_ALHALTE_MAITRE_D_SESSION_ID, MockOAuthProvider, RoomBridgeManager, RoomInfoResponse,
     RoomPermissionItem, RoomRole, SetRoomPermissionRequest, account_id_from_tin, account_id_to_tin,
     cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router, decrypt_sub, encrypt_sub,
-    extract_session_id_from_cookie, is_mutate_frame, parse_cli_args_from,
-    parse_session_id_from_cookie_str, previous_4am_local, resolve_banquette_bin,
-    session_id_from_tin, session_id_to_tin,
+    extract_session_id_from_cookie, parse_cli_args_from, parse_session_id_from_cookie_str,
+    previous_4am_local, resolve_banquette_bin, session_id_from_tin, session_id_to_tin,
 };
 
 // spec: alhalte-maitre-d/rooms registry
-/// Registers `room_id` in the room registry with `creator` as its initial GM.
+/// Registers `room_id` in the room registry with `creator` as its creator.
+///
+/// The creator becomes the room's initial `Admin` when banquette starts the
+/// room; `maitre-d` writes no permission row.
 fn register_room(db: &Database, room_id: u64, creator: u64, name: &str) {
     db.create_room(&format!("{room_id:016x}"), name, creator, 1000)
         .unwrap();
@@ -1245,76 +1247,174 @@ fn test_cookie_session_extraction() {
     assert_eq!(extract_session_id_from_cookie(&headers), Some(424242));
 }
 
-// spec: alhalte-maitre-d/room-permissions-sqlite
+// spec: alhalte-maitre-d/permissions 0001 maitre-d keeps no permission database
+//
+// The `Database` type has no permission accessor at all (compile time); this
+// test pins the SQLite schema: no `room_permissions` table and no `rooms.done`
+// column survive a fresh open.
 #[test]
-fn test_sqlite_room_permissions() {
-    let db = Database::new_in_memory().unwrap();
-    let acc1 = db
-        .get_or_create_account("sub-1", "Alice", Some([0x11; 32]), 1000)
-        .unwrap();
-    let acc2 = db
-        .get_or_create_account("sub-2", "Bob", None, 1000)
-        .unwrap();
-    let acc3 = db
-        .get_or_create_account("sub-3", "Charlie", None, 1000)
-        .unwrap();
+fn test_maitre_d_database_has_no_permission_schema() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("schema.sqlite3");
+    drop(Database::open(&path).unwrap());
 
-    let room_id = "0123456789abcdef";
-
-    // Initially no permissions
-    assert!(!db.has_room_permissions(room_id).unwrap());
-    assert_eq!(db.get_room_permissions(room_id).unwrap().len(), 0);
-    assert_eq!(db.get_room_role(room_id, acc1.account_id).unwrap(), None);
-
-    // Set GM for Alice
-    db.set_room_permission(room_id, acc1.account_id, RoomRole::Gm, 1000)
-        .unwrap();
-    assert!(db.has_room_permissions(room_id).unwrap());
-    assert_eq!(
-        db.get_room_role(room_id, acc1.account_id).unwrap(),
-        Some(RoomRole::Gm)
-    );
-    assert_eq!(db.get_room_gm(room_id).unwrap(), Some(acc1.account_id));
-
-    // Set PL for Bob and Viewer for Charlie
-    db.set_room_permission(room_id, acc2.account_id, RoomRole::Pl, 1010)
-        .unwrap();
-    db.set_room_permission(room_id, acc3.account_id, RoomRole::Viewer, 1020)
-        .unwrap();
-
-    let perms = db.get_room_permissions(room_id).unwrap();
-    assert_eq!(perms.len(), 3);
-    assert_eq!(perms[0].account_id, acc1.account_id);
-    assert_eq!(perms[0].username, "Alice");
-    assert_eq!(
-        perms[0].icon_url,
-        Some(format!("/api/cellar/tin/{}", hex::encode([0x11; 32])))
-    );
-    assert_eq!(perms[0].role, RoomRole::Gm);
-
-    assert_eq!(perms[1].account_id, acc2.account_id);
-    assert_eq!(perms[1].username, "Bob");
-    assert_eq!(perms[1].icon_url, None);
-    assert_eq!(perms[1].role, RoomRole::Pl);
-
-    assert_eq!(perms[2].account_id, acc3.account_id);
-    assert_eq!(perms[2].role, RoomRole::Viewer);
-
-    // Update Bob's role to Viewer
-    db.set_room_permission(room_id, acc2.account_id, RoomRole::Viewer, 1030)
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let permission_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'room_permissions'",
+            [],
+            |row| row.get(0),
+        )
         .unwrap();
     assert_eq!(
-        db.get_room_role(room_id, acc2.account_id).unwrap(),
-        Some(RoomRole::Viewer)
+        permission_table, 0,
+        "maitre-d must not own a room_permissions table (banquette holds the permission table)"
     );
 
-    // Delete Charlie's permission
-    assert!(db.delete_room_permission(room_id, acc3.account_id).unwrap());
-    assert_eq!(db.get_room_role(room_id, acc3.account_id).unwrap(), None);
-    let perms_after = db.get_room_permissions(room_id).unwrap();
-    assert_eq!(perms_after.len(), 2);
+    let done_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('rooms') WHERE name = 'done'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        done_column, 0,
+        "maitre-d must not keep a rooms.done projection"
+    );
+
+    let room_columns: Vec<String> = {
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('rooms') ORDER BY cid")
+            .unwrap();
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0)).unwrap();
+        rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+    };
+    assert_eq!(
+        room_columns,
+        vec![
+            "room_id".to_string(),
+            "name".to_string(),
+            "creator_account".to_string(),
+            "created_at".to_string(),
+        ],
+        "rooms is a pure registry"
+    );
 }
 
+// spec: alhalte-maitre-d/permissions 0002 legacy permission rows fail closed
+//
+// There is no migration: an operator that still has the pre-#200 permission
+// model in SQLite must reset the database.
+#[test]
+fn test_legacy_room_permissions_row_fails_startup() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy-permissions.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE room_permissions (
+                 room_id TEXT NOT NULL,
+                 account_id INTEGER NOT NULL,
+                 role TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (room_id, account_id)
+             );
+             INSERT INTO room_permissions (room_id, account_id, role, created_at)
+             VALUES ('0123456789abcdef', 1, 'gm', 1000);",
+        )
+        .unwrap();
+    }
+
+    match Database::open(&path) {
+        Err(alhalte_maitre_d::MaitreDError::LegacyRoomPermissions(rows)) => assert_eq!(rows, 1),
+        other => panic!("expected LegacyRoomPermissions, got {:?}", other.err()),
+    }
+}
+
+// spec: alhalte-maitre-d/permissions 0003 legacy rooms.done rows fail closed
+#[test]
+fn test_legacy_rooms_done_row_fails_startup() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy-done.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rooms (
+                 room_id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 creator_account INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 done INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO rooms (room_id, name, creator_account, created_at, done)
+             VALUES ('0123456789abcdef', 'Public room', 1, 1000, 1);",
+        )
+        .unwrap();
+    }
+
+    match Database::open(&path) {
+        Err(alhalte_maitre_d::MaitreDError::LegacyRoomDone(rooms)) => assert_eq!(rooms, 1),
+        other => panic!("expected LegacyRoomDone, got {:?}", other.err()),
+    }
+}
+
+// spec: alhalte-maitre-d/permissions 0004 empty legacy artifacts are dropped
+#[test]
+fn test_empty_legacy_permission_artifacts_are_dropped() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("empty-legacy.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rooms (
+                 room_id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 creator_account INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 done INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO rooms (room_id, name, creator_account, created_at, done)
+             VALUES ('0123456789abcdef', 'Private room', 1, 1000, 0);
+             CREATE TABLE room_permissions (
+                 room_id TEXT NOT NULL,
+                 account_id INTEGER NOT NULL,
+                 role TEXT NOT NULL,
+                 created_at INTEGER NOT NULL,
+                 PRIMARY KEY (room_id, account_id)
+             );",
+        )
+        .unwrap();
+    }
+
+    // An empty legacy schema carries no information, so it is dropped.
+    let db = Database::open(&path).unwrap();
+    let room = db.get_room("0123456789abcdef").unwrap().unwrap();
+    assert_eq!(room.creator_account, 1);
+    assert_eq!(room.name, "Private room");
+
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let permission_table: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'room_permissions'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(permission_table, 0);
+    let done_column: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('rooms') WHERE name = 'done'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(done_column, 0);
+
+    // Re-opening is idempotent.
+    drop(db);
+    Database::open(&path).unwrap();
+}
 // spec: alhalte-maitre-d/accounts-search-sqlite
 #[test]
 fn test_sqlite_account_search() {
@@ -1429,17 +1529,21 @@ async fn test_accounts_search_endpoint() {
     assert!(items_empty.is_empty());
 }
 
-// spec: alhalte-maitre-d/room-permissions-api requires a session and GM
+// spec: alhalte-maitre-d/permissions 0010 the HTTP permission API is a banquette proxy
+//
+// The routes stay for the pre-#201 argenterie build, but they neither read nor
+// write a maitre-d permission table: `GET` relays `QueryPermissions` and
+// `POST` / `DELETE` relay `SetMemberPermission`. banquette authorizes every
+// change, and its `RoomData` is the state that changes.
 #[tokio::test]
-async fn test_room_permissions_rest_api() {
-    let (addr, _temp_dir, db, _spawner, _manager) = spawn_recording_router().await;
+async fn test_room_permissions_rest_api_proxies_banquette() {
+    let (addr, _temp_dir, db, _spawner, manager) = spawn_recording_router().await;
     let (gm, gm_session) = account_with_session(&db, "sub-perm-1", "GM_Player");
     let (player, player_session) = account_with_session(&db, "sub-perm-2", "Normal_Player");
     let (outsider, outsider_session) = account_with_session(&db, "sub-perm-3", "Outsider");
     let room_id = "0123456789abcdef";
+    let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
     db.create_room(room_id, "Permissions room", gm, 1000)
-        .unwrap();
-    db.set_room_permission(room_id, player, RoomRole::Pl, 1010)
         .unwrap();
 
     let client = reqwest::Client::new();
@@ -1447,7 +1551,7 @@ async fn test_room_permissions_rest_api() {
     let player_auth = format!("account_id={player}&session_id={player_session}");
     let outsider_auth = format!("account_id={outsider}&session_id={outsider_session}");
 
-    // 1. Anonymous GET / candidate membership are rejected.
+    // 1. A session is required, and a denied account is rejected.
     let get_anonymous = client
         .get(format!("http://{addr}/api/room/{room_id}/permissions"))
         .send()
@@ -1467,118 +1571,105 @@ async fn test_room_permissions_rest_api() {
         reqwest::StatusCode::FORBIDDEN
     );
 
-    // 2. A member can list permissions.
-    let get_member = client
+    // 2. The creator is banquette's initial Admin, so the snapshot lists them.
+    let get_admin = client
         .get(format!(
-            "http://{addr}/api/room/{room_id}/permissions?{player_auth}"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(get_member.status(), reqwest::StatusCode::OK);
-    let perms: Vec<RoomPermissionItem> = get_member.json().await.unwrap();
-    assert_eq!(perms.len(), 2);
-
-    // 3. Anonymous POST is rejected; a member that is not GM is forbidden.
-    let post_anonymous = client
-        .post(format!("http://{addr}/api/room/{room_id}/permissions"))
-        .json(&SetRoomPermissionRequest {
-            account_id: outsider,
-            role: RoomRole::Viewer,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(post_anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-    let post_non_gm = client
-        .post(format!(
-            "http://{addr}/api/room/{room_id}/permissions?{player_auth}"
-        ))
-        .json(&SetRoomPermissionRequest {
-            account_id: outsider,
-            role: RoomRole::Viewer,
-        })
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(post_non_gm.status(), reqwest::StatusCode::FORBIDDEN);
-    assert_eq!(db.get_room_role(room_id, outsider).unwrap(), None);
-
-    // 4. The GM adds a viewer and a non-existent target is 404.
-    let post_viewer = client
-        .post(format!(
             "http://{addr}/api/room/{room_id}/permissions?{gm_auth}"
         ))
-        .json(&SetRoomPermissionRequest {
-            account_id: outsider,
-            role: RoomRole::Viewer,
-        })
         .send()
         .await
         .unwrap();
-    assert_eq!(post_viewer.status(), reqwest::StatusCode::OK);
+    assert_eq!(get_admin.status(), reqwest::StatusCode::OK);
+    let perms: Vec<RoomPermissionItem> = get_admin.json().await.unwrap();
+    assert_eq!(perms.len(), 1);
+    assert_eq!(perms[0].account_id, gm);
+    assert_eq!(perms[0].username, "GM_Player");
+    assert_eq!(perms[0].role, RoomRole::Admin);
 
+    // 3. A non-existent target is 404; a denied caller cannot change anything.
     let post_unknown = client
         .post(format!(
             "http://{addr}/api/room/{room_id}/permissions?{gm_auth}"
         ))
-        .json(&serde_json::json!({
-            "account_id": 99999,
-            "role": "viewer"
-        }))
+        .json(&serde_json::json!({ "account_id": 99999, "role": "viewer" }))
         .send()
         .await
         .unwrap();
     assert_eq!(post_unknown.status(), reqwest::StatusCode::NOT_FOUND);
 
-    // 5. The GM promotes the player to GM; the member can promote nobody.
-    let post_player_to_gm = client
+    let post_anonymous = client
+        .post(format!("http://{addr}/api/room/{room_id}/permissions"))
+        .json(&serde_json::json!({ "account_id": player, "role": "viewer" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 4. The Admin adds a participant. banquette's `RoomData` changes; the
+    //    maitre-d database is not touched (it has nowhere to store it).
+    let post_player = client
         .post(format!(
             "http://{addr}/api/room/{room_id}/permissions?{gm_auth}"
         ))
         .json(&SetRoomPermissionRequest {
             account_id: player,
-            role: RoomRole::Gm,
+            role: RoomRole::Participant,
         })
         .send()
         .await
         .unwrap();
-    assert_eq!(post_player_to_gm.status(), reqwest::StatusCode::OK);
+    assert_eq!(post_player.status(), reqwest::StatusCode::OK);
 
-    // 6. An unknown room is 404, and the viewer cannot delete permissions.
-    let get_unknown = client
-        .get(format!(
-            "http://{addr}/api/room/ffffffffffffffff/permissions?{gm_auth}"
-        ))
-        .send()
+    let bridge = manager
+        .get_or_create_room(room_u64, gm)
         .await
-        .unwrap();
-    assert_eq!(get_unknown.status(), reqwest::StatusCode::NOT_FOUND);
-
-    let del_non_gm = client
-        .delete(format!(
-            "http://{addr}/api/room/{room_id}/permissions/{outsider}?{outsider_auth}"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(del_non_gm.status(), reqwest::StatusCode::FORBIDDEN);
+        .expect("the room process is reusable");
     assert_eq!(
-        db.get_room_role(room_id, outsider).unwrap(),
-        Some(RoomRole::Viewer)
+        bridge.query_account_permission(player).await.unwrap(),
+        RoomPermissionLevel::Participant,
+        "the HTTP proxy must change banquette's permission table"
     );
 
-    // 7. The GM deletes the viewer's permission.
-    let del_gm = client
+    // 5. A participant (not an Admin) cannot change permissions: banquette
+    //    refuses and the route reports 403, not 500.
+    let post_non_admin = client
+        .post(format!(
+            "http://{addr}/api/room/{room_id}/permissions?{player_auth}"
+        ))
+        .json(&serde_json::json!({ "account_id": outsider, "role": "viewer" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(post_non_admin.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(
+        bridge.query_account_permission(outsider).await.unwrap(),
+        RoomPermissionLevel::Denied,
+        "a refused change must not touch the permission table"
+    );
+
+    // 6. DELETE installs an explicit Denied entry (banquette's model has no
+    //    "absent" state for an account that must be blocked).
+    let del_non_admin = client
         .delete(format!(
-            "http://{addr}/api/room/{room_id}/permissions/{outsider}?{gm_auth}"
+            "http://{addr}/api/room/{room_id}/permissions/{outsider}?{player_auth}"
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(del_gm.status(), reqwest::StatusCode::OK);
-    assert_eq!(db.get_room_role(room_id, outsider).unwrap(), None);
+    assert_eq!(del_non_admin.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let del_admin = client
+        .delete(format!(
+            "http://{addr}/api/room/{room_id}/permissions/{player}?{gm_auth}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del_admin.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        bridge.query_account_permission(player).await.unwrap(),
+        RoomPermissionLevel::Denied
+    );
 
     let get_after_del = client
         .get(format!(
@@ -1588,12 +1679,22 @@ async fn test_room_permissions_rest_api() {
         .await
         .unwrap();
     let perms_after_del: Vec<RoomPermissionItem> = get_after_del.json().await.unwrap();
-    assert_eq!(perms_after_del.len(), 2);
     assert!(
-        perms_after_del
-            .iter()
-            .all(|permission| permission.account_id != outsider)
+        perms_after_del.iter().any(
+            |permission| permission.account_id == player && permission.role == RoomRole::Denied
+        ),
+        "an explicit denial is visible in the snapshot: {perms_after_del:?}"
     );
+
+    // 7. An unknown room is 404 and never spawns anything.
+    let get_unknown = client
+        .get(format!(
+            "http://{addr}/api/room/ffffffffffffffff/permissions?{gm_auth}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(get_unknown.status(), reqwest::StatusCode::NOT_FOUND);
 }
 
 // spec: alhalte-maitre-d/account-api 0001 GET /api/account/{id} requires a session and hides encrypted_sub
@@ -1728,14 +1829,16 @@ async fn test_websocket_identity_rules() {
     )
     .await;
 
-    // 3. Anonymous private room is forbidden before banquette is spawned.
+    // 3. An anonymous caller of a room whose default permission is `denied` is
+    //    rejected. The room process has to exist to answer that question.
     expect_ws_rejection(
         format!("ws://{addr}/ws/room/{room_id}"),
         axum::http::StatusCode::FORBIDDEN,
     )
     .await;
 
-    // 4. A session alone derives the account and is accepted.
+    // 4. A session alone derives the account and is accepted (the creator is
+    //    banquette's initial Admin).
     let (mut session_only, _) = connect_async(format!(
         "ws://{addr}/ws/room/{room_id}?session_id={session}"
     ))
@@ -1751,11 +1854,19 @@ async fn test_websocket_identity_rules() {
     .expect("account_id plus a valid session must be accepted");
     let _ = both.close(None).await;
 
-    // 6. Anonymous is accepted only once the room is public.
-    manager.set_room_done(room_u64, true).await;
+    // 6. The Admin opens the room to anonymous viewers through banquette's
+    //    default permission, and only then is an anonymous connection accepted.
+    let bridge = manager
+        .get_or_create_room(room_u64, account)
+        .await
+        .expect("the room process is live");
+    bridge
+        .set_default_permission(account, RoomPermissionLevel::Viewer)
+        .await
+        .expect("the Admin may change the default permission");
     let (mut anonymous, _) = connect_async(format!("ws://{addr}/ws/room/{room_id}"))
         .await
-        .expect("anonymous must be accepted for a public room");
+        .expect("anonymous must be accepted for a room whose default is viewer");
     let _ = anonymous.close(None).await;
 }
 
@@ -1779,12 +1890,10 @@ fn test_room_registry_create_and_lookup() {
     assert_eq!(room.created_at, 1000);
     assert_eq!(db.get_room(room_id).unwrap(), Some(room));
 
-    // The creator is inserted as the initial gm.
-    assert_eq!(
-        db.get_room_role(room_id, account.account_id).unwrap(),
-        Some(RoomRole::Gm)
-    );
-    assert_eq!(db.get_room_gm(room_id).unwrap(), Some(account.account_id));
+    // Registration writes the registry row only: the room's authorization is
+    // created by banquette at spawn time (creator = initial Admin). The absence
+    // of a permission table is pinned by
+    // `test_maitre_d_database_has_no_permission_schema`.
 
     // Duplicate registration is an error and leaves the original intact.
     let duplicate = db.create_room(room_id, "Other", account.account_id, 2000);
@@ -1795,47 +1904,10 @@ fn test_room_registry_create_and_lookup() {
     assert_eq!(db.get_room(room_id).unwrap().unwrap().name, "Crypt");
 }
 
-// spec: alhalte-maitre-d/rooms registry legacy migration
-#[test]
-fn test_room_registry_migrates_legacy_permissions() {
-    let dir = tempdir().unwrap();
-    let path = dir.path().join("legacy.sqlite3");
-
-    let account_id = {
-        let db = Database::open(&path).unwrap();
-        let account = db
-            .get_or_create_account("sub-legacy", "Legacy", None, 900)
-            .unwrap();
-        // Pre-#154 rows stored the decimal form.
-        db.set_room_permission("777", account.account_id, RoomRole::Gm, 900)
-            .unwrap();
-        // A permission-only room also needs a registry row.
-        db.set_room_permission("deadbeefcafebabe", account.account_id, RoomRole::Pl, 950)
-            .unwrap();
-        account.account_id
-    };
-
-    // Reopening runs the startup migration.
-    let db = Database::open(&path).unwrap();
-    let canonical = format!("{:016x}", 777);
-    assert!(db.get_room("777").unwrap().is_none());
-    let migrated = db.get_room(&canonical).unwrap().unwrap();
-    assert_eq!(migrated.creator_account, account_id);
-    assert_eq!(migrated.name, "Unnamed room");
-    assert_eq!(
-        db.get_room_role(&canonical, account_id).unwrap(),
-        Some(RoomRole::Gm)
-    );
-
-    let recovered = db.get_room("deadbeefcafebabe").unwrap().unwrap();
-    assert_eq!(recovered.creator_account, account_id);
-    assert_eq!(recovered.name, "Unnamed room");
-}
-
 // spec: alhalte-maitre-d/rooms create api
 #[tokio::test]
-async fn test_create_room_api_registers_creator_as_gm() {
-    let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
+async fn test_create_room_api_registers_creator_as_admin() {
+    let (addr, _temp_dir, db, spawner, manager) = spawn_recording_router().await;
     let (account_id, session_id) = account_with_session(&db, "sub-create-room", "Creator");
     let client = reqwest::Client::new();
     let auth = format!("account_id={account_id}&session_id={session_id}");
@@ -1865,17 +1937,26 @@ async fn test_create_room_api_registers_creator_as_gm() {
     let info: RoomInfoResponse = response.json().await.unwrap();
     assert_eq!(info.room_id, "abcdef0123456789");
     assert_eq!(info.name, "Lair");
-    assert_eq!(info.role, RoomRole::Gm);
-    assert!(!info.done);
+    assert_eq!(info.role, RoomRole::Admin, "the creator is the room Admin");
 
     let room = db.get_room("abcdef0123456789").unwrap().unwrap();
     assert_eq!(room.creator_account, account_id);
-    assert_eq!(
-        db.get_room_role("abcdef0123456789", account_id).unwrap(),
-        Some(RoomRole::Gm)
-    );
-    // Creation does not spawn banquette.
+    // Creation does not spawn banquette and writes no permission anywhere.
     assert!(spawner.calls().is_empty());
+
+    // The creator really is banquette's initial Admin: the first spawn uses
+    // `rooms.creator_account` and `Room::new` inserts it as `Admin`.
+    let bridge = manager
+        .get_or_create_room(
+            u64::from_str_radix("abcdef0123456789", 16).unwrap(),
+            account_id,
+        )
+        .await
+        .expect("the room starts");
+    assert_eq!(
+        bridge.query_account_permission(account_id).await.unwrap(),
+        RoomPermissionLevel::Admin
+    );
 
     // Duplicate -> 409.
     let duplicate = client
@@ -1912,7 +1993,13 @@ async fn test_create_room_api_registers_creator_as_gm() {
             .creator_account,
         account_id
     );
-    assert!(spawner.calls().is_empty());
+    // Generating a room ID for an existing creator does not add a process: the
+    // only spawn so far is the explicit one above.
+    assert_eq!(spawner.calls().len(), 1);
+    assert_eq!(
+        spawner.calls()[0].0,
+        u64::from_str_radix("abcdef0123456789", 16).unwrap()
+    );
 }
 
 // spec: alhalte-maitre-d/rooms create api validation
@@ -1981,18 +2068,19 @@ async fn test_create_room_api_validates_input() {
     assert!(db.get_room("0000000000000309").unwrap().is_some());
 }
 
-// spec: alhalte-maitre-d/rooms get api
+// spec: alhalte-maitre-d/permissions 0020 GET /api/rooms/{id} answers with the four-level role
 #[tokio::test]
 async fn test_get_room_info_access_rules() {
     let (addr, _temp_dir, db, spawner, manager) = spawn_recording_router().await;
     let (creator, creator_session) = account_with_session(&db, "sub-info-creator", "Creator");
     let (outsider, outsider_session) = account_with_session(&db, "sub-info-outsider", "Outsider");
+    let (viewer, viewer_session) = account_with_session(&db, "sub-info-viewer", "Viewer");
     let room_id = "0123456789abcdef";
     let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
     db.create_room(room_id, "Info room", creator, 1000).unwrap();
     let client = reqwest::Client::new();
 
-    // Unknown room -> 404.
+    // Unknown room -> 404, and the registry is not touched / no process starts.
     let unknown = client
         .get(format!(
             "http://{addr}/api/rooms/ffffffffffffffff?account_id={outsider}&session_id={outsider_session}"
@@ -2001,6 +2089,7 @@ async fn test_get_room_info_access_rules() {
         .await
         .unwrap();
     assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    assert!(spawner.calls().is_empty());
 
     // Authentication is required.
     let anonymous = client
@@ -2010,17 +2099,17 @@ async fn test_get_room_info_access_rules() {
         .unwrap();
     assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // A non-member of a private room -> 403.
-    let private = client
+    // A caller the room's banquette reports as `denied` gets 403.
+    let denied = client
         .get(format!(
             "http://{addr}/api/rooms/{room_id}?account_id={outsider}&session_id={outsider_session}"
         ))
         .send()
         .await
         .unwrap();
-    assert_eq!(private.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
 
-    // The creator sees their GM role.
+    // The creator is banquette's initial Admin.
     let member = client
         .get(format!(
             "http://{addr}/api/rooms/{room_id}?account_id={creator}&session_id={creator_session}"
@@ -2030,14 +2119,58 @@ async fn test_get_room_info_access_rules() {
         .unwrap();
     assert_eq!(member.status(), reqwest::StatusCode::OK);
     let member_info: RoomInfoResponse = member.json().await.unwrap();
-    assert_eq!(member_info.role, RoomRole::Gm);
-    assert!(!member_info.done);
+    assert_eq!(member_info.role, RoomRole::Admin);
+    assert_eq!(member_info.name, "Info room");
 
-    // Once done, a non-member may read the room as a viewer.
-    manager.set_room_done(room_u64, true).await;
-    let public = client
+    // The room process was started to answer the gate (a permission question
+    // cannot be answered from maitre-d's database).
+    assert_eq!(spawner.calls(), vec![(room_u64, creator, None)]);
+
+    // An explicit `viewer` / `participant` entry comes back with that role.
+    let bridge = manager
+        .get_or_create_room(room_u64, creator)
+        .await
+        .expect("the room process is reusable");
+    bridge
+        .set_member_permission(creator, viewer, RoomPermissionLevel::Viewer)
+        .await
+        .unwrap();
+    let viewer_response = client
+        .get(format!(
+            "http://{addr}/api/rooms/{room_id}?account_id={viewer}&session_id={viewer_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(viewer_response.status(), reqwest::StatusCode::OK);
+    let viewer_info: RoomInfoResponse = viewer_response.json().await.unwrap();
+    assert_eq!(viewer_info.role, RoomRole::Viewer);
+
+    bridge
+        .set_member_permission(creator, outsider, RoomPermissionLevel::Participant)
+        .await
+        .unwrap();
+    let participant_response = client
         .get(format!(
             "http://{addr}/api/rooms/{room_id}?account_id={outsider}&session_id={outsider_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(participant_response.status(), reqwest::StatusCode::OK);
+    let participant_info: RoomInfoResponse = participant_response.json().await.unwrap();
+    assert_eq!(participant_info.role, RoomRole::Participant);
+
+    // Opening the room default (default permission = viewer) lets an unrelated
+    // account, and an anonymous caller, through as `viewer`.
+    bridge
+        .set_default_permission(creator, RoomPermissionLevel::Viewer)
+        .await
+        .unwrap();
+    let (newcomer, newcomer_session) = account_with_session(&db, "sub-info-newcomer", "Newcomer");
+    let public = client
+        .get(format!(
+            "http://{addr}/api/rooms/{room_id}?account_id={newcomer}&session_id={newcomer_session}"
         ))
         .send()
         .await
@@ -2045,19 +2178,62 @@ async fn test_get_room_info_access_rules() {
     assert_eq!(public.status(), reqwest::StatusCode::OK);
     let public_info: RoomInfoResponse = public.json().await.unwrap();
     assert_eq!(public_info.role, RoomRole::Viewer);
-    assert!(public_info.done);
-    assert_eq!(public_info.name, "Info room");
-
-    // Reading room info never spawns banquette.
-    assert!(spawner.calls().is_empty());
 }
 
-// spec: alhalte-maitre-d/rooms no implicit creation
+// spec: alhalte-maitre-d/permissions 0021 an anonymous default is the room default
 #[tokio::test]
-async fn test_unregistered_room_ws_and_export_do_not_create_rooms() {
+async fn test_anonymous_role_follows_the_default_permission() {
+    let (addr, _temp_dir, db, _spawner, manager) = spawn_recording_router().await;
+    let (creator, _creator_session) = account_with_session(&db, "sub-anon-creator", "Creator");
+    let room_id = "aaaabbbbccccdddd";
+    let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
+    db.create_room(room_id, "Anon room", creator, 1000).unwrap();
+
+    let bridge = manager
+        .get_or_create_room(room_u64, creator)
+        .await
+        .expect("the room starts");
+
+    // A closed room refuses account 0 (the anonymous account).
+    assert_eq!(
+        bridge.query_account_permission(0).await.unwrap(),
+        RoomPermissionLevel::Denied
+    );
+
+    // Opening the default permission makes anonymous a viewer.
+    bridge
+        .set_default_permission(creator, RoomPermissionLevel::Viewer)
+        .await
+        .unwrap();
+    assert_eq!(
+        bridge.query_account_permission(0).await.unwrap(),
+        RoomPermissionLevel::Viewer
+    );
+
+    // An anonymous WebSocket is accepted once the default is not `denied`.
+    let (mut anonymous, _) = connect_async(format!("ws://{addr}/ws/room/{room_id}"))
+        .await
+        .expect("anonymous viewer is accepted for a room whose default is viewer");
+    let _ = anonymous.close(None).await;
+
+    // Tightening it back closes the room to anonymous callers again.
+    bridge
+        .set_default_permission(creator, RoomPermissionLevel::Denied)
+        .await
+        .unwrap();
+    expect_ws_rejection(
+        format!("ws://{addr}/ws/room/{room_id}"),
+        axum::http::StatusCode::FORBIDDEN,
+    )
+    .await;
+}
+
+// spec: alhalte-maitre-d/permissions 0020 unknown room is 404 without spawning
+#[tokio::test]
+async fn test_unknown_room_is_not_registered_or_spawned() {
     let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
-    let (account_id, session_id) = account_with_session(&db, "sub-unknown-room", "Caller");
-    let unknown_room = "0000000000000abc";
+    let (account_id, session_id) = account_with_session(&db, "sub-unknown-room", "Unknown");
+    let unknown_room = "ffffffffffffffff";
 
     match connect_async(format!(
         "ws://{addr}/ws/room/{unknown_room}?account_id={account_id}&session_id={session_id}"
@@ -2082,13 +2258,14 @@ async fn test_unregistered_room_ws_and_export_do_not_create_rooms() {
     assert!(spawner.calls().is_empty());
 }
 
-// spec: alhalte-maitre-d/rooms export requires membership
+// spec: alhalte-maitre-d/permissions 0030 export rejects a denied caller
 #[tokio::test]
-async fn test_export_private_room_requires_membership_without_spawn() {
+async fn test_export_denied_caller_is_rejected() {
     let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
     let (creator, _creator_session) = account_with_session(&db, "sub-export-creator", "Creator");
     let (outsider, outsider_session) = account_with_session(&db, "sub-export-outsider", "Outsider");
     let room_id = "fedcba9876543210";
+    let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
     db.create_room(room_id, "Private export", creator, 1000)
         .unwrap();
 
@@ -2098,52 +2275,143 @@ async fn test_export_private_room_requires_membership_without_spawn() {
     .await
     .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
-    assert!(spawner.calls().is_empty());
+    // The permission question is asked of the room process, which is why the
+    // room is spawned even for a caller that ends up denied.
+    assert_eq!(spawner.calls(), vec![(room_u64, creator, None)]);
 }
 
-// spec: alhalte-maitre-d/rooms bridge admin is the creator, not the first connector
+// spec: alhalte-maitre-d/permissions 0031 export drops scenes the caller cannot access
+#[tokio::test]
+async fn test_export_filters_scenes_by_permission() {
+    let (addr, _temp_dir, db, _spawner, manager) = spawn_recording_router().await;
+    let (creator, creator_session) = account_with_session(&db, "sub-export-admin", "Admin");
+    let (participant, participant_session) =
+        account_with_session(&db, "sub-export-participant", "Participant");
+    let room_id = "1122334455667788";
+    let room_id_u64 = u64::from_str_radix(room_id, 16).unwrap();
+    db.create_room(room_id, "Filtered export", creator, 1000)
+        .unwrap();
+
+    // The creator builds two extra scenes over the real WebSocket path.
+    let (mut admin_ws, _) = connect_async(format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={creator}&session_id={creator_session}"
+    ))
+    .await
+    .expect("admin WebSocket");
+    for scene_id in ["tavern", "secret"] {
+        admin_ws
+            .send(WsMessage::Text(
+                serde_json::to_string(&ClientFrame::CreateScene {
+                    scene_id: scene_id.to_string(),
+                    inherit_juices: false,
+                    name: None,
+                })
+                .unwrap()
+                .into(),
+            ))
+            .await
+            .unwrap();
+    }
+    // Wait until the scenes are announced before exporting.
+    for _ in 0..20 {
+        if let Some(Ok(WsMessage::Text(text))) =
+            tokio::time::timeout(Duration::from_millis(500), admin_ws.next())
+                .await
+                .ok()
+                .flatten()
+            && let Ok(ServerFrame::SceneList { scenes }) =
+                serde_json::from_str::<ServerFrame>(&text)
+            && scenes.iter().any(|scene| scene.id == "tavern")
+            && scenes.iter().any(|scene| scene.id == "secret")
+        {
+            break;
+        }
+    }
+
+    // A participant only gets `/` unless an administrator grants more, so its
+    // export must not contain the admin-only scenes.
+    let bridge = manager
+        .get_or_create_room(room_id_u64, creator)
+        .await
+        .expect("the room process is reusable");
+    bridge
+        .set_member_permission(creator, participant, RoomPermissionLevel::Participant)
+        .await
+        .unwrap();
+
+    let response = reqwest::get(format!(
+        "http://{addr}/api/room/{room_id}/export/zip?type=full&account_id={participant}&session_id={participant_session}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.bytes().await.unwrap();
+    let archive =
+        alhalte_kitchen::RoomArchive::load_from_slice(&body, None).expect("a readable archive");
+
+    assert!(
+        archive.scenes.contains_key("/"),
+        "the root scene is always exported"
+    );
+    assert!(
+        !archive.scenes.contains_key("tavern"),
+        "a participant cannot read scenes it was not granted"
+    );
+    assert!(
+        !archive.scenes.contains_key("secret"),
+        "a participant cannot read scenes it was not granted"
+    );
+
+    // The administrator's own export still contains every scene.
+    let admin_export = reqwest::get(format!(
+        "http://{addr}/api/room/{room_id}/export/zip?type=full&account_id={creator}&session_id={creator_session}"
+    ))
+    .await
+    .unwrap();
+    assert_eq!(admin_export.status(), reqwest::StatusCode::OK);
+    let admin_body = admin_export.bytes().await.unwrap();
+    let admin_archive = alhalte_kitchen::RoomArchive::load_from_slice(&admin_body, None)
+        .expect("a readable archive");
+    assert!(admin_archive.scenes.contains_key("tavern"));
+    assert!(admin_archive.scenes.contains_key("secret"));
+
+    let _ = admin_ws.close(None).await;
+}
+
+// spec: alhalte-maitre-d/permissions 0032 the bridge admin is the room creator
 #[tokio::test]
 async fn test_bridge_admin_is_creator_not_first_connector() {
-    let (addr, _temp_dir, db, spawner, _manager) = spawn_recording_router().await;
+    let (addr, _temp_dir, db, spawner, manager) = spawn_recording_router().await;
     let (creator, _creator_session) = account_with_session(&db, "sub-admin-creator", "Creator");
     let (player, player_session) = account_with_session(&db, "sub-admin-player", "Player");
     let room_id = "abcdefabcdef0001";
     let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
     db.create_room(room_id, "Admin room", creator, 1000)
         .unwrap();
-    db.set_room_permission(room_id, player, RoomRole::Pl, 1010)
-        .unwrap();
 
-    // The player connects first; the bridge must still use the creator as admin.
-    let (mut ws_stream, _) = connect_async(format!(
-        "ws://{addr}/ws/room/{room_id}?account_id={player}&session_id={player_session}"
-    ))
-    .await
-    .unwrap();
-    let list_req = serde_json::to_string(&ClientFrame::ListScenes).unwrap();
-    ws_stream
-        .send(WsMessage::Text(list_req.into()))
-        .await
-        .unwrap();
-
-    let mut received_scene_list = false;
-    for _ in 0..20 {
-        if let Some(Ok(WsMessage::Text(text))) =
-            tokio::time::timeout(Duration::from_millis(500), ws_stream.next())
-                .await
-                .ok()
-                .flatten()
-            && let Ok(ServerFrame::SceneList { scenes }) =
-                serde_json::from_str::<ServerFrame>(&text)
-        {
-            assert!(scenes.iter().any(|s| s.id == "/"));
-            received_scene_list = true;
-            break;
-        }
-    }
-    assert!(received_scene_list);
+    // The player is not a member, so they are denied -- but answering that
+    // question spawns the room. The spawn must still use the creator, not the
+    // first caller, because `Room::new` makes its `admin_account` the Admin.
+    expect_ws_rejection(
+        format!("ws://{addr}/ws/room/{room_id}?account_id={player}&session_id={player_session}"),
+        axum::http::StatusCode::FORBIDDEN,
+    )
+    .await;
     assert_eq!(spawner.calls(), vec![(room_u64, creator, None)]);
-    ws_stream.close(None).await.unwrap();
+
+    let bridge = manager
+        .get_or_create_room(room_u64, creator)
+        .await
+        .expect("the room process is live");
+    assert_eq!(
+        bridge.query_account_permission(creator).await.unwrap(),
+        RoomPermissionLevel::Admin,
+        "the creator is the room Admin even though the player connected first"
+    );
+    assert_eq!(
+        bridge.query_account_permission(player).await.unwrap(),
+        RoomPermissionLevel::Denied
+    );
 }
 
 // spec: alhalte-maitre-d/cli-args chunk-size-exponent
@@ -2167,9 +2435,9 @@ fn test_service_token_cli_flag() {
     assert_eq!(with_token.service_token.as_deref(), Some("internal-secret"));
 }
 
-// spec: alhalte-maitre-d/websocket-auth-and-done-rejection
+// spec: alhalte-maitre-d/websocket-permission-gate 0001 denied is 403 before the upgrade
 #[tokio::test]
-async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted() {
+async fn test_websocket_denied_caller_rejected_and_default_viewer_permitted() {
     let temp_dir = tempdir().unwrap();
     let socket_dir = temp_dir.path().to_path_buf();
 
@@ -2200,11 +2468,10 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
 
     let room_id: u64 = 901;
 
-    // Register the room; the creator becomes the initial GM. The canonical
-    // 16-hex ID is what a 16-hex invitation URL resolves to.
+    // The creator is banquette's initial Admin; nothing is written to SQLite.
     register_room(&db, room_id, gm.account_id, "Private room");
 
-    // 1. Outsider attempts to connect to private room -> Rejected with 403 Forbidden!
+    // 1. A non-member is denied: banquette is asked, and the answer is 403.
     let outsider_ws_url = format!(
         "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
         outsider.account_id, outsider_sess.session_id
@@ -2216,7 +2483,7 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
         other => panic!("Expected 403 Forbidden rejection, got: {other:?}"),
     }
 
-    // 2. Unauthenticated user attempts to connect -> Rejected with 403 Forbidden!
+    // 2. An anonymous caller is denied for a room whose default is `denied`.
     let anon_ws_url = format!("ws://{addr}/ws/room/{room_id}");
     match connect_async(&anon_ws_url).await {
         Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
@@ -2225,17 +2492,17 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
         other => panic!("Expected 403 Forbidden rejection, got: {other:?}"),
     }
 
-    // 3. GM connects successfully
+    // 3. The Admin connects (the creator is the room Admin).
     let gm_ws_url = format!(
         "ws://{addr}/ws/room/{room_id}?account_id={}&session_id={}",
         gm.account_id, gm_sess.session_id
     );
     let (mut gm_stream, _) = connect_async(&gm_ws_url).await.unwrap();
 
-    // 4. GM opens the room to viewers (the four-level permission model replaced
-    // the `done` flag with a default permission, Issue #199).
+    // 4. The Admin opens the room to viewers through banquette's default
+    //    permission (the four-level model replaced the `done` flag, Issue #199).
     let set_default_permission = serde_json::to_string(&ClientFrame::SetDefaultPermission {
-        permission: alhalte_banquette::RoomPermissionLevel::Viewer,
+        permission: RoomPermissionLevel::Viewer,
     })
     .unwrap();
     gm_stream
@@ -2243,8 +2510,6 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
         .await
         .unwrap();
 
-    // Wait for the acknowledgement so `rooms.done` is already recorded when the
-    // outsider reconnects.
     let mut acknowledged = false;
     for _ in 0..20 {
         if let Some(Ok(WsMessage::Text(t))) =
@@ -2264,8 +2529,7 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
         "the room must acknowledge the permission change"
     );
 
-    // 5. Now outsider attempts to connect again -> succeeds because the room
-    // default permission grants viewer access!
+    // 5. The outsider now passes the gate as a viewer.
     let (mut outsider_stream, _) = connect_async(&outsider_ws_url).await.unwrap();
     let list_scenes = serde_json::to_string(&ClientFrame::ListScenes).unwrap();
     outsider_stream
@@ -2381,17 +2645,26 @@ async fn test_websocket_viewer_mutate_blocking() {
     let viewer_sess = db.create_session(viewer.account_id, 1000).unwrap();
 
     let room_id: u64 = 903;
-    let room_id_str = format!("{room_id:016x}");
 
-    // Register the room (GM) and add a Viewer permission.
+    // Register the room (the creator becomes banquette's initial Admin), start
+    // the room process, and grant the viewer through the room permission table.
     register_room(&db, room_id, gm.account_id, "Viewer room");
-    db.set_room_permission(&room_id_str, viewer.account_id, RoomRole::Viewer, 1010)
-        .unwrap();
-
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         socket_dir, 8,
     ));
     let room_manager = RoomBridgeManager::new(spawner, db.clone());
+    let bridge = room_manager
+        .get_or_create_room(room_id, gm.account_id)
+        .await
+        .expect("the room process starts");
+    bridge
+        .set_member_permission(
+            gm.account_id,
+            viewer.account_id,
+            RoomPermissionLevel::Viewer,
+        )
+        .await
+        .expect("the creator can grant viewer");
     let oauth = Arc::new(MockOAuthProvider::new());
     let state = AppState::new(db, "salt", oauth, room_manager);
     let app = create_router(state);
@@ -2440,8 +2713,8 @@ async fn test_websocket_viewer_mutate_blocking() {
             && let Ok(ServerFrame::Error { code, message }) =
                 serde_json::from_str::<ServerFrame>(&t)
         {
-            assert_eq!(code, "PermissionDenied");
-            assert!(message.contains("閲覧者"));
+            assert_eq!(code, "AppendLogFailed");
+            assert!(message.to_lowercase().contains("permission denied"));
             error_received = true;
             break;
         }
@@ -2470,9 +2743,11 @@ async fn test_websocket_viewer_mutate_blocking() {
                 .await
                 .ok()
                 .flatten()
-            && let Ok(ServerFrame::Error { code, .. }) = serde_json::from_str::<ServerFrame>(&t)
+            && let Ok(ServerFrame::Error { code, message }) =
+                serde_json::from_str::<ServerFrame>(&t)
         {
-            assert_eq!(code, "PermissionDenied");
+            assert!(code.ends_with("Failed"));
+            assert!(message.to_lowercase().contains("permission denied"));
             update_error_received = true;
             break;
         }
@@ -2500,9 +2775,11 @@ async fn test_websocket_viewer_mutate_blocking() {
                 .await
                 .ok()
                 .flatten()
-            && let Ok(ServerFrame::Error { code, .. }) = serde_json::from_str::<ServerFrame>(&t)
+            && let Ok(ServerFrame::Error { code, message }) =
+                serde_json::from_str::<ServerFrame>(&t)
         {
-            assert_eq!(code, "PermissionDenied");
+            assert!(code.ends_with("Failed"));
+            assert!(message.to_lowercase().contains("permission denied"));
             del_error_received = true;
             break;
         }
@@ -2768,26 +3045,4 @@ fn test_resolve_banquette_bin_paths() {
     let dummy = Path::new("nonexistent-banquette-bin-xyz-9876");
     let fallback = resolve_banquette_bin(dummy);
     assert_eq!(fallback, dummy);
-}
-
-// spec: alhalte-maitre-d/ws-permissions state and log writes mutate the room
-#[test]
-fn test_mutate_frames_are_detected() {
-    use alhalte_banquette::protocol::ClientFrame;
-    use tin::Tin;
-
-    let update = ClientFrame::UpdateState {
-        scene_id: "/".to_string(),
-        key: "std::name".to_string(),
-        value: Tin::from_string("広間"),
-    };
-    assert!(is_mutate_frame(&update));
-
-    let append = ClientFrame::AppendLog {
-        scene_id: "/".to_string(),
-        entry: None,
-    };
-    assert!(is_mutate_frame(&append));
-
-    assert!(!is_mutate_frame(&ClientFrame::HeartbeatResponse));
 }

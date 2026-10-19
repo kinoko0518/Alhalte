@@ -3,10 +3,12 @@
 #![deny(unsafe_code)]
 
 use alhalte_bistrot::{
-    BistrotError, SystemdOptions, encrypt_bistrot_toml, generate_all_args, generate_module_args,
-    generate_systemd_units, load_from_path_with_key,
+    BistrotError, SystemdOptions, encrypt_age_armored_value, encrypt_bistrot_toml,
+    generate_all_args, generate_module_args, generate_systemd_units, load_from_path_with_key,
+    write_secret_files,
 };
 use clap::{Parser, Subcommand};
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -22,7 +24,7 @@ struct Cli {
     #[arg(short, long, default_value = "Bistrot.toml")]
     config: PathBuf,
 
-    /// Age secret key to decrypt secrets (overrides ROPS_AGE environment variable).
+    /// Age secret key to decrypt secrets (overrides ROPS_AGE and ALHALTE_AGE_KEY).
     #[arg(long, env = "ROPS_AGE")]
     age_key: Option<String>,
 
@@ -97,6 +99,16 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+
+    /// Encrypt one secret value from stdin into an age ASCII-armored block.
+    ///
+    /// Paste the output into Bistrot.toml as the value of `maitre-d.client-secret`
+    /// or `cellar.service-token` using a TOML multi-line string.
+    EncryptValue {
+        /// Age recipient public key (e.g. `age1...`).
+        #[arg(short, long)]
+        recipient: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -115,6 +127,9 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
     match cli.command {
         Commands::Args { module } => {
             let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
+            // Secrets are injected as 0600 files (Issue #194); materialize them
+            // before printing the arguments that point at them.
+            let secrets = write_secret_files(&config)?;
 
             if module.eq_ignore_ascii_case("all") {
                 let all_args = generate_all_args(&config);
@@ -126,6 +141,10 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
                 let args = generate_module_args(&config, &module)?;
                 println!("{}", args.join(" "));
             }
+            eprintln!(
+                "Secrets materialized in {} (mode 0600)",
+                secrets.dir.display()
+            );
         }
         Commands::Systemd {
             bin_dir,
@@ -138,6 +157,9 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             extra_path,
         } => {
             let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
+            // The units only reference secret files, so they must exist before
+            // systemd starts the services.
+            write_secret_files(&config)?;
             let pnpm_bin = pnpm_bin.or_else(|| {
                 std::env::var_os("PATH").and_then(|paths| {
                     std::env::split_paths(&paths).find_map(|dir| {
@@ -234,6 +256,14 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             } else {
                 print!("{encrypted}");
             }
+        }
+        Commands::EncryptValue { recipient } => {
+            let mut plaintext = String::new();
+            std::io::stdin().read_to_string(&mut plaintext)?;
+            // A trailing newline from `echo` is never part of the secret.
+            let plaintext = plaintext.trim_end_matches(['\n', '\r']);
+            let encrypted = encrypt_age_armored_value(plaintext, &recipient)?;
+            println!("{encrypted}");
         }
     }
 

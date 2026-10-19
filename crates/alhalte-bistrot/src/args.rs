@@ -1,9 +1,18 @@
 //! Pure functions for generating command-line arguments for Alhalte modules.
 //!
 //! All functions in this module are deterministic and free of side effects.
+//!
+//! Secrets are passed as **file paths**, never as values (Issue #194):
+//! `maitre-d.client-secret` becomes `--client-secret-file <data-dir>/secrets/
+//! maitre-d-client-secret` and `cellar.service-token` becomes
+//! `--service-token-file <data-dir>/secrets/cellar-service-token`. Bistrot writes
+//! those files with mode `0600` via [`crate::secrets::write_secret_files`] before
+//! the services are started, so neither `ps` nor the generated systemd units see
+//! the secret.
 
 use crate::config::BistrotConfig;
 use crate::error::{BistrotError, Result};
+use crate::secrets::secret_files;
 
 /// Bundled arguments for the long-lived Alhalte services.
 ///
@@ -23,6 +32,10 @@ pub struct ModuleArgs {
 /// `[banquette] chunk-size-exponent` is passed as `--chunk-size-exponent` so
 /// maitre-d can forward it to every banquette process it spawns.
 ///
+/// The OAuth client secret is passed as `--client-secret-file <path>` and the
+/// internal service token as `--service-token-file <path>`; the values never
+/// appear in the argument list (Issue #194).
+///
 /// Deterministic and pure function.
 pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
     let cellar_url = config
@@ -30,6 +43,7 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         .cellar_url
         .clone()
         .unwrap_or_else(|| config.cellar_url());
+    let secrets = secret_files(config);
 
     let mut args = vec![
         "--host".to_string(),
@@ -40,8 +54,6 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         config.maitre_d_db_path().display().to_string(),
         "--client-id".to_string(),
         config.maitre_d.client_id.clone(),
-        "--client-secret".to_string(),
-        config.maitre_d.client_secret.clone(),
         "--salt".to_string(),
         config.maitre_d.salt.clone(),
         // Fixed Google OAuth redirect base; the argenterie origin is not part
@@ -57,14 +69,19 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         config.banquette.chunk_size_exponent.to_string(),
     ];
 
+    if let Some(path) = secrets.maitre_d_client_secret {
+        args.push("--client-secret-file".to_string());
+        args.push(path.display().to_string());
+    }
+
     if let Some(ref bin) = config.maitre_d.banquette_bin {
         args.push("--banquette-bin".to_string());
         args.push(bin.display().to_string());
     }
 
-    if let Some(ref token) = config.cellar.service_token {
-        args.push("--service-token".to_string());
-        args.push(token.clone());
+    if let Some(path) = secrets.service_token {
+        args.push("--service-token-file".to_string());
+        args.push(path.display().to_string());
     }
 
     // CORS is an explicit allow-list in maitre-d; derive it from the
@@ -85,6 +102,9 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
 /// `cellar.maitre-d-socket` is set. The socket takes precedence, matching
 /// `alhalte-cellar`'s own CLI behavior. `--allow-all-sessions` is emitted only
 /// when explicitly enabled in the configuration.
+///
+/// The internal service token is passed as `--service-token-file <path>`, never
+/// as a value (Issue #194).
 ///
 /// Deterministic and pure function.
 pub fn generate_cellar_args(config: &BistrotConfig) -> Vec<String> {
@@ -115,9 +135,9 @@ pub fn generate_cellar_args(config: &BistrotConfig) -> Vec<String> {
         args.push("--anti-oracle".to_string());
     }
 
-    if let Some(ref token) = config.cellar.service_token {
-        args.push("--service-token".to_string());
-        args.push(token.clone());
+    if let Some(path) = secret_files(config).service_token {
+        args.push("--service-token-file".to_string());
+        args.push(path.display().to_string());
     }
 
     args

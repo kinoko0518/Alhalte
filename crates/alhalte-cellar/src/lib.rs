@@ -57,6 +57,7 @@ pub mod error;
 pub mod gc;
 pub mod handlers;
 pub mod model;
+pub mod secret_file;
 pub mod service;
 pub mod storage;
 pub mod verifier;
@@ -71,6 +72,7 @@ pub use model::{
     GcStats, SYSTEM_OWNER, StoreRequest, StoreResponse, StoreResult, StoreStatus, TinReference,
     UnregisterRequest, format_tin_id, parse_tin_id,
 };
+pub use secret_file::{SecretFileError, read_secret_file, resolve_secret};
 pub use service::{CellarConfig, CellarService};
 pub use storage::StorageManager;
 pub use tin::TinId;
