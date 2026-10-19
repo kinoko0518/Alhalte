@@ -21,18 +21,18 @@ use alhalte_banquette::labels::{
     IDENT_ALHALTE_BANQUETTE, IDENT_ALHALTE_BANQUETTE_LOG_BIBLIO,
     IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
     IDENT_ALHALTE_BANQUETTE_LOG_CHUNK, IDENT_ALHALTE_BANQUETTE_SCENE,
-    IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID, KEY_STD_ADMINS,
-    LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO,
-    LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
-    LABEL_ALHALTE_BANQUETTE_LOG_CHUNK, LABEL_ALHALTE_BANQUETTE_SCENE,
-    LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID,
+    IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID, LABEL_ALHALTE_BANQUETTE,
+    LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME,
+    LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE, LABEL_ALHALTE_BANQUETTE_LOG_CHUNK,
+    LABEL_ALHALTE_BANQUETTE_SCENE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
+    LABEL_ALHALTE_MAITRE_D_SESSION_ID,
 };
 use alhalte_banquette::log::{CharacterCameEvent, CharacterGoneEvent, SceneLog};
 use alhalte_banquette::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
     WebRtcSignalPayload,
 };
-use alhalte_banquette::room::{HeartbeatOutcome, Room};
+use alhalte_banquette::room::{HeartbeatOutcome, Room, RoomPermissionLevel};
 use alhalte_banquette::server::{BanquetteServer, ServerConfig};
 use alhalte_banquette::state::SceneState;
 use tin::{Tin, label_hash};
@@ -76,16 +76,20 @@ fn test_label_definitions_and_hashes() {
 fn test_room_initialization_and_admin_rights() {
     let room = Room::new(1001, 42, 8).expect("Room creation failed");
     assert_eq!(room.room_id, 1001);
-    assert!(!room.done);
+    assert_eq!(room.default_permission, RoomPermissionLevel::Denied);
     assert!(room.scene_biblio.contains_key("/"));
     assert!(room.is_admin(42));
+    assert_eq!(room.get_account_permission(42), RoomPermissionLevel::Admin);
+    // An unknown account falls back to the closed default.
+    assert_eq!(room.get_account_permission(99), RoomPermissionLevel::Denied);
     assert!(!room.is_admin(99));
+    room.validate().expect("a fresh room is valid");
 
-    // Verify "/" state contains std::admins
+    // The permission table lives in `RoomData`, not in `"/"` state.
     let root = room.scene_biblio.get("/").unwrap();
-    let admins_tin = root.state.get(KEY_STD_ADMINS).unwrap();
-    let admins: Vec<u64> = postcard::from_bytes(&admins_tin.payload).unwrap();
-    assert_eq!(admins, vec![42]);
+    assert!(root.state.get("std::admins").is_none());
+    assert_eq!(room.admin_accounts(), vec![42]);
+    assert_eq!(room.accessible_scenes_of(42), ["/".to_string()]);
 }
 
 #[test]
@@ -180,8 +184,8 @@ fn test_character_biblio_and_permissions() {
 }
 
 #[tokio::test]
-// spec: alhalte-banquette/access-control 0001 silence for unpermitted non-done queries
-async fn test_access_control_silence_when_not_done() {
+// spec: alhalte-banquette/access-control 0001 silence for unpermitted queries
+async fn test_access_control_silence_for_denied_accounts() {
     let mut room = Room::new(1001, 42, 8).unwrap();
     let cellar = InMemoryCellarSink::new();
 
@@ -199,7 +203,8 @@ async fn test_access_control_silence_when_not_done() {
     let ids = room.list_scene_ids();
     assert!(ids.contains(&"tavern".to_string()));
 
-    // User 99 (not admin, has no characters in tavern) queries scene -> returns None (silence)
+    // User 99 is Denied by the closed default permission -> silence.
+    assert_eq!(room.get_account_permission(99), RoomPermissionLevel::Denied);
     assert!(room.query_scene(99, "tavern").is_none());
     assert!(room.query_state(99, "tavern").is_none());
     assert!(room.query_log_biblio(99, "tavern").is_none());
@@ -213,38 +218,57 @@ async fn test_access_control_silence_when_not_done() {
     assert!(room.query_scene(42, "tavern").is_some());
     assert!(room.query_state(42, "tavern").is_some());
 
-    // Create character owned by user 99 and move into "tavern"
+    // A participant only sees the scenes an administrator moved it into: the
+    // character owner no longer inherits read access by owning a character.
+    room.set_member_permission(42, 99, RoomPermissionLevel::Participant)
+        .unwrap();
+    assert!(room.query_scene(99, "tavern").is_none());
+    assert!(room.query_state(99, "/").is_some());
+
     let mut char_data = HashMap::new();
     set_character_name(&mut char_data, "Warrior");
-    let char_id = room.character_biblio.create_character(99, char_data);
-    room.move_character(99, char_id, "tavern").unwrap();
+    let char_id = room.create_character(99, char_data).unwrap();
+    room.assign_character_to_scene(char_id, "/").unwrap();
 
-    // Now user 99 has character in tavern -> queries succeed!
+    // Only an administrator moves characters, and the destination becomes an
+    // accessible scene for the participant owner.
+    assert!(matches!(
+        room.move_character(99, char_id, "tavern"),
+        Err(BanquetteError::PermissionDenied)
+    ));
+    room.move_character(42, char_id, "tavern").unwrap();
+    assert_eq!(
+        room.accessible_scenes_of(99),
+        ["/".to_string(), "tavern".to_string()]
+    );
+
+    // Now user 99 participates in tavern -> queries succeed!
     assert!(room.query_scene(99, "tavern").is_some());
     assert!(room.query_state(99, "tavern").is_some());
     assert!(room.query_log_biblio(99, "tavern").is_some());
 }
 
 #[tokio::test]
-// spec: alhalte-banquette/access-control 0002 done flag fully opens all scenes
-async fn test_access_control_done_flag() {
+// spec: alhalte-banquette/access-control 0002 viewer reads every scene but writes none
+async fn test_access_control_viewer_reads_everything() {
     let mut room = Room::new(1001, 42, 8).unwrap();
     let cellar = InMemoryCellarSink::new();
 
     room.create_scene(42, "secret_vault", None).unwrap();
 
-    // Non-admin cannot access when done == false
+    // User 99 is Denied until an administrator admits it.
     assert!(room.query_scene(99, "secret_vault").is_none());
 
-    // Set done = true (admin only)
+    // Raising the default permission is administrator-only.
     assert!(matches!(
-        room.set_done(99, true),
+        room.set_default_permission(99, RoomPermissionLevel::Viewer),
         Err(BanquetteError::PermissionDenied)
     ));
-    room.set_done(42, true).unwrap();
-    assert!(room.done);
+    room.set_default_permission(42, RoomPermissionLevel::Viewer)
+        .unwrap();
+    assert_eq!(room.default_permission, RoomPermissionLevel::Viewer);
 
-    // Now user 99 can access everything
+    // Now user 99 can read everything, but never write.
     assert!(room.query_scene(99, "secret_vault").is_some());
     assert!(room.query_state(99, "secret_vault").is_some());
     assert!(room.query_log_biblio(99, "secret_vault").is_some());
@@ -253,6 +277,15 @@ async fn test_access_control_done_flag() {
             .await
             .is_some()
     );
+    assert!(matches!(
+        room.update_scene_state(
+            99,
+            "secret_vault",
+            "custom::info".to_string(),
+            Tin::from_string("hack"),
+        ),
+        Err(BanquetteError::PermissionDenied)
+    ));
 }
 
 #[tokio::test]
@@ -396,15 +429,11 @@ fn test_state_size_limit_and_namespaces() {
 
     // Valid key and valid size (< 4KiB)
     let ok_val = Tin::from_string("hello world");
-    assert!(
-        state
-            .update("std::custom".to_string(), ok_val, false)
-            .is_ok()
-    );
+    assert!(state.update("std::custom".to_string(), ok_val).is_ok());
 
     // Key without :: separator -> InvalidStateKey error
     let bad_key_val = Tin::from_string("bad key");
-    let res = state.update("nokey".to_string(), bad_key_val, false);
+    let res = state.update("nokey".to_string(), bad_key_val);
     assert!(matches!(res, Err(BanquetteError::InvalidStateKey(_))));
 
     // Value exceeding 4096 bytes -> StateValueTooLarge error
@@ -412,7 +441,7 @@ fn test_state_size_limit_and_namespaces() {
     let big_payload = vec![0x42; 4089];
     let big_tin = Tin::new(12345, big_payload);
     assert_eq!(big_tin.to_plaintext().len(), 4097);
-    let res = state.update("custom::big".to_string(), big_tin, false);
+    let res = state.update("custom::big".to_string(), big_tin);
     assert!(matches!(
         res,
         Err(BanquetteError::StateValueTooLarge {
@@ -425,23 +454,13 @@ fn test_state_size_limit_and_namespaces() {
     let exact_payload = vec![0x42; 4088];
     let exact_tin = Tin::new(12345, exact_payload);
     assert_eq!(exact_tin.to_plaintext().len(), 4096);
-    assert!(
-        state
-            .update("custom::exact".to_string(), exact_tin, false)
-            .is_ok()
-    );
+    assert!(state.update("custom::exact".to_string(), exact_tin).is_ok());
 
-    // std::admins requires admin
-    let admin_val = Tin::from_string("admins");
-    assert!(matches!(
-        state.update(KEY_STD_ADMINS.to_string(), admin_val.clone(), false),
-        Err(BanquetteError::ReservedKeyPermissionDenied(_))
-    ));
-    assert!(
-        state
-            .update(KEY_STD_ADMINS.to_string(), admin_val, true)
-            .is_ok()
-    );
+    // No state key is reserved for administrators any more: room permissions
+    // live in `RoomData.permissions`, so a `std::` key is writable like any
+    // other once the caller passed the scene write check (Issue #199).
+    let std_val = Tin::from_string("value");
+    assert!(state.update("std::custom".to_string(), std_val).is_ok());
 }
 
 #[tokio::test]
@@ -745,7 +764,7 @@ impl CellarSink for RecordingCellarSink {
     }
 }
 
-/// Builds a room containing scenes, state, characters, log entries, admins, and `done`.
+/// Builds a room containing scenes, state, characters, log entries, and permissions.
 async fn populated_room(cellar: &dyn CellarSink) -> Room {
     let room_id = 0xabcd_ef01_2345_6789u64;
     let mut room = Room::new(room_id, 42, 8).unwrap();
@@ -761,7 +780,7 @@ async fn populated_room(cellar: &dyn CellarSink) -> Room {
         .unwrap();
     let character: alhalte_banquette::Character =
         HashMap::from([("std::name".to_string(), Tin::from_string("Alice"))]);
-    let character_id = room.character_biblio.create_character(42, character);
+    let character_id = room.create_character(42, character).unwrap();
     room.move_character(42, character_id, "tavern").unwrap();
     room.append_log(42, 100, "tavern", Some(Tin::from_string("hello")), cellar)
         .await
@@ -769,8 +788,11 @@ async fn populated_room(cellar: &dyn CellarSink) -> Room {
     room.append_log(42, 100, "tavern", Some(Tin::from_string("world")), cellar)
         .await
         .unwrap();
-    room.set_done(42, true).unwrap();
-    room.set_admins(42, vec![42, 77]).unwrap();
+    room.set_default_permission(42, RoomPermissionLevel::Viewer)
+        .unwrap();
+    room.set_member_permission(42, 77, RoomPermissionLevel::Participant)
+        .unwrap();
+    room.validate().expect("populated room is valid");
     room
 }
 
@@ -789,13 +811,20 @@ async fn test_persist_and_restore_whole_room() {
         .await
         .unwrap();
     assert_eq!(restored.room_id, room_id);
-    assert!(restored.done);
+    assert_eq!(restored.default_permission, RoomPermissionLevel::Viewer);
     assert_eq!(restored.chunk_exponent, 8);
     assert_eq!(restored.head_tin, Some(head));
-    // admins survive
+    // permissions survive
     assert!(restored.is_admin(42));
-    assert!(restored.is_admin(77));
-    assert!(!restored.is_admin(99));
+    assert_eq!(
+        restored.get_account_permission(77),
+        RoomPermissionLevel::Participant
+    );
+    assert_eq!(
+        restored.get_account_permission(99),
+        RoomPermissionLevel::Viewer
+    );
+    assert_eq!(restored.accessible_scenes_of(77), ["/".to_string()]);
     // scenes and state survive
     let tavern = restored
         .scene_biblio
@@ -834,7 +863,11 @@ async fn test_persist_and_restore_whole_room() {
     assert!(tavern.present_characters.contains(&1));
     // export of the restored room also exposes the data
     let (data, _chunks) = restored.export_snapshot(&cellar, Some(42)).await.unwrap();
-    assert!(data.done);
+    assert_eq!(data.default_permission, RoomPermissionLevel::Viewer);
+    assert_eq!(
+        data.permissions.get(&77),
+        Some(&RoomPermissionLevel::Participant)
+    );
     assert!(data.scenes.contains_key("tavern"));
     assert_eq!(data.character_biblio.len(), 1);
 }
@@ -1066,7 +1099,10 @@ async fn test_heartbeat_reports_room_persisted_frame() {
     let mut persisted = None;
     for _ in 0..40 {
         match tokio::time::timeout(Duration::from_millis(500), reader.next()).await {
-            Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done: _ }))) => {
+            Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted {
+                tin_id,
+                default_permission: _,
+            }))) => {
                 persisted = Some(tin_id);
                 break;
             }
@@ -1090,7 +1126,8 @@ async fn test_graceful_shutdown_persists_room_head() {
     let cellar = Arc::new(InMemoryCellarSink::new());
 
     let mut room = Room::new(2003, 10, 8).unwrap();
-    room.set_done(10, true).unwrap();
+    room.set_default_permission(10, RoomPermissionLevel::Viewer)
+        .unwrap();
 
     let server = BanquetteServer::new(
         ServerConfig {
@@ -1124,21 +1161,28 @@ async fn test_graceful_shutdown_persists_room_head() {
 
     let mut persisted = None;
     for _ in 0..20 {
-        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done }))) =
-            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted {
+            tin_id,
+            default_permission,
+        }))) = tokio::time::timeout(Duration::from_millis(500), reader.next()).await
         {
-            persisted = Some((tin_id, done));
+            persisted = Some((tin_id, default_permission));
             break;
         }
     }
-    let (tin_id, done) = persisted.expect("graceful shutdown must report the final room tin");
-    assert!(done, "the final persist must report the room's done flag");
+    let (tin_id, default_permission) =
+        persisted.expect("graceful shutdown must report the final room tin");
+    assert_eq!(
+        default_permission,
+        RoomPermissionLevel::Viewer,
+        "the final persist must report the room default permission"
+    );
     assert!(cellar.contains(&tin_id).await);
 
     let restored = Room::load_from_cellar(&*cellar, &tin_id, 2003)
         .await
         .unwrap();
-    assert!(restored.done);
+    assert_eq!(restored.default_permission, RoomPermissionLevel::Viewer);
 
     let _ = server_task.await;
 }
@@ -1231,15 +1275,22 @@ async fn test_sigterm_runs_graceful_final_persist() {
 
     let mut persisted = None;
     for _ in 0..40 {
-        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done }))) =
-            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted {
+            tin_id,
+            default_permission,
+        }))) = tokio::time::timeout(Duration::from_millis(500), reader.next()).await
         {
-            persisted = Some((tin_id, done));
+            persisted = Some((tin_id, default_permission));
             break;
         }
     }
-    let (tin_id, done) = persisted.expect("SIGTERM must trigger the final RoomPersisted");
-    assert!(!done, "a newly created room must not be public");
+    let (tin_id, default_permission) =
+        persisted.expect("SIGTERM must trigger the final RoomPersisted");
+    assert_eq!(
+        default_permission,
+        RoomPermissionLevel::Denied,
+        "a newly created room must stay closed"
+    );
     assert!(
         service.download(&tin_id, None).await.is_ok(),
         "the final RoomData must be stored in cellar"

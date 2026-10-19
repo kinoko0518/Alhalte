@@ -93,7 +93,7 @@ client 総体 = cutlery
 
 1. クライアントは `maitre-d` の `POST /api/rooms` に `{ room_id?, name }` を送る（要 session）。`room_id` を省略するとサーバーが 16 hex を生成する。
 2. `maitre-d` は SQLite の `rooms` に部屋を登録し、同じ transaction で作成者を `room_permissions` の `gm` にする。banquette はまだ起動しない。
-3. `GET /api/rooms/{room_id}` が名前・caller の role・done を返す。部屋は WS / export で参照されるまでプロセスを持たない。
+3. `GET /api/rooms/{room_id}` が名前・caller の role・done を返す（`done` は `RoomData.default_permission != Denied` の射影）。部屋は WS / export で参照されるまでプロセスを持たない。
 
 ### 入室
 
@@ -105,11 +105,11 @@ client 総体 = cutlery
 
 ### 部屋の永続化
 
-1. banquette は heartbeat（既定 4 分）ごとに部屋全体を `alhalte/banquette` Tin として cellar に保存し、成功した tin id と `done` を `RoomPersisted { tin_id, done }` で `maitre-d` へ返す。
-2. `maitre-d` は `room_heads(room_id, tin_id, updated_at)` に head を、`rooms.done` に公開フラグを記録する。`done` は `RoomData` の wire schema を変えずに `rooms` へ持つ外部メタデータで、pre-spawn の入場判定が `maitre-d` 再起動後も機能する。
+1. banquette は heartbeat（既定 4 分）ごとに部屋全体を `alhalte/banquette` Tin として cellar に保存し、成功した tin id と `default_permission` を `RoomPersisted { tin_id, default_permission }` で `maitre-d` へ返す。
+2. `maitre-d` は `room_heads(room_id, tin_id, updated_at)` に head を記録し、`default_permission != Denied` を `rooms.done` に射影する。`rooms.done` は pre-spawn の入場判定が `maitre-d` 再起動後も機能するための暫定フラグで、権限の正は `RoomData.default_permission` / `RoomData.permissions` にある（#200 で判定ごと置き換える）。
 3. 新 head の保存後、banquette は旧 head の参照を best-effort で unregister し、cellar GC が実体を回収できるようにする。現在の head は削除しない。
 4. idle 終了などの graceful shutdown、および standalone banquette の SIGTERM / SIGINT では、終了直前にもう一度 persist してから終了する。シグナルは `run_until_shutdown` の shutdown channel に配線する。
-5. 次回 spawn 時は head から scenes / state / characters / log biblio / admins / done を復元する。復元された `done` は次回の `RoomPersisted` で `rooms.done` に書き戻す。
+5. 次回 spawn 時は head から scenes / state / characters / log biblio / 権限（`default_permission` / `permissions` / `accessible_scenes`）を復元する。復元された `default_permission` は次回の `RoomPersisted` で `rooms.done` に書き戻す。
 
 ### 発言
 
@@ -162,9 +162,12 @@ client 総体 = cutlery
 
 ### 権限
 
-現行 main では、`maitre-d` が SQLite の `rooms(room_id, name, creator_account, created_at, done)` で部屋を管理し、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保持する。WebSocket 接続時の入場可否と viewer の mutate 遮断を行う。部屋は `POST /api/rooms` で明示的に作成し、未登録の部屋への WS / export は 404 で拒否する。`banquette` 側は `done` フラグと `std::admins` による scene アクセス制御を持つ。部屋状態の永続 head は `room_heads` が、公開フラグは `rooms.done` が持ち、内部書き込みの認可は `cellar.service-token` が担う。
+権限の正は `banquette` の `RoomData` にある。`RoomPermissionLevel` は `Denied` / `Viewer` / `Participant` / `Admin` の 4 段階で、`RoomData.permissions`（account ごとの上書き）と `RoomData.default_permission`（未登録 account の既定）が全 scene の read / write を決める。`Room::validate` が「Admin が最低 1 人」「`accessible_scenes` は実在 scene のみ」「書けない account に scene を与えない」を load 後と権限変更後に検証する。旧 `done` フラグと `std::admins` は撤去し、旧 schema の `RoomData` は decode 失敗として起動を止める（空部屋にしない）。
 
-Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせる構成へ、`banquette` は `Denied` / `Viewer` / `Participant` / `Admin` の 4 段階へ移行中である。移行の詳細と現時点の未接続点は [banquette](crates/alhalte-banquette/ARCHITECTURE.md) と [maitre-d](crates/alhalte-maitre-d/ARCHITECTURE.md) に記す。
+- `Denied`: 読み書き不可。`Viewer`: 全 scene を読めるが書けない。`Participant`: 管理者に移動させられた scene と `/` を読み書きできる。`Admin`: 全 scene の読み書きと権限変更。
+- 全 mutate frame（log / state / scene 構造 / character CRUD / 移動）は `banquette` 自身が権限表で拒否する。`maitre-d` の viewer 遮断に依存しない。
+- `maitre-d` は SQLite の `rooms(room_id, name, creator_account, created_at, done)` と `room_permissions(room_id, account_id, role)` をまだ持ち、WS 接続時の入場可否と viewer の mutate 遮断を行う。ただし #199 以降、DB の role は実行中の `banquette` へ push されない（`SetAdmins` は撤去）。`banquette` は `SetMemberPermission` / `SetDefaultPermission` / `QueryPermissions` で自身の権限表を更新し、`QueryAccountPermission` で `maitre-d` が問い合わせる。DB role と部屋権限表の接続は Issue #200 で行う。
+- 部屋状態の永続 head は `room_heads` が持ち、`rooms.done` は `default_permission` の射影（pre-spawn gate 用の暫定値）、内部書き込みの認可は `cellar.service-token` が担う。
 
 ### エラー・安全規約
 
@@ -200,11 +203,11 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 
 ## 実装と仕様の差分（要確認）
 
-設計時の記述と現在の実装が異なる主な点を列挙する。Issue #114 の権限モデル移行は未完了で、現時点の main には反映されていない。各項目の詳細はリンク先のモジュール文書を参照。
+設計時の記述と現在の実装が異なる主な点を列挙する。Issue #199 で `banquette` の 4 段階権限（`Denied` / `Viewer` / `Participant` / `Admin`）が main に入り、`maitre-d` の DB role 連携は Issue #200 で置き換える。各項目の詳細はリンク先のモジュール文書を参照。
 
 | 領域 | 設計時の記述 | 現在の実装 |
 | --- | --- | --- |
-| 権限 | 部屋の `done` フラグと `std::admins` | `maitre-d` の SQLite `gm/pl/viewer` と `done` を併用。Issue #114 で 4 段階権限へ移行中。 |
+| 権限 | 部屋の `done` フラグと `std::admins` | `banquette` の `RoomData.permissions` / `default_permission` が正（4 段階）。`maitre-d` の SQLite `gm/pl/viewer` と `rooms.done` は pre-spawn gate 用の暫定投影で、実行中の部屋へは push しない（#200 で接続）。 |
 | 部屋状態 | 部屋プロセスは揮発 | `maitre-d` の `room_heads` と cellar の `alhalte/banquette` Tin で永続化し、spawn 時に復元する。復元失敗は空部屋にフォールバックしない。 |
 | 内部書き込み | ユーザー session で認可 | `cellar.service-token` による内部認証。合成 session（旧 `system_session_id = 1`）は廃止。 |
 | 拡張 ABI | `process-generast(Generast) -> Generast` | `process_generast(ptr, len) -> i64`。`(Generast, speaker_id)` の Tin を入出力し、`alhalte_abi_version` / `alloc` / `dealloc` / `self_introduction` を持つ。 |
@@ -214,7 +217,7 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 | saignant の WASM 実行 | キャラクター名を解決 | ABI v2 の `render_generast_abi_v2(ptr, len, names_ptr, names_len)` が名前 JSON を受け取り、mention / `fluct` / `assign` を解決する。v1 は互換のため残し、名前なしでは `Anonymous` になる。 |
 | Markdown | 打ち消し線 `~~` を含む | パーサは `~~` を実装していない（自己紹介文には記載がある）。 |
 
-- 部屋の `done` は `rooms.done` に永続化済み。WS / `GET /api/rooms/{id}` / export の pre-spawn 判定は DB を参照するため、`maitre-d` 再起動後も公開部屋に非メンバーが入れる。`RoomPersisted.done` で復元された `RoomData.done` も書き戻す。
+- `rooms.done` は `RoomPersisted.default_permission` と `ServerFrame::PermissionsUpdated` から射影した暫定フラグで、WS / `GET /api/rooms/{id}` / export の pre-spawn 判定に使う。権限の正は `RoomData` 側にあり、#200 でゲートごと置き換える（`RoomData.done` という field は #199 で消滅した）。
 - standalone の `alhalte-banquette` は SIGTERM / SIGINT を捕捉し、`run_until_shutdown` と同じ graceful shutdown 経路で最終 persist を行う（`crates/alhalte-banquette/tests/spec_tests.rs` の SIGTERM 統合テストで確認）。
 | ディレクトリ名 | `generast-rs` | package 名は `generast`。文書内ではディレクトリ名と package 名を併記する。 |
 

@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use alhalte_banquette::character::{CharacterBiblio, set_character_name};
 use alhalte_banquette::log::{CharacterCameEvent, CharacterGoneEvent, LogBiblio, LogChunk};
-use alhalte_banquette::room::RoomData;
+use alhalte_banquette::room::{RoomData, RoomPermissionLevel};
 use alhalte_banquette::scene::SceneData;
 use alhalte_saignant::LogEntry;
 use generast::Generast;
@@ -157,7 +157,9 @@ pub fn create_test_room_data() -> (RoomData, Vec<(TinId, LogChunk)>) {
 
     let room_data = RoomData {
         room_id: 42,
-        done: true,
+        default_permission: RoomPermissionLevel::Viewer,
+        permissions: BTreeMap::new(),
+        accessible_scenes: BTreeMap::new(),
         chunk_exponent: 8,
         character_biblio,
         scenes,

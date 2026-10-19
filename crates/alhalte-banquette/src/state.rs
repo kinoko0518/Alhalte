@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use tin::Tin;
 
 use crate::error::{BanquetteError, Result};
-use crate::labels::KEY_STD_ADMINS;
 
 /// Maximum allowable serialized plaintext size of a single `Tin` stored in scene state (4KiB).
 pub const MAX_STATE_VALUE_SIZE: usize = 4096;
@@ -79,24 +78,22 @@ impl SceneState {
 
     /// Sets or updates a state entry with size and namespace validation.
     ///
-    /// If the key is `std::admins`, `is_admin` must be `true`.
-    pub fn update(&mut self, key: String, value: Tin, is_admin: bool) -> Result<Option<Tin>> {
+    /// No state key is reserved for administrators: room permissions live in
+    /// [`crate::room::RoomData::permissions`], not in `"/"` state, so writes are
+    /// authorized by the caller's [`crate::room::RoomPermissionLevel`] on the
+    /// target scene before reaching this method.
+    pub fn update(&mut self, key: String, value: Tin) -> Result<Option<Tin>> {
         validate_state_key(&key)?;
         validate_state_value(&value)?;
-
-        if key == KEY_STD_ADMINS && !is_admin {
-            return Err(BanquetteError::ReservedKeyPermissionDenied(key));
-        }
 
         Ok(self.entries.insert(key, value))
     }
 
     /// Deletes a key from the state map.
-    pub fn delete(&mut self, key: &str, is_admin: bool) -> Result<Option<Tin>> {
-        if key == KEY_STD_ADMINS && !is_admin {
-            return Err(BanquetteError::ReservedKeyPermissionDenied(key.to_string()));
-        }
-
+    ///
+    /// Like [`SceneState::update`], the caller-level authorization happens in
+    /// [`crate::room::Room`], so this method only enforces key syntax.
+    pub fn delete(&mut self, key: &str) -> Result<Option<Tin>> {
         Ok(self.entries.remove(key))
     }
 

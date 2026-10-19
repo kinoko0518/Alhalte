@@ -7,14 +7,44 @@ use serde::{Deserialize, Serialize};
 use tin::{Compression, Tin, TinId};
 
 use crate::cellar_sink::{CellarSink, INTERNAL_WRITE_SESSION_ID};
-use crate::character::{CharacterBiblio, get_character_owner};
+use crate::character::{Character, CharacterBiblio, get_character_owner};
 use crate::error::{BanquetteError, Result};
-use crate::labels::{
-    KEY_STD_ADMINS, KEY_STD_NAME, LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
-};
+use crate::labels::{KEY_STD_NAME, LABEL_ALHALTE_BANQUETTE};
 use crate::log::{LogBiblio, LogChunk, LogOperationEvent, SceneLog};
 use crate::scene::{Scene, SceneData};
 use crate::state::SceneState;
+
+/// Access level an account holds inside one room.
+///
+/// The level is stored per room ([`RoomData::permissions`]) with
+/// [`RoomData::default_permission`] as the fallback for accounts without an
+/// entry. It is never expressed through `"/"` scene state and never duplicated
+/// in `maitre-d`'s database: the persisted [`RoomData`] is the source of truth.
+///
+/// spec: alhalte-banquette/permissions 0001 four permission levels
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum RoomPermissionLevel {
+    /// The account is refused entry to the room.
+    Denied,
+    /// The account receives the log and state of every scene but may not write.
+    Viewer,
+    /// The account may read and write the scenes an administrator moved it into,
+    /// plus the root scene `"/"`.
+    Participant,
+    /// The account may read and write every scene and change the permission table.
+    Admin,
+}
+
+impl RoomPermissionLevel {
+    /// Returns whether this level may mutate room data at all.
+    ///
+    /// [`RoomPermissionLevel::Viewer`] is receive-only, so every mutate frame is
+    /// rejected for it; [`RoomPermissionLevel::Participant`] and
+    /// [`RoomPermissionLevel::Admin`] write, subject to scene authorization.
+    pub const fn can_write(self) -> bool {
+        matches!(self, Self::Participant | Self::Admin)
+    }
+}
 
 /// Outcome of a periodic heartbeat evaluation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,12 +69,31 @@ pub struct HeartbeatResult {
 }
 
 /// Serialized payload for the whole room state (`alhalte/banquette`).
+///
+/// The wire schema replaced the former `done: bool` with
+/// [`RoomData::default_permission`], [`RoomData::permissions`], and
+/// [`RoomData::accessible_scenes`]. Compatibility is intentionally cut
+/// (Issue #199): a `RoomData` written by the old schema either fails to decode
+/// or fails [`Room::validate`], and the caller refuses to start instead of
+/// opening an empty room.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoomData {
     /// 64-bit room identifier.
     pub room_id: u64,
-    /// Whether room is fully public.
-    pub done: bool,
+    /// Permission applied to accounts without an entry in `permissions`.
+    pub default_permission: RoomPermissionLevel,
+    /// Per-account permission overrides.
+    ///
+    /// An explicit entry always wins over `default_permission`, including an
+    /// explicit [`RoomPermissionLevel::Denied`] for a room whose default is more
+    /// permissive.
+    pub permissions: BTreeMap<u64, RoomPermissionLevel>,
+    /// Scenes an account may participate in, keyed by account ID.
+    ///
+    /// Only accounts that can write (see [`RoomPermissionLevel::can_write`]) may
+    /// hold entries, the scenes must exist, and the lists are sorted and
+    /// deduplicated. Both invariants are enforced by [`Room::validate`].
+    pub accessible_scenes: BTreeMap<u64, Vec<String>>,
     /// Log chunk size exponent $N$.
     pub chunk_exponent: u8,
     /// Character repository.
@@ -109,8 +158,12 @@ fn scene_name_or_id(scene: &Scene) -> String {
 pub struct Room {
     /// 64-bit room identifier.
     pub room_id: u64,
-    /// Done flag on root scene `"/"`; when `true`, all room information is fully public.
-    pub done: bool,
+    /// Permission applied to accounts without an entry in `permissions`.
+    pub default_permission: RoomPermissionLevel,
+    /// Per-account permission overrides.
+    pub permissions: BTreeMap<u64, RoomPermissionLevel>,
+    /// Scenes each account may participate in.
+    pub accessible_scenes: BTreeMap<u64, Vec<String>>,
     /// Log chunk capacity exponent $N$.
     pub chunk_exponent: u8,
     /// Scene repository mapping `scene-id` to [`Scene`].
@@ -130,10 +183,17 @@ pub struct Room {
 
 impl Room {
     /// Creates a new room initialized with root virtual scene `"/"` and the creator as admin.
+    ///
+    /// The room starts closed: [`RoomPermissionLevel::Denied`] is the default
+    /// permission, so only accounts an administrator admits can do anything. The
+    /// creator becomes the initial [`RoomPermissionLevel::Admin`] and gets `"/"`
+    /// as an accessible scene.
     pub fn new(room_id: u64, creator_account: u64, chunk_exponent: u8) -> Result<Self> {
         let mut room = Self {
             room_id,
-            done: false,
+            default_permission: RoomPermissionLevel::Denied,
+            permissions: BTreeMap::new(),
+            accessible_scenes: BTreeMap::new(),
             chunk_exponent,
             scene_biblio: HashMap::new(),
             character_biblio: CharacterBiblio::new(),
@@ -147,98 +207,300 @@ impl Room {
         root_scene.state.update(
             KEY_STD_NAME.to_string(),
             Tin::from_string(DEFAULT_ROOT_SCENE_NAME),
-            true,
         )?;
-        let admins = vec![creator_account];
-        let admins_bytes = postcard::to_allocvec(&admins)?;
-        let admins_tin = Tin::new(LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, admins_bytes);
-        root_scene
-            .state
-            .update(KEY_STD_ADMINS.to_string(), admins_tin, true)?;
-
         room.scene_biblio.insert("/".to_string(), root_scene);
+
+        room.permissions
+            .insert(creator_account, RoomPermissionLevel::Admin);
+        room.grant_accessible_scene(creator_account, "/");
+        room.validate()?;
         Ok(room)
+    }
+
+    // -----------------------------------------------------------------------
+    // Permissions
+    // -----------------------------------------------------------------------
+
+    /// Returns the effective permission of `account_id` in this room.
+    pub fn get_account_permission(&self, account_id: u64) -> RoomPermissionLevel {
+        self.permissions
+            .get(&account_id)
+            .copied()
+            .unwrap_or(self.default_permission)
     }
 
     /// Checks if a given account ID is an administrator of the room.
     pub fn is_admin(&self, account_id: u64) -> bool {
-        let Some(root) = self.scene_biblio.get("/") else {
-            return false;
-        };
-        let Some(tin) = root.state.get(KEY_STD_ADMINS) else {
-            return false;
-        };
-        let admins: Vec<u64> = match postcard::from_bytes(&tin.payload) {
-            Ok(a) => a,
-            Err(_) => return false,
-        };
-        admins.contains(&account_id)
+        self.get_account_permission(account_id) == RoomPermissionLevel::Admin
     }
 
-    /// Sets the list of administrators in `"/"` state. Requires admin privileges.
-    pub fn set_admins(&mut self, caller_account: u64, admins: Vec<u64>) -> Result<()> {
-        if !self.is_admin(caller_account) {
-            return Err(BanquetteError::PermissionDenied);
-        }
-        self.apply_admin_set(admins)
-    }
-
-    /// Replaces the administrator set from an internal control frame.
+    /// Returns the account IDs with an explicit [`RoomPermissionLevel::Admin`] entry.
     ///
-    /// This is the `maitre-d` control path used by
-    /// [`crate::protocol::MaitreDToBanquette::SetAdmins`]. Authorization already
-    /// happened against the database `room_permissions` rows, so no room-client
-    /// caller check is performed here. It is intentionally unreachable from a
-    /// [`crate::protocol::ClientFrame`]; clients keep using
-    /// [`Room::set_admins`], which enforces the admin check.
-    pub fn apply_admin_set(&mut self, admins: Vec<u64>) -> Result<()> {
-        let root = self
-            .scene_biblio
-            .get_mut("/")
-            .ok_or_else(|| BanquetteError::SceneNotFound("/".to_string()))?;
+    /// Accounts that are administrators only through
+    /// [`Room::default_permission`] are not listed.
+    pub fn admin_accounts(&self) -> Vec<u64> {
+        self.permissions
+            .iter()
+            .filter(|(_, level)| **level == RoomPermissionLevel::Admin)
+            .map(|(account_id, _)| *account_id)
+            .collect()
+    }
 
-        let admins_bytes = postcard::to_allocvec(&admins)?;
-        let admins_tin = Tin::new(LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, admins_bytes);
-        root.state
-            .update(KEY_STD_ADMINS.to_string(), admins_tin, true)?;
+    /// Returns the current `(default_permission, permissions)` pair.
+    ///
+    /// This is the payload of `ServerFrame::PermissionsSnapshot` /
+    /// `ServerFrame::PermissionsUpdated`.
+    pub fn permission_snapshot(&self) -> (RoomPermissionLevel, BTreeMap<u64, RoomPermissionLevel>) {
+        (self.default_permission, self.permissions.clone())
+    }
+
+    /// Sets the permission of a single account. Requires an administrator caller.
+    ///
+    /// Demoting the last administrator is rejected with
+    /// [`BanquetteError::LastAdminDemotion`]. The change is rolled back when the
+    /// resulting room would fail [`Room::validate`].
+    pub fn set_member_permission(
+        &mut self,
+        caller_account: u64,
+        account_id: u64,
+        permission: RoomPermissionLevel,
+    ) -> Result<()> {
+        self.authorize_admin(caller_account)?;
+        if permission != RoomPermissionLevel::Admin
+            && self.is_admin(account_id)
+            && !self.has_other_admin(account_id)
+        {
+            return Err(BanquetteError::LastAdminDemotion);
+        }
+
+        let previous_permissions = self.permissions.clone();
+        let previous_accessible = self.accessible_scenes.clone();
+
+        self.permissions.insert(account_id, permission);
+        if permission.can_write() {
+            self.grant_accessible_scene(account_id, "/");
+        }
+        self.normalize_accessible_scenes();
+
+        if let Err(error) = self.validate() {
+            self.permissions = previous_permissions;
+            self.accessible_scenes = previous_accessible;
+            return Err(error);
+        }
+
+        tracing::info!(
+            "room {} set account {account_id} permission to {permission:?}",
+            self.room_id
+        );
         Ok(())
     }
 
-    /// Sets the `done` flag on the room. Only administrators can change this flag.
-    pub fn set_done(&mut self, caller_account: u64, done: bool) -> Result<()> {
-        if !self.is_admin(caller_account) {
-            return Err(BanquetteError::PermissionDenied);
+    /// Sets the permission applied to accounts without an explicit entry.
+    ///
+    /// Requires an administrator caller and refuses to demote the last
+    /// administrator, exactly like [`Room::set_member_permission`].
+    pub fn set_default_permission(
+        &mut self,
+        caller_account: u64,
+        permission: RoomPermissionLevel,
+    ) -> Result<()> {
+        self.authorize_admin(caller_account)?;
+        if permission != RoomPermissionLevel::Admin
+            && self.default_permission == RoomPermissionLevel::Admin
+            && self.admin_accounts().is_empty()
+        {
+            return Err(BanquetteError::LastAdminDemotion);
         }
-        self.done = done;
+
+        let previous_default = self.default_permission;
+        let previous_accessible = self.accessible_scenes.clone();
+
+        self.default_permission = permission;
+        self.normalize_accessible_scenes();
+
+        if let Err(error) = self.validate() {
+            self.default_permission = previous_default;
+            self.accessible_scenes = previous_accessible;
+            return Err(error);
+        }
+
+        tracing::info!(
+            "room {} set default permission to {permission:?}",
+            self.room_id
+        );
         Ok(())
     }
 
-    /// Checks whether an account has access rights to query a specific scene.
+    /// Validates the room invariants.
     ///
-    /// According to ARCHITECTURE.md:
-    /// - If `done` flag is true, all room info is fully public.
-    /// - Administrators have access to all scenes.
-    /// - Root virtual scene `"/"` is accessible to all room members.
-    /// - Otherwise, the account must own at least one character present in that scene.
-    pub fn can_access_scene(&self, account_id: u64, scene_id: &str) -> bool {
-        if self.done || self.is_admin(account_id) || scene_id == "/" {
-            return true;
+    /// Called after loading a persisted room and after every permission change:
+    ///
+    /// - the room keeps at least one administrator (explicitly or through the
+    ///   default permission),
+    /// - `accessible_scenes` only lists scenes that exist,
+    /// - `accessible_scenes` only lists accounts that can write, so a
+    ///   [`RoomPermissionLevel::Viewer`] or [`RoomPermissionLevel::Denied`]
+    ///   account never carries scene grants.
+    pub fn validate(&self) -> Result<()> {
+        if !self.has_admin() {
+            return Err(BanquetteError::InvalidRoomData(
+                "a room must keep at least one administrator".to_string(),
+            ));
         }
 
-        let Some(scene) = self.scene_biblio.get(scene_id) else {
-            return false;
-        };
-
-        for &char_id in &scene.present_characters {
-            if let Some(ch) = self.character_biblio.get(char_id)
-                && get_character_owner(ch) == Some(account_id)
-            {
-                return true;
+        for (account_id, scenes) in &self.accessible_scenes {
+            let level = self.get_account_permission(*account_id);
+            if !level.can_write() {
+                return Err(BanquetteError::InvalidRoomData(format!(
+                    "account {account_id} holds accessible scenes at permission {level:?}"
+                )));
+            }
+            for scene_id in scenes {
+                if !self.scene_biblio.contains_key(scene_id) {
+                    return Err(BanquetteError::InvalidRoomData(format!(
+                        "account {account_id} references unknown scene '{scene_id}'"
+                    )));
+                }
             }
         }
 
-        false
+        Ok(())
     }
+
+    /// Checks whether an account may receive the log / state of a scene.
+    ///
+    /// - `Denied`: never.
+    /// - `Viewer`: every scene.
+    /// - `Participant`: `"/"` and the scenes granted by an administrator.
+    /// - `Admin`: every scene.
+    pub fn can_access_scene(&self, account_id: u64, scene_id: &str) -> bool {
+        if !self.scene_biblio.contains_key(scene_id) {
+            return false;
+        }
+        match self.get_account_permission(account_id) {
+            RoomPermissionLevel::Denied => false,
+            RoomPermissionLevel::Viewer | RoomPermissionLevel::Admin => true,
+            RoomPermissionLevel::Participant => {
+                scene_id == "/" || self.scene_is_accessible(account_id, scene_id)
+            }
+        }
+    }
+
+    /// Checks whether an account may mutate a scene (log / state writes).
+    ///
+    /// Same scene set as [`Room::can_access_scene`], but `Viewer` and `Denied`
+    /// never write.
+    pub fn can_send_to_scene(&self, account_id: u64, scene_id: &str) -> bool {
+        if !self.scene_biblio.contains_key(scene_id) {
+            return false;
+        }
+        match self.get_account_permission(account_id) {
+            RoomPermissionLevel::Denied | RoomPermissionLevel::Viewer => false,
+            RoomPermissionLevel::Admin => true,
+            RoomPermissionLevel::Participant => {
+                scene_id == "/" || self.scene_is_accessible(account_id, scene_id)
+            }
+        }
+    }
+
+    /// Returns the scenes explicitly granted to `account_id`.
+    pub fn accessible_scenes_of(&self, account_id: u64) -> &[String] {
+        self.accessible_scenes
+            .get(&account_id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Returns whether the room keeps at least one administrator.
+    fn has_admin(&self) -> bool {
+        self.default_permission == RoomPermissionLevel::Admin
+            || self
+                .permissions
+                .values()
+                .any(|level| *level == RoomPermissionLevel::Admin)
+    }
+
+    /// Returns whether any account other than `account_id` is an administrator.
+    ///
+    /// An `Admin` default permission keeps every unlisted account an
+    /// administrator, so demoting one explicit entry cannot empty the set.
+    fn has_other_admin(&self, account_id: u64) -> bool {
+        if self.default_permission == RoomPermissionLevel::Admin {
+            return true;
+        }
+        self.permissions
+            .iter()
+            .any(|(other, level)| *other != account_id && *level == RoomPermissionLevel::Admin)
+    }
+
+    /// Returns whether `scene_id` was explicitly granted to `account_id`.
+    fn scene_is_accessible(&self, account_id: u64, scene_id: &str) -> bool {
+        self.accessible_scenes
+            .get(&account_id)
+            .is_some_and(|scenes| scenes.iter().any(|scene| scene == scene_id))
+    }
+
+    /// Grants `scene_id` to `account_id`, keeping the list sorted and unique.
+    ///
+    /// Grants are only recorded for accounts that can write and for scenes that
+    /// exist, so [`Room::validate`] keeps holding without extra checks.
+    fn grant_accessible_scene(&mut self, account_id: u64, scene_id: &str) {
+        if !self.get_account_permission(account_id).can_write()
+            || !self.scene_biblio.contains_key(scene_id)
+        {
+            return;
+        }
+        let scenes = self.accessible_scenes.entry(account_id).or_default();
+        if let Err(index) = scenes.binary_search_by(|probe| probe.as_str().cmp(scene_id)) {
+            scenes.insert(index, scene_id.to_string());
+        }
+    }
+
+    /// Drops scene grants that are no longer valid.
+    ///
+    /// Grants are removed when the account lost write access, when the scene was
+    /// deleted, and empty lists are dropped entirely.
+    fn normalize_accessible_scenes(&mut self) {
+        let default_permission = self.default_permission;
+        let permissions = &self.permissions;
+        let scene_biblio = &self.scene_biblio;
+        self.accessible_scenes.retain(|account_id, scenes| {
+            let level = permissions
+                .get(account_id)
+                .copied()
+                .unwrap_or(default_permission);
+            if !level.can_write() {
+                return false;
+            }
+            scenes.retain(|scene_id| scene_biblio.contains_key(scene_id));
+            scenes.sort();
+            scenes.dedup();
+            !scenes.is_empty()
+        });
+    }
+
+    /// Requires `caller_account` to be an administrator.
+    fn authorize_admin(&self, caller_account: u64) -> Result<()> {
+        if !self.is_admin(caller_account) {
+            return Err(BanquetteError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    /// Requires `caller_account` to be allowed to write to `scene_id`.
+    fn authorize_send(&self, caller_account: u64, scene_id: &str) -> Result<()> {
+        if !self.scene_biblio.contains_key(scene_id) {
+            return Err(BanquetteError::SceneNotFound(scene_id.to_string()));
+        }
+        if !self.can_send_to_scene(caller_account, scene_id) {
+            return Err(BanquetteError::PermissionDenied);
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Scene queries
+    // -----------------------------------------------------------------------
 
     /// Returns list of all scene IDs in the room (scene IDs are public information).
     pub fn list_scene_ids(&self) -> Vec<String> {
@@ -280,7 +542,7 @@ impl Room {
 
     /// Queries scene summary metadata.
     ///
-    /// Returns `None` without response if caller lacks permission under non-done status.
+    /// Returns `None` without response if caller lacks [`Room::can_access_scene`].
     pub fn query_scene(&self, caller_account: u64, scene_id: &str) -> Option<SceneSummary> {
         if !self.can_access_scene(caller_account, scene_id) {
             return None;
@@ -291,7 +553,7 @@ impl Room {
 
     /// Queries scene state.
     ///
-    /// Returns `None` without response if caller lacks permission under non-done status.
+    /// Returns `None` without response if caller lacks [`Room::can_access_scene`].
     pub fn query_state(
         &self,
         caller_account: u64,
@@ -307,7 +569,7 @@ impl Room {
 
     /// Queries scene log biblio.
     ///
-    /// Returns `None` without response if caller lacks permission under non-done status.
+    /// Returns `None` without response if caller lacks [`Room::can_access_scene`].
     pub fn query_log_biblio(&self, caller_account: u64, scene_id: &str) -> Option<&LogBiblio> {
         if !self.can_access_scene(caller_account, scene_id) {
             return None;
@@ -319,7 +581,7 @@ impl Room {
 
     /// Queries a chunk of log entries.
     ///
-    /// Returns `None` without response if caller lacks permission under non-done status.
+    /// Returns `None` without response if caller lacks [`Room::can_access_scene`].
     pub async fn query_log_chunk(
         &self,
         caller_account: u64,
@@ -339,10 +601,15 @@ impl Room {
             .ok()
     }
 
+    // -----------------------------------------------------------------------
+    // Scene mutations
+    // -----------------------------------------------------------------------
+
     /// Creates a new scene in the room.
     ///
     /// Kept for callers that do not have a display name; use
     /// [`Room::create_scene_named`] to write `std::name` atomically at creation.
+    /// Scene structure is an administrator operation.
     pub fn create_scene(
         &mut self,
         caller_account: u64,
@@ -354,21 +621,24 @@ impl Room {
 
     /// Creates a new scene and writes its name to `std::name` in the same step.
     ///
-    /// When the scene already exists the name is updated when provided, so a
-    /// retried `CreateScene` with a name stays idempotent instead of clobbering
-    /// the scene state. `std::name` is not inherited from the juice source.
+    /// Requires an administrator caller. When the scene already exists the name
+    /// is updated when provided, so a retried `CreateScene` with a name stays
+    /// idempotent instead of clobbering the scene state. `std::name` is not
+    /// inherited from the juice source.
     pub fn create_scene_named(
         &mut self,
-        _caller_account: u64,
+        caller_account: u64,
         scene_id: &str,
         inherit_juices_from: Option<&str>,
         name: Option<&str>,
     ) -> Result<()> {
+        self.authorize_admin(caller_account)?;
+
         if let Some(existing) = self.scene_biblio.get_mut(scene_id) {
             if let Some(name) = name {
                 existing
                     .state
-                    .update(KEY_STD_NAME.to_string(), Tin::from_string(name), true)?;
+                    .update(KEY_STD_NAME.to_string(), Tin::from_string(name))?;
             }
             return Ok(());
         }
@@ -380,8 +650,8 @@ impl Room {
         // source scene's display name.
         if let Some(source) = inherit_juices_from.and_then(|id| self.scene_biblio.get(id)) {
             for (k, v) in source.state.as_map() {
-                if k.starts_with("std::") && k != KEY_STD_ADMINS && k != KEY_STD_NAME {
-                    let _ = new_scene.state.update(k.clone(), v.clone(), true);
+                if k.starts_with("std::") && k != KEY_STD_NAME {
+                    let _ = new_scene.state.update(k.clone(), v.clone());
                 }
             }
         }
@@ -389,18 +659,19 @@ impl Room {
         if let Some(name) = name {
             new_scene
                 .state
-                .update(KEY_STD_NAME.to_string(), Tin::from_string(name), true)?;
+                .update(KEY_STD_NAME.to_string(), Tin::from_string(name))?;
         }
 
         self.scene_biblio.insert(scene_id.to_string(), new_scene);
         Ok(())
     }
 
-    /// Deletes a scene. Only administrators can delete scenes (cannot delete root scene `"/""`).
+    /// Deletes a scene.
+    ///
+    /// Requires an administrator caller. The root scene `"/"` cannot be deleted,
+    /// and scene grants that referenced the removed scene are dropped.
     pub fn delete_scene(&mut self, caller_account: u64, scene_id: &str) -> Result<()> {
-        if !self.is_admin(caller_account) {
-            return Err(BanquetteError::PermissionDenied);
-        }
+        self.authorize_admin(caller_account)?;
         if scene_id == "/" {
             return Err(BanquetteError::PermissionDenied);
         }
@@ -408,12 +679,15 @@ impl Room {
         self.scene_biblio
             .remove(scene_id)
             .ok_or_else(|| BanquetteError::SceneNotFound(scene_id.to_string()))?;
+        self.normalize_accessible_scenes();
         Ok(())
     }
 
     /// Updates scene state.
     ///
-    /// Only administrators can modify `"/"` state.
+    /// Requires [`Room::can_send_to_scene`] on the target scene, so a
+    /// `Participant` writes the scenes it was moved into and the root scene,
+    /// while a `Viewer` never writes.
     pub fn update_scene_state(
         &mut self,
         caller_account: u64,
@@ -421,40 +695,42 @@ impl Room {
         key: String,
         value: Tin,
     ) -> Result<Option<Tin>> {
-        let is_admin = self.is_admin(caller_account);
-        if scene_id == "/" && !is_admin {
-            return Err(BanquetteError::PermissionDenied);
-        }
+        self.authorize_send(caller_account, scene_id)?;
 
         let scene = self
             .scene_biblio
             .get_mut(scene_id)
             .ok_or_else(|| BanquetteError::SceneNotFound(scene_id.to_string()))?;
 
-        scene.state.update(key, value, is_admin)
+        scene.state.update(key, value)
     }
 
     /// Deletes a key from scene state.
+    ///
+    /// Requires [`Room::can_send_to_scene`] on the target scene.
     pub fn delete_scene_state(
         &mut self,
         caller_account: u64,
         scene_id: &str,
         key: &str,
     ) -> Result<Option<Tin>> {
-        let is_admin = self.is_admin(caller_account);
-        if scene_id == "/" && !is_admin {
-            return Err(BanquetteError::PermissionDenied);
-        }
+        self.authorize_send(caller_account, scene_id)?;
 
         let scene = self
             .scene_biblio
             .get_mut(scene_id)
             .ok_or_else(|| BanquetteError::SceneNotFound(scene_id.to_string()))?;
 
-        scene.state.delete(key, is_admin)
+        scene.state.delete(key)
     }
 
+    // -----------------------------------------------------------------------
+    // Log mutations
+    // -----------------------------------------------------------------------
+
     /// Appends a log entry to a scene.
+    ///
+    /// Requires [`Room::can_send_to_scene`] on the target scene.
     pub async fn append_log(
         &mut self,
         caller_account: u64,
@@ -463,6 +739,8 @@ impl Room {
         entry: Option<Tin>,
         cellar: &dyn CellarSink,
     ) -> Result<LogOperationEvent> {
+        self.authorize_send(caller_account, scene_id)?;
+
         let scene = self
             .scene_biblio
             .get_mut(scene_id)
@@ -474,7 +752,154 @@ impl Room {
             .await
     }
 
+    /// Edits an existing log entry before the head.
+    ///
+    /// Requires [`Room::can_send_to_scene`] on the target scene.
+    ///
+    /// The parameter list mirrors the wire frame and the append/delete paths;
+    /// grouping it into a struct would obscure the one-to-one mapping.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn edit_log(
+        &mut self,
+        caller_account: u64,
+        session_id: u64,
+        scene_id: &str,
+        chunk_index: u32,
+        position: u32,
+        entry: Tin,
+        cellar: &dyn CellarSink,
+    ) -> Result<LogOperationEvent> {
+        self.authorize_send(caller_account, scene_id)?;
+
+        let scene = self
+            .scene_biblio
+            .get_mut(scene_id)
+            .ok_or_else(|| BanquetteError::SceneNotFound(scene_id.to_string()))?;
+
+        scene
+            .log
+            .edit(
+                chunk_index,
+                position,
+                entry,
+                cellar,
+                caller_account,
+                session_id,
+            )
+            .await
+    }
+
+    /// Deletes an existing log entry before the head (tombstone).
+    ///
+    /// Requires [`Room::can_send_to_scene`] on the target scene.
+    pub async fn delete_log(
+        &mut self,
+        caller_account: u64,
+        session_id: u64,
+        scene_id: &str,
+        chunk_index: u32,
+        position: u32,
+        cellar: &dyn CellarSink,
+    ) -> Result<LogOperationEvent> {
+        self.authorize_send(caller_account, scene_id)?;
+
+        let scene = self
+            .scene_biblio
+            .get_mut(scene_id)
+            .ok_or_else(|| BanquetteError::SceneNotFound(scene_id.to_string()))?;
+
+        scene
+            .log
+            .delete(chunk_index, position, cellar, caller_account, session_id)
+            .await
+    }
+
+    /// Rewinds the log head to an earlier position.
+    ///
+    /// Requires [`Room::can_send_to_scene`] on the target scene.
+    pub fn rewind_log(
+        &mut self,
+        caller_account: u64,
+        scene_id: &str,
+        chunk_index: u32,
+        position: u32,
+    ) -> Result<LogOperationEvent> {
+        self.authorize_send(caller_account, scene_id)?;
+
+        let scene = self
+            .scene_biblio
+            .get_mut(scene_id)
+            .ok_or_else(|| BanquetteError::SceneNotFound(scene_id.to_string()))?;
+
+        scene.log.rewind(chunk_index, position)
+    }
+
+    // -----------------------------------------------------------------------
+    // Characters
+    // -----------------------------------------------------------------------
+
+    /// Allocates a character owned by `creator_account`.
+    ///
+    /// Requires write access (`Participant` or `Admin`), so a `Viewer` cannot
+    /// create characters. Scene placement is the caller's responsibility (see
+    /// [`Room::assign_character_to_scene`]).
+    pub fn create_character(&mut self, creator_account: u64, data: Character) -> Result<u64> {
+        if !self.get_account_permission(creator_account).can_write() {
+            return Err(BanquetteError::PermissionDenied);
+        }
+        Ok(self
+            .character_biblio
+            .create_character(creator_account, data))
+    }
+
+    /// Updates a character. Requires write access and ownership or `Admin`.
+    pub fn update_character(
+        &mut self,
+        caller_account: u64,
+        character_id: u64,
+        data: Character,
+    ) -> Result<()> {
+        let level = self.get_account_permission(caller_account);
+        if !level.can_write() {
+            return Err(BanquetteError::PermissionDenied);
+        }
+        self.character_biblio.update(
+            character_id,
+            caller_account,
+            level == RoomPermissionLevel::Admin,
+            data,
+        )
+    }
+
+    /// Deletes a character. Requires write access and ownership or `Admin`.
+    ///
+    /// The caller is responsible for removing the scene membership and piece
+    /// state afterwards (see [`Room::remove_character_from_scenes`] and
+    /// [`Room::clear_character_piece_state`]).
+    pub fn delete_character(
+        &mut self,
+        caller_account: u64,
+        character_id: u64,
+    ) -> Result<Character> {
+        let level = self.get_account_permission(caller_account);
+        if !level.can_write() {
+            return Err(BanquetteError::PermissionDenied);
+        }
+        self.character_biblio.delete(
+            character_id,
+            caller_account,
+            level == RoomPermissionLevel::Admin,
+        )
+    }
+
     /// Moves a character to a target scene.
+    ///
+    /// Only an administrator may move a character. A participant cannot move
+    /// even its own character: being moved is how an administrator grants the
+    /// participant access to a scene. When the mover is an administrator, the
+    /// destination scene is added to the character owner's
+    /// [`Room::accessible_scenes`] so the participant can then read and write
+    /// it.
     ///
     /// The destination scene is created implicitly when missing. Membership is
     /// stored on [`Scene::present_characters`] (persisted through `SceneData`),
@@ -486,25 +911,30 @@ impl Room {
         character_id: u64,
         to_scene_id: &str,
     ) -> Result<()> {
-        let is_admin = self.is_admin(caller_account);
-        let ch = self
+        self.authorize_admin(caller_account)?;
+
+        let owner_account = self
             .character_biblio
             .get(character_id)
-            .ok_or(BanquetteError::CharacterNotFound(character_id))?;
-
-        if !is_admin && get_character_owner(ch) != Some(caller_account) {
-            return Err(BanquetteError::PermissionDenied);
-        }
+            .ok_or(BanquetteError::CharacterNotFound(character_id))
+            .map(get_character_owner)?;
 
         if !self.scene_biblio.contains_key(to_scene_id) {
             self.create_scene(caller_account, to_scene_id, Some("/"))?;
         }
 
         self.assign_character_to_scene(character_id, to_scene_id)?;
+
+        if let Some(owner_account) = owner_account {
+            self.grant_accessible_scene(owner_account, to_scene_id);
+        }
         Ok(())
     }
 
     /// Places a character in `scene_id`, removing it from every other scene.
+    ///
+    /// Internal helper without a permission check: callers authorize the move
+    /// first ([`Room::move_character`] or `CreateCharacter`).
     ///
     /// Returns the affected scene IDs sorted ascending (source scenes that lost
     /// the character plus the destination). Used by character creation and
@@ -555,9 +985,10 @@ impl Room {
     /// character from every scene.
     ///
     /// Called on deletion so no client keeps an interactive stale piece. The
-    /// removal is an internal cleanup and bypasses the caller check (it cannot
-    /// touch `std::admins`). Returns the `(scene_id, key)` pairs that were
-    /// actually present, sorted, so the server can announce `StateDeleted`.
+    /// removal is an internal cleanup that bypasses the per-scene write check
+    /// (room permissions live outside scene state, so no reserved key is
+    /// involved). Returns the `(scene_id, key)` pairs that were actually
+    /// present, sorted, so the server can announce `StateDeleted`.
     pub fn clear_character_piece_state(&mut self, character_id: u64) -> Vec<(String, String)> {
         let keys = [
             format!("piece::{character_id}::placed"),
@@ -566,7 +997,7 @@ impl Room {
         let mut removed = Vec::new();
         for (sid, scene) in &mut self.scene_biblio {
             for key in &keys {
-                if let Ok(Some(_)) = scene.state.delete(key, true) {
+                if let Ok(Some(_)) = scene.state.delete(key) {
                     removed.push((sid.clone(), key.clone()));
                 }
             }
@@ -575,9 +1006,14 @@ impl Room {
         removed
     }
 
+    // -----------------------------------------------------------------------
+    // Client presence and lifecycle
+    // -----------------------------------------------------------------------
+
     /// Handles client entering a scene.
     ///
-    /// If the scene was unloaded, restores it from cellar.
+    /// If the scene was unloaded, restores it from cellar. Entry itself is
+    /// authorized by the caller (`can_access_scene`), not here.
     pub async fn client_enter_scene(
         &mut self,
         client_id: u64,
@@ -746,6 +1182,10 @@ impl Room {
         })
     }
 
+    // -----------------------------------------------------------------------
+    // Persistence
+    // -----------------------------------------------------------------------
+
     /// Serializes whole room state into a `Tin` with label `alhalte/banquette`.
     pub fn to_tin(&self) -> Result<Tin> {
         let mut scenes_data = HashMap::new();
@@ -763,7 +1203,9 @@ impl Room {
 
         let data = RoomData {
             room_id: self.room_id,
-            done: self.done,
+            default_permission: self.default_permission,
+            permissions: self.permissions.clone(),
+            accessible_scenes: self.accessible_scenes.clone(),
             chunk_exponent: self.chunk_exponent,
             character_biblio: self.character_biblio.clone(),
             scenes: scenes_data,
@@ -773,6 +1215,11 @@ impl Room {
     }
 
     /// Reconstructs a [`Room`] from a `Tin` with label `alhalte/banquette`.
+    ///
+    /// A payload written by the pre-#199 schema has no `default_permission` /
+    /// `permissions` / `accessible_scenes`, so it either fails to decode
+    /// ([`BanquetteError::Tin`]) or fails [`Room::validate`]. The old form is
+    /// never converted and never silently accepted as an empty room.
     pub fn from_tin(tin: &Tin) -> Result<Self> {
         if tin.label != LABEL_ALHALTE_BANQUETTE {
             return Err(BanquetteError::Tin(tin::TinError::LabelMismatch {
@@ -806,16 +1253,20 @@ impl Room {
             return Err(BanquetteError::MissingRootScene);
         }
 
-        Ok(Self {
+        let room = Self {
             room_id: data.room_id,
-            done: data.done,
+            default_permission: data.default_permission,
+            permissions: data.permissions,
+            accessible_scenes: data.accessible_scenes,
             chunk_exponent: data.chunk_exponent,
             scene_biblio,
             character_biblio: data.character_biblio,
             missed_heartbeats: 0,
             client_activity_in_cycle: true,
             head_tin: None,
-        })
+        };
+        room.validate()?;
+        Ok(room)
     }
 
     /// Reconstructs a [`Room`] from a persisted `RoomData` tin and records its tin ID as the head.
@@ -832,8 +1283,9 @@ impl Room {
     ///
     /// This is the restore path used when `maitre-d` starts a banquette for a
     /// room that already has a persisted head. It never falls back to an empty
-    /// room: a missing tin, a corrupted payload, a content hash that does not
-    /// match the head pointer, a missing root scene, or a room ID mismatch all
+    /// room: a missing tin, a corrupted payload, a payload written by the
+    /// pre-#199 schema, a content hash that does not match the head pointer, a
+    /// missing root scene, a room ID mismatch, or a failed [`Room::validate`] all
     /// return an error so the caller can fail the spawn loudly.
     pub async fn load_from_cellar(
         cellar: &dyn CellarSink,
@@ -872,7 +1324,15 @@ impl Room {
         Ok(room)
     }
 
+    // -----------------------------------------------------------------------
+    // Export
+    // -----------------------------------------------------------------------
+
     /// Exports the room data and associated log chunks for permitted scenes.
+    ///
+    /// Scenes the caller cannot access are dropped from the exported
+    /// [`RoomData`] (see [`Room::can_access_scene`]). The permission table itself
+    /// is exported as-is: it describes the room, not the caller's view.
     pub async fn export_snapshot(
         &self,
         cellar: &dyn CellarSink,
@@ -883,8 +1343,11 @@ impl Room {
 
         for (sid, scene) in &self.scene_biblio {
             let can_access = match caller_account {
-                Some(acc) => self.can_access_scene(acc, sid),
-                None => self.done || sid == "/",
+                Some(account_id) => self.can_access_scene(account_id, sid),
+                // An unauthenticated export follows the room default. The root
+                // scene is always included so the exported `RoomData` stays
+                // structurally valid.
+                None => self.default_permission != RoomPermissionLevel::Denied || sid == "/",
             };
             if !can_access {
                 continue;
@@ -925,7 +1388,9 @@ impl Room {
 
         let room_data = RoomData {
             room_id: self.room_id,
-            done: self.done,
+            default_permission: self.default_permission,
+            permissions: self.permissions.clone(),
+            accessible_scenes: self.accessible_scenes.clone(),
             chunk_exponent: self.chunk_exponent,
             character_biblio: self.character_biblio.clone(),
             scenes: scenes_data,

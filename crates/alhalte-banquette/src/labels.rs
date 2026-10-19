@@ -46,8 +46,6 @@ pub const LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID: Label =
 pub const LABEL_ALHALTE_MAITRE_D_SESSION_ID: Label =
     xxhash_rust::const_xxh64::xxh64(IDENT_ALHALTE_MAITRE_D_SESSION_ID.as_bytes(), 0);
 
-/// Reserved state key in `"/"` storing administrator account IDs: `std::admins`.
-pub const KEY_STD_ADMINS: &str = "std::admins";
 /// Character attribute key for human-readable name: `std::name`.
 pub const KEY_STD_NAME: &str = "std::name";
 /// Character attribute key for owner account ID: `std::owner_account`.

@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use alhalte_banquette::{
     BanquetteToMaitreD, ClientFrame, LogChunk, MaitreDToBanquette, ProtocolCodec, RoomData,
-    ServerFrame,
+    RoomPermissionLevel, ServerFrame,
 };
 use futures_util::{SinkExt, StreamExt};
 use tin::TinId;
@@ -184,17 +184,30 @@ impl RoomBridge {
         pending_exports: &Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
         is_done: &Arc<AtomicBool>,
     ) {
-        /// Persists a `DoneUpdated` acknowledgement before it is forwarded.
-        fn record_done(db: &Database, room_id: u64, done: bool, is_done: &Arc<AtomicBool>) {
+        /// Projects a room's default permission onto the `rooms.done` gate.
+        ///
+        /// TODO(#200): `rooms.done` is the pre-spawn membership gate that
+        /// predates the four-level room permissions of Issue #199. Banquette is
+        /// now the source of truth for `default_permission` / `permissions`, and
+        /// this flag is only a projection kept so the WebSocket / `GET
+        /// /api/rooms/{id}` gate keeps working. #200 replaces the gate with the
+        /// room permission table and deletes this function together with
+        /// `rooms.done`.
+        fn record_permissions(
+            db: &Database,
+            room_id: u64,
+            default_permission: RoomPermissionLevel,
+            is_done: &Arc<AtomicBool>,
+        ) {
             let room_id_hex = format!("{room_id:016x}");
-            // The success frame is the only trigger: a rejected `SetDone` never
-            // reaches this point, so `rooms.done` cannot be raised by a
-            // non-admin request.
+            let done = default_permission != RoomPermissionLevel::Denied;
+            // Only a successful `SetDefaultPermission` / persist produces a
+            // permission frame, so a rejected request cannot flip the gate.
             match db.set_room_done(&room_id_hex, done) {
                 Ok(true) => {}
-                Ok(false) => {
-                    tracing::warn!("room {room_id_hex} reported done={done} but is not registered")
-                }
+                Ok(false) => tracing::warn!(
+                    "room {room_id_hex} reported default_permission={default_permission:?} but is not registered"
+                ),
                 Err(e) => tracing::error!("Failed to record done for {room_id_hex}: {e}"),
             }
             is_done.store(done, Ordering::Relaxed);
@@ -202,8 +215,11 @@ impl RoomBridge {
 
         match frame {
             BanquetteToMaitreD::SendToClient { client_id, frame } => {
-                if let ServerFrame::DoneUpdated { done } = &frame {
-                    record_done(db, room_id, *done, is_done);
+                if let ServerFrame::PermissionsUpdated {
+                    default_permission, ..
+                } = &frame
+                {
+                    record_permissions(db, room_id, *default_permission, is_done);
                 }
                 let cl = clients.read().await;
                 if let Some(tx) = cl.get(&client_id) {
@@ -211,8 +227,11 @@ impl RoomBridge {
                 }
             }
             BanquetteToMaitreD::BroadcastToRoom { frame } => {
-                if let ServerFrame::DoneUpdated { done } = &frame {
-                    record_done(db, room_id, *done, is_done);
+                if let ServerFrame::PermissionsUpdated {
+                    default_permission, ..
+                } = &frame
+                {
+                    record_permissions(db, room_id, *default_permission, is_done);
                 }
                 let cl = clients.read().await;
                 for tx in cl.values() {
@@ -220,8 +239,11 @@ impl RoomBridge {
                 }
             }
             BanquetteToMaitreD::BroadcastToScene { scene_id, frame } => {
-                if let ServerFrame::DoneUpdated { done } = &frame {
-                    record_done(db, room_id, *done, is_done);
+                if let ServerFrame::PermissionsUpdated {
+                    default_permission, ..
+                } = &frame
+                {
+                    record_permissions(db, room_id, *default_permission, is_done);
                 }
                 let cl = clients.read().await;
                 let scenes = client_scenes.read().await;
@@ -256,29 +278,19 @@ impl RoomBridge {
                     let _ = tx.send(result);
                 }
             }
-            BanquetteToMaitreD::AdminsUpdated { admins } => {
-                tracing::debug!(
-                    "room {} applied administrator set of {} account(s)",
-                    format!("{room_id:016x}"),
-                    admins.len()
-                );
-            }
             // spec: alhalte-maitre-d/room-head 0001 persist RoomData head pointer
             // spec: alhalte-maitre-d/room-done 0001 persist the public flag with the head
-            BanquetteToMaitreD::RoomPersisted { tin_id, done } => {
+            BanquetteToMaitreD::RoomPersisted {
+                tin_id,
+                default_permission,
+            } => {
                 let room_id_hex = format!("{room_id:016x}");
                 // `done` lives on the room row (not in `RoomData`) so the
                 // pre-spawn gate survives a maitre-d restart. A successful
                 // persist (including a restored room's first persist) updates it.
-                match db.set_room_done(&room_id_hex, done) {
-                    Ok(true) => {}
-                    Ok(false) => tracing::warn!(
-                        "room {room_id_hex} reported done={done} but is not registered"
-                    ),
-                    Err(e) => {
-                        tracing::error!("Failed to record done for {room_id_hex}: {e}");
-                    }
-                }
+                // TODO(#200): derive the gate from the room permission table
+                // instead of this `default_permission` projection.
+                record_permissions(db, room_id, default_permission, is_done);
                 match db.set_room_head(&room_id_hex, &tin_id, unix_timestamp()) {
                     Ok(previous) => {
                         if let Some(previous) = previous
@@ -299,6 +311,20 @@ impl RoomBridge {
                         tracing::error!("Failed to record room head for {room_id_hex}: {e}");
                     }
                 }
+            }
+            // TODO(#200): `maitre-d` does not query account permissions yet. When
+            // the pre-spawn gate moves to the room permission table, this becomes
+            // the authoritative answer for `GET /api/room/{room_id}` and the
+            // database role rows are deleted.
+            BanquetteToMaitreD::AccountPermissionResponse {
+                request_id,
+                account_id,
+                permission,
+            } => {
+                tracing::debug!(
+                    "room {} account {account_id} permission {permission:?} (request {request_id})",
+                    format!("{room_id:016x}")
+                );
             }
         }
     }
@@ -354,23 +380,13 @@ impl RoomBridge {
 
     /// Seeds or updates the in-memory done flag for this room.
     ///
-    /// Used when a bridge is created (from `rooms.done`) and as the fallback
-    /// when the database row is missing. A live `SetDone` becomes authoritative
-    /// only after banquette acknowledges it with `DoneUpdated`.
+    /// TODO(#200): this is a projection of the room's default permission kept
+    /// for the pre-spawn membership gate. It is used when a bridge is created
+    /// (from `rooms.done`) and as the fallback when the database row is missing;
+    /// a live `SetDefaultPermission` becomes authoritative only after banquette
+    /// acknowledges it with `PermissionsUpdated`.
     pub fn set_done(&self, done: bool) {
         self.is_done.store(done, Ordering::Relaxed);
-    }
-
-    /// Pushes a complete administrator set to the room's `banquette` process.
-    ///
-    /// The database `room_permissions` rows are the source of truth; this
-    /// internal control frame makes a running room observe a runtime permission
-    /// change without a restart. When no bridge is live the call is a no-op and
-    /// the set is applied at the next spawn.
-    pub fn set_admins(&self, admins: Vec<u64>) {
-        let _ = self
-            .to_banquette_tx
-            .send(MaitreDToBanquette::SetAdmins { admins });
     }
 
     /// Sends a ServerFrame to a specific connected client.
@@ -398,8 +414,10 @@ impl RoomBridge {
                     scenes.write().await.remove(&client_id);
                 });
             }
-            // `SetDone` is intentionally not applied here: the in-memory / DB
-            // `done` flag changes only when banquette sends `DoneUpdated`.
+            // Room permissions are applied by banquette itself: the DB role rows
+            // are no longer pushed into a running room.
+            // TODO(#200): make `room_permissions` a mirror of the banquette
+            // permission table and delete the DB-driven role sync entirely.
             _ => {}
         }
 
@@ -516,36 +534,8 @@ impl RoomBridgeManager {
         );
         bridge.set_done(initial_done);
 
-        // The database `gm` rows are the source of truth. Push the whole set
-        // into the freshly started room so a permission changed while no bridge
-        // existed is in effect immediately; fall back to the spawn-time admin so
-        // a room without a GM row still has an administrator.
-        let admins = match self.db.get_room_admin_ids(&room_id_hex) {
-            Ok(admins) if !admins.is_empty() => admins,
-            Ok(_) => vec![admin_account],
-            Err(e) => {
-                tracing::error!(
-                    "Failed to read administrators for room {room_id_hex}: {e}; using {admin_account}"
-                );
-                vec![admin_account]
-            }
-        };
-        bridge.set_admins(admins);
-
         rooms.insert(room_id, Arc::clone(&bridge));
         Ok(bridge)
-    }
-
-    /// Pushes the current database administrator set to a running room.
-    ///
-    /// Does nothing when the room has no live bridge: the set is read again and
-    /// applied at the next spawn. This is called after every permission change
-    /// so role updates take effect without restarting `banquette`.
-    pub async fn sync_room_admins(&self, room_id: u64, admins: Vec<u64>) {
-        let rooms = self.rooms.read().await;
-        if let Some(bridge) = rooms.get(&room_id) {
-            bridge.set_admins(admins);
-        }
     }
 
     /// Explicitly removes a room from management.
