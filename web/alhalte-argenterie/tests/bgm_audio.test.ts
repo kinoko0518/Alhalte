@@ -124,7 +124,7 @@ function mountSettings(
     props: {
       currentScene: scene,
       allScenes: [scene],
-      isAdmin: true,
+      role: 'admin',
       roomSocket: asRoomSocket(socket),
       roomKey: ROOM_KEY,
       audioManager: audio.manager,
@@ -421,7 +421,7 @@ describe('BGM audio playback (Issue #164)', () => {
       props: {
         currentScene: scene,
         allScenes: [scene],
-        isAdmin: true,
+        role: 'admin',
         roomSocket: asRoomSocket(socket),
         roomKey: null,
         audioManager: audio.manager,

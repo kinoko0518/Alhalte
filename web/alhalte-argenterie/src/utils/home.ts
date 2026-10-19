@@ -10,7 +10,7 @@
 import { bytesToHex } from '@alhalte/pantry';
 import type { VisitedRoom } from '../types/index.js';
 import { removeRecentRoom, saveRecentRoom } from './recentRooms.js';
-import { buildAuthHeaders, type RoomRole } from './session.js';
+import { buildAuthHeaders, isRoomRole, type RoomRole } from './session.js';
 
 export const LOCAL_STORAGE_VISITED_ROOMS_KEY = 'alhalte:visited-rooms';
 
@@ -24,10 +24,21 @@ export interface RoomInfo {
   room_id: string;
   /** Human-readable room name. */
   name: string;
-  /** Role of the authenticated caller in the room. */
+  /**
+   * Role of the authenticated caller in the room.
+   *
+   * One of `admin` / `participant` / `viewer` / `denied` (Issue #200). A
+   * `denied` caller normally receives `403`, which the preflight maps to
+   * `GateScreen`; a `denied` value in a `200` body is handled the same way.
+   */
   role: RoomRole;
-  /** Whether the room is marked done (fully public). */
-  done: boolean;
+  /**
+   * Legacy "fully public" flag.
+   *
+   * `maitre-d` no longer persists it after Issue #200 (the room permission
+   * table replaced it), so it is optional and no UI decision depends on it.
+   */
+  done?: boolean;
 }
 
 /**
@@ -100,10 +111,6 @@ function statusErrorKind(status: number): RoomApiErrorKind {
   return 'http';
 }
 
-function isRoomRole(value: unknown): value is RoomRole {
-  return value === 'gm' || value === 'pl' || value === 'viewer';
-}
-
 /** Validates the room registry response before it reaches the UI. */
 function parseRoomInfo(payload: unknown): RoomInfo {
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
@@ -113,7 +120,6 @@ function parseRoomInfo(payload: unknown): RoomInfo {
   const roomId = record.room_id;
   const name = record.name;
   const role = record.role;
-  const done = record.done;
   if (typeof roomId !== 'string' || !isValidRoomId(roomId)) {
     throw new RoomApiError('invalid-response', 'Room response is missing a valid room_id');
   }
@@ -123,10 +129,10 @@ function parseRoomInfo(payload: unknown): RoomInfo {
   if (!isRoomRole(role)) {
     throw new RoomApiError('invalid-response', 'Room response is missing a valid role');
   }
-  if (typeof done !== 'boolean') {
-    throw new RoomApiError('invalid-response', 'Room response is missing the done flag');
-  }
-  return { room_id: roomId, name, role, done };
+  // `done` disappeared with the four-level permission model (Issue #200); keep
+  // accepting it for older responses but never require it.
+  const done = typeof record.done === 'boolean' ? record.done : undefined;
+  return { room_id: roomId, name, role, ...(done === undefined ? {} : { done }) };
 }
 
 async function requestRoomJson(

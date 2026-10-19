@@ -66,6 +66,7 @@
     getMenuPositionStyle,
   } from '../../../utils/menuPosition.js';
   import type { ConnectionState } from '../../../utils/connection.js';
+  import { roomRoleCapabilities, type RoomRole } from '../../../utils/session.js';
   import type { RoomSocket } from '../../../utils/roomSocket.js';
   import {
     EXTENSION_SEEDED_MARKER_VALUE,
@@ -83,8 +84,7 @@
 
   let {
     extensions = [],
-    isAdmin = false,
-    isViewer = false,
+    role = 'participant',
     roomSocket = null,
     roomKey,
     connectionState,
@@ -92,9 +92,11 @@
     onRegisterExtension,
   }: {
     extensions?: ExtensionItem[];
-    isAdmin?: boolean;
-    /** Viewers get the read-only (non-admin) extension UI (Issue #156). */
-    isViewer?: boolean;
+    /**
+     * Role of the caller (Issue #201). Extension management (add, delete,
+     * reorder, toggle) is admin-only; every other role sees the read-only UI.
+     */
+    role?: RoomRole;
     /**
      * Socket used to query / persist the room extension state (Issue #109 /
      * sub-issue #145). Without a socket (standalone usage / tests) the tab is
@@ -111,8 +113,8 @@
     onRegisterExtension?: (id: string, wasmBytes: Uint8Array) => void;
   } = $props();
 
-  /** Effective admin UI flag: a viewer never manages extensions (Issue #156). */
-  let canAdmin = $derived(isAdmin && !isViewer);
+  /** Effective admin UI flag: only an admin manages extensions (Issue #201). */
+  let canAdmin = $derived(roomRoleCapabilities(role).canManageExtensions);
 
   /**
    * Lifecycle of the tab-open `QueryState('/')` round trip:

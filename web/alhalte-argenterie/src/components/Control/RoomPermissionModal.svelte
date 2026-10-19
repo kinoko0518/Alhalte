@@ -1,60 +1,80 @@
 <script lang="ts">
   /**
-   * Room Permission Management Modal (Issue #94).
+   * Room Permission Management Modal (Issue #94 / #201).
    *
    * Features:
    * - Title: 「部屋の権限管理」
-   * - M3 Search to query accounts by handle name or numeric account ID.
+   * - The table itself is read and written over the room WebSocket
+   *   (`QueryPermissions` / `SetMemberPermission` / `SetDefaultPermission`,
+   *   Issue #201). Only account search stays on HTTP (`/api/accounts/search`).
+   * - M3 Search to find accounts by handle name or numeric account ID.
    * - Search results display icon, name, and #(account_id).
-   * - Selecting an account adds it to the Divider-separated list.
-   * - Each row has:
-   *   - Avatar icon, username, #(account_id)
-   *   - Size "s" connected button group (ButtonGroup variant="connected") toggling "閲覧者", "PL", "GM"
-   *   - Remove button (Button or IconButton with delete icon)
-   * - Full-screen warning dialog on:
-   *   - Remove button click
-   *   - Switch to "閲覧者" (Viewer)
-   *   - Switch to "GM"
+   * - Selecting an account adds it to the Divider-separated list as
+   *   参加者 (participant).
+   * - Each row has a size "s" connected button group with the four levels
+   *   (拒否 / 閲覧者 / 参加者 / 管理者) and a "既定に戻す" button.
+   * - Default permission selector for accounts without an explicit entry.
+   * - Every mutation is applied only after the banquette ack (never
+   *   optimistically): the row list is replaced by the acknowledged table.
    *
    * References:
-   * - ARCHITECTURE.md: `## alhalte-maitre-d -> ### 部屋権限管理API`
+   * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 権限 UI`
    * - GitHub Issue #94: アカウントの概念をArgenterieと接続
+   * - GitHub Issue #201: 4 段階権限を WebSocket で変更する
    */
   import { Button, ButtonGroup, Divider, IconButton, Item, Search } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { AccountSearchItem, RoomPermissionItem, RoomRole } from '../../types/index.js';
+  import type {
+    AccountSearchItem,
+    RoomPermissionItem,
+    RoomPermissionsSnapshot,
+  } from '../../types/index.js';
   import {
-    deleteRoomPermission,
-    getRoomPermissions,
+    ROOM_ROLES,
+    ROOM_ROLE_LABELS,
+    permissionsSnapshotToTable,
+    roleToPermissionLevel,
     searchAccounts,
-    setRoomPermission,
+    type RoomRole,
   } from '../../utils/session.js';
+  import type { PermissionsAck, RoomSocket } from '../../utils/roomSocket.js';
 
   let {
-    roomId,
-    initialPermissions = [],
+    roomSocket,
     isOpen = true,
     fetchFn,
     baseUrl = '',
     onClose,
     onPermissionsChange,
   }: {
-    roomId: string | number;
-    initialPermissions?: RoomPermissionItem[];
+    roomSocket?: RoomSocket | null;
     isOpen?: boolean;
     fetchFn?: typeof fetch;
     baseUrl?: string;
     onClose?: () => void;
-    onPermissionsChange?: (permissions: RoomPermissionItem[]) => void;
+    /**
+     * Called with the acknowledged table after every query / mutation so `App`
+     * can follow a change of its own role and the header selector.
+     */
+    onPermissionsChange?: (table: RoomPermissionsSnapshot) => void;
   } = $props();
 
-  let permissions = $state<RoomPermissionItem[]>([...initialPermissions]);
+  /** Timeout for a permission frame (matches `RoomSocket`'s default). */
+  const PERMISSION_TIMEOUT_MS = 8000;
+
+  let permissions = $state<RoomPermissionItem[]>([]);
+  let defaultPermission = $state<RoomRole>('viewer');
+  let isLoading = $state(false);
+  let isMutating = $state(false);
+  let pendingAction = $state<string | null>(null);
+  let permissionError = $state<string | null>(null);
+  let defaultPermissionError = $state<string | null>(null);
+
   let searchQuery = $state('');
   let isSearchExpanded = $state(false);
   let searchResults = $state<AccountSearchItem[]>([]);
   let isSearching = $state(false);
   let searchDebounceTimer: any = null;
-  let permissionError = $state<string | null>(null);
 
   /** Formats a failed permission mutation for the error banner. */
   function permissionErrorMessage(action: string, err: unknown): string {
@@ -62,37 +82,106 @@
     return `${action}に失敗しました: ${detail}`;
   }
 
-  // Active warning dialog state
-  type PendingWarning =
-    | {
-        type: 'delete';
-        account: RoomPermissionItem;
-      }
-    | {
-        type: 'role-change';
-        account: RoomPermissionItem;
-        targetRole: 'viewer' | 'gm';
-        previousRole: RoomRole;
-      }
-    | null;
+  /** Resolves one account ID to its display name through the search API. */
+  async function lookupAccount(accountId: number): Promise<AccountSearchItem | null> {
+    try {
+      const results = await searchAccounts(String(accountId), { baseUrl, fetchFn });
+      return results.find((item) => item.account_id === accountId) ?? null;
+    } catch (err) {
+      // The permission table only carries IDs; an unresolved name falls back to
+      // `#(account_id)` instead of failing the whole table.
+      console.warn('Failed to resolve the account name:', err);
+      return null;
+    }
+  }
 
-  let activeWarning = $state<PendingWarning>(null);
+  /**
+   * Fills in the display name of every row.
+   *
+   * `PermissionsSnapshot` only carries account IDs, so names come from
+   * `/api/accounts/search?q=<id>` (and from the previous list when known).
+   */
+  async function resolveNames(items: RoomPermissionItem[]): Promise<RoomPermissionItem[]> {
+    const known = new Map(permissions.map((item) => [item.account_id, item]));
+    return Promise.all(
+      items.map(async (item) => {
+        if (item.username) return item;
+        const cached = known.get(item.account_id);
+        if (cached?.username) {
+          return { ...item, username: cached.username, icon_url: cached.icon_url };
+        }
+        const account = await lookupAccount(item.account_id);
+        return account
+          ? { ...item, username: account.username, icon_url: account.icon_url }
+          : item;
+      }),
+    );
+  }
 
-  // Load existing permissions on mount
+  /** Replaces the local table with an acknowledged one (names resolved). */
+  async function applyTable(table: RoomPermissionsSnapshot): Promise<void> {
+    const resolved = await resolveNames(table.permissions);
+    permissions = resolved;
+    defaultPermission = table.defaultPermission;
+    onPermissionsChange?.({ defaultPermission: table.defaultPermission, permissions: resolved });
+  }
+
+  // Query the table every time the modal opens (or the socket is replaced).
   $effect(() => {
-    if (initialPermissions.length === 0 && roomId) {
-      loadPermissions();
+    if (isOpen && roomSocket) {
+      void loadPermissions();
     }
   });
 
-  async function loadPermissions() {
+  async function loadPermissions(): Promise<void> {
+    if (!roomSocket) {
+      permissionError = 'ルームに接続していません';
+      return;
+    }
+    isLoading = true;
+    permissionError = null;
     try {
-      const list = await getRoomPermissions(roomId, { baseUrl, fetchFn });
-      permissions = list;
-      onPermissionsChange?.(list);
+      const ack = await roomSocket.requestQueryPermissions(PERMISSION_TIMEOUT_MS);
+      await applyTable(permissionsSnapshotToTable(ack));
     } catch (err) {
-      // If error or unauthenticated, maintain current list
-      console.warn('Failed to load room permissions:', err);
+      permissionError = permissionErrorMessage('権限一覧の取得', err);
+    } finally {
+      isLoading = false;
+    }
+  }
+
+  /**
+   * Sends one permission frame and applies the acknowledged table.
+   *
+   * The local list is never changed before the ack: a rejection (non-admin,
+   * last-admin demotion, timeout) leaves the previous table in place and shows
+   * the error banner.
+   */
+  async function mutate(
+    key: string,
+    action: string,
+    send: () => Promise<PermissionsAck>,
+  ): Promise<boolean> {
+    if (!roomSocket) {
+      permissionError = 'ルームに接続していません';
+      return false;
+    }
+    if (isMutating) return false;
+    isMutating = true;
+    pendingAction = key;
+    permissionError = null;
+    defaultPermissionError = null;
+    try {
+      const ack = await send();
+      await applyTable(permissionsSnapshotToTable(ack));
+      return true;
+    } catch (err) {
+      permissionError = permissionErrorMessage(action, err);
+      console.warn('Failed to update the room permission table:', err);
+      return false;
+    } finally {
+      isMutating = false;
+      pendingAction = null;
     }
   }
 
@@ -128,106 +217,163 @@
     };
   });
 
+  // Active warning dialog state
+  type PendingWarning =
+    | { type: 'reset'; account: RoomPermissionItem }
+    | { type: 'role-change'; account: RoomPermissionItem; targetRole: RoomRole }
+    | { type: 'default-change'; targetRole: RoomRole }
+    | null;
+
+  let activeWarning = $state<PendingWarning>(null);
+
+  /** True when a level change is loud enough to need a confirmation dialog. */
+  function needsWarning(role: RoomRole): boolean {
+    return role === 'admin' || role === 'denied' || role === 'viewer';
+  }
+
+  function roleWarningCopy(role: RoomRole): { title: string; message: string; icon: string } {
+    if (role === 'admin') {
+      return {
+        title: 'ロールを「管理者」に切り替えますか？',
+        message:
+          '管理者は部屋の権限管理・シーン管理・拡張機能管理など、すべての運営操作を行えます。',
+        icon: 'security',
+      };
+    }
+    if (role === 'denied') {
+      return {
+        title: 'このアカウントを「拒否」にしますか？',
+        message:
+          '拒否されたアカウントは部屋に入室できなくなります。ログや状態の受信も行えません。',
+        icon: 'block',
+      };
+    }
+    return {
+      title: 'ロールを「閲覧者」に切り替えますか？',
+      message:
+        '閲覧者は部屋の情報やログを閲覧できますが、メッセージの送信や部屋の状態変更（コマ移動・シーン更新など）は行えなくなります。',
+      icon: 'visibility',
+    };
+  }
+
   // Select account from search candidate to add to permissions.
-  //
-  // The list is only updated after `setRoomPermission` succeeds; on failure the
-  // previous list is restored (unchanged) and an error banner is shown.
   async function handleSelectAccount(account: AccountSearchItem) {
-    // If account already exists in permissions, ignore or focus
     if (permissions.some((p) => p.account_id === account.account_id)) {
       searchQuery = '';
       isSearchExpanded = false;
       return;
     }
 
-    const previous = permissions;
-    const defaultRole: RoomRole = 'pl';
-    const newItem: RoomPermissionItem = {
-      account_id: account.account_id,
-      username: account.username,
-      icon_url: account.icon_url,
-      role: defaultRole,
-    };
+    const ok = await mutate(
+      `add:${account.account_id}`,
+      '権限の追加',
+      () => roomSocket!.requestSetMemberPermission(
+        account.account_id,
+        roleToPermissionLevel('participant'),
+        PERMISSION_TIMEOUT_MS,
+      ),
+    );
+    if (!ok) return;
 
-    permissionError = null;
-    try {
-      await setRoomPermission(roomId, account.account_id, defaultRole, { baseUrl, fetchFn });
-      permissions = [...previous, newItem];
-      searchQuery = '';
-      isSearchExpanded = false;
-      onPermissionsChange?.(permissions);
-    } catch (err) {
-      permissions = previous;
-      permissionError = permissionErrorMessage('権限の追加', err);
-      console.warn('Failed to persist room permission:', err);
-    }
+    // The snapshot only carries IDs; keep the name the search already resolved.
+    permissions = permissions.map((item) =>
+      item.account_id === account.account_id
+        ? { ...item, username: account.username, icon_url: account.icon_url }
+        : item,
+    );
+    searchQuery = '';
+    isSearchExpanded = false;
   }
 
   // Role button clicked in connected button group
   function handleRequestRoleChange(item: RoomPermissionItem, newRole: RoomRole) {
     if (item.role === newRole) return;
-
-    if (newRole === 'viewer' || newRole === 'gm') {
-      // Issue warning dialog
-      activeWarning = {
-        type: 'role-change',
-        account: item,
-        targetRole: newRole,
-        previousRole: item.role,
-      };
-    } else {
-      // Direct change to PL
-      applyRoleChange(item.account_id, newRole);
+    if (needsWarning(newRole)) {
+      activeWarning = { type: 'role-change', account: item, targetRole: newRole };
+      return;
     }
+    void applyRoleChange(item.account_id, newRole);
   }
 
-  async function applyRoleChange(accountId: number, role: RoomRole) {
-    const previous = permissions;
-    permissionError = null;
-    try {
-      await setRoomPermission(roomId, accountId, role, { baseUrl, fetchFn });
-      permissions = previous.map((p) =>
-        p.account_id === accountId ? { ...p, role } : p,
-      );
-      onPermissionsChange?.(permissions);
-    } catch (err) {
-      permissions = previous;
-      permissionError = permissionErrorMessage('ロールの変更', err);
-      console.warn('Failed to update room permission:', err);
-    }
+  async function applyRoleChange(accountId: number, role: RoomRole): Promise<void> {
+    await mutate(`role:${accountId}`, 'ロールの変更', () =>
+      roomSocket!.requestSetMemberPermission(
+        accountId,
+        roleToPermissionLevel(role),
+        PERMISSION_TIMEOUT_MS,
+      ),
+    );
   }
 
-  // Delete button clicked
+  // Reset button clicked (drops the explicit entry back to the room default)
   function handleRequestDelete(item: RoomPermissionItem) {
-    activeWarning = {
-      type: 'delete',
-      account: item,
-    };
+    activeWarning = { type: 'reset', account: item };
+  }
+
+  function handleRequestDefaultPermission(role: RoomRole) {
+    if (role === defaultPermission) return;
+    if (role === 'admin' || role === 'denied') {
+      activeWarning = { type: 'default-change', targetRole: role };
+      return;
+    }
+    void applyDefaultPermission(role);
+  }
+
+  async function applyDefaultPermission(role: RoomRole): Promise<void> {
+    if (!roomSocket) {
+      defaultPermissionError = 'ルームに接続していません';
+      return;
+    }
+    if (isMutating) return;
+    isMutating = true;
+    pendingAction = `default:${role}`;
+    defaultPermissionError = null;
+    try {
+      const ack = await roomSocket.requestSetDefaultPermission(
+        roleToPermissionLevel(role),
+        PERMISSION_TIMEOUT_MS,
+      );
+      await applyTable(permissionsSnapshotToTable(ack));
+    } catch (err) {
+      defaultPermissionError = permissionErrorMessage('既定の権限の変更', err);
+      console.warn('Failed to update the default room permission:', err);
+    } finally {
+      isMutating = false;
+      pendingAction = null;
+    }
+  }
+
+  /** Resets an account to the room default permission (the ack is authoritative). */
+  async function applyReset(item: RoomPermissionItem): Promise<void> {
+    await mutate(`reset:${item.account_id}`, '権限の削除', () =>
+      roomSocket!.requestSetMemberPermission(
+        item.account_id,
+        roleToPermissionLevel(defaultPermission),
+        PERMISSION_TIMEOUT_MS,
+      ),
+    );
   }
 
   async function confirmWarning() {
     if (!activeWarning) return;
-    if (activeWarning.type === 'delete') {
-      const aid = activeWarning.account.account_id;
-      const previous = permissions;
-      permissionError = null;
-      try {
-        await deleteRoomPermission(roomId, aid, { baseUrl, fetchFn });
-        permissions = previous.filter((p) => p.account_id !== aid);
-        onPermissionsChange?.(permissions);
-      } catch (err) {
-        permissions = previous;
-        permissionError = permissionErrorMessage('権限の削除', err);
-        console.warn('Failed to delete room permission:', err);
-      }
-    } else if (activeWarning.type === 'role-change') {
-      await applyRoleChange(activeWarning.account.account_id, activeWarning.targetRole);
-    }
+    const warning = activeWarning;
     activeWarning = null;
+    if (warning.type === 'reset') {
+      await applyReset(warning.account);
+    } else if (warning.type === 'role-change') {
+      await applyRoleChange(warning.account.account_id, warning.targetRole);
+    } else {
+      await applyDefaultPermission(warning.targetRole);
+    }
   }
 
   function cancelWarning() {
     activeWarning = null;
+  }
+
+  /** Display name of an account with the `#id` fallback. */
+  function displayName(item: RoomPermissionItem): string {
+    return item.username && item.username.length > 0 ? item.username : `#${item.account_id}`;
   }
 </script>
 
@@ -326,7 +472,45 @@
         </Search>
       </div>
 
-      <!-- Persistence failure banner (the list is rolled back on failure) -->
+      <!-- Default permission selector (accounts without an explicit entry) -->
+      <div class="default-permission-section" data-testid="default-permission-section">
+        <div class="default-permission-label">
+          <span>既定の権限</span>
+          <span class="default-permission-hint">明示的に設定されていないアカウントに適用されます</span>
+        </div>
+        <ButtonGroup
+          variant="connected"
+          size="s"
+          data-testid="modal-default-permission-group"
+          aria-label="既定の権限"
+        >
+          {#each ROOM_ROLES as role (role)}
+            <Button
+              size="s"
+              variant={defaultPermission === role ? 'filled' : 'outlined'}
+              onclick={() => handleRequestDefaultPermission(role)}
+              disabled={isMutating}
+              data-testid={`modal-default-permission-btn-${role}`}
+              data-role={role}
+            >
+              {ROOM_ROLE_LABELS[role]}
+            </Button>
+          {/each}
+        </ButtonGroup>
+      </div>
+
+      {#if defaultPermissionError}
+        <div
+          class="permission-error-banner"
+          data-testid="default-permission-error"
+          role="alert"
+        >
+          <Icon>error</Icon>
+          <span>{defaultPermissionError}</span>
+        </div>
+      {/if}
+
+      <!-- Persistence failure banner (the list is unchanged on failure) -->
       {#if permissionError}
         <div
           class="permission-error-banner"
@@ -340,7 +524,12 @@
 
       <!-- Divider-separated Permissions List -->
       <div class="permissions-list-container" data-testid="permissions-list">
-        {#if permissions.length === 0}
+        {#if isLoading && permissions.length === 0}
+          <div class="empty-permissions" data-testid="permission-loading" role="status">
+            <Icon class="empty-icon">hourglass_top</Icon>
+            <p>権限一覧を読み込んでいます…</p>
+          </div>
+        {:else if permissions.length === 0}
           <div class="empty-permissions" data-testid="empty-permissions-notice">
             <Icon class="empty-icon">group_off</Icon>
             <p>権限が設定されているアカウントはありません</p>
@@ -355,6 +544,7 @@
               class="permission-row"
               data-testid={`permission-row-${perm.account_id}`}
               data-role={perm.role}
+              data-pending={pendingAction === `role:${perm.account_id}` ? 'true' : 'false'}
             >
               <!-- Left: Avatar, Username, #(account_id) -->
               <div class="user-info-col">
@@ -367,7 +557,7 @@
                 </div>
                 <div class="user-name-group">
                   <span class="user-name" data-testid={`user-name-${perm.account_id}`}>
-                    {perm.username}
+                    {displayName(perm)}
                   </span>
                   <span class="user-id" data-testid={`user-id-${perm.account_id}`}>
                     #{perm.account_id}
@@ -375,50 +565,35 @@
                 </div>
               </div>
 
-              <!-- Right: Connected Button Group (size="s") & Delete Button -->
+              <!-- Right: Connected Button Group (size="s") & Reset Button -->
               <div class="actions-col">
                 <ButtonGroup
                   variant="connected"
                   size="s"
-                  selection="single"
-                  value={perm.role}
                   data-testid={`role-button-group-${perm.account_id}`}
+                  aria-label={`${displayName(perm)} の権限`}
                 >
-                  <Button
-                    size="s"
-                    variant={perm.role === 'viewer' ? 'filled' : 'outlined'}
-                    value="viewer"
-                    onclick={() => handleRequestRoleChange(perm, 'viewer')}
-                    data-testid={`role-viewer-btn-${perm.account_id}`}
-                  >
-                    閲覧者
-                  </Button>
-                  <Button
-                    size="s"
-                    variant={perm.role === 'pl' ? 'filled' : 'outlined'}
-                    value="pl"
-                    onclick={() => handleRequestRoleChange(perm, 'pl')}
-                    data-testid={`role-pl-btn-${perm.account_id}`}
-                  >
-                    PL
-                  </Button>
-                  <Button
-                    size="s"
-                    variant={perm.role === 'gm' ? 'filled' : 'outlined'}
-                    value="gm"
-                    onclick={() => handleRequestRoleChange(perm, 'gm')}
-                    data-testid={`role-gm-btn-${perm.account_id}`}
-                  >
-                    GM
-                  </Button>
+                  {#each ROOM_ROLES as role (role)}
+                    <Button
+                      size="s"
+                      variant={perm.role === role ? 'filled' : 'outlined'}
+                      onclick={() => handleRequestRoleChange(perm, role)}
+                      disabled={isMutating}
+                      data-testid={`role-${role}-btn-${perm.account_id}`}
+                      data-role={role}
+                    >
+                      {ROOM_ROLE_LABELS[role]}
+                    </Button>
+                  {/each}
                 </ButtonGroup>
 
                 <IconButton
                   variant="tonal"
                   size="s"
                   onclick={() => handleRequestDelete(perm)}
-                  aria-label={`アカウント ${perm.username} を権限から削除`}
-                  title="削除"
+                  disabled={isMutating || perm.role === defaultPermission}
+                  aria-label={`アカウント ${displayName(perm)} の権限を既定に戻す`}
+                  title="既定の権限に戻す"
                   data-testid={`delete-permission-btn-${perm.account_id}`}
                   class="permission-delete-btn"
                 >
@@ -440,7 +615,7 @@
   </div>
 {/if}
 
-<!-- Fullscreen Warning Alert Dialog (for Delete, Viewer, GM confirmation) -->
+<!-- Fullscreen Warning Alert Dialog (reset / viewer / denied / admin) -->
 {#if activeWarning}
   <div
     class="fullscreen-warning-overlay"
@@ -455,7 +630,7 @@
       role="alertdialog"
       aria-modal="true"
     >
-      {#if activeWarning.type === 'delete'}
+      {#if activeWarning.type === 'reset'}
         <div class="warning-header-icon error-icon" aria-hidden="true">
           <Icon>warning</Icon>
         </div>
@@ -463,8 +638,7 @@
           アカウント権限の削除
         </h3>
         <p class="warning-message" data-testid="warning-message">
-          「{activeWarning.account.username} (#{activeWarning.account.account_id})」の権限をリストから削除しますか？<br />
-          全体公開されていない部屋の場合、このアカウントは入室できなくなります。
+          「{displayName(activeWarning.account)} (#{activeWarning.account.account_id})」の明示的な権限を削除し、既定の権限「{ROOM_ROLE_LABELS[defaultPermission]}」に戻しますか？
         </p>
         <div class="warning-actions">
           <Button variant="text" onclick={cancelWarning} data-testid="warning-cancel-btn">
@@ -480,42 +654,52 @@
             </Button>
           </div>
         </div>
-      {:else if activeWarning.type === 'role-change' && activeWarning.targetRole === 'viewer'}
-        <div class="warning-header-icon tertiary-icon" aria-hidden="true">
-          <Icon>visibility</Icon>
+      {:else if activeWarning.type === 'role-change'}
+        <div
+          class="warning-header-icon {activeWarning.targetRole === 'admin'
+            ? 'primary-icon'
+            : activeWarning.targetRole === 'denied'
+              ? 'error-icon'
+              : 'tertiary-icon'}"
+          aria-hidden="true"
+        >
+          <Icon>{roleWarningCopy(activeWarning.targetRole).icon}</Icon>
         </div>
         <h3 class="warning-title" data-testid="warning-title">
-          ロールを「閲覧者」に切り替えますか？
+          {roleWarningCopy(activeWarning.targetRole).title}
         </h3>
         <p class="warning-message" data-testid="warning-message">
-          「{activeWarning.account.username}」のロールを「閲覧者」に変更します。<br />
-          閲覧者は部屋の情報やログを受信・閲覧できますが、<strong>メッセージの送信や部屋の状態変更（コマ移動・シーン更新等）を行うことはできなくなります</strong>。
+          「{displayName(activeWarning.account)}」の権限を「{ROOM_ROLE_LABELS[activeWarning.targetRole]}」に変更します。<br />
+          {roleWarningCopy(activeWarning.targetRole).message}
         </p>
         <div class="warning-actions">
           <Button variant="text" onclick={cancelWarning} data-testid="warning-cancel-btn">
             キャンセル
           </Button>
           <Button variant="filled" onclick={confirmWarning} data-testid="warning-confirm-role-btn">
-            閲覧者に変更する
+            {ROOM_ROLE_LABELS[activeWarning.targetRole]}に変更する
           </Button>
         </div>
-      {:else if activeWarning.type === 'role-change' && activeWarning.targetRole === 'gm'}
-        <div class="warning-header-icon primary-icon" aria-hidden="true">
-          <Icon>security</Icon>
+      {:else if activeWarning.type === 'default-change'}
+        <div
+          class="warning-header-icon {activeWarning.targetRole === 'admin' ? 'primary-icon' : 'error-icon'}"
+          aria-hidden="true"
+        >
+          <Icon>{activeWarning.targetRole === 'admin' ? 'security' : 'block'}</Icon>
         </div>
         <h3 class="warning-title" data-testid="warning-title">
-          ロールを「GM（管理者）」に切り替えますか？
+          既定の権限を「{ROOM_ROLE_LABELS[activeWarning.targetRole]}」に切り替えますか？
         </h3>
         <p class="warning-message" data-testid="warning-message">
-          「{activeWarning.account.username}」にGM権限を付与します。<br />
-          GMは<strong>部屋の権限管理、シーン削除、部屋の全体公開など、すべての管理者機能へのアクセスが可能になります</strong>。
+          明示的に設定されていないすべてのアカウント（未サインインを含む）に適用されます。<br />
+          {roleWarningCopy(activeWarning.targetRole).message}
         </p>
         <div class="warning-actions">
           <Button variant="text" onclick={cancelWarning} data-testid="warning-cancel-btn">
             キャンセル
           </Button>
-          <Button variant="filled" onclick={confirmWarning} data-testid="warning-confirm-role-btn">
-            GMに変更する
+          <Button variant="filled" onclick={confirmWarning} data-testid="warning-confirm-default-btn">
+            {ROOM_ROLE_LABELS[activeWarning.targetRole]}に変更する
           </Button>
         </div>
       {/if}
@@ -538,7 +722,7 @@
     color: var(--np-color-on-surface);
     border-radius: var(--np-shape-corner-extra-large, 28px);
     width: 92%;
-    max-width: 640px;
+    max-width: 720px;
     max-height: 85vh;
     box-shadow: var(--np-elevation-3);
     display: flex;
@@ -629,6 +813,26 @@
     padding: 12px 16px;
     text-align: center;
     font-size: 0.85rem;
+    color: var(--np-color-on-surface-variant);
+  }
+  .default-permission-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 24px 12px;
+    border-bottom: 1px solid var(--np-color-outline-variant);
+  }
+  .default-permission-label {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 0.9rem;
+    font-weight: 600;
+    color: var(--np-color-on-surface);
+  }
+  .default-permission-hint {
+    font-size: 0.75rem;
+    font-weight: 400;
     color: var(--np-color-on-surface-variant);
   }
   .permission-error-banner {
@@ -802,6 +1006,6 @@
   }
   .warning-destructive-wrapper {
     --np-button-container-color: var(--np-color-error);
-    --np-button-label-text-color: var(--np-color-on-error);
+    --np-button-label-color: var(--np-color-on-error);
   }
 </style>

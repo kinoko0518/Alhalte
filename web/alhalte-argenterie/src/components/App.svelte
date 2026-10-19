@@ -87,10 +87,13 @@
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
   import { resolveRoomKey } from '../utils/cellarTransfer.js';
   import {
-    getRoomPermissions,
     getSavedAccountId,
     getSavedSessionId,
+    permissionsSnapshotToTable,
+    roomRoleCapabilities,
+    roleToPermissionLevel,
     type RoomPermissionItem,
+    type RoomPermissionsSnapshot,
     type RoomRole,
   } from '../utils/session.js';
 
@@ -121,13 +124,16 @@
     initialExtensions?: ExtensionItem[];
     initialMovements?: SceneMovementEvent[];
     /**
-     * Explicit test / preview override for the GM-only UI. When omitted, the
-     * server role (`userRole === 'gm'`) is authoritative (Issue #156).
+     * Explicit test / preview override for the admin-only UI. When omitted, the
+     * server role (`userRole === 'admin'`) is authoritative (Issue #156 / #201).
      */
     isAdmin?: boolean;
+    /** Role answered by the join preflight; always one of the four levels. */
     userRole?: RoomRole | null;
+    /** Legacy test helper: equivalent to `userRole: 'viewer'`. */
     isViewer?: boolean;
     isForbidden?: boolean;
+    /** Initial permission rows (legacy tests); the table is read over WebSocket. */
     initialPermissions?: RoomPermissionItem[];
     connectionManager?: ConnectionManager;
     connectionState?: ConnectionState;
@@ -194,19 +200,38 @@
     initialRoom !== undefined ? initialRoom : resolveRoomFromLocation(),
   );
 
-  // User role & permission states (Issue #94 / #156)
-  let userRole = $state<RoomRole | null>(initialUserRole);
-  let isViewer = $derived(explicitIsViewer !== undefined ? explicitIsViewer : userRole === 'viewer');
+  // User role & permission states (Issue #94 / #156 / #201)
+  let userRole = $state<RoomRole | null>(initialUserRole ?? (explicitIsViewer === true ? 'viewer' : null));
   /**
-   * GM-only UI. The server role is authoritative; `isAdmin` is only an explicit
-   * test / preview override, and a viewer can never be an admin (Issue #156).
+   * Effective role. The server role (`GET /api/rooms/{id}`) is authoritative;
+   * the `isAdmin` prop is an explicit test / preview override, and unknown
+   * (no preflight: `initialRoom` in tests) behaves like `participant` so a
+   * preview stays usable without granting admin.
    */
-  let isAdmin = $derived(
-    !isViewer && (isAdminOverride !== undefined ? isAdminOverride : userRole === 'gm'),
+  let effectiveRole = $derived<RoomRole>(
+    userRole ?? (isAdminOverride === true ? 'admin' : 'participant'),
   );
+  /** UI capabilities derived from the effective role (single source of truth). */
+  let roleCapabilities = $derived(roomRoleCapabilities(effectiveRole));
+  /** `role === 'admin'` only. */
+  let isAdmin = $derived(roleCapabilities.isAdmin);
+  /** `role === 'participant'` only; never a viewer. */
+  let isParticipant = $derived(roleCapabilities.isParticipant);
+  /** `role === 'viewer'` only; a participant is never treated as a viewer. */
+  let isViewer = $derived(roleCapabilities.isViewer);
+  /** Log / state writes to the scenes the server authorizes. */
+  let canWrite = $derived(roleCapabilities.canSend);
+  /** Scene creation / deletion / log deletion / member moves (admin only). */
+  let canManageScenes = $derived(roleCapabilities.canManageScenes);
+  /** Character create / update / delete (admin and participant). */
+  let canManageCharacters = $derived(roleCapabilities.canManageCharacters);
   let isForbidden = $state(initialIsForbidden);
+  /** `denied` (or the forbidden fallback) replaces the room with `GateScreen`. */
+  let isDenied = $derived(isForbidden || effectiveRole === 'denied');
   let isPermissionModalOpen = $state(false);
   let roomPermissions = $state<RoomPermissionItem[]>([...initialPermissions]);
+  /** Level applied to accounts without an explicit entry (`null` = unknown). */
+  let defaultPermission = $state<RoomRole | null>(null);
 
   /**
    * Join preflight state (Issue #156).
@@ -406,9 +431,34 @@
    */
   let extensionStateApplied = false;
 
+  /**
+   * Scenes whose content this client already holds (graph / read view).
+   *
+   * `SceneList` is not permission-filtered, so every known scene id is listed;
+   * the server still refuses reads the role may not perform.
+   */
   let accessibleSceneIds = $derived.by(() => {
     return new Set(scenes.map((s) => s.id));
   });
+
+  /**
+   * Scenes this client may send log / state frames to (Issue #201).
+   *
+   * `PermissionsSnapshot` does not carry `accessible_scenes`, so a participant
+   * only claims the current scene (plus `/`, which banquette always grants to
+   * writers); the server remains the final authority for every write. Admin may
+   * write everywhere, viewer / denied nowhere.
+   */
+  let writableSceneIds = $derived.by(() => {
+    if (isAdmin) return new Set(scenes.map((s) => s.id));
+    if (isParticipant) return new Set([currentScene.id]);
+    return new Set<string>();
+  });
+
+  /** True when the caller may send a message / state write to `sceneId`. */
+  function canSendToScene(sceneId: string): boolean {
+    return canWrite && writableSceneIds.has(sceneId);
+  }
 
   // Full-screen overlay & dialog state at root viewport level
   type ActiveOverlay =
@@ -491,7 +541,7 @@
    * the server allocates an id (or after the outbox flush does).
    */
   function handleRequestCreateCharacter(draft: Character) {
-    if (isViewer) return;
+    if (!canManageCharacters) return;
     activeCharacterEdit = draft;
     characterEditIsNew = true;
     characterSaveError = null;
@@ -668,22 +718,63 @@
     }
   });
 
+  let roomSocket = $state<RoomSocket | null>(customRoomSocket ?? null);
+
+  /**
+   * Applies an acknowledged permission table (Issue #201).
+   *
+   * `PermissionsSnapshot` (answer to `QueryPermissions`) and `PermissionsUpdated`
+   * (success ack of the set frames) both carry the whole table and are only sent
+   * to the requester. The App refreshes the default permission selector and
+   * follows a change of its own role (an admin demoted by another admin learns
+   * it here, because banquette never broadcasts the change).
+   */
+  function applyPermissionsAck(ack: {
+    default_permission?: unknown;
+    permissions?: Record<string, unknown> | null;
+  }): void {
+    const table: RoomPermissionsSnapshot = permissionsSnapshotToTable(ack);
+    defaultPermission = table.defaultPermission;
+    roomPermissions = table.permissions;
+    const aid = Number(getSavedAccountId() ?? '') || 0;
+    const mine = aid ? table.permissions.find((p) => p.account_id === aid) : undefined;
+    if (mine) userRole = mine.role;
+  }
+
+  /**
+   * Re-reads the permission table on every (re)connect (Issue #201).
+   *
+   * The preflight only reports the role at join time, so a role change during
+   * the session would otherwise stay invisible until the next reload. A denied
+   * account never reaches this path (the preflight already shows `GateScreen`).
+   */
   $effect(() => {
-    const rId = activeRoomId;
-    if (rId && typeof fetch !== 'undefined') {
-      // The permission list only feeds `RoomPermissionModal`; role and entry
-      // authority come from the `GET /api/rooms/{id}` preflight (Issue #156).
-      getRoomPermissions(rId)
-        .then((perms) => {
-          roomPermissions = perms;
-        })
-        .catch(() => {
-          // Keep the cached list; the modal reports its own errors.
-        });
-    }
+    const socket = roomSocket;
+    const state = currentConnectionState;
+    if (!socket || state !== 'connected') return;
+    socket
+      .requestQueryPermissions()
+      .then((ack) => applyPermissionsAck(ack))
+      .catch(() => {
+        // The preflight is the entry authority; a missing table only leaves the
+        // default permission selector unknown.
+      });
   });
 
-  let roomSocket = $state<RoomSocket | null>(customRoomSocket ?? null);
+  /** Opens the permission modal (admin only). */
+  function handleOpenPermissionModal(): void {
+    if (!isAdmin) return;
+    isPermissionModalOpen = true;
+  }
+
+  /** Applies the table the modal received over the WebSocket. */
+  function handlePermissionsTableChange(table: RoomPermissionsSnapshot): void {
+    roomPermissions = table.permissions;
+    defaultPermission = table.defaultPermission;
+    const aid = Number(getSavedAccountId() ?? '') || 0;
+    const mine = aid ? table.permissions.find((p) => p.account_id === aid) : undefined;
+    if (mine) userRole = mine.role;
+  }
 
   // ---------------------------------------------------------------------------
   // Message sending & offline outbox (Issue #109 / sub-issue #139)
@@ -1214,6 +1305,9 @@
         autoConnect: true,
         onStateSnapshot: (sceneId, states) => {
           applyStateSnapshot(sceneId, states);
+        },
+        onPermissions: (ack) => {
+          applyPermissionsAck(ack);
         },
         onError: (err) => {
           if (
@@ -2219,7 +2313,7 @@
    * look like success and then vanish on reconnect.
    */
   async function handleCreateScene(name: string, inheritJuice: boolean): Promise<boolean | void> {
-    if (isViewer) return;
+    if (!canManageScenes) return;
     if (!beginSceneAction('create')) return;
 
     try {
@@ -2263,7 +2357,7 @@
    * local list is left untouched instead of pretending the deletion succeeded.
    */
   async function handleDeleteScene(sceneId: string): Promise<boolean | void> {
-    if (isViewer) return;
+    if (!canManageScenes) return;
     if (scenes.length <= 1) return; // Keep at least one scene
     if (!beginSceneAction('delete-scene')) return;
 
@@ -2291,6 +2385,7 @@
    * is kept, so an offline "success" cannot silently drop the conversation.
    */
   async function handleDeleteSceneLogs(sceneId: string): Promise<boolean | void> {
+    if (!canManageScenes) return;
     if (!beginSceneAction('delete-logs')) return;
 
     try {
@@ -2345,7 +2440,7 @@
     characterId: string,
     targetSceneName: string,
   ): Promise<boolean | void> {
-    if (isViewer) return;
+    if (!canManageScenes) return;
     if (!beginSceneAction(`move:${characterId}`)) return;
 
     try {
@@ -2380,7 +2475,7 @@
    * pretending it succeeded and losing the change on the next reload.
    */
   async function handleTogglePiece(characterId: string) {
-    if (isViewer) return;
+    if (!canWrite) return;
     if (pendingPieceToggles.has(characterId)) return;
 
     const socket = roomSocket;
@@ -2421,7 +2516,7 @@
    * A failed or offline write reverts the local position and reports an error.
    */
   async function handlePieceMove(characterId: string, position: { x: number; y: number }) {
-    if (isViewer) return;
+    if (!canWrite) return;
 
     const sceneId = currentScene.id;
     const socket = roomSocket;
@@ -2481,7 +2576,7 @@
    *   in-memory queue (it would resend the frame on reconnect and double send).
    */
   async function handleSaveCharacter(updated: Character): Promise<void> {
-    if (isViewer) return;
+    if (!canManageCharacters) return;
     if (characterSaving) return; // guard against a double submit
 
     const isCreate = characterEditIsNew;
@@ -2566,7 +2661,7 @@
    * - No room / no socket: local removal (legacy standalone behaviour).
    */
   async function handleDeleteCharacter(charId: string) {
-    if (isViewer) return;
+    if (!canManageCharacters) return;
 
     const roomId = getActiveRoomId();
     const socket = roomSocket;
@@ -2602,7 +2697,7 @@
   }
 
   function handleTransformChange(id: string, t: ViewTransform) {
-    if (isViewer) return;
+    if (!canWrite) return;
     const sc = scenes.find((s) => s.id === id);
     if (sc) sc.viewTransform = t;
     roomSocket?.updateState(id, 'view::transform', t);
@@ -2622,6 +2717,7 @@
    */
   function handleUpdateExtensions(next: ExtensionItem[]): void {
     if (!Array.isArray(next)) return;
+    if (!roleCapabilities.canManageExtensions) return;
     extensionStateApplied = true;
 
     const nextIds = new Set(next.map((ext) => ext.id));
@@ -2639,12 +2735,30 @@
    * `loadDefaultExtensions`.
    */
   async function handleRegisterExtension(id: string, wasmBytes: Uint8Array): Promise<void> {
+    if (!roleCapabilities.canManageExtensions) return;
     try {
       const instance = await WasmExtensionInstance.instantiate(wasmBytes);
       extensionPipeline.registerInstance(id, instance);
     } catch (err) {
       console.error(`Failed to instantiate the extension "${id}":`, err);
     }
+  }
+
+  /**
+   * Requests a default-permission change and resolves only after the banquette
+   * ack (`PermissionsUpdated`, Issue #201).
+   *
+   * `CommonHeader` only reports success after this resolves, so a failed or
+   * denied request never looks like success. The ack carries the whole table,
+   * which is applied in {@link applyPermissionsAck}.
+   */
+  async function handleSetDefaultPermission(permission: RoomRole): Promise<void> {
+    const socket = roomSocket;
+    if (!socket) {
+      throw new Error('ルームに接続していません');
+    }
+    const ack = await socket.requestSetDefaultPermission(roleToPermissionLevel(permission));
+    applyPermissionsAck(ack);
   }
 
   /**
@@ -2663,22 +2777,12 @@
    * - no room id at all (e.g. `App` mounted without a room in tests): there is
    *   nowhere to key an outbox entry, so the record is appended locally and
    *   treated as local-only.
-   */
-  /**
-   * Requests a room `done` change and resolves only after the banquette ack.
    *
-   * `CommonHeader` keeps its confirmation dialog open until this resolves, so a
-   * failed or denied request never looks like success.
+   * A `viewer` / `denied` caller and a participant whose current scene is not
+   * writable never reach the socket (Issue #201); the server authorizes again.
    */
-  async function handleSetDone(done: boolean): Promise<void> {
-    if (!roomSocket) {
-      throw new Error('ルームに接続していません');
-    }
-    await roomSocket.requestSetDone(done);
-  }
-
   async function handleSendMessage(text: string, characterId?: string) {
-    if (isViewer) return;
+    if (!canSendToScene(currentScene.id)) return;
     if (isSending) return; // prevent double sends while an echo is pending
 
     const char = characters.find((c) => c.id === characterId);
@@ -2793,7 +2897,7 @@
     </div>
   {/if}
 
-  {#if isForbidden}
+  {#if isDenied}
     <GateScreen onReturnHome={returnHome} />
   {:else if preflightStatus === 'not-found'}
     <div class="room-state-screen" data-testid="room-not-found">
@@ -2885,8 +2989,8 @@
                   {movements}
                   {accessibleSceneIds}
                   {selectedCharacterId}
-                  {isAdmin}
-                  {isViewer}
+                  role={effectiveRole}
+                  {defaultPermission}
                   sending={isSending}
                   {queuedMessages}
                   {sceneActionPending}
@@ -2913,8 +3017,8 @@
                   onDeleteSceneLogs={handleDeleteSceneLogs}
                   onRequestDeleteCharacter={handleRequestDeleteCharacter}
                   roomId={currentRoom.id || (currentRoom as any).roomId}
-                  onManagePermissions={() => (isPermissionModalOpen = true)}
-                  onSetDone={handleSetDone}
+                  onManagePermissions={handleOpenPermissionModal}
+                  onSetDefaultPermission={handleSetDefaultPermission}
                   onRequestAssetPicker={handleRequestAssetPicker}
                   onRequestEditCharacter={handleRequestEditCharacter}
                   onRequestCreateCharacter={handleRequestCreateCharacter}
@@ -2979,8 +3083,8 @@
                 {movements}
                 {accessibleSceneIds}
                 {selectedCharacterId}
-                {isAdmin}
-                {isViewer}
+                role={effectiveRole}
+                {defaultPermission}
                 sending={isSending}
                 {queuedMessages}
                 {sceneActionPending}
@@ -3007,8 +3111,8 @@
                 onDeleteSceneLogs={handleDeleteSceneLogs}
                 onRequestDeleteCharacter={handleRequestDeleteCharacter}
                 roomId={currentRoom.id || (currentRoom as any).roomId}
-                onManagePermissions={() => (isPermissionModalOpen = true)}
-                onSetDone={handleSetDone}
+                onManagePermissions={handleOpenPermissionModal}
+                onSetDefaultPermission={handleSetDefaultPermission}
                 onRequestAssetPicker={handleRequestAssetPicker}
                 onRequestEditCharacter={handleRequestEditCharacter}
                 onRequestCreateCharacter={handleRequestCreateCharacter}
@@ -3216,22 +3320,16 @@
     </div>
   {/if}
 
-  <!-- Room Permission Management Modal (Issue #94) -->
+  <!-- Room Permission Management Modal (Issue #94 / #201).
+       The list and every mutation go through the room WebSocket; only the
+       account search stays on HTTP. -->
   {#if isPermissionModalOpen && (currentRoom?.id || (currentRoom as any)?.roomId)}
     <RoomPermissionModal
-      roomId={currentRoom.id || (currentRoom as any).roomId}
-      initialPermissions={roomPermissions}
+      {roomSocket}
+      {fetchFn}
       isOpen={isPermissionModalOpen}
       onClose={() => (isPermissionModalOpen = false)}
-      onPermissionsChange={(perms) => {
-        roomPermissions = perms;
-        const aidStr = getSavedAccountId();
-        const aid = aidStr ? Number(aidStr) : 0;
-        const myPerm = aid ? perms.find((p) => p.account_id === aid) : undefined;
-        if (myPerm) {
-          userRole = myPerm.role;
-        }
-      }}
+      onPermissionsChange={handlePermissionsTableChange}
     />
   {/if}
 </div>

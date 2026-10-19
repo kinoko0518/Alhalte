@@ -15,6 +15,12 @@
   import { Icon } from 'noph-ui/icons';
   import type { Character, Scene } from '../../types/index.js';
   import {
+    ROOM_ROLES,
+    ROOM_ROLE_LABELS,
+    roomRoleCapabilities,
+    type RoomRole,
+  } from '../../utils/session.js';
+  import {
     THEME_PALETTES,
     getThemeSettings,
     setThemePalette,
@@ -30,7 +36,8 @@
     allScenes = [],
     characters = [],
     roomId,
-    isAdmin = false,
+    role = 'participant',
+    defaultPermission = null,
     onCollapse,
     onSelectScene,
     onExportZip,
@@ -38,13 +45,19 @@
     onDeleteScene,
     onManageMembers,
     onManagePermissions,
-    onSetDone,
+    onSetDefaultPermission,
   }: {
     scene: Scene;
     allScenes?: Scene[];
     characters?: Character[];
     roomId?: string;
-    isAdmin?: boolean;
+    /**
+     * Role of the caller (Issue #201). The admin-only gear menu section is
+     * derived from it; a participant never sees it.
+     */
+    role?: RoomRole;
+    /** Current level for accounts without an explicit entry (`null` = unknown). */
+    defaultPermission?: RoomRole | null;
     onCollapse?: () => void;
     onSelectScene?: (sceneId: string) => void;
     onExportZip?: (type: 'full' | 'logs') => void;
@@ -52,8 +65,15 @@
     onDeleteScene?: () => void;
     onManageMembers?: () => void;
     onManagePermissions?: () => void;
-    onSetDone?: (done: boolean) => void | Promise<unknown>;
+    /**
+     * Sends `SetDefaultPermission` and resolves only after the banquette ack
+     * (Issue #201). Replaces the old 「部屋の全てをPLに公開」 toggle.
+     */
+    onSetDefaultPermission?: (permission: RoomRole) => void | Promise<unknown>;
   } = $props();
+
+  let capabilities = $derived(roomRoleCapabilities(role));
+  let isAdmin = $derived(capabilities.isAdmin);
 
   // Search state
   let sceneSearchQuery = $state('');
@@ -76,30 +96,30 @@
   // Theme settings
   let currentPaletteId = $state<ThemePaletteId>(getThemeSettings().palette);
 
-  // Fullscreen Dialogs state
-  let isDoneWarningOpen = $state(false);
-  let isDoneSubmitting = $state(false);
-  let doneError = $state<string | null>(null);
+  // Default permission selector state (Issue #201)
+  /** Level whose `SetDefaultPermission` is in flight (spinner / disabled state). */
+  let pendingDefaultPermission = $state<RoomRole | null>(null);
+  let defaultPermissionError = $state<string | null>(null);
 
   /**
-   * Confirms the public-room change.
+   * Sends `SetDefaultPermission` for the picked level.
    *
-   * The dialog stays open until the server acknowledges the `SetDone` with
-   * `DoneUpdated`. A rejection (`SetDoneFailed` / `PermissionDenied` / timeout)
-   * keeps the dialog open and shows the error, so the UI never reports success
-   * for a change that did not happen.
+   * The selector reflects `defaultPermission`, which only changes after the
+   * banquette ack (`PermissionsUpdated`), so a rejected request
+   * (`SetDefaultPermissionFailed` / `PermissionDenied` / timeout) never looks
+   * like success.
    */
-  async function confirmSetDone() {
-    if (isDoneSubmitting) return;
-    isDoneSubmitting = true;
-    doneError = null;
+  async function handleSelectDefaultPermission(permission: RoomRole) {
+    if (pendingDefaultPermission !== null) return;
+    if (defaultPermission === permission) return;
+    pendingDefaultPermission = permission;
+    defaultPermissionError = null;
     try {
-      await onSetDone?.(true);
-      isDoneWarningOpen = false;
+      await onSetDefaultPermission?.(permission);
     } catch (err) {
-      doneError = err instanceof Error ? err.message : String(err);
+      defaultPermissionError = err instanceof Error ? err.message : String(err);
     } finally {
-      isDoneSubmitting = false;
+      pendingDefaultPermission = null;
     }
   }
 
@@ -294,17 +314,41 @@
             {#snippet start()}<Icon>admin_panel_settings</Icon>{/snippet}
             部屋の権限管理
           </MenuItem>
-          <MenuItem
-            onclick={() => {
-              isGearMenuOpen = false;
-              doneError = null;
-              isDoneWarningOpen = true;
-            }}
-            data-testid="set-done-item"
-          >
-            {#snippet start()}<Icon>public</Icon>{/snippet}
-            部屋の全てをPLに公開
-          </MenuItem>
+
+          <!-- 既定の権限 selector (Issue #201): replaces the old
+               「部屋の全てをPLに公開」 toggle. The ack is authoritative. -->
+          <div class="default-permission-section" data-testid="default-permission-section">
+            <div class="menu-section-header" data-testid="default-permission-label">既定の権限</div>
+            <div
+              class="default-permission-row"
+              role="group"
+              aria-label="既定の権限"
+              data-testid="default-permission-selector"
+            >
+              {#each ROOM_ROLES as permission (permission)}
+                <Button
+                  size="s"
+                  variant={defaultPermission === permission ? 'filled' : 'outlined'}
+                  onclick={() => handleSelectDefaultPermission(permission)}
+                  disabled={pendingDefaultPermission !== null}
+                  data-testid={`default-permission-btn-${permission}`}
+                  data-role={permission}
+                >
+                  {ROOM_ROLE_LABELS[permission]}
+                </Button>
+              {/each}
+            </div>
+            {#if pendingDefaultPermission}
+              <div class="default-permission-pending" role="status" data-testid="default-permission-pending">
+                既定の権限を「{ROOM_ROLE_LABELS[pendingDefaultPermission]}」に変更しています…
+              </div>
+            {/if}
+            {#if defaultPermissionError}
+              <p class="warning-error" data-testid="default-permission-error" role="alert">
+                既定の権限の変更に失敗しました: {defaultPermissionError}
+              </p>
+            {/if}
+          </div>
         {/if}
 
         <Divider />
@@ -342,64 +386,6 @@
   </div>
 </header>
 
-<!-- PL 公開確認 全画面警告ダイアログ -->
-{#if isDoneWarningOpen}
-  <div
-    class="fullscreen-dialog-overlay"
-    data-testid="set-done-warning-dialog"
-    onclick={(e) => {
-      if (e.target === e.currentTarget && !isDoneSubmitting) isDoneWarningOpen = false;
-    }}
-  >
-    <div
-      class="dialog-box"
-      data-testid="done-warning-box"
-      role="alertdialog"
-      aria-modal="true"
-    >
-      <h2 class="dialog-title-centered warning-text" data-testid="done-dialog-title">
-        部屋の全てをPLに公開しますか？
-      </h2>
-      <p class="warning-body" data-testid="done-dialog-warning">
-        部屋を「公開（done）」状態にします。
-        非公開シーンを含むすべてのシーン、キャラクター、ログが参加者全員に閲覧可能になります。
-        この操作を実行してよろしいですか？
-      </p>
-
-      {#if doneError}
-        <p class="warning-error" data-testid="done-error-message" role="alert">
-          公開に失敗しました: {doneError}
-        </p>
-      {/if}
-
-      <div class="dialog-footer-right">
-        <Button
-          variant="text"
-          onclick={() => {
-            if (isDoneSubmitting) return;
-            doneError = null;
-            isDoneWarningOpen = false;
-          }}
-          disabled={isDoneSubmitting}
-          data-testid="cancel-done-btn"
-        >
-          キャンセル
-        </Button>
-        <div class="confirm-done-wrapper">
-          <Button
-            variant="filled"
-            class="confirm-done-btn"
-            onclick={confirmSetDone}
-            disabled={isDoneSubmitting}
-            data-testid="confirm-done-button"
-          >
-            {isDoneSubmitting ? '公開中...' : '公開する'}
-          </Button>
-        </div>
-      </div>
-    </div>
-  </div>
-{/if}
 
 <style>
   .common-header {
@@ -520,101 +506,26 @@
     color: #ffffff;
     filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.7));
   }
-  .fullscreen-dialog-overlay {
-    position: fixed;
-    inset: 0;
-    background: var(--np-color-scrim, rgba(0, 0, 0, 0.32));
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 9000;
-  }
-  .dialog-box {
-    background: var(--np-color-surface-container-high, #ece6f0);
-    border-radius: var(--np-shape-corner-extra-large, 28px);
-    padding: 24px;
-    width: 90%;
-    max-width: 480px;
-    box-shadow: var(--np-elevation-3, 0 8px 24px rgba(0, 0, 0, 0.2));
+  .default-permission-section {
     display: flex;
     flex-direction: column;
-    gap: 16px;
+    gap: 6px;
+    padding: 4px 16px 8px;
   }
-  .dialog-title-centered {
-    margin: 0;
-    text-align: center;
-    font-size: 1.35rem;
-    font-weight: 600;
-    color: var(--np-color-on-surface, #1d1b20);
+  .default-permission-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
   }
-  .warning-text {
-    color: var(--np-color-error, #b3261e);
-  }
-  .warning-body {
-    margin: 0;
-    text-align: center;
-    font-size: 0.92rem;
-    color: var(--np-color-on-surface-variant, #49454f);
-    line-height: 1.5;
+  .default-permission-pending {
+    font-size: 0.78rem;
+    color: var(--np-color-on-surface-variant);
+    padding: 2px 0;
   }
   .warning-error {
     margin: 0;
-    text-align: center;
-    font-size: 0.88rem;
+    font-size: 0.82rem;
     color: var(--np-color-error, #b3261e);
     line-height: 1.4;
-  }
-  .dialog-footer-right {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 8px;
-  }
-  .confirm-done-wrapper {
-    --np-button-container-color: var(--np-color-error, #b3261e);
-    --np-button-label-text-color: var(--np-color-on-error, #ffffff);
-  }
-  .members-list-preview {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    max-height: 240px;
-    overflow-y: auto;
-  }
-  .member-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 6px 12px;
-    background: var(--np-color-surface);
-    border-radius: var(--np-shape-corner-small, 8px);
-  }
-  .member-name-group {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .member-dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: var(--np-color-primary);
-  }
-  .member-name {
-    font-size: 0.9rem;
-    font-weight: 500;
-  }
-  .member-role-badge {
-    font-size: 0.75rem;
-    padding: 2px 6px;
-    border-radius: var(--np-shape-corner-extra-small, 4px);
-    background: var(--np-color-surface-container);
-    color: var(--np-color-on-surface-variant);
-  }
-  .empty-notice {
-    text-align: center;
-    color: var(--np-color-on-surface-variant);
-    font-size: 0.85rem;
-    margin: 12px 0;
   }
 </style>

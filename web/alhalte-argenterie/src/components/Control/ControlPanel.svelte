@@ -16,6 +16,7 @@
   import type { RoomSocket } from '../../utils/roomSocket.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
   import { ExtensionPipeline } from '../../wasm/runner.js';
+  import type { RoomRole } from '../../utils/session.js';
   import CommonFooter, { type ActiveTab } from './CommonFooter.svelte';
   import CommonHeader from './CommonHeader.svelte';
   import CharacterManagementTab from './tabs/CharacterManagementTab.svelte';
@@ -33,7 +34,8 @@
     movements = [],
     accessibleSceneIds = new Set<string>(),
     selectedCharacterId,
-    isAdmin = false,
+    role = 'participant',
+    defaultPermission = null,
     chunkManager = new ChunkLogManager(),
     onTabChange,
     onSelectScene,
@@ -52,11 +54,10 @@
     onExportZip,
     onCollapse,
     roomId,
-    isViewer = false,
     sending = false,
     queuedMessages = [],
-    onSetDone,
     onManagePermissions,
+    onSetDefaultPermission,
     onRequestDeleteScene,
     onRequestDeleteSceneLogs,
     onDeleteSceneLogs,
@@ -81,8 +82,13 @@
     movements?: SceneMovementEvent[];
     accessibleSceneIds?: Set<string>;
     selectedCharacterId?: string;
-    isAdmin?: boolean;
-    isViewer?: boolean;
+    /**
+     * Role of the caller (Issue #201). Every child derives its own
+     * capabilities from it; `isAdmin` / `isViewer` are no longer passed around.
+     */
+    role?: RoomRole;
+    /** Current default permission shown by the header selector (`null` = unknown). */
+    defaultPermission?: RoomRole | null;
     chunkManager?: ChunkLogManager;
     onTabChange?: (tab: ActiveTab) => void;
     onSelectScene?: (sceneId: string) => void;
@@ -109,8 +115,9 @@
      * room, rendered inline below the loaded messages (Issue #148).
      */
     queuedMessages?: QueuedLogMessage[];
-    onSetDone?: (done: boolean) => void;
     onManagePermissions?: () => void;
+    /** Sends `SetDefaultPermission` for the header default permission selector (Issue #201). */
+    onSetDefaultPermission?: (permission: RoomRole) => void | Promise<unknown>;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
     onRequestDeleteSceneLogs?: (scene: { id: string; name: string }) => void;
     onDeleteSceneLogs?: (sceneId: string) => void;
@@ -187,7 +194,8 @@
     {allScenes}
     {characters}
     {roomId}
-    {isAdmin}
+    {role}
+    {defaultPermission}
     {onCollapse}
     {onSelectScene}
     {onExportZip}
@@ -195,7 +203,7 @@
     onDeleteScene={() => (activeTab = 'settings')}
     onManageMembers={() => (activeTab = 'settings')}
     {onManagePermissions}
-    {onSetDone}
+    {onSetDefaultPermission}
   />
 
   <!-- Active Tab Body -->
@@ -208,7 +216,8 @@
         {extensions}
         {extensionPipeline}
         {roomId}
-        {isAdmin}
+        {role}
+        {defaultPermission}
         {chunkManager}
         {roomSocket}
         {connectionState}
@@ -216,7 +225,6 @@
         {onCollapse}
         {onSelectScene}
         {onExportZip}
-        {onSetDone}
         {onRequestAssetPicker}
         hideHeader={true}
         onRenameScene={() => (activeTab = 'settings')}
@@ -228,8 +236,7 @@
         {movements}
         sceneNames={sceneNamesMap}
         {accessibleSceneIds}
-        {isAdmin}
-        {isViewer}
+        {role}
         onNavigateToScene={handleNavigateFromGraph}
         onOpenSceneLog={handleOpenSceneLog}
         {onDeleteScene}
@@ -240,8 +247,7 @@
         {currentScene}
         {allScenes}
         {characters}
-        {isAdmin}
-        {isViewer}
+        {role}
         {onUpdateScene}
         {onSelectScene}
         {onCreateScene}
@@ -260,8 +266,7 @@
     {:else if activeTab === 'characters'}
       <CharacterManagementTab
         {characters}
-        {isAdmin}
-        {isViewer}
+        {role}
         {onUpdateCharacter}
         {onCreateCharacter}
         {onDeleteCharacter}
@@ -278,8 +283,7 @@
     {:else if activeTab === 'extensions'}
       <ExtensionManagementTab
         {extensions}
-        {isAdmin}
-        {isViewer}
+        {role}
         {roomSocket}
         {connectionState}
         {roomKey}
@@ -296,7 +300,7 @@
     {extensions}
     {extensionPipeline}
     {selectedCharacterId}
-    {isViewer}
+    {role}
     {sending}
     onTabChange={handleTabChange}
     {onSelectCharacter}

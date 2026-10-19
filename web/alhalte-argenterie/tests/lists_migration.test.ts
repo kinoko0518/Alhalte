@@ -41,7 +41,7 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
       target,
       props: {
         characters: [testChar],
-        isAdmin: true,
+        role: 'admin',
         onTogglePiece: (id) => {
           toggledPieceId = id;
         },
@@ -124,7 +124,7 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
       target,
       props: {
         extensions: [testExt],
-        isAdmin: true,
+        role: 'admin',
         roomSocket: asRoomSocket(fakeSocket),
         onUpdateExtensions: (exts) => {
           updatedExtensions = exts;
@@ -227,7 +227,7 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
       target,
       props: {
         extensions: [testExt],
-        isAdmin: false,
+        role: 'participant',
       },
     });
 

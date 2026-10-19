@@ -66,6 +66,10 @@
     applyMenuPosition,
     getMenuPositionStyle,
   } from '../../utils/menuPosition.js';
+  import {
+    roomRoleCapabilities,
+    type RoomRole,
+  } from '../../utils/session.js';
   import { ExtensionPipeline } from '../../wasm/runner.js';
 
   export type ActiveTab =
@@ -83,7 +87,7 @@
     extensionPipeline = new ExtensionPipeline(),
     selectedCharacterId,
     showDicePicker = $bindable(true),
-    isViewer = false,
+    role = 'participant',
     sending = false,
     onTabChange,
     onSelectCharacter,
@@ -97,7 +101,12 @@
     extensionPipeline?: ExtensionPipeline;
     selectedCharacterId?: string;
     showDicePicker?: boolean;
-    isViewer?: boolean;
+    /**
+     * Role of the caller (Issue #201). `admin` and `participant` may speak;
+     * `viewer` and `denied` are read-only, so the input, send button and dice
+     * picker are disabled.
+     */
+    role?: RoomRole;
     /**
      * True while a message send is waiting for the server acknowledgement.
      * Swaps the send icon for a wavy indeterminate `CircularProgress`, dims the
@@ -112,8 +121,20 @@
     onToggleDicePicker?: (show: boolean) => void;
   } = $props();
 
+  let capabilities = $derived(roomRoleCapabilities(role));
+  /** Only a viewer gets the viewer-specific copy; a participant may speak. */
+  let isViewer = $derived(capabilities.isViewer);
+  let canSend = $derived(capabilities.canSend);
   /** Footer interactions are blocked while a send is in flight (Issue #109). */
-  let isBusy = $derived(isViewer || sending);
+  let isBusy = $derived(!canSend || sending);
+  /** Tooltip / placeholder explaining why sending is unavailable. */
+  let sendBlockedLabel = $derived(
+    isViewer
+      ? '閲覧者は送信できません'
+      : capabilities.isDenied
+        ? '入室権限がないため送信できません'
+        : 'この権限では送信できません',
+  );
 
   let messageInput = $state('');
   let isCharPickerOpen = $state(false);
@@ -205,7 +226,7 @@
     // `sending` blocks double sends while the previous message awaits its echo
     // (Issue #109); the disabled attributes alone are not enough because the
     // Enter key path also reaches this function.
-    if (isViewer || sending) return;
+    if (!canSend || sending) return;
     const rawText = messageInput.trim();
     if (!rawText) return;
 
@@ -442,7 +463,7 @@
         onclick={handleSend}
         disabled={isBusy}
         aria-label="送信"
-        title={isViewer ? '閲覧者は送信できません' : sending ? '送信中...' : '送信'}
+        title={!canSend ? sendBlockedLabel : sending ? '送信中...' : '送信'}
         data-testid="send-message-button"
       >
         {#snippet start()}
@@ -560,7 +581,11 @@
       maxLines={10}
       rows={4}
       disabled={isBusy}
-      placeholder={isViewer ? '閲覧者モードのためメッセージは送信できません' : 'メッセージを入力...'}
+      placeholder={isViewer
+        ? '閲覧者モードのためメッセージは送信できません'
+        : !canSend
+          ? 'この権限ではメッセージは送信できません'
+          : 'メッセージを入力...'}
       bind:value={messageInput}
       bind:inputElement={textareaElement}
       oninput={() => {

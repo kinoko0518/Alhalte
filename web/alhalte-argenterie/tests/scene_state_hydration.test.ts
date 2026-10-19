@@ -402,7 +402,7 @@ describe('Scene state hydration (Issue #159)', () => {
         currentScene,
         allScenes: [currentScene],
         characters: [],
-        isAdmin: true,
+        role: 'admin',
         roomSocket: asRoomSocket(socket),
         roomKey: ROOM_KEY,
       },

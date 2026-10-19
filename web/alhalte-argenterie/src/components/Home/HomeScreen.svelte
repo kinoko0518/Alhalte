@@ -156,7 +156,7 @@
         visitedAt: now,
         // Kept for backwards-compatible local storage only; the server role is
         // the authority and `App` re-fetches it on entry.
-        isAdmin: created.role === 'gm',
+        isAdmin: created.role === 'admin',
         id: created.room_id,
         name: created.name || name,
         lastVisited: now,

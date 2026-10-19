@@ -151,7 +151,7 @@ describe('App room key wiring (Issue #156)', () => {
         initialRoom: room,
         initialScenes: [MAIN_SCENE],
         initialExtensions: extensions,
-        userRole: 'gm',
+        userRole: 'admin',
         roomSocket: asRoomSocket(socket),
       },
     }) as unknown as Record<string, unknown>;

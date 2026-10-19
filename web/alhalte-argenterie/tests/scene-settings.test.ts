@@ -151,6 +151,7 @@ describe('Scene Settings & Juices', () => {
       target,
       props: {
         currentScene,
+        role: 'admin',
         allScenes: [currentScene],
         characters,
         onCreateScene: (name, inheritJuice) => {
@@ -321,7 +322,7 @@ describe('Scene Settings & Juices', () => {
         currentScene,
         allScenes: [currentScene],
         characters: [],
-        isAdmin: false,
+        role: 'participant',
         onUpdateScene: (sc) => {
           lastUpdatedScene = sc;
         },
@@ -398,7 +399,7 @@ describe('Scene Settings & Juices', () => {
         currentScene,
         allScenes: [currentScene],
         characters: [],
-        isAdmin: true,
+        role: 'admin',
         onUpdateScene: (sc) => {
           lastUpdatedScene = sc;
         },
@@ -551,7 +552,7 @@ describe('Scene Settings & Juices', () => {
         currentScene: scA,
         allScenes: [scA, scB],
         characters: [char1, char2],
-        isAdmin: true,
+        role: 'admin',
         onMoveMember: (cid, targetSc) => {
           movedCharId = cid;
           movedTargetScene = targetSc;
@@ -665,6 +666,7 @@ describe('Scene Settings & Juices', () => {
       target,
       props: {
         currentScene,
+        role: 'admin',
         allScenes: [currentScene],
         characters: [],
         onUpdateScene: (sc) => {

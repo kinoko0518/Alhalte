@@ -67,7 +67,7 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
         currentScene: scene1,
         allScenes: [scene1, scene2],
         characters: [testChar],
-        isAdmin: true,
+        role: 'admin',
         onMoveMember: (charId, targetScene) => {
           movedCharId = charId;
           movedTargetScene = targetScene;
@@ -845,6 +845,7 @@ describe('Scene management actions — server acknowledgement (Issue #109 / #143
       target,
       props: {
         currentScene: scenes[0],
+        role: 'admin',
         allScenes: scenes,
         characters: [makeCharacter()],
         onDeleteScene: () =>

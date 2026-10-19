@@ -9,13 +9,13 @@
   import { Button } from 'noph-ui';
   import type { SceneGraphNode, SceneGraphResult } from '../../../types/index.js';
   import { buildSceneGraph, type SceneMovementEvent } from '../../../utils/sceneGraph.js';
+  import { roomRoleCapabilities, type RoomRole } from '../../../utils/session.js';
 
   let {
     movements = [],
     sceneNames = new Map<string, string>(),
     accessibleSceneIds = new Set<string>(),
-    isAdmin = false,
-    isViewer = false,
+    role = 'participant',
     onNavigateToScene,
     onOpenSceneLog,
     onDeleteScene,
@@ -24,14 +24,15 @@
     movements?: SceneMovementEvent[];
     sceneNames?: Map<string, string>;
     accessibleSceneIds?: Set<string>;
-    isAdmin?: boolean;
-    /** Viewers cannot delete scenes (Issue #156). */
-    isViewer?: boolean;
+    /** Role of the caller (Issue #201); only an admin may delete a scene. */
+    role?: RoomRole;
     onNavigateToScene?: (sceneId: string) => void;
     onOpenSceneLog?: (sceneId: string) => void;
     onDeleteScene?: (sceneId: string) => void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
   } = $props();
+
+  let capabilities = $derived(roomRoleCapabilities(role));
 
   let graphData = $derived.by<SceneGraphResult>(() => {
     return buildSceneGraph(movements, sceneNames, accessibleSceneIds);
@@ -235,7 +236,7 @@
                   <span class="node-time">{new Date(node.timestamp * 1000).toLocaleTimeString()}</span>
                 </button>
 
-                {#if activeActionNodeId === node.id && !node.isUnknown && isAdmin && !isViewer && node.sceneId !== '/'}
+                {#if activeActionNodeId === node.id && !node.isUnknown && capabilities.isAdmin && node.sceneId !== '/'}
                   <div class="node-actions" data-testid="node-actions-{node.id}">
                     <div class="delete-btn-wrapper">
                       <Button

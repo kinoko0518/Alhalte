@@ -162,7 +162,7 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
       target,
       props: {
         extensions,
-        isAdmin: false,
+        role: 'participant',
       },
     });
 
@@ -296,7 +296,7 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
       target,
       props: {
         extensions,
-        isAdmin: true,
+        role: 'admin',
       },
     });
 
@@ -377,7 +377,7 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
       target,
       props: {
         extensions,
-        isAdmin: true,
+        role: 'admin',
         // The tab is inert when it has no socket (Issue #109 / #145), so drive
         // the menu on a connected one.
         roomSocket: asRoomSocket(new FakeRoomSocket()),
@@ -535,7 +535,7 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
             wasmBytes: hexToBytes(VALID_WASM_HEX),
           },
         ],
-        isAdmin: true,
+        role: 'admin',
         roomSocket: asRoomSocket(socket),
       },
     });

@@ -124,7 +124,7 @@ describe('Image Picker Separation (Issue #52)', () => {
         currentScene,
         allScenes: [currentScene],
         characters: [],
-        isAdmin: false,
+        role: 'participant',
         onUpdateScene: (sc) => {
           updatedScene = sc;
         },
@@ -240,7 +240,7 @@ describe('Image Picker Separation (Issue #52)', () => {
       target,
       props: {
         characters: [testChar],
-        isAdmin: false,
+        role: 'participant',
       },
     });
 

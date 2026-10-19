@@ -239,7 +239,7 @@ describe('Character Management & Edit Panel', () => {
       target,
       props: {
         characters: [testChar],
-        isAdmin: false,
+        role: 'participant',
         onUpdateCharacter: (c) => {
           savedChar = c;
         },
