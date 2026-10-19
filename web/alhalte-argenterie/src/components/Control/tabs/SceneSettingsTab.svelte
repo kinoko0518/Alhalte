@@ -44,6 +44,7 @@
     allScenes = [],
     characters = [],
     isAdmin = false,
+    isViewer = false,
     onUpdateScene,
     onCreateScene,
     onDeleteScene,
@@ -60,6 +61,8 @@
     allScenes?: Scene[];
     characters?: Character[];
     isAdmin?: boolean;
+    /** Viewers cannot create/delete scenes or move members (Issue #156). */
+    isViewer?: boolean;
     onUpdateScene?: (scene: Scene) => void;
     onSelectScene?: (sceneId: string) => void;
     onCreateScene?: (
@@ -108,8 +111,13 @@
     return unsubscribe;
   });
 
+  /** Viewers get a read-only scene settings tab (Issue #156). */
+  let canManageScenes = $derived(!isViewer);
+
   let imageAssets = $derived(
-    allAssets.filter((a) => a.mediaType === 'image' && (isAdmin || a.scope === 'personal')),
+    allAssets.filter(
+      (a) => a.mediaType === 'image' && ((isAdmin && canManageScenes) || a.scope === 'personal'),
+    ),
   );
 
   // Overlays
@@ -710,7 +718,7 @@
         label="背景画像アセット"
         aspectRatio={16 / 9}
         showNone={true}
-        {isAdmin}
+        isAdmin={isAdmin && canManageScenes}
         imageAssets={imageAssets}
         onSelect={handleQuickSelectBgImage}
         onOpenPicker={handleBgImageSelect}
@@ -871,6 +879,7 @@
           label="シーン名"
           value={currentScene.name}
           oninput={handleSceneNameInput}
+          disabled={!canManageScenes}
           data-testid="scene-name-input"
           placeholder="シーン名"
           class="scene-name-field"
@@ -902,7 +911,7 @@
             size="m"
             class="action-square-btn create-scene-btn"
             onclick={() => (isCreateSceneOpen = true)}
-            disabled={isAnySceneActionPending()}
+            disabled={!canManageScenes || isAnySceneActionPending()}
             aria-label="シーンを新規作成"
             data-testid="open-create-scene-btn"
           >
@@ -939,7 +948,7 @@
             size="m"
             class="action-square-btn delete-logs-btn destructive-tonal-btn"
             onclick={handleDeleteLogsButtonClick}
-            disabled={isAnySceneActionPending()}
+            disabled={!canManageScenes || isAnySceneActionPending()}
             aria-label="シーンのログを削除"
             data-testid="delete-logs-btn"
           >
@@ -976,7 +985,7 @@
             size="m"
             class="action-square-btn delete-scene-btn delete-scene-tonal-btn destructive-tonal-btn"
             onclick={handleDeleteButtonClick}
-            disabled={isAnySceneActionPending()}
+            disabled={!canManageScenes || isAnySceneActionPending()}
             aria-label="シーンを削除"
             data-testid="delete-scene-btn"
           >
@@ -1109,7 +1118,7 @@
                       size="m"
                       class="apply-move-btn"
                       onclick={() => handleMoveMemberApply(char.id)}
-                      disabled={isAnySceneActionPending()}
+                      disabled={!canManageScenes || isAnySceneActionPending()}
                       data-testid="apply-move-btn-{char.id}"
                     >
                       {#if isSceneActionPending(`move:${char.id}`)}
@@ -1259,7 +1268,7 @@
     <AssetPickerModal
       open={isAssetPickerOpen}
       initialMediaType={assetPickerMediaType}
-      {isAdmin}
+      isAdmin={isAdmin && canManageScenes}
       onSelect={handleAssetPicked}
       onClose={() => (isAssetPickerOpen = false)}
     />

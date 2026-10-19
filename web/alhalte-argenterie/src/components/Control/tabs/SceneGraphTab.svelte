@@ -14,7 +14,8 @@
     movements = [],
     sceneNames = new Map<string, string>(),
     accessibleSceneIds = new Set<string>(),
-    isAdmin = true,
+    isAdmin = false,
+    isViewer = false,
     onNavigateToScene,
     onOpenSceneLog,
     onDeleteScene,
@@ -24,6 +25,8 @@
     sceneNames?: Map<string, string>;
     accessibleSceneIds?: Set<string>;
     isAdmin?: boolean;
+    /** Viewers cannot delete scenes (Issue #156). */
+    isViewer?: boolean;
     onNavigateToScene?: (sceneId: string) => void;
     onOpenSceneLog?: (sceneId: string) => void;
     onDeleteScene?: (sceneId: string) => void;
@@ -232,7 +235,7 @@
                   <span class="node-time">{new Date(node.timestamp * 1000).toLocaleTimeString()}</span>
                 </button>
 
-                {#if activeActionNodeId === node.id && !node.isUnknown && isAdmin && node.sceneId !== '/'}
+                {#if activeActionNodeId === node.id && !node.isUnknown && isAdmin && !isViewer && node.sceneId !== '/'}
                   <div class="node-actions" data-testid="node-actions-{node.id}">
                     <div class="delete-btn-wrapper">
                       <Button

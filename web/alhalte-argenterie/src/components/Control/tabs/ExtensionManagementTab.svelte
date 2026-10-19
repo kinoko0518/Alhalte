@@ -54,7 +54,6 @@
     applyMenuPosition,
     getMenuPositionStyle,
   } from '../../../utils/menuPosition.js';
-  import { getRoomKeyFromLocation } from '../../../utils/cellarTransfer.js';
   import type { ConnectionState } from '../../../utils/connection.js';
   import type { RoomSocket } from '../../../utils/roomSocket.js';
   import {
@@ -70,14 +69,17 @@
   let {
     extensions = [],
     isAdmin = false,
+    isViewer = false,
     roomSocket = null,
-    roomKey = getRoomKeyFromLocation(),
+    roomKey,
     connectionState,
     onUpdateExtensions,
     onRegisterExtension,
   }: {
     extensions?: ExtensionItem[];
     isAdmin?: boolean;
+    /** Viewers get the read-only (non-admin) extension UI (Issue #156). */
+    isViewer?: boolean;
     /**
      * Socket used to query / persist the room extension state (Issue #109 /
      * sub-issue #145). Without a socket (standalone usage / tests) the tab is
@@ -93,6 +95,9 @@
     /** Registers downloaded / uploaded wasm with the pipeline (Issue #145). */
     onRegisterExtension?: (id: string, wasmBytes: Uint8Array) => void;
   } = $props();
+
+  /** Effective admin UI flag: a viewer never manages extensions (Issue #156). */
+  let canAdmin = $derived(isAdmin && !isViewer);
 
   /**
    * Lifecycle of the tab-open `QueryState('/')` round trip:
@@ -249,7 +254,7 @@
 
   /** Mutations are admin-only and impossible while offline or busy. */
   function canMutate(): boolean {
-    return canManageExtensions(isAdmin) && !offline && !isBusy;
+    return canManageExtensions(canAdmin) && !offline && !isBusy;
   }
 
   /** Items whose persisted fields differ between two lists. */
@@ -324,7 +329,7 @@
     if (!canMutate()) return;
     const before = extensions;
     try {
-      const updated = toggleExtension(before, id, isAdmin);
+      const updated = toggleExtension(before, id, canAdmin);
       await commitStateChanges(collectChangedItems(before, updated), updated);
     } catch {
       // Non-admin blocked (defensive; the UI is disabled as well).
@@ -336,7 +341,7 @@
     activeMenuExtId = null;
     const before = extensions;
     try {
-      const updated = deleteExtension(before, id, isAdmin);
+      const updated = deleteExtension(before, id, canAdmin);
       // Removing a row renumbers the priorities of the following rows, so they
       // must be persisted too or the server order drifts from the UI.
       await commitStateChanges(collectChangedItems(before, updated), updated, [id]);
@@ -349,7 +354,7 @@
     if (!canMutate() || index <= 0) return;
     const before = extensions;
     try {
-      const updated = reorderExtensions(before, index, index - 1, isAdmin);
+      const updated = reorderExtensions(before, index, index - 1, canAdmin);
       await commitStateChanges(collectChangedItems(before, updated), updated);
     } catch {
       // Non-admin blocked (defensive).
@@ -360,7 +365,7 @@
     if (!canMutate() || index >= sortedExtensions.length - 1) return;
     const before = extensions;
     try {
-      const updated = reorderExtensions(before, index, index + 1, isAdmin);
+      const updated = reorderExtensions(before, index, index + 1, canAdmin);
       await commitStateChanges(collectChangedItems(before, updated), updated);
     } catch {
       // Non-admin blocked (defensive).
@@ -479,7 +484,7 @@
 <div
   class="extension-tab-shell"
   class:extensions-offline={offline}
-  class:non-admin-locked={!isAdmin}
+  class:non-admin-locked={!canAdmin}
   aria-disabled={offline ? 'true' : undefined}
   data-testid="extension-management-tab"
 >
@@ -506,11 +511,11 @@
     <div class="tab-header">
       <div class="title-with-lock">
         <h3 class="tab-title">拡張機能一覧</h3>
-        {#if !isAdmin}
+        {#if !canAdmin}
           <span class="lock-indicator" data-testid="lock-indicator">（管理者のみ操作可能）</span>
         {/if}
       </div>
-      {#if isAdmin}
+      {#if canAdmin}
         <Button
           variant="filled"
           disabled={offline || isBusy}
@@ -594,12 +599,12 @@
             >
               {#snippet start()}
                 <div class="ext-start-group">
-                  {#if isAdmin}
+                  {#if canAdmin}
                     <div class="reorder-col">
                       <button
                         type="button"
                         class="reorder-btn"
-                        disabled={!isAdmin || offline || isBusy || idx === 0}
+                        disabled={!canAdmin || offline || isBusy || idx === 0}
                         onclick={() => handleMoveUp(idx)}
                         data-testid="move-up-btn-{ext.id}"
                         title="優先度を上げる"
@@ -609,7 +614,7 @@
                       <button
                         type="button"
                         class="reorder-btn"
-                        disabled={!isAdmin || offline || isBusy || idx === sortedExtensions.length - 1}
+                        disabled={!canAdmin || offline || isBusy || idx === sortedExtensions.length - 1}
                         onclick={() => handleMoveDown(idx)}
                         data-testid="move-down-btn-{ext.id}"
                         title="優先度を下げる"
@@ -658,7 +663,7 @@
                   <span class="priority-badge">#{ext.priority + 1}</span>
                   <Switch
                     selected={ext.enabled}
-                    disabled={!isAdmin || offline || isBusy}
+                    disabled={!canAdmin || offline || isBusy}
                     onchange={() => handleToggle(ext.id)}
                     data-testid="ext-toggle-{ext.id}"
                     aria-label="{ext.name}の有効/無効化"
@@ -667,7 +672,7 @@
                   <div class="more-menu-wrapper">
                     <IconButton
                       variant="text"
-                      disabled={!isAdmin || offline || isBusy}
+                      disabled={!canAdmin || offline || isBusy}
                       onclick={(e) => {
                         e.stopPropagation();
                         activeMenuExtId = activeMenuExtId === ext.id ? null : ext.id;
@@ -695,7 +700,7 @@
                       }}
                     >
                       <MenuItem
-                        disabled={!isAdmin || offline || isBusy}
+                        disabled={!canAdmin || offline || isBusy}
                         onclick={() => {
                           activeMenuExtId = null;
                           handleDelete(ext.id);

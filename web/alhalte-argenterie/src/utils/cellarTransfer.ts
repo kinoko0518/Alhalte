@@ -276,6 +276,61 @@ export function getRoomKeyFromLocation(
 }
 
 /**
+ * Reads the room key from a room URL's fragment (`...#<64 hex>`).
+ *
+ * `currentRoom.url` usually carries the invitation URL, including its fragment,
+ * even after the browser URL changed. Resolving from it keeps cellar transfers
+ * working for rooms opened from the Home screen's recent list.
+ *
+ * @param url Absolute or root-relative room URL (e.g. `/rooms/<id>#<key>`).
+ * @returns The 32-byte room key, or `null` when the URL is missing, malformed,
+ * or its fragment is not a 64-character hex string.
+ */
+export function getRoomKeyFromUrl(url: string | null | undefined): Uint8Array | null {
+  if (!url || typeof url !== 'string') return null;
+  try {
+    const parsed = new URL(url, 'https://alhalte.local');
+    return getRoomKeyFromLocation({ hash: parsed.hash });
+  } catch {
+    return null;
+  }
+}
+
+/** Options for {@link resolveRoomKey}. */
+export interface ResolveRoomKeyOptions {
+  /**
+   * Explicit 32-byte key (App's `roomKey` prop). `null` disables resolution and
+   * `undefined` falls through to the room URL / location.
+   */
+  roomKey?: Uint8Array | null;
+  /** Invitation URL of the current room (`currentRoom.url`). */
+  roomUrl?: string | null;
+  /** Location-like fallback (defaults to `globalThis.location`). */
+  location?: { hash: string } | null;
+}
+
+/** True when `key` is a 32-byte room key. */
+function isRoomKey(key: unknown): key is Uint8Array {
+  return key instanceof Uint8Array && key.length === 32;
+}
+
+/**
+ * Resolves the room key for cellar transfers.
+ *
+ * Resolution order: explicit prop, the current room's invitation URL, then the
+ * browser URL fragment. Every source is validated as a 32-byte key (64 hex), so
+ * a missing key is reported instead of a doomed upload being attempted.
+ */
+export function resolveRoomKey(options: ResolveRoomKeyOptions = {}): Uint8Array | null {
+  if (options.roomKey !== undefined) {
+    return isRoomKey(options.roomKey) ? options.roomKey : null;
+  }
+  const fromRoomUrl = getRoomKeyFromUrl(options.roomUrl);
+  if (fromRoomUrl) return fromRoomUrl;
+  return getRoomKeyFromLocation(options.location);
+}
+
+/**
  * Encodes a room payload into a tin encrypted with the room key.
  *
  * Uses `Encryption.RoomKey` (random 96-bit nonce, AES-256-GCM-SIV) and, by

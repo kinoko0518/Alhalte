@@ -32,7 +32,7 @@
     movements = [],
     accessibleSceneIds = new Set<string>(),
     selectedCharacterId,
-    isAdmin = true,
+    isAdmin = false,
     chunkManager = new ChunkLogManager(),
     onTabChange,
     onSelectScene,
@@ -217,6 +217,7 @@
         sceneNames={sceneNamesMap}
         {accessibleSceneIds}
         {isAdmin}
+        {isViewer}
         onNavigateToScene={handleNavigateFromGraph}
         onOpenSceneLog={handleOpenSceneLog}
         {onDeleteScene}
@@ -228,6 +229,7 @@
         {allScenes}
         {characters}
         {isAdmin}
+        {isViewer}
         {onUpdateScene}
         {onSelectScene}
         {onCreateScene}
@@ -245,6 +247,7 @@
       <CharacterManagementTab
         {characters}
         {isAdmin}
+        {isViewer}
         {onUpdateCharacter}
         {onCreateCharacter}
         {onDeleteCharacter}
@@ -262,6 +265,7 @@
       <ExtensionManagementTab
         {extensions}
         {isAdmin}
+        {isViewer}
         {roomSocket}
         {connectionState}
         {roomKey}
