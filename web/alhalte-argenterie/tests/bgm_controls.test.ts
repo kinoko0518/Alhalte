@@ -376,8 +376,8 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     return { target, instance };
   }
 
-  // spec: argenterie/bgm-controls 再生/停止はUpdateState/DeleteState + ChangeBgmを送り、両方のack後にのみローカル確定
-  it('sends UpdateState + ChangeBgm for play, shows the wavy spinner while pending, and commits only after both acks', async () => {
+  // spec: argenterie/bgm-controls 再生/停止はUpdateState/DeleteStateを送り、ack後にのみローカル確定
+  it('sends UpdateState for play, shows the wavy spinner while pending, and commits only after the acks', async () => {
     const scene = makeScene({
       juices: {
         ...createDefaultJuices(),
@@ -409,19 +409,11 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     const trackWrite = socket.requestUpdateStateCalls.find((call) => call.key === 'std::bgm');
     expect(playingWrite?.value).toBe(true);
     expect(trackWrite?.value).toMatchObject({ tinId: TIN_ID_A, mimeType: 'audio/mpeg' });
-    expect(socket.requestChangeBgmCalls).toHaveLength(1);
-    expect(socket.requestChangeBgmCalls[0]).toMatchObject({ slot: 1, tinId: TIN_ID_A });
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
     expect(selectBtn.disabled).toBe(true);
     expect(playBtn.disabled).toBe(true);
     // The play/stop icon itself is not replaced.
     expect(playBtn.textContent).toContain('play_arrow');
-    expect(updateCount).toBe(0);
-
-    // Only the ChangeBgm ack arrives: still pending, still no local commit.
-    socket.resolveChangeBgm();
-    await settle(0);
-    expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
     expect(updateCount).toBe(0);
 
     // The first StateUpdated ack arrives: one write is still outstanding.
@@ -444,8 +436,8 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     target.remove();
   });
 
-  // spec: argenterie/bgm-controls 停止は bgm::<slot>::playing=false + ChangeBgm(null) (Issue #164)
-  it('sends playing=false + ChangeBgm(null) when stopping a playing slot', async () => {
+  // spec: argenterie/bgm-controls 停止は bgm::<slot>::playing=false (Issue #164)
+  it('sends playing=false when stopping a playing slot', async () => {
     const scene = makeScene({
       juices: {
         ...createDefaultJuices(),
@@ -474,11 +466,9 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     expect(socket.requestUpdateStateCalls).toHaveLength(1);
     expect(socket.requestUpdateStateCalls[0].key).toBe('bgm::1::playing');
     expect(socket.requestUpdateStateCalls[0].value).toBe(false);
-    expect(socket.requestChangeBgmCalls[0]).toMatchObject({ slot: 1, tinId: null });
     expect(lastUpdatedScene).toBeNull();
 
     socket.resolveStateWrite();
-    socket.resolveChangeBgm();
     await settle();
 
     const slot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
@@ -517,7 +507,6 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     await settle(0);
 
     socket.rejectStateWrite(new OperationTimeoutError('updateState', 8000));
-    socket.rejectChangeBgm(new OperationTimeoutError('changeBgm', 8000));
     await settle();
 
     // No local mutation and no onUpdateScene; the row shows the error.
@@ -559,7 +548,6 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]')!.click();
     await settle(0);
     socket.rejectStateWrite(new ServerOperationError('PermissionDenied', 'admin only'));
-    socket.rejectChangeBgm(new ServerOperationError('PermissionDenied', 'admin only'));
     await settle();
 
     expect(
@@ -647,7 +635,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
   });
 
   // spec: argenterie/bgm-controls アセット選択は64桁hexのtinIdを使いdata URLを使わない
-  it('uses the selected asset tinId (64 hex) for the state and the BGM change log', async () => {
+  it('uses the selected asset tinId (64 hex) for the state writes', async () => {
     const audioAsset = addAsset({
       id: 'bgm-track-tin',
       name: 'tin_track.ogg',
@@ -701,13 +689,11 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
       name: 'tin_track.ogg',
     });
     expect(trackWrite?.value).not.toBe(audioAsset.dataUrl);
-    expect(socket.requestChangeBgmCalls[0]).toMatchObject({ slot: 2, tinId: TIN_ID_B });
     expect(target.querySelector('[data-testid="bgm-pending-2"]')).toBeTruthy();
     expect(updateCount).toBe(0);
 
     socket.resolveStateWrite();
     socket.resolveStateWrite();
-    socket.resolveChangeBgm();
     await settle();
 
     const slot2 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 2);
@@ -761,7 +747,6 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     await settle();
 
     expect(socket.requestUpdateStateCalls).toHaveLength(0);
-    expect(socket.requestChangeBgmCalls).toHaveLength(0);
     expect(updateCount).toBe(0);
     expect(scene.juices.bgmSlots?.find((s) => s.slot === 2)?.tinId).toBeNull();
     const error = target.querySelector<HTMLElement>('[data-testid="bgm-error-2"]');

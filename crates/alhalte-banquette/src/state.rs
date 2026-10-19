@@ -14,7 +14,7 @@ pub const MAX_STATE_VALUE_SIZE: usize = 4096;
 
 /// Validates that a state key follows the required namespace convention.
 ///
-/// Keys are expected to use one or more `::` separators (e.g. `std::bgm`, `alhalte::grid`).
+/// Keys are expected to use one or more `::` separators (e.g. `std::name`, `alhalte::grid`).
 pub fn validate_state_key(key: &str) -> Result<()> {
     if !key.contains("::") {
         return Err(BanquetteError::InvalidStateKey(key.to_string()));

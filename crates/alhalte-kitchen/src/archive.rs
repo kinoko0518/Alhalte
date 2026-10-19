@@ -7,13 +7,10 @@ use std::path::Path;
 use alhalte_banquette::character::Character;
 use alhalte_banquette::labels::{
     LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO,
-    LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG, LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BGM,
     LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
     LABEL_ALHALTE_BANQUETTE_LOG_CHUNK, LABEL_ALHALTE_BANQUETTE_SCENE,
 };
-use alhalte_banquette::log::{
-    ChangeBgImgEvent, ChangeBgmEvent, CharacterCameEvent, CharacterGoneEvent, LogChunk,
-};
+use alhalte_banquette::log::{CharacterCameEvent, CharacterGoneEvent, LogChunk};
 use alhalte_banquette::room::RoomData;
 use alhalte_banquette::scene::SceneData;
 use alhalte_saignant::LogEntry;
@@ -52,10 +49,6 @@ pub enum SceneEvent {
         /// Character identifier.
         character_id: u64,
     },
-    /// Background image change event.
-    ChangeBgImg(ChangeBgImgEvent),
-    /// Background music change event.
-    ChangeBgm(ChangeBgmEvent),
 }
 
 /// A parsed scene event with ordering metadata.
@@ -338,14 +331,6 @@ fn parse_entry_tin(
             },
             None,
         );
-    } else if tin.label == LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG
-        && let Ok(ev) = ChangeBgImgEvent::from_tin(tin)
-    {
-        return (SceneEvent::ChangeBgImg(ev), None);
-    } else if tin.label == LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BGM
-        && let Ok(ev) = ChangeBgmEvent::from_tin(tin)
-    {
-        return (SceneEvent::ChangeBgm(ev), None);
     }
 
     // Try duck-typed HashMap<String, Tin>

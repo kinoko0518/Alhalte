@@ -28,10 +28,6 @@
  *   settles them through {@link FakeRoomSocket.resolveStateWrite} /
  *   {@link FakeRoomSocket.rejectStateWrite} /
  *   {@link FakeRoomSocket.rejectDeleteState}.
- * - `requestChangeBgm` — the BGM change log (Issue #109 / sub-issue #142),
- *   recorded in {@link FakeRoomSocket.requestChangeBgmCalls} and settled with
- *   {@link FakeRoomSocket.resolveChangeBgm} /
- *   {@link FakeRoomSocket.rejectChangeBgm}.
  * - `requestCreateScene` / `requestDeleteScene` / `requestRewindLog` /
  *   `requestMoveCharacter` — the scene management actions
  *   (Issue #109 / sub-issue #143). They resolve immediately unless
@@ -86,13 +82,6 @@ export interface StateWriteCall {
 export interface StateDeleteCall {
   sceneId: string;
   key: string;
-}
-
-/** One recorded `requestChangeBgm` call. */
-export interface ChangeBgmCall {
-  sceneId: string;
-  slot: number;
-  tinId: string | null;
 }
 
 /** One recorded `requestCreateScene` call (Issue #109 / #143, #159). */
@@ -164,14 +153,6 @@ interface PendingStateOperation {
   kind: 'update' | 'delete';
   sceneId: string;
   key: string;
-  resolve: (value: unknown) => void;
-  reject: (error: unknown) => void;
-}
-
-interface PendingChangeBgmOperation {
-  sceneId: string;
-  slot: number;
-  tinId: string | null;
   resolve: (value: unknown) => void;
   reject: (error: unknown) => void;
 }
@@ -255,7 +236,6 @@ export class FakeRoomSocket {
   readonly queryStateCalls: Array<{ sceneId: string }> = [];
   readonly requestUpdateStateCalls: StateWriteCall[] = [];
   readonly requestDeleteStateCalls: StateDeleteCall[] = [];
-  readonly requestChangeBgmCalls: ChangeBgmCall[] = [];
   readonly requestCreateSceneCalls: CreateSceneCall[] = [];
   readonly requestDeleteSceneCalls: DeleteSceneCall[] = [];
   readonly requestRewindLogCalls: RewindLogCall[] = [];
@@ -279,7 +259,6 @@ export class FakeRoomSocket {
     resolve: (value: Record<string, unknown>) => void;
     reject: (error: unknown) => void;
   }> = [];
-  private readonly pendingChangeBgmOperations: PendingChangeBgmOperation[] = [];
   private readonly pendingSceneActions: PendingSceneAction[] = [];
   private readonly pendingListCharacterQueries: Array<{
     resolve: (value: Character[]) => void;
@@ -403,31 +382,9 @@ export class FakeRoomSocket {
     });
   }
 
-  /**
-   * Records the BGM change log write (`ChangeBgm`).
-   *
-   * Shares {@link FakeRoomSocket.autoAnswerStateWrites} with the state writes so
-   * BGM tests can hold both acknowledgements back and prove the local model is
-   * only committed after both arrive.
-   */
-  requestChangeBgm(sceneId: string, slot: number, tinId: string | null): Promise<unknown> {
-    this.requestChangeBgmCalls.push({ sceneId, slot, tinId });
-    if (this.autoAnswerStateWrites) {
-      return Promise.resolve({ scene_id: sceneId, slot, tin_id: tinId });
-    }
-    return new Promise((resolve, reject) => {
-      this.pendingChangeBgmOperations.push({ sceneId, slot, tinId, resolve, reject });
-    });
-  }
-
   /** Number of state writes / deletes still waiting for a manual answer. */
   get pendingStateOperationCount(): number {
     return this.pendingStateOperations.length;
-  }
-
-  /** Number of `ChangeBgm` writes still waiting for a manual answer. */
-  get pendingChangeBgmCount(): number {
-    return this.pendingChangeBgmOperations.length;
   }
 
   // -------------------------------------------------------------------------
@@ -651,20 +608,6 @@ export class FakeRoomSocket {
   /** Rejects the oldest pending state delete ack (e.g. `PermissionDenied`). */
   rejectDeleteState(error: unknown): void {
     this.takeStateOperation('delete').reject(error);
-  }
-
-  /** Resolves the oldest pending `ChangeBgm` ack. */
-  resolveChangeBgm(): void {
-    const operation = this.pendingChangeBgmOperations.shift();
-    if (!operation) throw new Error('FakeRoomSocket: no pending ChangeBgm');
-    operation.resolve({ scene_id: operation.sceneId, slot: operation.slot, tin_id: operation.tinId });
-  }
-
-  /** Rejects the oldest pending `ChangeBgm` ack. */
-  rejectChangeBgm(error: unknown): void {
-    const operation = this.pendingChangeBgmOperations.shift();
-    if (!operation) throw new Error('FakeRoomSocket: no pending ChangeBgm');
-    operation.reject(error);
   }
 
   /**

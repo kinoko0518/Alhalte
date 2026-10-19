@@ -289,18 +289,6 @@ impl RoomGraph {
                         nodes[idx].logs.push(log_entry);
                     }
                 }
-
-                SceneEvent::ChangeBgImg(_) | SceneEvent::ChangeBgm(_) => {
-                    // Update timestamp on current node
-                    if let Some(&idx) = node_index_map.get(&current_node_id) {
-                        if nodes[idx].start_time == 0 || ev.timestamp < nodes[idx].start_time {
-                            nodes[idx].start_time = ev.timestamp;
-                        }
-                        if ev.timestamp > nodes[idx].end_time {
-                            nodes[idx].end_time = ev.timestamp;
-                        }
-                    }
-                }
             }
         }
 

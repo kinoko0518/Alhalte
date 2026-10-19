@@ -19,19 +19,15 @@ use alhalte_banquette::character::{
 use alhalte_banquette::error::BanquetteError;
 use alhalte_banquette::labels::{
     IDENT_ALHALTE_BANQUETTE, IDENT_ALHALTE_BANQUETTE_LOG_BIBLIO,
-    IDENT_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG, IDENT_ALHALTE_BANQUETTE_LOG_CHANGE_BGM,
     IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
     IDENT_ALHALTE_BANQUETTE_LOG_CHUNK, IDENT_ALHALTE_BANQUETTE_SCENE,
     IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID, KEY_STD_ADMINS,
     LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO,
-    LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG, LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BGM,
     LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
     LABEL_ALHALTE_BANQUETTE_LOG_CHUNK, LABEL_ALHALTE_BANQUETTE_SCENE,
     LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID,
 };
-use alhalte_banquette::log::{
-    ChangeBgImgEvent, ChangeBgmEvent, CharacterCameEvent, CharacterGoneEvent, SceneLog,
-};
+use alhalte_banquette::log::{CharacterCameEvent, CharacterGoneEvent, SceneLog};
 use alhalte_banquette::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
     WebRtcSignalPayload,
@@ -56,14 +52,6 @@ fn test_label_definitions_and_hashes() {
     assert_eq!(
         label_hash(IDENT_ALHALTE_BANQUETTE_LOG_BIBLIO),
         LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO
-    );
-    assert_eq!(
-        label_hash(IDENT_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG),
-        LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG
-    );
-    assert_eq!(
-        label_hash(IDENT_ALHALTE_BANQUETTE_LOG_CHANGE_BGM),
-        LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BGM
     );
     assert_eq!(
         label_hash(IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME),
@@ -374,50 +362,7 @@ async fn test_log_chunk_sealing_to_cellar() {
 #[test]
 // spec: alhalte-banquette/log 0003 event serialization and duck-typing
 fn test_log_event_serialization_and_duck_typing() {
-    // 1. ChangeBgImgEvent
-    let img_evt = ChangeBgImgEvent {
-        image_tin_id: Some([7u8; 32]),
-        width: Some(1920),
-        height: Some(1080),
-    };
-    let tin = img_evt.to_tin().unwrap();
-    assert_eq!(tin.label, LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG);
-    let decoded = ChangeBgImgEvent::from_tin(&tin).unwrap();
-    assert_eq!(decoded, img_evt);
-
-    let duck = img_evt.to_duck_typed_map();
-    let from_duck = ChangeBgImgEvent::from_duck_typed_map(&duck).unwrap();
-    assert_eq!(from_duck, img_evt);
-
-    // 2. ChangeBgmEvent (spec: banquette/log change-bgm slot & stop)
-    let bgm_evt = ChangeBgmEvent {
-        bgm_tin_id: Some([9u8; 32]),
-        volume: Some(0.85),
-        slot: 2,
-        track_index: Some(2),
-    };
-    let tin = bgm_evt.to_tin().unwrap();
-    assert_eq!(tin.label, LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BGM);
-    let decoded = ChangeBgmEvent::from_tin(&tin).unwrap();
-    assert_eq!(decoded, bgm_evt);
-
-    let duck = bgm_evt.to_duck_typed_map();
-    let from_duck = ChangeBgmEvent::from_duck_typed_map(&duck).unwrap();
-    assert_eq!(from_duck, bgm_evt);
-
-    // Stop BGM with None
-    let stop_bgm = ChangeBgmEvent {
-        bgm_tin_id: None,
-        volume: None,
-        slot: 1,
-        track_index: None,
-    };
-    let stop_tin = stop_bgm.to_tin().unwrap();
-    let decoded_stop = ChangeBgmEvent::from_tin(&stop_tin).unwrap();
-    assert_eq!(decoded_stop.bgm_tin_id, None);
-    assert_eq!(decoded_stop.slot, 1);
-
-    // 3. CharacterCameEvent
+    // 1. CharacterCameEvent
     let came = CharacterCameEvent {
         character_id: 12345,
     };
@@ -430,7 +375,7 @@ fn test_log_event_serialization_and_duck_typing() {
     let from_duck = CharacterCameEvent::from_duck_typed_map(&duck).unwrap();
     assert_eq!(from_duck, came);
 
-    // 4. CharacterGoneEvent
+    // 2. CharacterGoneEvent
     let gone = CharacterGoneEvent {
         character_id: 12345,
     };
@@ -451,7 +396,11 @@ fn test_state_size_limit_and_namespaces() {
 
     // Valid key and valid size (< 4KiB)
     let ok_val = Tin::from_string("hello world");
-    assert!(state.update("std::bgm".to_string(), ok_val, false).is_ok());
+    assert!(
+        state
+            .update("std::custom".to_string(), ok_val, false)
+            .is_ok()
+    );
 
     // Key without :: separator -> InvalidStateKey error
     let bad_key_val = Tin::from_string("bad key");
@@ -808,7 +757,7 @@ async fn populated_room(cellar: &dyn CellarSink) -> Room {
         Tin::from_string("rain"),
     )
     .unwrap();
-    room.update_scene_state(42, "/", "std::b-img".to_string(), Tin::from_string("bg"))
+    room.update_scene_state(42, "/", "std::asset".to_string(), Tin::from_string("bg"))
         .unwrap();
     let character: alhalte_banquette::Character =
         HashMap::from([("std::name".to_string(), Tin::from_string("Alice"))]);
@@ -867,7 +816,7 @@ async fn test_persist_and_restore_whole_room() {
             .get("/")
             .unwrap()
             .state
-            .get("std::b-img")
+            .get("std::asset")
             .unwrap()
             .as_string()
             .unwrap(),

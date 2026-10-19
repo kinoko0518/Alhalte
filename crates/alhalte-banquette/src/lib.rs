@@ -14,7 +14,7 @@
 //!   supporting `append`, `edit`, `delete` (tombstone), and `rewind`. When chunks fill up, they are sealed into
 //!   `alhalte/banquette/log/chunk` tins and uploaded to `alhalte-cellar`.
 //! - **Scene state**: High-frequency associative state (`BTreeMap<String, Tin>`) bounded to 4KiB per tin value,
-//!   with reserved keys (`std::admins`, `std::bgm`, `std::b-img`) and `::` namespace separation.
+//!   with reserved keys (`std::admins`) and `::` namespace separation.
 //! - **Access control**: Under non-`done` status, non-administrators without characters present in a scene
 //!   receive **no response** to queries for scene log, state, or name.
 //! - **Lifecycle**: Unloading idle scenes when active client counts drop to zero, and periodic 4-minute heartbeats
@@ -60,20 +60,17 @@ pub use cli::{CliArgs, parse_cli_args};
 pub use error::{BanquetteError, Result};
 pub use labels::{
     IDENT_ALHALTE_BANQUETTE, IDENT_ALHALTE_BANQUETTE_LOG_BIBLIO,
-    IDENT_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG, IDENT_ALHALTE_BANQUETTE_LOG_CHANGE_BGM,
     IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
     IDENT_ALHALTE_BANQUETTE_LOG_CHUNK, IDENT_ALHALTE_BANQUETTE_SCENE,
     IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID, KEY_STD_ADMINS,
-    KEY_STD_B_IMG, KEY_STD_BGM, KEY_STD_NAME, KEY_STD_OWNER_ACCOUNT, LABEL_ALHALTE_BANQUETTE,
-    LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO, LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BG_IMG,
-    LABEL_ALHALTE_BANQUETTE_LOG_CHANGE_BGM, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME,
+    KEY_STD_NAME, KEY_STD_OWNER_ACCOUNT, LABEL_ALHALTE_BANQUETTE,
+    LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME,
     LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE, LABEL_ALHALTE_BANQUETTE_LOG_CHUNK,
     LABEL_ALHALTE_BANQUETTE_SCENE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
     LABEL_ALHALTE_MAITRE_D_SESSION_ID,
 };
 pub use log::{
-    ChangeBgImgEvent, ChangeBgmEvent, CharacterCameEvent, CharacterGoneEvent, LogBiblio, LogChunk,
-    LogOperationEvent, SceneLog,
+    CharacterCameEvent, CharacterGoneEvent, LogBiblio, LogChunk, LogOperationEvent, SceneLog,
 };
 pub use protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
