@@ -38,6 +38,15 @@ pub enum MaitreDError {
     #[error("Banquette communication error: {0}")]
     Banquette(String),
 
+    /// Banquette refused a room permission change.
+    ///
+    /// The room process answers a rejected `SetMemberPermission` /
+    /// `SetDefaultPermission` with an `Error` frame (caller is not an
+    /// administrator, last administrator demotion, ...). The HTTP layer maps
+    /// this to `403 Forbidden`; it is distinct from a transport failure.
+    #[error("Room permission refused: {0}")]
+    RoomPermissionRefused(String),
+
     /// Serialization or deserialization error.
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -53,6 +62,25 @@ pub enum MaitreDError {
     /// A room with this ID is already registered.
     #[error("Room already exists: {0}")]
     RoomAlreadyExists(String),
+
+    /// The database still holds rows of the retired `room_permissions` table.
+    ///
+    /// Issue #200 moved room authorization to `alhalte-banquette`'s `RoomData`
+    /// and deliberately provides no migration: the operator must reset the
+    /// database (delete the SQLite file) and let a fresh one be created.
+    #[error(
+        "database still holds {0} row(s) of the retired room_permissions table; room permissions are owned by alhalte-banquette now. Delete the SQLite database and restart"
+    )]
+    LegacyRoomPermissions(usize),
+
+    /// The database still holds rooms with the retired `rooms.done` flag set.
+    ///
+    /// Like [`MaitreDError::LegacyRoomPermissions`], there is no migration: the
+    /// public/private switch is the room's `default_permission` in banquette.
+    #[error(
+        "database still holds {0} room(s) with the retired rooms.done flag set; the public/private switch is alhalte-banquette's default_permission now. Delete the SQLite database and restart"
+    )]
+    LegacyRoomDone(usize),
 
     /// Invalid request parameters.
     #[error("Bad request: {0}")]

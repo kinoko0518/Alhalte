@@ -1,9 +1,9 @@
 //! WebSocket room demultiplexer and UNIX socket communication bridge with `alhalte-banquette`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alhalte_banquette::{
@@ -22,6 +22,13 @@ use crate::spawner::BanquetteSpawner;
 
 type ExportResponseSender =
     oneshot::Sender<std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>>;
+
+/// How long a one-shot permission request waits for an answer from banquette.
+///
+/// A permission query always produces one `AccountPermissionResponse`, and a
+/// permission mutation produces exactly one `PermissionsUpdated` or `Error`.
+/// The timeout only guards against a wedged room process.
+const PERMISSION_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Current UNIX timestamp in seconds, used for `room_heads.updated_at`.
 fn unix_timestamp() -> i64 {
@@ -43,18 +50,26 @@ pub struct RoomBridge {
     to_banquette_tx: mpsc::UnboundedSender<MaitreDToBanquette>,
     /// Pending export snapshot response senders.
     pending_exports: Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
+    /// Pending `QueryAccountPermission` response senders.
+    pending_permission_queries: Arc<RwLock<HashMap<u64, oneshot::Sender<RoomPermissionLevel>>>>,
     /// Monotonic counter for export request IDs.
     export_counter: Arc<AtomicU64>,
-    /// Done flag indicating whether room is fully public.
-    is_done: Arc<AtomicBool>,
+    /// Monotonic counter for `QueryAccountPermission` request IDs.
+    permission_counter: Arc<AtomicU64>,
+    /// Client ID namespace for the transient clients used by permission requests.
+    ///
+    /// Real WebSocket clients are allocated upward from 1, so this counter walks
+    /// down from `u64::MAX`; the two namespaces cannot collide.
+    proxy_client_counter: Arc<AtomicU64>,
 }
 
 impl RoomBridge {
     /// Spawns a banquette for `room_id`, connects to its UNIX socket, and returns the bridge.
     ///
-    /// `room_head` is the persisted `RoomData` tin pointer. The spawner restores
-    /// the room from it, so a bridge is never silently created around an empty
-    /// room when a head exists.
+    /// `admin_account` is the room creator, which banquette makes its initial
+    /// `Admin` when the room starts from scratch. `room_head` is the persisted
+    /// `RoomData` tin pointer. The spawner restores the room from it, so a
+    /// bridge is never silently created around an empty room when a head exists.
     ///
     /// # Errors
     ///
@@ -72,15 +87,17 @@ impl RoomBridge {
         let clients = Arc::new(RwLock::new(HashMap::new()));
         let client_scenes = Arc::new(RwLock::new(HashMap::new()));
         let pending_exports = Arc::new(RwLock::new(HashMap::new()));
+        let pending_permission_queries = Arc::new(RwLock::new(HashMap::new()));
         let export_counter = Arc::new(AtomicU64::new(1));
-        let is_done = Arc::new(AtomicBool::new(false));
+        let permission_counter = Arc::new(AtomicU64::new(1));
+        let proxy_client_counter = Arc::new(AtomicU64::new(u64::MAX));
         let (to_banquette_tx, mut to_banquette_rx) =
             mpsc::unbounded_channel::<MaitreDToBanquette>();
 
         let bridge_clients = Arc::clone(&clients);
         let bridge_scenes = Arc::clone(&client_scenes);
         let bridge_exports = Arc::clone(&pending_exports);
-        let bridge_done = Arc::clone(&is_done);
+        let bridge_permission_queries = Arc::clone(&pending_permission_queries);
 
         tracing::info!("Launching banquette for room {room_id}...");
         let socket_path = spawner
@@ -121,7 +138,7 @@ impl RoomBridge {
                             &bridge_clients,
                             &bridge_scenes,
                             &bridge_exports,
-                            &bridge_done,
+                            &bridge_permission_queries,
                         )
                         .await;
                     }
@@ -140,6 +157,10 @@ impl RoomBridge {
                 let mut pending = bridge_exports.write().await;
                 pending.clear();
             }
+            {
+                let mut pending = bridge_permission_queries.write().await;
+                pending.clear();
+            }
             on_terminated(room_id);
         });
 
@@ -149,8 +170,10 @@ impl RoomBridge {
             client_scenes,
             to_banquette_tx,
             pending_exports,
+            pending_permission_queries,
             export_counter,
-            is_done,
+            permission_counter,
+            proxy_client_counter,
         })
     }
 
@@ -182,69 +205,24 @@ impl RoomBridge {
         clients: &Arc<RwLock<HashMap<u64, mpsc::Sender<ServerFrame>>>>,
         client_scenes: &Arc<RwLock<HashMap<u64, String>>>,
         pending_exports: &Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
-        is_done: &Arc<AtomicBool>,
+        pending_permission_queries: &Arc<
+            RwLock<HashMap<u64, oneshot::Sender<RoomPermissionLevel>>>,
+        >,
     ) {
-        /// Projects a room's default permission onto the `rooms.done` gate.
-        ///
-        /// TODO(#200): `rooms.done` is the pre-spawn membership gate that
-        /// predates the four-level room permissions of Issue #199. Banquette is
-        /// now the source of truth for `default_permission` / `permissions`, and
-        /// this flag is only a projection kept so the WebSocket / `GET
-        /// /api/rooms/{id}` gate keeps working. #200 replaces the gate with the
-        /// room permission table and deletes this function together with
-        /// `rooms.done`.
-        fn record_permissions(
-            db: &Database,
-            room_id: u64,
-            default_permission: RoomPermissionLevel,
-            is_done: &Arc<AtomicBool>,
-        ) {
-            let room_id_hex = format!("{room_id:016x}");
-            let done = default_permission != RoomPermissionLevel::Denied;
-            // Only a successful `SetDefaultPermission` / persist produces a
-            // permission frame, so a rejected request cannot flip the gate.
-            match db.set_room_done(&room_id_hex, done) {
-                Ok(true) => {}
-                Ok(false) => tracing::warn!(
-                    "room {room_id_hex} reported default_permission={default_permission:?} but is not registered"
-                ),
-                Err(e) => tracing::error!("Failed to record done for {room_id_hex}: {e}"),
-            }
-            is_done.store(done, Ordering::Relaxed);
-        }
-
         match frame {
             BanquetteToMaitreD::SendToClient { client_id, frame } => {
-                if let ServerFrame::PermissionsUpdated {
-                    default_permission, ..
-                } = &frame
-                {
-                    record_permissions(db, room_id, *default_permission, is_done);
-                }
                 let cl = clients.read().await;
                 if let Some(tx) = cl.get(&client_id) {
                     let _ = tx.send(frame).await;
                 }
             }
             BanquetteToMaitreD::BroadcastToRoom { frame } => {
-                if let ServerFrame::PermissionsUpdated {
-                    default_permission, ..
-                } = &frame
-                {
-                    record_permissions(db, room_id, *default_permission, is_done);
-                }
                 let cl = clients.read().await;
                 for tx in cl.values() {
                     let _ = tx.send(frame.clone()).await;
                 }
             }
             BanquetteToMaitreD::BroadcastToScene { scene_id, frame } => {
-                if let ServerFrame::PermissionsUpdated {
-                    default_permission, ..
-                } = &frame
-                {
-                    record_permissions(db, room_id, *default_permission, is_done);
-                }
                 let cl = clients.read().await;
                 let scenes = client_scenes.read().await;
                 for (cid, tx) in cl.iter() {
@@ -279,18 +257,13 @@ impl RoomBridge {
                 }
             }
             // spec: alhalte-maitre-d/room-head 0001 persist RoomData head pointer
-            // spec: alhalte-maitre-d/room-done 0001 persist the public flag with the head
-            BanquetteToMaitreD::RoomPersisted {
-                tin_id,
-                default_permission,
-            } => {
+            //
+            // `RoomPersisted.default_permission` is not stored: the room's
+            // permission table lives in the persisted `RoomData` and `maitre-d`
+            // keeps no copy of it (Issue #200). Only the head pointer is
+            // recorded, and only after banquette reports a successful store.
+            BanquetteToMaitreD::RoomPersisted { tin_id, .. } => {
                 let room_id_hex = format!("{room_id:016x}");
-                // `done` lives on the room row (not in `RoomData`) so the
-                // pre-spawn gate survives a maitre-d restart. A successful
-                // persist (including a restored room's first persist) updates it.
-                // TODO(#200): derive the gate from the room permission table
-                // instead of this `default_permission` projection.
-                record_permissions(db, room_id, default_permission, is_done);
                 match db.set_room_head(&room_id_hex, &tin_id, unix_timestamp()) {
                     Ok(previous) => {
                         if let Some(previous) = previous
@@ -312,20 +285,226 @@ impl RoomBridge {
                     }
                 }
             }
-            // TODO(#200): `maitre-d` does not query account permissions yet. When
-            // the pre-spawn gate moves to the room permission table, this becomes
-            // the authoritative answer for `GET /api/room/{room_id}` and the
-            // database role rows are deleted.
+            // answer to `RoomBridge::query_account_permission`.
             BanquetteToMaitreD::AccountPermissionResponse {
                 request_id,
                 account_id,
                 permission,
             } => {
-                tracing::debug!(
-                    "room {} account {account_id} permission {permission:?} (request {request_id})",
-                    format!("{room_id:016x}")
-                );
+                let mut pending = pending_permission_queries.write().await;
+                if let Some(tx) = pending.remove(&request_id) {
+                    let _ = tx.send(permission);
+                } else {
+                    tracing::debug!(
+                        "room {} account {account_id} permission {permission:?} (request {request_id}) had no waiter",
+                        format!("{room_id:016x}")
+                    );
+                }
             }
+        }
+    }
+
+    /// Asks banquette for the effective permission of `account_id`.
+    ///
+    /// `0` asks for the room default, which is what an anonymous client gets.
+    /// The answer is banquette's `RoomData.permissions` /
+    /// `RoomData.default_permission`; `maitre-d` has no permission table of its
+    /// own (Issue #200).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be delivered or banquette does
+    /// not answer before [`PERMISSION_REQUEST_TIMEOUT`].
+    pub async fn query_account_permission(&self, account_id: u64) -> Result<RoomPermissionLevel> {
+        let request_id = self.permission_counter.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut pending = self.pending_permission_queries.write().await;
+            pending.insert(request_id, tx);
+        }
+
+        if let Err(e) = self
+            .to_banquette_tx
+            .send(MaitreDToBanquette::QueryAccountPermission {
+                request_id,
+                account_id,
+            })
+        {
+            let mut pending = self.pending_permission_queries.write().await;
+            pending.remove(&request_id);
+            return Err(MaitreDError::Banquette(format!(
+                "Failed to send QueryAccountPermission to banquette: {e}"
+            )));
+        }
+
+        match tokio::time::timeout(PERMISSION_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(permission)) => Ok(permission),
+            Ok(Err(_)) => Err(MaitreDError::Banquette(
+                "Permission response channel dropped".to_string(),
+            )),
+            Err(_) => {
+                let mut pending = self.pending_permission_queries.write().await;
+                pending.remove(&request_id);
+                Err(MaitreDError::Banquette(
+                    "Account permission query timed out".to_string(),
+                ))
+            }
+        }
+    }
+
+    /// Returns the room's permission table as banquette sees it.
+    ///
+    /// The query is sent as `account_id` through a transient client, so
+    /// banquette itself decides whether that account may read the table. A
+    /// `None` answer means banquette returned nothing (an account without
+    /// access to the root scene).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be delivered or banquette does
+    /// not answer before [`PERMISSION_REQUEST_TIMEOUT`].
+    pub async fn permissions_snapshot(
+        &self,
+        account_id: u64,
+    ) -> Result<Option<(RoomPermissionLevel, BTreeMap<u64, RoomPermissionLevel>)>> {
+        let frame = self
+            .send_permission_frame(account_id, ClientFrame::QueryPermissions, |frame| {
+                matches!(
+                    frame,
+                    ServerFrame::PermissionsSnapshot { .. } | ServerFrame::Error { .. }
+                )
+            })
+            .await?;
+
+        match frame {
+            ServerFrame::PermissionsSnapshot {
+                default_permission,
+                permissions,
+            } => Ok(Some((default_permission, permissions))),
+            ServerFrame::Error { code, message } => Err(MaitreDError::RoomPermissionRefused(
+                format!("banquette refused the permission request ({code}): {message}"),
+            )),
+            other => Err(MaitreDError::Banquette(format!(
+                "unexpected answer to QueryPermissions: {other:?}"
+            ))),
+        }
+    }
+
+    /// Applies [`ClientFrame::SetMemberPermission`] as `caller_account`.
+    ///
+    /// banquette authorizes the request: a caller that is not an administrator,
+    /// or a demotion of the last administrator, comes back as an `Error` frame
+    /// and is surfaced as [`MaitreDError::Banquette`].
+    ///
+    /// # Errors
+    ///
+    /// See [`RoomBridge::query_account_permission`]; a refused permission change
+    /// is also an error.
+    pub async fn set_member_permission(
+        &self,
+        caller_account: u64,
+        target_account: u64,
+        permission: RoomPermissionLevel,
+    ) -> Result<()> {
+        self.send_permission_mutation(
+            caller_account,
+            ClientFrame::SetMemberPermission {
+                account_id: target_account,
+                permission,
+            },
+        )
+        .await
+    }
+
+    /// Applies [`ClientFrame::SetDefaultPermission`] as `caller_account`.
+    ///
+    /// # Errors
+    ///
+    /// See [`RoomBridge::set_member_permission`].
+    pub async fn set_default_permission(
+        &self,
+        caller_account: u64,
+        permission: RoomPermissionLevel,
+    ) -> Result<()> {
+        self.send_permission_mutation(
+            caller_account,
+            ClientFrame::SetDefaultPermission { permission },
+        )
+        .await
+    }
+
+    /// Sends a permission mutation and waits for banquette's acknowledgement.
+    async fn send_permission_mutation(
+        &self,
+        caller_account: u64,
+        frame: ClientFrame,
+    ) -> Result<()> {
+        let frame = self
+            .send_permission_frame(caller_account, frame, |frame| {
+                matches!(
+                    frame,
+                    ServerFrame::PermissionsUpdated { .. } | ServerFrame::Error { .. }
+                )
+            })
+            .await?;
+
+        match frame {
+            ServerFrame::PermissionsUpdated { .. } => Ok(()),
+            ServerFrame::Error { code, message } => Err(MaitreDError::RoomPermissionRefused(
+                format!("banquette refused the permission request ({code}): {message}"),
+            )),
+            other => Err(MaitreDError::Banquette(format!(
+                "unexpected answer to a permission change: {other:?}"
+            ))),
+        }
+    }
+
+    /// Sends one client frame through a transient client and returns the first
+    /// frame banquette addresses to it that `accept` matches.
+    ///
+    /// Room / scene broadcasts reach the transient client as well, so frames
+    /// that are not the answer are skipped until the deadline.
+    async fn send_permission_frame(
+        &self,
+        account_id: u64,
+        frame: ClientFrame,
+        mut accept: impl FnMut(&ServerFrame) -> bool,
+    ) -> Result<ServerFrame> {
+        let client_id = self.proxy_client_counter.fetch_sub(1, Ordering::Relaxed);
+        let mut rx = self.register_client(client_id, account_id, 0).await;
+
+        if let Err(e) = self
+            .to_banquette_tx
+            .send(MaitreDToBanquette::ClientMessage { client_id, frame })
+        {
+            self.unregister_client(client_id).await;
+            return Err(MaitreDError::Banquette(format!(
+                "Failed to send a permission request to banquette: {e}"
+            )));
+        }
+
+        let deadline = tokio::time::Instant::now() + PERMISSION_REQUEST_TIMEOUT;
+        let mut answer = None;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(frame)) => {
+                    if accept(&frame) {
+                        answer = Some(frame);
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        self.unregister_client(client_id).await;
+
+        match answer {
+            Some(frame) => Ok(frame),
+            None => Err(MaitreDError::Banquette(
+                "banquette did not answer the permission request".to_string(),
+            )),
         }
     }
 
@@ -373,22 +552,6 @@ impl RoomBridge {
             .send(MaitreDToBanquette::ClientDisconnected { client_id });
     }
 
-    /// Returns whether this room is marked as done (fully public).
-    pub fn is_done(&self) -> bool {
-        self.is_done.load(Ordering::Relaxed)
-    }
-
-    /// Seeds or updates the in-memory done flag for this room.
-    ///
-    /// TODO(#200): this is a projection of the room's default permission kept
-    /// for the pre-spawn membership gate. It is used when a bridge is created
-    /// (from `rooms.done`) and as the fallback when the database row is missing;
-    /// a live `SetDefaultPermission` becomes authoritative only after banquette
-    /// acknowledges it with `PermissionsUpdated`.
-    pub fn set_done(&self, done: bool) {
-        self.is_done.store(done, Ordering::Relaxed);
-    }
-
     /// Sends a ServerFrame to a specific connected client.
     pub async fn send_to_client(&self, client_id: u64, frame: ServerFrame) {
         let cl = self.clients.read().await;
@@ -398,8 +561,12 @@ impl RoomBridge {
     }
 
     /// Forwards a client frame to the room's `banquette` process.
+    ///
+    /// Every `ClientFrame` is forwarded unchanged: authorization (including the
+    /// viewer/full-access split) is enforced by banquette's room permission
+    /// table, never by `maitre-d` (Issue #200).
     pub fn send_client_frame(&self, client_id: u64, frame: ClientFrame) {
-        // Track scene movements locally
+        // Track scene movements locally so scene broadcasts are demultiplexed.
         match &frame {
             ClientFrame::EnterScene { scene_id } => {
                 let scenes = Arc::clone(&self.client_scenes);
@@ -414,10 +581,6 @@ impl RoomBridge {
                     scenes.write().await.remove(&client_id);
                 });
             }
-            // Room permissions are applied by banquette itself: the DB role rows
-            // are no longer pushed into a running room.
-            // TODO(#200): make `room_permissions` a mirror of the banquette
-            // permission table and delete the DB-driven role sync entirely.
             _ => {}
         }
 
@@ -489,6 +652,10 @@ impl RoomBridgeManager {
 
     /// Obtains an existing [`RoomBridge`] or launches a new one from the persisted head.
     ///
+    /// `admin_account` is the room's `rooms.creator_account`. It is the only
+    /// source of the initial administrator: neither the connecting account nor a
+    /// database role decides it (Issue #200).
+    ///
     /// # Errors
     ///
     /// Returns an error when the room head cannot be read from the database or
@@ -509,10 +676,6 @@ impl RoomBridgeManager {
         let room_id_hex = format!("{room_id:016x}");
         let room_head = self.db.get_room_head(&room_id_hex)?;
 
-        // The `rooms.done` row is authoritative across restarts; a restored
-        // `RoomData.done` is written back through `RoomPersisted`.
-        let initial_done = self.db.get_room_done(&room_id_hex)?.unwrap_or(false);
-
         let rooms_ref = Arc::clone(&self.rooms);
         let on_term = move |rid: u64| {
             let rooms_inner = Arc::clone(&rooms_ref);
@@ -532,7 +695,6 @@ impl RoomBridgeManager {
             )
             .await?,
         );
-        bridge.set_done(initial_done);
 
         rooms.insert(room_id, Arc::clone(&bridge));
         Ok(bridge)
@@ -542,46 +704,5 @@ impl RoomBridgeManager {
     pub async fn remove_room(&self, room_id: u64) {
         let mut rooms = self.rooms.write().await;
         rooms.remove(&room_id);
-    }
-
-    /// Checks whether a room is marked as done (fully public).
-    ///
-    /// The persisted `rooms.done` row is authoritative so a `maitre-d` restart
-    /// still allows non-members through the pre-spawn gate before any banquette
-    /// process exists. The in-memory bridge is only a fallback if the row is
-    /// missing or cannot be read.
-    pub async fn is_room_done(&self, room_id: u64) -> bool {
-        let room_id_hex = format!("{room_id:016x}");
-        match self.db.get_room_done(&room_id_hex) {
-            Ok(Some(done)) => return done,
-            Ok(None) => {}
-            Err(e) => tracing::error!("Failed to read done for room {room_id_hex}: {e}"),
-        }
-
-        let rooms = self.rooms.read().await;
-        rooms
-            .get(&room_id)
-            .map(|bridge| bridge.is_done())
-            .unwrap_or(false)
-    }
-
-    /// Sets the done flag for a room and persists it to the database.
-    ///
-    /// Persisting happens even when no bridge is live (for example before the
-    /// first WebSocket connection) so the flag is visible after a restart.
-    pub async fn set_room_done(&self, room_id: u64, done: bool) {
-        let room_id_hex = format!("{room_id:016x}");
-        match self.db.set_room_done(&room_id_hex, done) {
-            Ok(true) => {}
-            Ok(false) => {
-                tracing::warn!("Cannot persist done={done}: room {room_id_hex} is not registered")
-            }
-            Err(e) => tracing::error!("Failed to persist done for room {room_id_hex}: {e}"),
-        }
-
-        let rooms = self.rooms.read().await;
-        if let Some(bridge) = rooms.get(&room_id) {
-            bridge.set_done(done);
-        }
     }
 }
