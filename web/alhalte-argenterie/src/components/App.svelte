@@ -19,7 +19,18 @@
   import { fetchRoomInfo, resolveRoomFromLocation, RoomApiError } from '../utils/home.js';
   import { ChunkLogManager } from '../utils/log.js';
   import type { SceneMovementEvent } from '../utils/sceneGraph.js';
-  import { createDefaultJuices, getNormalizedBgmSlots, inheritJuices, moveMemberToScene } from '../utils/sceneSettings.js';
+  import {
+    createDefaultJuices,
+    downloadSceneBackground,
+    getNormalizedBgmSlots,
+    inheritJuices,
+    moveMemberToScene,
+    parseSceneBackgroundState,
+    SCENE_BACKGROUND_HEIGHT_STATE_KEY,
+    SCENE_BACKGROUND_STATE_KEY,
+    SCENE_BACKGROUND_WIDTH_STATE_KEY,
+    SCENE_NAME_STATE_KEY,
+  } from '../utils/sceneSettings.js';
   import { applyThemeToDocument } from '../utils/theme.js';
   import {
     DEFAULT_OFFICIAL_EXTENSIONS,
@@ -45,7 +56,9 @@
     OperationTimeoutError,
     ServerOperationError,
     parseCharacter,
+    sceneListEntrySummary,
     tinToJson,
+    type SceneSummary,
   } from '../utils/roomSocket.js';
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
   import { resolveRoomKey } from '../utils/cellarTransfer.js';
@@ -1028,6 +1041,9 @@
         chunkLogManager: chunkManager,
         initialSceneId: currentSceneId,
         autoConnect: true,
+        onStateSnapshot: (sceneId, states) => {
+          applyStateSnapshot(sceneId, states);
+        },
         onError: (err) => {
           if (
             err.message?.includes('全体公開されていない部屋です') ||
@@ -1063,21 +1079,35 @@
   });
 
   // ---------------------------------------------------------------------------
-  // BGM scene-state synchronization (Issue #109 / sub-issue #142)
+  // Scene-state hydration: BGM / background / name / view / pieces (Issue #159)
   // ---------------------------------------------------------------------------
-  /** Scene-state keys carrying a slot's track; legacy `std::bgm` is slot 1. */
-  const BGM_SLOT_STATE_KEYS: Record<string, number> = {
-    'std::bgm': 1,
-    'std::bgm2': 2,
-    'std::bgm3': 3,
-  };
+  /** Scene-state key carrying a slot's track; legacy `std::bgm` is slot 1. */
+  const BGM_SLOT_STATE_KEY = /^std::bgm(\d*)$/;
 
   /** Scene-state key carrying a slot volume (`bgm::<slot>::volume`). */
   const BGM_VOLUME_STATE_KEY = /^bgm::(\d+)::volume$/;
 
+  /** `piece::<characterId>::placed` and `piece::<characterId>::pos` keys. */
+  const PIECE_PLACED_STATE_KEY = /^piece::(.+)::placed$/;
+  const PIECE_POS_STATE_KEY = /^piece::(.+)::pos$/;
+
+  /**
+   * Parses the BGM slot of a `std::bgm<N>` key.
+   *
+   * `std::bgm` is slot 1 (legacy) and `std::bgm2`, `std::bgm3`, ... are the
+   * arbitrary slots the server accepts; `std::bgm1` is accepted as slot 1 too.
+   */
+  function bgmSlotFromStateKey(key: string): number | null {
+    const match = BGM_SLOT_STATE_KEY.exec(key);
+    if (!match) return null;
+    const raw = match[1];
+    const slot = raw === '' ? 1 : Number(raw);
+    return Number.isInteger(slot) && slot >= 1 ? slot : null;
+  }
+
   /** True when a `StateUpdated` / `StateDeleted` key belongs to the BGM schema. */
   function isBgmStateKey(key: string): boolean {
-    return key in BGM_SLOT_STATE_KEYS || BGM_VOLUME_STATE_KEY.test(key);
+    return bgmSlotFromStateKey(key) !== null || BGM_VOLUME_STATE_KEY.test(key);
   }
 
   /** Mirrors a slot's tin id (and optionally volume) into the legacy `bgm1..3` fields. */
@@ -1106,6 +1136,16 @@
   }
 
   /**
+   * Returns `slots` with `slotNum` present. Arbitrary slot numbers are created
+   * on demand so a `std::bgm4` snapshot hydrates even when the client has only
+   * ever rendered slots 1..3.
+   */
+  function ensureBgmSlot(slots: BgmSlot[], slotNum: number): BgmSlot[] {
+    if (slots.some((slot) => slot.slot === slotNum)) return slots;
+    return [...slots, { slot: slotNum, tinId: null, volume: 0.8, isPlaying: false }];
+  }
+
+  /**
    * Applies a BGM `StateUpdated` frame.
    *
    * Track values are the 64-hex cellar tin id; the legacy plain-string form of
@@ -1121,7 +1161,7 @@
       const volume = typeof value === 'number' ? value : Number(value);
       if (!Number.isFinite(volume)) return;
       const clamped = Math.max(0, Math.min(1, volume));
-      const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
         slot.slot === slotNum ? { ...slot, volume: clamped } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1130,10 +1170,10 @@
       return;
     }
 
-    const slotNum = BGM_SLOT_STATE_KEYS[key];
-    if (slotNum === undefined) return;
+    const slotNum = bgmSlotFromStateKey(key);
+    if (slotNum === null) return;
     const tinId = typeof value === 'string' && value.length > 0 ? value : null;
-    const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+    const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
       slot.slot === slotNum ? { ...slot, tinId, isPlaying: tinId !== null } : { ...slot },
     );
     setNormalizedBgmSlots(scene.juices, slots);
@@ -1145,7 +1185,7 @@
     const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
     if (volumeMatch) {
       const slotNum = Number(volumeMatch[1]);
-      const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
         slot.slot === slotNum ? { ...slot, volume: 0.8 } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1154,13 +1194,293 @@
       return;
     }
 
-    const slotNum = BGM_SLOT_STATE_KEYS[key];
-    if (slotNum === undefined) return;
-    const slots = getNormalizedBgmSlots(scene.juices).map((slot) =>
+    const slotNum = bgmSlotFromStateKey(key);
+    if (slotNum === null) return;
+    const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
       slot.slot === slotNum ? { ...slot, tinId: null, isPlaying: false } : { ...slot },
     );
     setNormalizedBgmSlots(scene.juices, slots);
     syncLegacyBgmFields(scene.juices, slotNum, null);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Background image / dimensions hydration (Issue #159)
+  // ---------------------------------------------------------------------------
+  /** Last background reference applied per scene, keyed `tinId:mimeType`. */
+  const appliedBackgroundKeys = new Map<string, string>();
+  /** In-flight background downloads per scene, so a reconnect does not refetch. */
+  const backgroundDownloads = new Map<string, string>();
+
+  /**
+   * Applies a `std::b-img` value: downloads the referenced tin and stores a data
+   * URL in `juices.bgImage`. Data URLs written by an older client are still
+   * accepted as-is. The download is skipped when the same reference is already
+   * applied, making snapshot re-application (reconnect / scene switch) cheap.
+   */
+  function applyBackgroundImage(scene: Scene, rawValue: unknown) {
+    const decoded = tinToJson(rawValue);
+    if (typeof decoded === 'string' && decoded.startsWith('data:')) {
+      appliedBackgroundKeys.delete(scene.id);
+      scene.juices.bgImage = decoded;
+      return;
+    }
+
+    const parsed = parseSceneBackgroundState(decoded);
+    if (!parsed) {
+      appliedBackgroundKeys.delete(scene.id);
+      scene.juices.bgImage = undefined;
+      return;
+    }
+
+    const reference = `${parsed.tinId}:${parsed.mimeType}`;
+    if (appliedBackgroundKeys.get(scene.id) === reference && scene.juices.bgImage) return;
+
+    appliedBackgroundKeys.set(scene.id, reference);
+    const roomKey = extensionRoomKey;
+    if (!roomKey) {
+      // No key means the image cannot be decrypted; keep the reference so a
+      // later snapshot with a key can retry, and leave the previous preview.
+      appliedBackgroundKeys.delete(scene.id);
+      return;
+    }
+
+    const inFlight = backgroundDownloads.get(scene.id);
+    if (inFlight === reference) return;
+    backgroundDownloads.set(scene.id, reference);
+
+    void downloadSceneBackground(parsed, roomKey)
+      .then((dataUrl) => {
+        if (backgroundDownloads.get(scene.id) === reference) {
+          backgroundDownloads.delete(scene.id);
+        }
+        appliedBackgroundKeys.set(scene.id, reference);
+        const target = scenes.find((candidate) => candidate.id === scene.id);
+        if (target) target.juices.bgImage = dataUrl;
+      })
+      .catch((error) => {
+        console.warn('[App] Failed to load the scene background image:', error);
+        if (backgroundDownloads.get(scene.id) === reference) {
+          backgroundDownloads.delete(scene.id);
+        }
+        appliedBackgroundKeys.delete(scene.id);
+      });
+  }
+
+  function applyBackgroundDimensions(scene: Scene, key: string, rawValue: unknown) {
+    const value = tinToJson(rawValue);
+    const numeric = typeof value === 'number' ? value : Number(value);
+    const parsed = Number.isFinite(numeric) && numeric > 0 ? numeric : undefined;
+    if (key === SCENE_BACKGROUND_WIDTH_STATE_KEY) {
+      scene.juices.bgWidth = parsed;
+    } else {
+      scene.juices.bgHeight = parsed;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Piece hydration (Issue #159)
+  // ---------------------------------------------------------------------------
+  interface PieceState {
+    placed?: boolean;
+    pos?: { x: number; y: number };
+  }
+  /** Piece state per scene, applied to `characters` for the current scene. */
+  const pieceStatesByScene = new Map<string, Map<string, PieceState>>();
+
+  function parsePieceStateKey(key: string): { characterId: string; kind: 'placed' | 'pos' } | null {
+    const placed = PIECE_PLACED_STATE_KEY.exec(key);
+    if (placed) return { characterId: placed[1], kind: 'placed' };
+    const pos = PIECE_POS_STATE_KEY.exec(key);
+    if (pos) return { characterId: pos[1], kind: 'pos' };
+    return null;
+  }
+
+  function readPiecePosition(value: unknown): { x: number; y: number } | undefined {
+    const decoded = tinToJson(value);
+    if (decoded && typeof decoded === 'object') {
+      const { x, y } = decoded as { x?: unknown; y?: unknown };
+      if (typeof x === 'number' && typeof y === 'number') return { x, y };
+    }
+    return undefined;
+  }
+
+  /** Applies the stored piece state of `sceneId` to the character list. */
+  function applyPieceStatesToCharacters(sceneId: string) {
+    const states = pieceStatesByScene.get(sceneId);
+    if (!states) return;
+    characters = characters.map((character) => {
+      const state = states.get(character.id);
+      if (!state) {
+        return character.placedAsPiece === false
+          ? character
+          : { ...character, placedAsPiece: false };
+      }
+      return {
+        ...character,
+        placedAsPiece: state.placed === true,
+        ...(state.pos ? { piecePosition: { ...state.pos } } : {}),
+      };
+    });
+  }
+
+  function applyPieceStateEntry(sceneId: string, key: string, rawValue: unknown) {
+    const parsed = parsePieceStateKey(key);
+    if (!parsed) return;
+    let states = pieceStatesByScene.get(sceneId);
+    if (!states) {
+      states = new Map();
+      pieceStatesByScene.set(sceneId, states);
+    }
+    const current = states.get(parsed.characterId) ?? {};
+    if (parsed.kind === 'placed') {
+      current.placed = Boolean(tinToJson(rawValue));
+    } else {
+      const pos = readPiecePosition(rawValue);
+      if (pos) current.pos = pos;
+    }
+    states.set(parsed.characterId, current);
+    if (sceneId === currentSceneId) applyPieceStatesToCharacters(sceneId);
+  }
+
+  function applyPieceStateDeleted(sceneId: string, key: string) {
+    const parsed = parsePieceStateKey(key);
+    if (!parsed) return;
+    const states = pieceStatesByScene.get(sceneId);
+    if (!states) return;
+    const current = states.get(parsed.characterId);
+    if (!current) return;
+    if (parsed.kind === 'placed') current.placed = false;
+    else delete current.pos;
+    states.set(parsed.characterId, current);
+    if (sceneId === currentSceneId) applyPieceStatesToCharacters(sceneId);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Generic scene-state application (snapshot / StateUpdated / SceneInfo)
+  // ---------------------------------------------------------------------------
+  /** Applies one decoded scene-state entry to the local scene model. */
+  function applySceneStateEntry(scene: Scene, key: string, rawValue: unknown) {
+    if (key === SCENE_NAME_STATE_KEY) {
+      const name = tinToJson(rawValue);
+      if (typeof name === 'string' && name.trim().length > 0) {
+        scene.name = name;
+      }
+      return;
+    }
+    if (isBgmStateKey(key)) {
+      applyBgmStateUpdated(scene, key, rawValue);
+      return;
+    }
+    if (key === SCENE_BACKGROUND_STATE_KEY) {
+      applyBackgroundImage(scene, rawValue);
+      return;
+    }
+    if (
+      key === SCENE_BACKGROUND_WIDTH_STATE_KEY ||
+      key === SCENE_BACKGROUND_HEIGHT_STATE_KEY
+    ) {
+      applyBackgroundDimensions(scene, key, rawValue);
+      return;
+    }
+    if (key === 'view::transform') {
+      const value = tinToJson(rawValue);
+      if (value && typeof value === 'object') {
+        const { x, y, scale } = value as { x?: unknown; y?: unknown; scale?: unknown };
+        if (typeof x === 'number') scene.viewTransform.x = x;
+        if (typeof y === 'number') scene.viewTransform.y = y;
+        if (typeof scale === 'number' && scale > 0) scene.viewTransform.scale = scale;
+      }
+      return;
+    }
+    if (parsePieceStateKey(key)) {
+      applyPieceStateEntry(scene.id, key, rawValue);
+    }
+  }
+
+  /** Applies one decoded scene-state deletion to the local scene model. */
+  function applySceneStateDeleted(scene: Scene, key: string) {
+    if (key === SCENE_NAME_STATE_KEY) return;
+    if (isBgmStateKey(key)) {
+      applyBgmStateDeleted(scene, key);
+      return;
+    }
+    if (key === SCENE_BACKGROUND_STATE_KEY) {
+      appliedBackgroundKeys.delete(scene.id);
+      backgroundDownloads.delete(scene.id);
+      scene.juices.bgImage = undefined;
+      return;
+    }
+    if (key === SCENE_BACKGROUND_WIDTH_STATE_KEY) {
+      scene.juices.bgWidth = undefined;
+      return;
+    }
+    if (key === SCENE_BACKGROUND_HEIGHT_STATE_KEY) {
+      scene.juices.bgHeight = undefined;
+      return;
+    }
+    if (parsePieceStateKey(key)) {
+      applyPieceStateDeleted(scene.id, key);
+    }
+  }
+
+  /** Decodes a raw Tin-encoded state map (as carried by `StateSnapshot`). */
+  function tinToJsonMap(raw: Record<string, unknown> | null | undefined): Record<string, unknown> {
+    const decoded: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(raw ?? {})) {
+      decoded[key] = tinToJson(value);
+    }
+    return decoded;
+  }
+
+  /**
+   * Applies a `StateSnapshot` for a scene.
+   *
+   * The snapshot is authoritative for that scene: every supported key is
+   * applied, and piece placement is reset for characters that are not listed.
+   * Applying the same snapshot again (reconnect / scene switch) is idempotent.
+   */
+  function applyStateSnapshot(sceneId: string, states: Record<string, unknown> | null | undefined) {
+    let scene = scenes.find((candidate) => candidate.id === sceneId);
+    if (!scene) {
+      const placeholder = createPlaceholderScene(sceneId);
+      scenes = [...scenes, placeholder];
+      // Re-read through the reactive array so mutations below hit the proxied
+      // scene object.
+      scene = scenes.find((candidate) => candidate.id === sceneId) ?? placeholder;
+    }
+
+    pieceStatesByScene.set(sceneId, new Map());
+    for (const [key, value] of Object.entries(states ?? {})) {
+      if (parsePieceStateKey(key)) {
+        applyPieceStateEntry(sceneId, key, value);
+      } else {
+        applySceneStateEntry(scene, key, value);
+      }
+    }
+    if (sceneId === currentSceneId) applyPieceStatesToCharacters(sceneId);
+  }
+
+  /**
+   * Applies a `SceneInfo` summary (create / rename broadcast).
+   *
+   * The name is server-authoritative: placeholders created from a `SceneList`
+   * id are replaced with the announced name without a reload.
+   */
+  function applySceneSummary(rawSummary: unknown) {
+    const summary: SceneSummary | null = sceneListEntrySummary(rawSummary);
+    if (!summary) return;
+    const scene = scenes.find((candidate) => candidate.id === summary.id);
+    const name =
+      typeof summary.name === 'string' && summary.name.trim().length > 0
+        ? summary.name
+        : undefined;
+    if (!scene) {
+      const placeholder = createPlaceholderScene(summary.id);
+      if (name) placeholder.name = name;
+      scenes = [...scenes, placeholder];
+      return;
+    }
+    if (name && scene.name !== name) scene.name = name;
   }
 
   /**
@@ -1272,22 +1592,36 @@
   }
 
   /**
-   * Applies a `SceneList` frame (Issue #109 / sub-issue #143).
+   * Applies a `SceneList` frame (Issue #109 / sub-issue #143, Issue #159).
    *
-   * Unlike the previous revision this is authoritative in both directions: it
-   * adds unknown scenes, removes scenes the server no longer lists, and
-   * re-points `currentSceneId` when the current scene vanished. `/` and scenes
+   * The list is authoritative in both directions: it adds unknown scenes,
+   * removes scenes the server no longer lists, and re-points `currentSceneId`
+   * when the current scene vanished. Entries are `SceneSummary` objects (new
+   * protocol) or bare ids (older servers); the summary `name` is
+   * server-authoritative and overwrites local placeholders. `/` and scenes
    * still waiting for a list that includes a fresh `SceneCreated` id are kept.
    */
-  function applySceneList(rawSceneIds: unknown) {
-    if (!Array.isArray(rawSceneIds) || rawSceneIds.length === 0) return;
-    const serverIds = new Set(rawSceneIds.map((id) => String(id)));
+  function applySceneList(rawEntries: unknown) {
+    if (!Array.isArray(rawEntries) || rawEntries.length === 0) return;
+    const summaries = rawEntries
+      .map((entry) => sceneListEntrySummary(entry))
+      .filter((summary): summary is SceneSummary => summary !== null);
+    if (summaries.length === 0) return;
+
+    const summariesById = new Map(summaries.map((summary) => [summary.id, summary]));
+    const serverIds = new Set(summariesById.keys());
     const next: Scene[] = [];
     let changed = false;
 
     for (const scene of scenes) {
       if (serverIds.has(scene.id)) {
         pendingSceneListIds.delete(scene.id);
+        const summary = summariesById.get(scene.id);
+        const name =
+          summary && typeof summary.name === 'string' && summary.name.trim().length > 0
+            ? summary.name
+            : undefined;
+        if (name && scene.name !== name) scene.name = name;
         next.push(scene);
         continue;
       }
@@ -1300,9 +1634,13 @@
       changed = true;
     }
 
-    for (const sceneId of serverIds) {
-      if (next.some((scene) => scene.id === sceneId)) continue;
-      next.push(createPlaceholderScene(sceneId));
+    for (const summary of summaries) {
+      if (next.some((scene) => scene.id === summary.id)) continue;
+      const placeholder = createPlaceholderScene(summary.id);
+      if (typeof summary.name === 'string' && summary.name.trim().length > 0) {
+        placeholder.name = summary.name;
+      }
+      next.push(placeholder);
       changed = true;
     }
 
@@ -1312,6 +1650,7 @@
       const fallback = next.find((scene) => scene.id === '/') ?? next[0];
       if (fallback) {
         currentSceneId = fallback.id;
+        applyPieceStatesToCharacters(currentSceneId);
         roomSocket?.enterScene(fallback.id);
       }
     }
@@ -1324,6 +1663,11 @@
       if (typeof frame !== 'object' || frame === null) return;
       if ('SceneList' in frame) {
         applySceneList(frame.SceneList.scenes);
+      }
+      // `SceneInfo` carries the server-authoritative name for create / rename
+      // broadcasts so other clients update without a reload (Issue #159).
+      if ('SceneInfo' in frame) {
+        applySceneSummary(frame.SceneInfo);
       }
       // Second safeguard for a deletion: the broadcast also removes the scene
       // even when this client did not issue the `DeleteScene` request.
@@ -1340,23 +1684,26 @@
         // The server list is authoritative: replace even when it is empty
         // (Issue #109 / #144) and keep the selection valid.
         applyCharacterList(charList);
+        applyPieceStatesToCharacters(currentSceneId);
       }
       if ('CharacterDeleted' in frame) {
         removeCharacterLocally(String(frame.CharacterDeleted.character_id));
+      }
+      // Snapshot application is registered both as the `onStateSnapshot`
+      // callback (real socket) and here (custom / test sockets). Every supported
+      // key is applied idempotently, so a duplicate snapshot is harmless.
+      if ('StateSnapshot' in frame) {
+        const { scene_id, states } = frame.StateSnapshot;
+        applyStateSnapshot(scene_id, tinToJsonMap(states));
       }
       if ('StateUpdated' in frame) {
         const { scene_id, key, value } = frame.StateUpdated;
         const targetScene = scenes.find((s) => s.id === scene_id);
         if (targetScene) {
-          if (isBgmStateKey(key)) {
-            // BGM state keys: `std::bgm` (legacy + slot 1), `std::bgm2/3`,
-            // `bgm::<slot>::volume`. Values arrive Tin-encoded.
-            applyBgmStateUpdated(targetScene, key, value);
-          } else if (key === 'std::b-img') {
-            targetScene.juices.bgImage = typeof value === 'string' ? value : undefined;
-          } else if (key === 'view::transform' && value && typeof value === 'object') {
-            targetScene.viewTransform = { ...targetScene.viewTransform, ...value };
-          }
+          // BGM keys (`std::bgm`, `std::bgm<N>`, `bgm::<slot>::volume`), the
+          // scene name, the background reference / dimensions, the view
+          // transform and piece placement all share one idempotent path.
+          applySceneStateEntry(targetScene, key, value);
         }
       }
       if ('StateDeleted' in frame) {
@@ -1366,11 +1713,7 @@
         // branch, which threw a ReferenceError on every StateDeleted frame.
         const targetScene = scenes.find((s) => s.id === scene_id);
         if (targetScene) {
-          if (isBgmStateKey(key)) {
-            applyBgmStateDeleted(targetScene, key);
-          } else if (key === 'std::b-img') {
-            targetScene.juices.bgImage = undefined;
-          }
+          applySceneStateDeleted(targetScene, key);
         }
       }
       if ('Error' in frame) {
@@ -1415,17 +1758,21 @@
   function handleSelectScene(sceneId: string) {
     if (scenes.some((s) => s.id === sceneId)) {
       currentSceneId = sceneId;
+      // Restore the placement hydrated for this scene (Issue #159). The
+      // entering `StateSnapshot` refreshes it a moment later.
+      applyPieceStatesToCharacters(sceneId);
       roomSocket?.enterScene(sceneId);
     }
   }
 
   /**
-   * Creates a scene and selects it (Issue #109 / sub-issue #143).
+   * Creates a scene and selects it (Issue #109 / sub-issue #143, Issue #159).
    *
-   * The id is generated exactly as before. Without a connected socket the
-   * historical local-only behaviour is kept (push + select). With a socket the
-   * local model changes only after the `SceneCreated` ack; `SceneList` may add
-   * the same id first, so the insertion dedupes by id and keeps the typed name.
+   * The name is written to `std::name` atomically with the creation, so the
+   * `SceneCreated` ack already carries the authoritative summary. Without a
+   * connected socket the action is reported as an error and the local scene
+   * list is left untouched: an offline mutation that only exists locally would
+   * look like success and then vanish on reconnect.
    */
   async function handleCreateScene(name: string, inheritJuice: boolean): Promise<boolean | void> {
     if (isViewer) return;
@@ -1437,15 +1784,10 @@
       const socket = roomSocket;
 
       if (!socket || !socket.isConnected) {
-        scenes = [
-          ...scenes,
-          { id: newId, name, juices, viewTransform: { x: 0, y: 0, scale: 1 }, members: [] },
-        ];
-        currentSceneId = newId;
-        return true;
+        throw new Error('ルームに接続していないため、シーンを作成できません');
       }
 
-      await socket.requestCreateScene(newId, inheritJuice);
+      await socket.requestCreateScene(newId, inheritJuice, name);
 
       pendingSceneListIds.add(newId);
       const alreadyListed = scenes.find((scene) => scene.id === newId);
@@ -1460,6 +1802,7 @@
         ];
       }
       currentSceneId = newId;
+      applyPieceStatesToCharacters(newId);
       return true;
     } catch (error) {
       return failSceneAction(error, 'create');
@@ -1469,11 +1812,11 @@
   }
 
   /**
-   * Deletes a scene (Issue #109 / sub-issue #143).
+   * Deletes a scene (Issue #109 / sub-issue #143, Issue #159).
    *
-   * The "keep at least one scene" guard is unchanged. Without a connected
-   * socket the scene is removed locally as before; with a socket the removal
-   * waits for the `SceneDeleted` ack and a failure leaves the list untouched.
+   * The "keep at least one scene" guard is unchanged. The removal waits for the
+   * `SceneDeleted` ack; without a connected socket the action fails and the
+   * local list is left untouched instead of pretending the deletion succeeded.
    */
   async function handleDeleteScene(sceneId: string): Promise<boolean | void> {
     if (isViewer) return;
@@ -1483,8 +1826,7 @@
     try {
       const socket = roomSocket;
       if (!socket || !socket.isConnected) {
-        removeSceneLocally(sceneId);
-        return true;
+        throw new Error('ルームに接続していないため、シーンを削除できません');
       }
 
       await socket.requestDeleteScene(sceneId);
@@ -1498,20 +1840,21 @@
   }
 
   /**
-   * Deletes every log of a scene (Issue #109 / sub-issue #143).
+   * Deletes every log of a scene (Issue #109 / sub-issue #143, Issue #159).
    *
    * The local chunk cache is cleared only after `requestRewindLog(sceneId, 0, 0)`
-   * is acknowledged, so a timeout no longer loses the cached conversation.
-   * Without a connected socket the historical local-only clear is kept.
+   * is acknowledged. Without a connected socket the action fails and the cache
+   * is kept, so an offline "success" cannot silently drop the conversation.
    */
   async function handleDeleteSceneLogs(sceneId: string): Promise<boolean | void> {
     if (!beginSceneAction('delete-logs')) return;
 
     try {
       const socket = roomSocket;
-      if (socket && socket.isConnected) {
-        await socket.requestRewindLog(sceneId, 0, 0);
+      if (!socket || !socket.isConnected) {
+        throw new Error('ルームに接続していないため、ログを削除できません');
       }
+      await socket.requestRewindLog(sceneId, 0, 0);
       chunkManager.clearSceneRecords(sceneId);
       if (currentRoom?.id) {
         persistRoomLogs(currentRoom.id);
@@ -1544,11 +1887,12 @@
   }
 
   /**
-   * Moves a character to another scene (Issue #109 / sub-issue #143).
+   * Moves a character to another scene (Issue #109 / sub-issue #143, #159).
    *
    * The target scene id (and the implicitly created scene for an unknown name)
    * is computed before the request because `MoveCharacter` carries it, but the
-   * local model is only replaced after the ack. The room-state mirror
+   * local model is only replaced after the ack. Without a connected socket the
+   * move fails instead of mutating the local model. The room-state mirror
    * `character::<id>::scene` is kept and is best effort: the `CharacterMoved`
    * ack is authoritative, so a rejected state write only logs a warning.
    */
@@ -1567,8 +1911,7 @@
       const numericCharId = Number(characterId);
 
       if (!socket || !socket.isConnected) {
-        commitMemberMove(characterId, fromSceneId, result);
-        return true;
+        throw new Error('ルームに接続していないため、メンバーを移動できません');
       }
 
       if (!Number.isNaN(numericCharId)) {
@@ -1598,6 +1941,15 @@
     characters = characters.map((c) => {
       if (c.id === characterId) {
         const nextPlaced = !c.placedAsPiece;
+        // Keep the per-scene hydrate map in sync so a later `CharacterList`
+        // re-application does not undo this toggle.
+        const sceneId = currentScene.id;
+        let states = pieceStatesByScene.get(sceneId);
+        if (!states) {
+          states = new Map();
+          pieceStatesByScene.set(sceneId, states);
+        }
+        states.set(characterId, { ...(states.get(characterId) ?? {}), placed: nextPlaced });
         // RoomSocket de-duplicates state frames and replays the final value on
         // reconnect; without a socket the change stays local only.
         roomSocket?.updateState(currentScene.id, `piece::${characterId}::placed`, nextPlaced);
@@ -1622,6 +1974,13 @@
       }
       return c;
     });
+    const sceneId = currentScene.id;
+    let states = pieceStatesByScene.get(sceneId);
+    if (!states) {
+      states = new Map();
+      pieceStatesByScene.set(sceneId, states);
+    }
+    states.set(characterId, { ...(states.get(characterId) ?? {}), pos: { ...position } });
     roomSocket?.updateState(currentScene.id, `piece::${characterId}::pos`, position);
   }
 

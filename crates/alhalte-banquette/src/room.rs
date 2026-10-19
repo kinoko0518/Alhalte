@@ -9,7 +9,9 @@ use tin::{Compression, Tin, TinId};
 use crate::cellar_sink::{CellarSink, INTERNAL_WRITE_SESSION_ID};
 use crate::character::{CharacterBiblio, get_character_owner};
 use crate::error::{BanquetteError, Result};
-use crate::labels::{KEY_STD_ADMINS, LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID};
+use crate::labels::{
+    KEY_STD_ADMINS, KEY_STD_NAME, LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
+};
 use crate::log::{LogBiblio, LogChunk, LogOperationEvent, SceneLog};
 use crate::scene::{Scene, SceneData};
 use crate::state::SceneState;
@@ -56,12 +58,40 @@ pub struct RoomData {
 pub struct SceneSummary {
     /// Scene identifier string.
     pub id: String,
+    /// Human-readable scene name (`std::name`), falling back to the scene ID.
+    pub name: String,
     /// Number of present characters.
     pub present_character_count: usize,
     /// Number of active connected clients.
     pub active_client_count: usize,
     /// Whether the scene is currently loaded in memory.
     pub is_loaded: bool,
+}
+
+/// Default human-readable name of the root virtual scene `"/"`.
+pub const DEFAULT_ROOT_SCENE_NAME: &str = "メインシーン";
+
+/// Reads the human-readable scene name from a scene state map.
+///
+/// The value may be a `primitive/string` Tin or any other Tin whose payload is
+/// valid UTF-8 (older writers did not encode the label consistently). An empty
+/// or missing name falls back to the root default for `"/"` and to the scene ID
+/// otherwise, so `SceneList` always renders.
+fn scene_name_or_id(scene: &Scene) -> String {
+    scene
+        .state
+        .get(KEY_STD_NAME)
+        .and_then(|tin| std::str::from_utf8(&tin.payload).ok())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| {
+            if scene.id == "/" {
+                DEFAULT_ROOT_SCENE_NAME.to_string()
+            } else {
+                scene.id.clone()
+            }
+        })
 }
 
 /// The core session room process managing scenes, characters, and client presence.
@@ -104,6 +134,11 @@ impl Room {
 
         // Create root virtual scene "/"
         let mut root_scene = Scene::new("/", chunk_exponent);
+        root_scene.state.update(
+            KEY_STD_NAME.to_string(),
+            Tin::from_string(DEFAULT_ROOT_SCENE_NAME),
+            true,
+        )?;
         let admins = vec![creator_account];
         let admins_bytes = postcard::to_allocvec(&admins)?;
         let admins_tin = Tin::new(LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, admins_bytes);
@@ -202,6 +237,34 @@ impl Room {
         ids
     }
 
+    /// Builds the summary of a scene without a caller permission check.
+    ///
+    /// Scene summaries are public room information (they only expose the ID,
+    /// the `std::name` value, and presence counts) and are broadcast as
+    /// `SceneList` / `SceneInfo`.
+    fn summary_of(scene: &Scene) -> SceneSummary {
+        SceneSummary {
+            id: scene.id.clone(),
+            name: scene_name_or_id(scene),
+            present_character_count: scene.present_characters.len(),
+            active_client_count: scene.active_clients.len(),
+            is_loaded: scene.is_loaded,
+        }
+    }
+
+    /// Returns the summary of a scene by ID, or `None` when it does not exist.
+    pub fn scene_summary(&self, scene_id: &str) -> Option<SceneSummary> {
+        self.scene_biblio.get(scene_id).map(Self::summary_of)
+    }
+
+    /// Returns summaries of every scene in the room, sorted by scene ID.
+    pub fn list_scene_summaries(&self) -> Vec<SceneSummary> {
+        let mut summaries: Vec<SceneSummary> =
+            self.scene_biblio.values().map(Self::summary_of).collect();
+        summaries.sort_by(|a, b| a.id.cmp(&b.id));
+        summaries
+    }
+
     /// Queries scene summary metadata.
     ///
     /// Returns `None` without response if caller lacks permission under non-done status.
@@ -210,13 +273,7 @@ impl Room {
             return None;
         }
 
-        let scene = self.scene_biblio.get(scene_id)?;
-        Some(SceneSummary {
-            id: scene.id.clone(),
-            present_character_count: scene.present_characters.len(),
-            active_client_count: scene.active_clients.len(),
-            is_loaded: scene.is_loaded,
-        })
+        self.scene_summary(scene_id)
     }
 
     /// Queries scene state.
@@ -270,25 +327,56 @@ impl Room {
     }
 
     /// Creates a new scene in the room.
+    ///
+    /// Kept for callers that do not have a display name; use
+    /// [`Room::create_scene_named`] to write `std::name` atomically at creation.
     pub fn create_scene(
+        &mut self,
+        caller_account: u64,
+        scene_id: &str,
+        inherit_juices_from: Option<&str>,
+    ) -> Result<()> {
+        self.create_scene_named(caller_account, scene_id, inherit_juices_from, None)
+    }
+
+    /// Creates a new scene and writes its name to `std::name` in the same step.
+    ///
+    /// When the scene already exists the name is updated when provided, so a
+    /// retried `CreateScene` with a name stays idempotent instead of clobbering
+    /// the scene state. `std::name` is not inherited from the juice source.
+    pub fn create_scene_named(
         &mut self,
         _caller_account: u64,
         scene_id: &str,
         inherit_juices_from: Option<&str>,
+        name: Option<&str>,
     ) -> Result<()> {
-        if self.scene_biblio.contains_key(scene_id) {
+        if let Some(existing) = self.scene_biblio.get_mut(scene_id) {
+            if let Some(name) = name {
+                existing
+                    .state
+                    .update(KEY_STD_NAME.to_string(), Tin::from_string(name), true)?;
+            }
             return Ok(());
         }
 
         let mut new_scene = Scene::new(scene_id, self.chunk_exponent);
 
-        // Inherit juices (e.g. background image and BGM) if requested
+        // Inherit juices (e.g. background image and BGM) if requested. The
+        // scene name is not a juice: a derived scene must not inherit the
+        // source scene's display name.
         if let Some(source) = inherit_juices_from.and_then(|id| self.scene_biblio.get(id)) {
             for (k, v) in source.state.as_map() {
-                if k.starts_with("std::") && k != KEY_STD_ADMINS {
+                if k.starts_with("std::") && k != KEY_STD_ADMINS && k != KEY_STD_NAME {
                     let _ = new_scene.state.update(k.clone(), v.clone(), true);
                 }
             }
+        }
+
+        if let Some(name) = name {
+            new_scene
+                .state
+                .update(KEY_STD_NAME.to_string(), Tin::from_string(name), true)?;
         }
 
         self.scene_biblio.insert(scene_id.to_string(), new_scene);

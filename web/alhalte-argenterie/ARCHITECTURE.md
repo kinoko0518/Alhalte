@@ -43,6 +43,8 @@
   - `Error` は対応する `*Failed` code と `PermissionDenied` で reject する。
   - 応答が無い場合は `DEFAULT_OPERATION_TIMEOUT_MS = 8000` で `OperationTimeoutError`（`code: 'timeout'`）にし、pending を必ず破棄する。サーバー由来の失敗は `ServerOperationError`（`code` 付き）で返す。
 - 未処理だった `StateSnapshot` / `LogBiblioSnapshot` / `LogChunkSnapshot` / `CharacterInfo` / `LogEventRewound` / `SceneCreated` / `SceneDeleted` / `CharacterMoved` も dispatch し、`onServerFrame` と個別 callback の両方へ流す。
+- **SceneList / SceneInfo**: `SceneList.scenes` は `SceneSummary`（`id`、`name`、`present_character_count`、`active_client_count`、`is_loaded`）の列で、旧サーバーの bare id 列も受理する。`RoomSocket` は id 列を `getScenes()`、summary を `getSceneSummaries()` に保持し、`onSceneInfo` で create / rename の broadcast を通知する。
+- **StateSnapshot hydration**: `EnterScene` の成功応答として banquette が `StateSnapshot` を返す（access 可能な場合）。`App` は `onStateSnapshot`（real socket）と subscribe（custom / test socket）の両経路で受け、`std::name` / `std::bgm<N>` / `bgm::<slot>::volume` / `std::b-img*` / `view::transform` / `piece::<id>::*` を冪等に適用する。再接続・scene 切替でも同じ snapshot が再適用される。
 
 ### WASM
 
@@ -91,7 +93,7 @@
 2. `App.svelte` は `resolveRoomFromLocation` で URL から部屋を解決する。
 3. 入室前に `GET /api/rooms/{room_id}` を preflight する。成功時は返却された `name` を `currentRoom.name` に、`role` を `userRole` に反映してから `RoomSocket` を作る。403 / 401 は `GateScreen`、404 は not-found 画面、ネットワーク / 5xx は 2 秒間隔・最大 5 回の再試行後に再試行 UI を出す。403 / 404 は再試行しない。
 4. `RoomSocket` を作り、account / session をクエリに付けて接続する。preflight が `ok` になるまで WebSocket は開かない。`initialRoom` prop はテスト / プレビュー用の明示 override で、preflight と `userRole` の上書きをスキップする。
-5. `ServerFrame` の `SceneList`、`CharacterList`、`StateUpdated`、`StateDeleted`、`LogEventAppended`、`SceneCreated` / `SceneDeleted` / `CharacterMoved` などを Svelte の state に反映する。
+5. `ServerFrame` の `SceneList`（`SceneSummary` の列）、`SceneInfo`、`CharacterList`、`StateSnapshot`、`StateUpdated`、`StateDeleted`、`LogEventAppended`、`SceneCreated` / `SceneDeleted` / `CharacterMoved` などを Svelte の state に反映する。`SceneList` / `StateSnapshot` がシーン名・BGM・背景・view・駒の権威で、`SceneInfo` は create / rename を他クライアントへ即時反映する。
 6. ログタブは入室時と scene 切り替え時に最新 chunk を読む（後述）。WebSocket の `Error` frame や close code（`1008` / `4403` / `4404`）も `isForbidden` のフォールバックとして `GateScreen` を出す。
 
 `isAdmin` は `userRole === 'gm'`（viewer は常に false）で導出し、`isAdmin` prop はテスト / プレビュー用の明示 override に限定する。`VisitedRoom.isAdmin` は localStorage 互換のために保存するだけで、権限判定には使わない。
@@ -139,7 +141,8 @@
 
 ### BGM
 
-- BGM は state とログの両方に書く。state キーは `std::bgm`（slot 1、旧来の互換）、`std::bgm2` / `std::bgm3`（slot 2/3）、音量は `bgm::<slot>::volume`。値は 64 hex の Tin ID（停止・未設定は null / 削除）。
+- BGM は state とログの両方に書く。state キーは `std::bgm`（slot 1、旧来の互換）、`std::bgm<N>`（任意の slot N >= 2）、音量は `bgm::<slot>::volume`。値は 64 hex の Tin ID（停止・未設定は null / 削除）。
+- slot は 1〜3 固定ではなく任意番号を扱う。`StateSnapshot` / `StateUpdated` に未知の slot 番号が現れたら `bgmSlots` に追加して表示する。`SceneSettingsTab` の「スロット追加」も最大 slot + 1 を使う。
 - `SceneSettingsTab` は再生/停止・選択・音量変更を async 化し、`requestUpdateState(sceneId, key, tinIdOrNull)` と `requestChangeBgm(sceneId, slot, tinIdOrNull)` の両方が成功したときだけローカルの `bgmSlots` / `scene.juices` を確定する。送信中は対象 slot の「BGM選択」アイコンを波線 `CircularProgress` にし、二重実行を防ぐ。
 - 失敗時は変更前へ戻し、slot 付近にエラーを出す。キューには積まない（最終状態のみが意味を持つため、再接続時の自動再送をしない）。
 - `App` は `StateUpdated` / `StateDeleted` の BGM キーを `bgmSlots` と旧 `bgm1..3` へ反映する。ルート scene `/` の state 更新は管理者のみで、`PermissionDenied` はそのまま表示する。
@@ -147,9 +150,10 @@
 ### scene の管理操作
 
 - 「シーンを新規作成」「ログを削除」「シーンを削除」「メンバー移動」は `requestCreateScene` / `requestRewindLog(sceneId, 0, 0)` / `requestDeleteScene` / `requestMoveCharacter` で送り、成功 ack 後にだけローカル state を更新する（楽観更新しない）。
+- シーン作成時の表示名は `CreateScene.name` として送り、banquette が `std::name` へ原子的に書く。リネームは `requestUpdateState(sceneId, 'std::name', name)` の `StateUpdated` ack 後にだけローカル名を確定する。サーバーは create / rename で `SceneInfo` を room へ broadcast し、他クライアントは再読み込みなしで名前を更新する。
 - ログ削除は `RewindLog(0, 0)` で全ログを切り詰め、`LogEventRewound` 後にローカルの chunk をクリアする。
 - 送信中は押したアイコンを波線 `CircularProgress` にし、当該操作を二重実行できない。失敗時は管理領域の下に中央寄せで「サーバーと通信できませんでした」を出す。
-- 接続中は ack 後にだけローカル state を更新し、失敗時は管理領域の下に中央寄せで「サーバーと通信できませんでした」を出す。`roomSocket` が無い / 未接続の場合は従来のローカル専用動作（一覧・現在 scene・chunk・members をローカルで更新するだけで、サーバーへは送らず、キューにも積まず、エラー表示もしない）。`SceneList` broadcast は scene 一覧の権威として反映し、`SceneDeleted` は第二の防護として該当 scene を除く。
+- 接続中は ack 後にだけローカル state を更新する。**未接続時は scene 作成 / 削除 / ログ削除 / メンバー移動を成功扱いにせず**、ローカル一覧を変更せずに同じエラーを表示する（ローカル専用フォールバックは持たない）。`SceneList` broadcast は scene 一覧の権威として反映し、`SceneDeleted` は第二の防護として該当 scene を除く。
 
 ### キャラクター同期
 
@@ -170,8 +174,10 @@
 - `utils/assets.ts` は画像・音声を `FileReader` で data URL にし、localStorage と in-memory の Pantry キャッシュアダプタへ保存する。`AssetPickerModal` は personal / room、image / audio で絞り込み、NONE カードと削除を提供する。
 - アップロードは `encodeRoomTin`（RoomKey 暗号化 + LZ4）→ `uploadTin` で cellar へ送る。進捗は実 XHR の `upload.onprogress` のみを使い、カード内に波線 `LinearProgress` を出す。成功時は `asset.id` に `tinId` を付け、room scope はさらに `/` の state key `asset::<id>` にメタデータ（id, name, mediaType, mimeType, size, tinId, createdAt, ownerAccountId）を `requestUpdateState` で保存する。失敗時はカード内に「アップロードに失敗しました」と再試行ボタンを出す。
 - personal のメタデータは localStorage のみに置き、`tinId` を他者へ公開しない。本体は cellar に置く。
+- シーン背景は `AssetPickerModal` の選択から `encodeRoomTin` + `uploadTin`（部屋鍵）で cellar へ上げ、scene state `std::b-img` に `{ tinId, mimeType }` の小さな JSON Tin として保存する（data URL は state に入れない）。旧形式の 64 hex 文字列も受信側で受理する。幅・高さは `std::b-img::width` / `std::b-img::height` に数値 Tin で保存する。
+- 背景画像の受信側は `tinId` から `downloadTin` で復号し、`juices.bgImage` に data URL を設定する。`std::b-img` の upload / state 更新が失敗した場合はローカルを確定せず、背景カードの下に「サーバーと通信できませんでした」を出す。部屋鍵が無い場合も upload を開始しない。
 - モーダルを開くたびに `syncRoomAssets` が `queryState('/')` で `asset::*` を取得してローカルへマージし、欠けている tin は `downloadTin` で取得する。同期失敗時は静かに既存キャッシュを表示する。アセットは 30 日 TTL の対象外（永続）。
-- `App` は `AssetPickerModal` に `roomSocket` と解決済みの部屋鍵を渡す。部屋鍵が無い場合、`AssetPickerModal` / `SceneSettingsTab` の背景・BGM upload は開始せず、カード内に失敗を表示する。
+- `App` は `AssetPickerModal` に `roomSocket` と解決済みの部屋鍵を渡す。`SceneSettingsTab` も同じ `roomKey` を受け取り、背景画像・寸法の state 更新に使う。部屋鍵が無い場合、`AssetPickerModal` / `SceneSettingsTab` の背景・BGM upload は開始せず、カード内に失敗を表示する。
 
 ### 権限 UI
 

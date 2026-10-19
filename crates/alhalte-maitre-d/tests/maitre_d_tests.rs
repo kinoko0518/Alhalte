@@ -724,7 +724,7 @@ async fn test_websocket_demux_and_banquette_spawner() {
                 serde_json::from_str::<ServerFrame>(&text)
         {
             // Root virtual scene "/" must always be present
-            assert!(scenes.contains(&"/".to_string()));
+            assert!(scenes.iter().any(|s| s.id == "/"));
             received_scene_list = true;
             break;
         }
@@ -739,6 +739,7 @@ async fn test_websocket_demux_and_banquette_spawner() {
     let create_scene = serde_json::to_string(&ClientFrame::CreateScene {
         scene_id: "tavern".to_string(),
         inherit_juices: true,
+        name: None,
     })
     .unwrap();
     ws_stream
@@ -762,7 +763,7 @@ async fn test_websocket_demux_and_banquette_spawner() {
                 .flatten()
             && let Ok(ServerFrame::SceneList { scenes }) =
                 serde_json::from_str::<ServerFrame>(&text)
-            && scenes.contains(&"tavern".to_string())
+            && scenes.iter().any(|s| s.id == "tavern")
         {
             created_scene_found = true;
             break;
@@ -833,6 +834,7 @@ async fn test_room_zip_export_endpoints() {
     let create_scene_frame = serde_json::to_string(&ClientFrame::CreateScene {
         scene_id: "dungeon".to_string(),
         inherit_juices: true,
+        name: None,
     })
     .unwrap();
     ws_stream
@@ -1921,7 +1923,7 @@ async fn test_bridge_admin_is_creator_not_first_connector() {
             && let Ok(ServerFrame::SceneList { scenes }) =
                 serde_json::from_str::<ServerFrame>(&text)
         {
-            assert!(scenes.contains(&"/".to_string()));
+            assert!(scenes.iter().any(|s| s.id == "/"));
             received_scene_list = true;
             break;
         }
@@ -2044,7 +2046,7 @@ async fn test_websocket_unauthorized_room_connection_rejected_and_done_permitted
                 .flatten()
             && let Ok(ServerFrame::SceneList { scenes }) = serde_json::from_str::<ServerFrame>(&t)
         {
-            assert!(scenes.contains(&"/".to_string()));
+            assert!(scenes.iter().any(|s| s.id == "/"));
             scene_received = true;
             break;
         }
@@ -2113,7 +2115,7 @@ async fn test_websocket_cookie_session_authentication() {
                 .flatten()
             && let Ok(ServerFrame::SceneList { scenes }) = serde_json::from_str::<ServerFrame>(&t)
         {
-            assert!(scenes.contains(&"/".to_string()));
+            assert!(scenes.iter().any(|s| s.id == "/"));
             scene_received = true;
             break;
         }
@@ -2443,6 +2445,7 @@ async fn test_initial_scene_demultiplexing_and_root_broadcasts() {
     let create_scene = serde_json::to_string(&ClientFrame::CreateScene {
         scene_id: "side-room".to_string(),
         inherit_juices: false,
+        name: None,
     })
     .unwrap();
     ws_stream

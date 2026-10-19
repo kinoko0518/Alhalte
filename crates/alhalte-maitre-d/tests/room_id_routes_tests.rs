@@ -122,7 +122,7 @@ async fn websocket_query_accepts_canonical_hex_room_id() {
             && let Ok(ServerFrame::SceneList { scenes }) =
                 serde_json::from_str::<ServerFrame>(&text)
         {
-            assert!(scenes.contains(&"/".to_string()));
+            assert!(scenes.iter().any(|s| s.id == "/"));
             received = true;
             break;
         }

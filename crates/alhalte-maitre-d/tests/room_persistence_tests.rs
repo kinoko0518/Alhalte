@@ -177,6 +177,7 @@ async fn test_room_state_restored_after_banquette_restart() {
         ClientFrame::CreateScene {
             scene_id: "tavern".to_string(),
             inherit_juices: false,
+            name: None,
         },
     );
     wait_for_frame(
@@ -308,8 +309,8 @@ async fn test_room_state_restored_after_banquette_restart() {
     .await;
     match scene_list {
         ServerFrame::SceneList { scenes } => {
-            assert!(scenes.contains(&"/".to_string()));
-            assert!(scenes.contains(&"tavern".to_string()));
+            assert!(scenes.iter().any(|s| s.id == "/"));
+            assert!(scenes.iter().any(|s| s.id == "tavern"));
         }
         _ => unreachable!(),
     }
@@ -365,6 +366,7 @@ async fn test_heartbeat_updates_room_head() {
         ClientFrame::CreateScene {
             scene_id: "garden".to_string(),
             inherit_juices: false,
+            name: None,
         },
     );
     wait_for_frame(&mut rx, |frame| {

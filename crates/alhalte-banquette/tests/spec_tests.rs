@@ -676,7 +676,7 @@ async fn test_unix_socket_server_integration() {
                 BanquetteToMaitreD::SendToClient { client_id, frame } => {
                     assert_eq!(client_id, 100);
                     if let ServerFrame::SceneList { scenes } = frame {
-                        assert!(scenes.contains(&"/".to_string()));
+                        assert!(scenes.iter().any(|s| s.id == "/"));
                         received_list = true;
                     }
                 }

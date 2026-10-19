@@ -95,10 +95,12 @@ export interface ChangeBgmCall {
   tinId: string | null;
 }
 
-/** One recorded `requestCreateScene` call (Issue #109 / #143). */
+/** One recorded `requestCreateScene` call (Issue #109 / #143, #159). */
 export interface CreateSceneCall {
   sceneId: string;
   inheritJuices: boolean;
+  /** Optional `std::name` written atomically with the creation. */
+  name?: string;
 }
 
 /** One recorded `requestDeleteScene` call (Issue #109 / #143). */
@@ -419,8 +421,8 @@ export class FakeRoomSocket {
   // -------------------------------------------------------------------------
 
   /** Records a `CreateScene` request (resolves with the `SceneCreated` ack shape). */
-  requestCreateScene(sceneId: string, inheritJuices = false): Promise<unknown> {
-    this.requestCreateSceneCalls.push({ sceneId, inheritJuices });
+  requestCreateScene(sceneId: string, inheritJuices = false, name?: string): Promise<unknown> {
+    this.requestCreateSceneCalls.push({ sceneId, inheritJuices, ...(name ? { name } : {}) });
     if (this.autoAnswerSceneActions) return Promise.resolve({ scene_id: sceneId });
     return this.holdSceneAction('create', `create:${sceneId}`);
   }

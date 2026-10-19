@@ -58,9 +58,13 @@ CLI（`CliArgs`）:
 
 `ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答、BGM 変更を持つ。`ServerFrame` はその結果と broadcast を返す。
 
-- `CreateScene` / `DeleteScene` の成功時は要求元へ `SceneCreated` / `SceneDeleted` を返し、更新後の scene id 列を `SceneList` として room 全体へ broadcast する。`MoveCharacter` の成功時は `CharacterMoved` を返し、移動先 scene が暗黙に作られた場合は `SceneList` も broadcast する。
+- `ListScenes` / `CreateScene` / `DeleteScene` / `MoveCharacter` の scene 一覧は `SceneSummary`（`id`、`name`、`present_character_count`、`active_client_count`、`is_loaded`）の列 `SceneList` として返す。`name` は scene state `std::name` の UTF-8 文字列で、未設定なら scene id、`/` は作成時に `メインシーン` が入る。
+- `CreateScene { scene_id, inherit_juices, name }` は `name` を `std::name` へ作成と同時に書き、`SceneCreated` を要求元へ返し、`SceneList` と新 scene の `SceneInfo` を room 全体へ broadcast する。`std::name` は juice 継承の対象外。
+- `UpdateState` で `key == "std::name"` が成功したときは `StateUpdated` の ack / scene broadcast に加えて `SceneInfo` を room 全体へ broadcast する。これにより他クライアントは再読み込みなしで rename を反映できる。
+- `EnterScene` 成功時、caller が `can_access_scene` を満たす場合はその scene の `StateSnapshot` を直接返す。クライアントは入室ごとの `QueryState` を必要としない（`QueryState` は従来どおり明示問い合わせ用に残る）。
+- `CreateScene` / `DeleteScene` の成功時は要求元へ `SceneCreated` / `SceneDeleted` を返し、更新後の scene 一覧を `SceneList` として room 全体へ broadcast する。`MoveCharacter` の成功時は `CharacterMoved` を返し、移動先 scene が暗黙に作られた場合は `SceneList` も broadcast する。
 - state の `UpdateState` / `DeleteState` 成功時は、要求元への直接 ack と対象 scene への broadcast の両方を行う。ルート scene `/` の state は他 scene から編集される（アセット・拡張機能）ため、要求元が対象 scene に居なくても ack が届く。両方を受け取ったクライアントは同じ frame を 2 回適用するが、state 更新・削除は冪等。
-- `ClientFrame::ChangeBgm { scene_id, slot, tin_id }` は `tin_id` の 64 hex 文字列を `TinId` に復元し、`ChangeBgmEvent` を log に append する。成功は既存の `LogEventAppended` broadcast で観測できる。BGM の現在値は `std::bgm` / `std::bgm2` / `std::bgm3` の state が持つ。
+- `ClientFrame::ChangeBgm { scene_id, slot, tin_id }` は `tin_id` の 64 hex 文字列を `TinId` に復元し、`ChangeBgmEvent` を log に append する。成功は既存の `LogEventAppended` broadcast で観測できる。BGM の現在値は `std::bgm` / `std::bgm<N>` の state が持つ（slot 番号は任意）。
 
 ## データ形式
 
@@ -78,7 +82,8 @@ CLI（`CliArgs`）:
 予約 state キー:
 
 - `std::admins`（`/` の state。account-id の postcard リスト）
-- `std::bgm`、`std::bgm2`、`std::bgm3`（BGM slot 1/2/3 の Tin ID）、`bgm::<slot>::volume`（音量）、`std::b-img`
+- `std::bgm`、`std::bgm<N>`（BGM slot 1 / 任意 slot N の Tin ID）、`bgm::<slot>::volume`（音量）、`std::b-img`（背景画像の `{ tinId, mimeType }` JSON）、`std::b-img::width` / `std::b-img::height`（背景の表示寸法、数値）
+- scene 名の `std::name`（scene state の UTF-8 文字列。character 属性にも同名キーがある）
 - character 属性の `std::name`、`std::owner_account`
 - cutlery 予約: `asset::<id>`（`/` のアセットメタデータ）、`extension::<id>`（`/` の拡張機能メタデータ）
 
@@ -109,7 +114,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 ### クライアント接続
 
 1. `ClientConnected` で `ConnectedClient` を登録し、クライアントを `/` に入室させる。
-2. `ClientMessage` を `ClientFrame` として処理する。
+2. `ClientMessage` を `ClientFrame` として処理する。`EnterScene` 成功時は access 可能なら `StateSnapshot` を返し、クライアントは scene の state を即座に復元できる。
 3. `ClientDisconnected` で scene から退室させ、必要なら scene を永続化してメモリを解放する。
 4. `Ping` には `Pong` を返す。
 

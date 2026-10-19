@@ -276,6 +276,7 @@ async fn test_scene_create_and_delete_acks() {
         ClientFrame::CreateScene {
             scene_id: "tavern".to_string(),
             inherit_juices: false,
+            name: None,
         },
     )
     .await;
@@ -298,7 +299,7 @@ async fn test_scene_create_and_delete_acks() {
         })
         .await,
     ) {
-        ServerFrame::SceneList { scenes } => assert!(scenes.contains(&"tavern".to_string())),
+        ServerFrame::SceneList { scenes } => assert!(scenes.iter().any(|s| s.id == "tavern")),
         other => panic!("expected SceneList, got {other:?}"),
     }
 
@@ -371,7 +372,7 @@ async fn test_scene_create_and_delete_acks() {
         })
         .await,
     ) {
-        ServerFrame::SceneList { scenes } => assert!(!scenes.contains(&"tavern".to_string())),
+        ServerFrame::SceneList { scenes } => assert!(!scenes.iter().any(|s| s.id == "tavern")),
         other => panic!("expected SceneList, got {other:?}"),
     }
 
@@ -446,7 +447,7 @@ async fn test_character_move_ack() {
         })
         .await,
     ) {
-        ServerFrame::SceneList { scenes } => assert!(scenes.contains(&"dungeon".to_string())),
+        ServerFrame::SceneList { scenes } => assert!(scenes.iter().any(|s| s.id == "dungeon")),
         other => panic!("expected SceneList, got {other:?}"),
     }
 
@@ -679,6 +680,7 @@ async fn test_state_acks_are_direct_and_broadcast() {
         ClientFrame::CreateScene {
             scene_id: "tavern".to_string(),
             inherit_juices: false,
+            name: None,
         },
     )
     .await;
@@ -909,6 +911,227 @@ async fn test_set_done_ack_and_admin_set_control_frame() {
     );
     assert_eq!(client_id, 100);
     assert_eq!(frame, ServerFrame::DoneUpdated { done: false });
+
+    server_task.abort();
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/scene state hydration on EnterScene (Issue #159)
+async fn test_enter_scene_sends_state_snapshot() {
+    let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
+
+    // Populate the root scene state with the keys the client hydrates.
+    let states = [
+        ("std::name", Tin::from_string("広間")),
+        ("std::bgm", Tin::from_string(&tin_id_hex(0x11))),
+        ("std::bgm4", Tin::from_string(&tin_id_hex(0x44))),
+        ("std::b-img", Tin::from_string(r#"{"tinId":"deadbeef"}"#)),
+        ("std::b-img::width", Tin::from_u64(1280)),
+        ("std::b-img::height", Tin::from_u64(720)),
+        (
+            "view::transform",
+            Tin::from_string(r#"{"x":1,"y":2,"scale":1.5}"#),
+        ),
+        ("piece::7::placed", Tin::from_u64(1)),
+    ];
+    for (key, value) in states {
+        send_frame(
+            &mut sink,
+            100,
+            ClientFrame::UpdateState {
+                scene_id: "/".to_string(),
+                key: key.to_string(),
+                value,
+            },
+        )
+        .await;
+        wait_for_frame(&mut stream, |frame| {
+            matches!(
+                frame,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::StateUpdated { .. },
+                    ..
+                }
+            )
+        })
+        .await;
+    }
+
+    // Entering the scene must answer the caller with a StateSnapshot without a
+    // separate QueryState request.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::EnterScene {
+            scene_id: "/".to_string(),
+        },
+    )
+    .await;
+
+    let (client_id, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |frame| {
+            matches!(
+                frame,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::StateSnapshot { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    assert_eq!(client_id, 100);
+    match frame {
+        ServerFrame::StateSnapshot { scene_id, states } => {
+            assert_eq!(scene_id, "/");
+            assert_eq!(
+                states.get("std::name").and_then(|tin| tin.as_string().ok()),
+                Some("広間")
+            );
+            assert_eq!(
+                states.get("std::bgm4").and_then(|tin| tin.as_string().ok()),
+                Some(tin_id_hex(0x44).as_str())
+            );
+            assert!(states.contains_key("std::b-img"));
+            assert!(states.contains_key("std::b-img::width"));
+            assert!(states.contains_key("std::b-img::height"));
+            assert!(states.contains_key("view::transform"));
+            assert!(states.contains_key("piece::7::placed"));
+        }
+        other => panic!("expected StateSnapshot, got {other:?}"),
+    }
+
+    server_task.abort();
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/scene name create / rename broadcast (Issue #159)
+async fn test_scene_name_is_summarized_and_broadcast() {
+    let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
+
+    // The root scene has a default server-authoritative name.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::QueryScene {
+            scene_id: "/".to_string(),
+        },
+    )
+    .await;
+    let (_, root_info) = expect_send_to_client(
+        wait_for_frame(&mut stream, |frame| {
+            matches!(
+                frame,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::SceneInfo(_),
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    match root_info {
+        ServerFrame::SceneInfo(summary) => {
+            assert_eq!(summary.id, "/");
+            assert_eq!(summary.name, "メインシーン");
+            assert_eq!(summary.present_character_count, 0);
+        }
+        other => panic!("expected SceneInfo, got {other:?}"),
+    }
+
+    // CreateScene carries the name atomically, so SceneList already has it.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::CreateScene {
+            scene_id: "tavern".to_string(),
+            inherit_juices: false,
+            name: Some("酒場".to_string()),
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |frame| {
+        matches!(
+            frame,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::SceneCreated { .. },
+                ..
+            }
+        )
+    })
+    .await;
+
+    let list = expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |frame| {
+            matches!(
+                frame,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::SceneList { .. }
+                }
+            )
+        })
+        .await,
+    );
+    match list {
+        ServerFrame::SceneList { scenes } => {
+            let tavern = scenes
+                .iter()
+                .find(|summary| summary.id == "tavern")
+                .expect("tavern must be listed");
+            assert_eq!(tavern.name, "酒場");
+        }
+        other => panic!("expected SceneList, got {other:?}"),
+    }
+
+    // Create also announces the new summary so a client can add it immediately.
+    let created_info = expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |frame| {
+            matches!(
+                frame,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::SceneInfo(_)
+                }
+            )
+        })
+        .await,
+    );
+    match created_info {
+        ServerFrame::SceneInfo(summary) => {
+            assert_eq!(summary.id, "tavern");
+            assert_eq!(summary.name, "酒場");
+        }
+        other => panic!("expected SceneInfo, got {other:?}"),
+    }
+
+    // Renaming goes through UpdateState and re-broadcasts SceneInfo.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::UpdateState {
+            scene_id: "tavern".to_string(),
+            key: "std::name".to_string(),
+            value: Tin::from_string("大酒場"),
+        },
+    )
+    .await;
+    let renamed_info = expect_broadcast_to_room(
+        wait_for_frame(&mut stream, |frame| {
+            matches!(
+                frame,
+                BanquetteToMaitreD::BroadcastToRoom {
+                    frame: ServerFrame::SceneInfo(_)
+                }
+            )
+        })
+        .await,
+    );
+    match renamed_info {
+        ServerFrame::SceneInfo(summary) => {
+            assert_eq!(summary.id, "tavern");
+            assert_eq!(summary.name, "大酒場");
+        }
+        other => panic!("expected SceneInfo, got {other:?}"),
+    }
 
     server_task.abort();
 }
