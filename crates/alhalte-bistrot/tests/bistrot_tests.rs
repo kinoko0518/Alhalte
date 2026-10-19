@@ -10,14 +10,49 @@ use alhalte_bistrot::config::{
     MaitreDConfig, RestaurantConfig,
 };
 use alhalte_bistrot::rops::{
-    decrypt_rops_toml_with_key, encrypt_bistrot_toml, is_rops_encrypted, load_from_path,
-    load_from_path_with_key, parse_bistrot_toml, parse_bistrot_toml_with_key,
+    ParseOptions, decrypt_rops_toml_with_key, encrypt_age_armored_value, encrypt_bistrot_toml,
+    is_rops_encrypted, load_from_path_with_options, parse_bistrot_toml,
+    parse_bistrot_toml_with_options,
 };
+use alhalte_bistrot::secrets::{secret_files, write_secret_files};
 use alhalte_bistrot::systemd::{
     SystemdOptions, generate_argenterie_service, generate_bistrot_target, generate_cellar_service,
     generate_maitre_d_service, generate_systemd_units,
 };
 use std::path::PathBuf;
+
+/// Options that allow plaintext secrets (development only).
+///
+/// The bundled local development configuration and most parser tests use
+/// plaintext secrets. Production-style tests call [`parse_bistrot_toml`] /
+/// [`parse_bistrot_toml_with_options`] directly to assert the fail-closed path.
+fn dev_options(age_key: Option<&str>) -> ParseOptions<'_> {
+    ParseOptions {
+        age_key,
+        allow_plaintext_secrets: true,
+    }
+}
+
+fn dev_parse(content: &str) -> Result<BistrotConfig, alhalte_bistrot::BistrotError> {
+    parse_bistrot_toml_with_options(content, &dev_options(None))
+}
+
+fn dev_load(path: &std::path::Path) -> Result<BistrotConfig, alhalte_bistrot::BistrotError> {
+    load_from_path_with_options(path, &dev_options(None))
+}
+
+fn dev_load_with_key(
+    path: &std::path::Path,
+    age_key: Option<&str>,
+) -> Result<BistrotConfig, alhalte_bistrot::BistrotError> {
+    load_from_path_with_options(path, &dev_options(age_key))
+}
+
+/// Returns the value following `flag` in a generated argument list.
+fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let index = args.iter().position(|arg| arg == flag)?;
+    args.get(index + 1).map(String::as_str)
+}
 
 // spec: alhalte-bistrot/config-parser
 #[test]
@@ -46,7 +81,7 @@ anti-oracle = true
 chunk-size-exponent = 10
 "#;
 
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
 
     assert_eq!(config.restaurant.domain, "vtt.alhalte.example");
     assert_eq!(config.restaurant.host, "0.0.0.0");
@@ -90,7 +125,7 @@ salt = "test-salt"
 [cellar]
 "#;
 
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
 
     assert_eq!(config.restaurant.domain, "localhost");
     assert_eq!(config.restaurant.host, "127.0.0.1");
@@ -149,7 +184,7 @@ anti_oracle = false
 chunk_size_exponent = 9
 "#;
 
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(config.restaurant.domain, "snake.example");
     assert_eq!(config.maitre_d.port, 8888);
     assert_eq!(config.maitre_d.client_id, "client-snake");
@@ -167,7 +202,7 @@ client-secret = "secret"
 salt = "salt"
 [cellar]
 "#;
-    assert!(parse_bistrot_toml(empty_client_id).is_err());
+    assert!(dev_parse(empty_client_id).is_err());
 
     let empty_secret = r#"
 [maitre-d]
@@ -176,7 +211,7 @@ client-secret = ""
 salt = "salt"
 [cellar]
 "#;
-    assert!(parse_bistrot_toml(empty_secret).is_err());
+    assert!(dev_parse(empty_secret).is_err());
 
     let empty_salt = r#"
 [maitre-d]
@@ -185,7 +220,7 @@ client-secret = "secret"
 salt = ""
 [cellar]
 "#;
-    assert!(parse_bistrot_toml(empty_salt).is_err());
+    assert!(dev_parse(empty_salt).is_err());
 
     let invalid_exp = r#"
 [maitre-d]
@@ -196,7 +231,7 @@ salt = "salt"
 [banquette]
 chunk-size-exponent = 0
 "#;
-    assert!(parse_bistrot_toml(invalid_exp).is_err());
+    assert!(dev_parse(invalid_exp).is_err());
 }
 
 // spec: alhalte-bistrot/rops-decryption
@@ -232,8 +267,14 @@ anti-oracle = true
     assert!(decrypted_str.contains("super-secret-token-xyz"));
 
     // Parse into BistrotConfig using parse_bistrot_toml_with_key
-    let config =
-        parse_bistrot_toml_with_key(&encrypted_toml, Some(secret.expose_secret())).unwrap();
+    let config = parse_bistrot_toml_with_options(
+        &encrypted_toml,
+        &ParseOptions {
+            age_key: Some(secret.expose_secret()),
+            allow_plaintext_secrets: false,
+        },
+    )
+    .unwrap();
     assert_eq!(config.restaurant.domain, "vtt.secure.example");
     assert_eq!(config.maitre_d.client_secret, "super-secret-token-xyz");
     assert_eq!(config.maitre_d.salt, "random-salt-12345678");
@@ -242,8 +283,14 @@ anti-oracle = true
     // Verifying decryption failure with invalid key
     let bad_identity = Identity::generate();
     let bad_secret = bad_identity.to_string();
-    let err =
-        parse_bistrot_toml_with_key(&encrypted_toml, Some(bad_secret.expose_secret())).unwrap_err();
+    let err = parse_bistrot_toml_with_options(
+        &encrypted_toml,
+        &ParseOptions {
+            age_key: Some(bad_secret.expose_secret()),
+            allow_plaintext_secrets: false,
+        },
+    )
+    .unwrap_err();
     assert!(matches!(err, alhalte_bistrot::BistrotError::RopsDecrypt(_)));
 }
 
@@ -262,7 +309,7 @@ salt = "salt"
 "#;
     std::fs::write(&config_path, plain_toml).unwrap();
 
-    let config = load_from_path(&config_path).unwrap();
+    let config = dev_load(&config_path).unwrap();
     assert_eq!(config.maitre_d.client_id, "id");
     assert_eq!(config.maitre_d.client_secret, "secret");
 
@@ -275,7 +322,7 @@ salt = "salt"
     let encrypted = encrypt_bistrot_toml(plain_toml, &recipient).unwrap();
     std::fs::write(&enc_path, encrypted).unwrap();
 
-    let config_dec = load_from_path_with_key(&enc_path, Some(secret.expose_secret())).unwrap();
+    let config_dec = dev_load_with_key(&enc_path, Some(secret.expose_secret())).unwrap();
     assert_eq!(config_dec.maitre_d.client_id, "id");
     assert_eq!(config_dec.maitre_d.client_secret, "secret");
 }
@@ -328,8 +375,6 @@ fn test_generate_maitre_d_args() {
             "/data/maitre-d.sqlite3",
             "--client-id",
             "google-client",
-            "--client-secret",
-            "google-secret",
             "--salt",
             "instancesalt",
             "--public-url",
@@ -340,6 +385,10 @@ fn test_generate_maitre_d_args() {
             "http://127.0.0.1:8081",
             "--chunk-size-exponent",
             "8",
+            // spec: alhalte-bistrot/secrets 0003 the client secret is passed as a
+            // file path, never as an argument value.
+            "--client-secret-file",
+            "/data/secrets/maitre-d-client-secret",
             "--cors-origin",
             "http://127.0.0.1:5173",
             "--cors-origin",
@@ -351,6 +400,14 @@ fn test_generate_maitre_d_args() {
             "--cors-origin",
             "https://vtt.example.com",
         ]
+    );
+    assert!(
+        !args.iter().any(|arg| arg == "google-secret"),
+        "the OAuth client secret must never be passed on the command line"
+    );
+    assert_eq!(
+        secret_files(&config).maitre_d_client_secret,
+        Some(PathBuf::from("/data/secrets/maitre-d-client-secret"))
     );
 
     // The chunk size exponent comes from `[banquette]` in `Bistrot.toml`.
@@ -528,7 +585,7 @@ salt = "salt"
 
 [cellar]
 "#;
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(config.cellar.maitre_d_url, None);
     assert_eq!(config.cellar.maitre_d_socket, None);
     assert!(!config.cellar.allow_all_sessions);
@@ -554,7 +611,7 @@ salt = "salt"
 
 [cellar]
 "#;
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(config.cellar_maitre_d_url(), "http://127.0.0.1:8080");
 
     // Explicit HTTP URL and the local-development allow-all switch.
@@ -568,7 +625,7 @@ salt = "salt"
 maitre-d-url = "http://maitre-d.internal:8080"
 allow-all-sessions = true
 "#;
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(
         config.cellar.maitre_d_url.as_deref(),
         Some("http://maitre-d.internal:8080")
@@ -592,7 +649,7 @@ salt = "salt"
 maitre_d_socket = "/run/alhalte/maitre-d.sock"
 allow_all_sessions = false
 "#;
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(
         config.cellar.maitre_d_socket,
         Some(PathBuf::from("/run/alhalte/maitre-d.sock"))
@@ -767,13 +824,23 @@ fn test_systemd_generator() {
 #[test]
 fn test_cli_subcommands_end_to_end() {
     let bin_path = env!("CARGO_BIN_EXE_alhalte-bistrot");
+    // The bundled local development configuration keeps plaintext secrets, so
+    // the CLI runs with the documented development escape hatch.
+    let bistrot_cmd = || {
+        let mut cmd = std::process::Command::new(bin_path);
+        cmd.env("ALHALTE_ALLOW_PLAINTEXT_SECRETS", "1");
+        cmd
+    };
     let temp_dir = tempfile::tempdir().unwrap();
     let config_path = temp_dir.path().join("Bistrot.toml");
+    let data_dir = temp_dir.path().join("data");
 
-    let plain_toml = r#"
+    let plain_toml = format!(
+        r#"
 [restaurant]
 domain = "cli.example.com"
 host = "127.0.0.1"
+data-dir = "{}"
 
 [maitre-d]
 client-id = "cli-client"
@@ -785,11 +852,13 @@ anti-oracle = true
 
 [banquette]
 chunk-size-exponent = 8
-"#;
+"#,
+        data_dir.display()
+    );
     std::fs::write(&config_path, plain_toml).unwrap();
 
     // 1. Test validate command
-    let output = std::process::Command::new(bin_path)
+    let output = bistrot_cmd()
         .arg("-c")
         .arg(&config_path)
         .arg("validate")
@@ -801,7 +870,7 @@ chunk-size-exponent = 8
     assert!(stdout.contains("cli.example.com"));
 
     // 2. Test args command for maitre-d
-    let output = std::process::Command::new(bin_path)
+    let output = bistrot_cmd()
         .arg("-c")
         .arg(&config_path)
         .arg("args")
@@ -811,12 +880,32 @@ chunk-size-exponent = 8
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--client-id cli-client"));
-    assert!(stdout.contains("--client-secret cli-secret-oauth"));
+    assert!(stdout.contains("--client-secret-file"));
+    assert!(!stdout.contains("--client-secret "));
+    assert!(!stdout.contains("cli-secret-oauth"));
     assert!(stdout.contains("--chunk-size-exponent 8"));
     assert!(stdout.contains("--public-url https://cli.example.com"));
 
+    // spec: alhalte-bistrot/secrets 0004 the client secret is materialized as a
+    // 0600 file that the argument list points at.
+    let client_secret_path = data_dir.join("secrets/maitre-d-client-secret");
+    assert_eq!(
+        std::fs::read_to_string(&client_secret_path).unwrap().trim(),
+        "cli-secret-oauth"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&client_secret_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "secret files must be owner-only");
+    }
+
     // 3. Test args command for all
-    let output = std::process::Command::new(bin_path)
+    let output = bistrot_cmd()
         .arg("-c")
         .arg(&config_path)
         .arg("args")
@@ -835,7 +924,7 @@ chunk-size-exponent = 8
 
     // 4. Test systemd command with output-dir
     let units_dir = temp_dir.path().join("systemd_units");
-    let output = std::process::Command::new(bin_path)
+    let output = bistrot_cmd()
         .arg("-c")
         .arg(&config_path)
         .arg("systemd")
@@ -850,7 +939,7 @@ chunk-size-exponent = 8
     assert!(units_dir.join("alhalte-bistrot.target").exists());
 
     // 5. Test url command
-    let output = std::process::Command::new(bin_path)
+    let output = bistrot_cmd()
         .arg("-c")
         .arg(&config_path)
         .arg("url")
@@ -866,7 +955,7 @@ chunk-size-exponent = 8
     let secret = identity.to_string();
 
     let enc_path = temp_dir.path().join("EncBistrot.toml");
-    let output = std::process::Command::new(bin_path)
+    let output = bistrot_cmd()
         .arg("-c")
         .arg(&config_path)
         .arg("encrypt")
@@ -879,7 +968,7 @@ chunk-size-exponent = 8
     assert!(output.status.success());
     assert!(enc_path.exists());
 
-    let output = std::process::Command::new(bin_path)
+    let output = bistrot_cmd()
         .arg("-c")
         .arg(&enc_path)
         .arg("--age-key")
@@ -891,6 +980,61 @@ chunk-size-exponent = 8
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("cli.example.com"));
     assert!(stdout.contains("argenterie port: 5173"));
+
+    // 7. Test encrypt-value: stdin plaintext -> armored age value on stdout.
+    let mut child = bistrot_cmd()
+        .arg("encrypt-value")
+        .arg("--recipient")
+        .arg(&recipient)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(b"value-secret\n").unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let armored = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(armored.starts_with(alhalte_bistrot::AGE_ARMOR_BEGIN));
+    assert!(armored.contains(alhalte_bistrot::AGE_ARMOR_END));
+    assert!(!armored.contains("value-secret"));
+
+    // The armored value round-trips into a config that no longer has a plaintext
+    // secret, so no development escape hatch is needed to parse it.
+    let armored_config_path = temp_dir.path().join("ArmoredBistrot.toml");
+    let armored_config = format!(
+        r#"
+[restaurant]
+data-dir = "{data_dir}"
+
+[maitre-d]
+client-id = "cli-client"
+client-secret = """
+{armored}"""
+salt = "cli-salt"
+
+[cellar]
+"#,
+        data_dir = data_dir.display(),
+        armored = armored
+    );
+    std::fs::write(&armored_config_path, armored_config).unwrap();
+    let output = std::process::Command::new(bin_path)
+        .arg("-c")
+        .arg(&armored_config_path)
+        .arg("--age-key")
+        .arg(secret.expose_secret())
+        .arg("validate")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "decrypting an armored value must not require the plaintext escape hatch: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // spec: alhalte-bistrot/argenterie
@@ -905,7 +1049,7 @@ salt = "salt"
 
 [cellar]
 "#;
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(config.argenterie.port, 5173);
     assert_eq!(config.argenterie_url(), "http://127.0.0.1:5173/");
 
@@ -924,7 +1068,7 @@ salt = "salt"
 [argenterie]
 port = 3000
 "#;
-    let config_custom = parse_bistrot_toml(toml_str_custom).unwrap();
+    let config_custom = dev_parse(toml_str_custom).unwrap();
     assert_eq!(config_custom.argenterie.port, 3000);
     assert_eq!(config_custom.argenterie_url(), "http://127.0.0.1:3000/");
 
@@ -940,7 +1084,7 @@ salt = "salt"
 [argenterie]
 port = 0
 "#;
-    assert!(parse_bistrot_toml(toml_invalid_port).is_err());
+    assert!(dev_parse(toml_invalid_port).is_err());
 }
 
 // spec: alhalte-bistrot/extensions
@@ -965,7 +1109,7 @@ id = "custom-ext"
 path = "custom.wasm"
 "#;
 
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(config.extensions.len(), 2);
     assert_eq!(config.extensions[0].id, "alhalte-dsl");
     assert_eq!(config.extensions[0].name.as_deref(), Some("Alhalte DSL"));
@@ -996,7 +1140,7 @@ salt = "salt"
 id = "   "
 path = "dummy.wasm"
 "#;
-    assert!(parse_bistrot_toml(toml_str).is_err());
+    assert!(dev_parse(toml_str).is_err());
 }
 
 // spec: alhalte-bistrot/stage-extensions 0001 every configured wasm is copied and listed in manifest.json
@@ -1037,7 +1181,7 @@ enabled = false
         wasm2_path.display(),
     );
 
-    let config = parse_bistrot_toml(&toml_str).unwrap();
+    let config = dev_parse(&toml_str).unwrap();
     let manifest_entries = config.stage_extensions(&out_dir).unwrap();
 
     assert_eq!(manifest_entries.len(), 2);
@@ -1109,7 +1253,7 @@ enabled = true
         missing_wasm_path.display(),
     );
 
-    let config = parse_bistrot_toml(&toml_str).unwrap();
+    let config = dev_parse(&toml_str).unwrap();
     let err = config.stage_extensions(&out_dir).unwrap_err();
 
     match err {
@@ -1148,7 +1292,7 @@ salt = "salt"
 id = "rel-ext"
 path = "wasm/rel.wasm"
 "#;
-    let config = parse_bistrot_toml(relative_toml).unwrap();
+    let config = dev_parse(relative_toml).unwrap();
     let entries = config
         .stage_extensions_with_base(&out_dir, Some(&base_dir))
         .unwrap();
@@ -1170,7 +1314,7 @@ salt = "salt"
 id = "gone-ext"
 path = "wasm/gone.wasm"
 "#;
-    let missing_config = parse_bistrot_toml(missing_toml).unwrap();
+    let missing_config = dev_parse(missing_toml).unwrap();
     let missing_out = temp_dir.path().join("staged-missing");
     let err = missing_config
         .stage_extensions_with_base(&missing_out, Some(&base_dir))
@@ -1196,7 +1340,7 @@ fn test_root_bistrot_toml_extensions_configuration() {
         .unwrap()
         .join("Bistrot.toml");
     let content = std::fs::read_to_string(&root_bistrot).unwrap();
-    let config = parse_bistrot_toml(&content).unwrap();
+    let config = dev_parse(&content).unwrap();
 
     assert_eq!(config.extensions.len(), 6);
 
@@ -1250,6 +1394,7 @@ fn test_root_bistrot_toml_extensions_configuration() {
 }
 
 // spec: alhalte-bistrot/service-token 0001 internal cellar service token is passed to maitre-d and cellar
+// spec: alhalte-bistrot/secrets 0003 the token is passed as a file path, not as a value
 #[test]
 fn test_generate_args_includes_service_token() {
     let toml_str = r#"
@@ -1261,28 +1406,42 @@ salt = "salt"
 [cellar]
 service-token = "internal-service-token"
 "#;
-    let config = parse_bistrot_toml(toml_str).unwrap();
+    let config = dev_parse(toml_str).unwrap();
     assert_eq!(
         config.cellar.service_token.as_deref(),
         Some("internal-service-token")
     );
 
-    let maitre_d_args = generate_maitre_d_args(&config);
-    let token_index = maitre_d_args
-        .iter()
-        .position(|arg| arg == "--service-token")
-        .expect("maitre-d must receive --service-token");
-    assert_eq!(maitre_d_args[token_index + 1], "internal-service-token");
+    let token_path = config
+        .secrets_dir()
+        .join("cellar-service-token")
+        .display()
+        .to_string();
 
+    let maitre_d_args = generate_maitre_d_args(&config);
+    assert_eq!(
+        arg_after(&maitre_d_args, "--service-token-file"),
+        Some(token_path.as_str()),
+        "maitre-d must receive --service-token-file"
+    );
     let cellar_args = generate_cellar_args(&config);
-    let token_index = cellar_args
-        .iter()
-        .position(|arg| arg == "--service-token")
-        .expect("cellar must receive --service-token");
-    assert_eq!(cellar_args[token_index + 1], "internal-service-token");
+    assert_eq!(
+        arg_after(&cellar_args, "--service-token-file"),
+        Some(token_path.as_str()),
+        "cellar must receive --service-token-file"
+    );
+
+    // The value itself never appears in the argument list of either service.
+    for args in [&maitre_d_args, &cellar_args] {
+        assert!(
+            !args.iter().any(|arg| arg == "internal-service-token"),
+            "the service token must never be passed on the command line"
+        );
+        assert!(!args.iter().any(|arg| arg == "--service-token"));
+    }
 
     // Without a token no flag is emitted.
-    let plain = parse_bistrot_toml(
+    let plain = dev_parse(
         r#"
 [maitre-d]
 client-id = "id"
@@ -1296,12 +1455,12 @@ salt = "salt"
     assert!(
         !generate_maitre_d_args(&plain)
             .iter()
-            .any(|arg| arg == "--service-token")
+            .any(|arg| arg == "--service-token-file")
     );
     assert!(
         !generate_cellar_args(&plain)
             .iter()
-            .any(|arg| arg == "--service-token")
+            .any(|arg| arg == "--service-token-file")
     );
 
     // An explicitly empty token is rejected.
@@ -1314,17 +1473,13 @@ salt = "salt"
 [cellar]
 service-token = ""
 "#;
-    assert!(parse_bistrot_toml(empty).is_err());
+    assert!(dev_parse(empty).is_err());
 }
 
 // spec: alhalte-bistrot/service-token 0002 the default Bistrot.toml shares the token
+// spec: alhalte-bistrot/secrets 0006 the systemd units never contain the secret value
 #[test]
 fn test_root_bistrot_toml_shares_the_local_service_token() {
-    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-        let index = args.iter().position(|arg| arg == flag)?;
-        args.get(index + 1).map(String::as_str)
-    }
-
     // The checked-in local development configuration must set the token so
     // `nix run .#bistrot` persists room state out of the box.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -1334,29 +1489,436 @@ fn test_root_bistrot_toml_shares_the_local_service_token() {
         .parent()
         .unwrap()
         .join("Bistrot.toml");
-    let config = load_from_path(&root_bistrot).unwrap();
+    let config = dev_load(&root_bistrot).unwrap();
     let token = config
         .cellar
         .service_token
         .as_deref()
-        .expect("the default Bistrot.toml must configure cellar.service-token");
+        .expect("the default Bistrot.toml must configure cellar.service-token")
+        .to_string();
     assert!(!token.trim().is_empty());
 
+    let token_path = config
+        .secrets_dir()
+        .join("cellar-service-token")
+        .display()
+        .to_string();
     let maitre_d_args = generate_maitre_d_args(&config);
     let cellar_args = generate_cellar_args(&config);
-    assert_eq!(arg_after(&maitre_d_args, "--service-token"), Some(token));
-    assert_eq!(arg_after(&cellar_args, "--service-token"), Some(token));
+    assert_eq!(
+        arg_after(&maitre_d_args, "--service-token-file"),
+        Some(token_path.as_str())
+    );
+    assert_eq!(
+        arg_after(&cellar_args, "--service-token-file"),
+        Some(token_path.as_str())
+    );
 
-    // The generated systemd units carry the same token to both services.
+    // The generated systemd units only reference the shared secret file.
     let units = generate_systemd_units(&config, &SystemdOptions::default());
     assert!(
         units
             .maitre_d_service
-            .contains(&format!("--service-token {token}"))
+            .contains(&format!("--service-token-file {token_path}"))
     );
     assert!(
         units
             .cellar_service
-            .contains(&format!("--service-token {token}"))
+            .contains(&format!("--service-token-file {token_path}"))
     );
+    for unit in [&units.maitre_d_service, &units.cellar_service] {
+        assert!(
+            !unit.contains(&token),
+            "the generated unit must not contain the service token value"
+        );
+    }
+}
+
+// spec: alhalte-bistrot/secrets 0001 a `-----BEGIN AGE ENCRYPTED FILE-----` value
+// is decrypted recursively before deserialization
+#[test]
+fn test_per_value_age_armor_decryption() {
+    let identity = Identity::generate();
+    let recipient = identity.to_public().to_string();
+    let secret_key = identity.to_string();
+
+    let client_secret = encrypt_age_armored_value("oauth-client-secret", &recipient).unwrap();
+    let service_token = encrypt_age_armored_value("internal-service-token", &recipient).unwrap();
+
+    let toml_str = format!(
+        r#"
+[restaurant]
+data-dir = "/data/alhalte"
+
+[maitre-d]
+client-id = "google-client"
+client-secret = """
+{client_secret}"""
+salt = "instance-salt"
+
+[cellar]
+service-token = """
+{service_token}"""
+
+[[extensions]]
+id = "alhalte-dsl"
+path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
+"#
+    );
+
+    // The encrypted document does not contain the plaintext secrets.
+    assert!(!toml_str.contains("oauth-client-secret"));
+    assert!(!toml_str.contains("internal-service-token"));
+
+    let options = ParseOptions {
+        age_key: Some(secret_key.expose_secret()),
+        allow_plaintext_secrets: false,
+    };
+    let config = parse_bistrot_toml_with_options(&toml_str, &options).unwrap();
+    assert_eq!(config.maitre_d.client_id, "google-client");
+    assert_eq!(config.maitre_d.client_secret, "oauth-client-secret");
+    assert_eq!(
+        config.cellar.service_token.as_deref(),
+        Some("internal-service-token")
+    );
+    // Non-secret values survive the recursive walk untouched.
+    assert_eq!(config.extensions.len(), 1);
+    assert_eq!(config.extensions[0].id, "alhalte-dsl");
+
+    // The decrypted secrets become 0600 files and the argument lists only carry
+    // the file paths.
+    let maitre_d_args = generate_maitre_d_args(&config);
+    let cellar_args = generate_cellar_args(&config);
+    assert_eq!(
+        arg_after(&maitre_d_args, "--client-secret-file"),
+        Some("/data/alhalte/secrets/maitre-d-client-secret")
+    );
+    assert_eq!(
+        arg_after(&maitre_d_args, "--service-token-file"),
+        Some("/data/alhalte/secrets/cellar-service-token")
+    );
+    assert_eq!(
+        arg_after(&cellar_args, "--service-token-file"),
+        Some("/data/alhalte/secrets/cellar-service-token")
+    );
+    for args in [&maitre_d_args, &cellar_args] {
+        assert!(!args.iter().any(|arg| arg == "oauth-client-secret"));
+        assert!(!args.iter().any(|arg| arg == "internal-service-token"));
+    }
+
+    let units = generate_systemd_units(&config, &SystemdOptions::default());
+    for unit in [
+        &units.maitre_d_service,
+        &units.cellar_service,
+        &units.argenterie_service,
+        &units.bistrot_target,
+    ] {
+        assert!(!unit.contains("oauth-client-secret"));
+        assert!(!unit.contains("internal-service-token"));
+        assert!(!unit.contains(alhalte_bistrot::AGE_ARMOR_BEGIN));
+    }
+}
+
+// spec: alhalte-bistrot/secrets 0002 missing identity, wrong identity, and
+// corrupted armor all fail closed
+#[test]
+fn test_armored_value_failures() {
+    let identity = Identity::generate();
+    let recipient = identity.to_public().to_string();
+    let armored = encrypt_age_armored_value("some-secret", &recipient).unwrap();
+
+    let toml_str = format!(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = """
+{armored}"""
+salt = "salt"
+
+[cellar]
+"#
+    );
+
+    // 1. No identity configured anywhere -> AgeKeyMissing.
+    if std::env::var("ROPS_AGE").is_err() && std::env::var("ALHALTE_AGE_KEY").is_err() {
+        let err = parse_bistrot_toml_with_options(&toml_str, &ParseOptions::default()).unwrap_err();
+        assert!(
+            matches!(err, alhalte_bistrot::BistrotError::AgeKeyMissing),
+            "expected AgeKeyMissing, got {err:?}"
+        );
+    }
+
+    // 2. A different identity cannot decrypt the value -> AgeDecrypt.
+    let other = Identity::generate().to_string();
+    let err = parse_bistrot_toml_with_options(
+        &toml_str,
+        &ParseOptions {
+            age_key: Some(other.expose_secret()),
+            allow_plaintext_secrets: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, alhalte_bistrot::BistrotError::AgeDecrypt(_)),
+        "expected AgeDecrypt, got {err:?}"
+    );
+
+    // 3. A malformed armor block is rejected instead of being treated as a
+    // plaintext secret.
+    let broken = format!(
+        "[maitre-d]\nclient-id = \"id\"\nclient-secret = \"\"\"\n{}\nbm90LWEtcmVhbC1jaXBoZXJ0ZXh0\n{}\n\"\"\"\nsalt = \"salt\"\n\n[cellar]\n",
+        alhalte_bistrot::AGE_ARMOR_BEGIN,
+        alhalte_bistrot::AGE_ARMOR_END
+    );
+    let key = identity.to_string();
+    let err = parse_bistrot_toml_with_options(
+        &broken,
+        &ParseOptions {
+            age_key: Some(key.expose_secret()),
+            allow_plaintext_secrets: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, alhalte_bistrot::BistrotError::AgeDecrypt(_)),
+        "expected AgeDecrypt for corrupted armor, got {err:?}"
+    );
+
+    // 4. An invalid identity string is reported as such.
+    let err = parse_bistrot_toml_with_options(
+        &toml_str,
+        &ParseOptions {
+            age_key: Some("not-an-age-secret-key"),
+            allow_plaintext_secrets: false,
+        },
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, alhalte_bistrot::BistrotError::AgeIdentity(_)),
+        "expected AgeIdentity, got {err:?}"
+    );
+}
+
+// spec: alhalte-bistrot/secrets 0005 plaintext secrets are fail-closed unless
+// ALHALTE_ALLOW_PLAINTEXT_SECRETS=1
+#[test]
+fn test_plaintext_secrets_are_fail_closed() {
+    let plaintext = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "plain-oauth-secret"
+salt = "salt"
+
+[cellar]
+service-token = "plain-service-token"
+"#;
+
+    // Production default: both fields are reported.
+    let err = parse_bistrot_toml_with_options(plaintext, &ParseOptions::default()).unwrap_err();
+    match err {
+        alhalte_bistrot::BistrotError::PlaintextSecret(fields) => {
+            assert!(
+                fields.contains("maitre-d.client-secret"),
+                "fields: {fields}"
+            );
+            assert!(fields.contains("cellar.service-token"), "fields: {fields}");
+        }
+        other => panic!("expected PlaintextSecret, got {other:?}"),
+    }
+
+    // The `--config`/library entry point without options also fails closed for a
+    // real file.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("Bistrot.toml");
+    std::fs::write(&path, plaintext).unwrap();
+    let err = parse_bistrot_toml(&std::fs::read_to_string(&path).unwrap()).unwrap_err();
+    assert!(matches!(
+        err,
+        alhalte_bistrot::BistrotError::PlaintextSecret(_)
+    ));
+
+    // Development escape hatch (explicit, never implicit).
+    let config = parse_bistrot_toml_with_options(
+        plaintext,
+        &ParseOptions {
+            age_key: None,
+            allow_plaintext_secrets: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(config.maitre_d.client_secret, "plain-oauth-secret");
+
+    // An armored secret alongside a plaintext one still reports only the
+    // plaintext field.
+    let identity = Identity::generate();
+    let armored =
+        encrypt_age_armored_value("encrypted-secret", &identity.to_public().to_string()).unwrap();
+    let key = identity.to_string();
+    let mixed = format!(
+        "[maitre-d]\nclient-id = \"id\"\nclient-secret = \"\"\"\n{armored}\"\"\"\nsalt = \"salt\"\n\n[cellar]\nservice-token = \"plain-service-token\"\n"
+    );
+    let err = parse_bistrot_toml_with_options(
+        &mixed,
+        &ParseOptions {
+            age_key: Some(key.expose_secret()),
+            allow_plaintext_secrets: false,
+        },
+    )
+    .unwrap_err();
+    match err {
+        alhalte_bistrot::BistrotError::PlaintextSecret(fields) => {
+            assert_eq!(fields, "cellar.service-token");
+        }
+        other => panic!("expected PlaintextSecret, got {other:?}"),
+    }
+}
+
+// spec: alhalte-bistrot/secrets 0004 decrypted secrets are materialized with
+// mode 0600 in a 0700 directory
+#[test]
+fn test_write_secret_files_permissions() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let config = BistrotConfig {
+        restaurant: RestaurantConfig {
+            domain: "localhost".to_string(),
+            host: "127.0.0.1".to_string(),
+            data_dir: temp_dir.path().join("data"),
+            socket_dir: temp_dir.path().join("sockets"),
+        },
+        maitre_d: MaitreDConfig {
+            port: 8080,
+            db_path: None,
+            client_id: "id".to_string(),
+            client_secret: "oauth-secret-value".to_string(),
+            salt: "salt".to_string(),
+            socket_dir: None,
+            banquette_bin: None,
+            cellar_url: None,
+            public_url: None,
+        },
+        cellar: CellarConfig {
+            port: 8081,
+            storage_path: None,
+            db_path: None,
+            anti_oracle: false,
+            maitre_d_url: None,
+            maitre_d_socket: None,
+            allow_all_sessions: false,
+            service_token: Some("service-token-value".to_string()),
+        },
+        banquette: BanquetteConfig::default(),
+        argenterie: ArgenterieConfig::default(),
+        extensions: vec![],
+    };
+
+    // The pure path computation does not touch the filesystem.
+    let planned = secret_files(&config);
+    assert!(!planned.dir.exists());
+
+    let written = write_secret_files(&config).unwrap();
+    assert_eq!(written, planned);
+
+    let client_secret_path = written.maitre_d_client_secret.unwrap();
+    let token_path = written.service_token.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&client_secret_path).unwrap().trim(),
+        "oauth-secret-value"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&token_path).unwrap().trim(),
+        "service-token-value"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode =
+            |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&client_secret_path), 0o600);
+        assert_eq!(mode(&token_path), 0o600);
+        assert_eq!(mode(&written.dir), 0o700);
+    }
+
+    // Rewriting keeps the restrictive mode even though the file already exists.
+    write_secret_files(&config).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&client_secret_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // A configuration without secrets creates no directory at all.
+    let mut bare = config.clone();
+    bare.maitre_d.client_secret = String::new();
+    bare.cellar.service_token = None;
+    let bare_files = write_secret_files(&bare).unwrap();
+    assert!(bare_files.maitre_d_client_secret.is_none());
+    assert!(bare_files.service_token.is_none());
+}
+
+// spec: alhalte-bistrot/secrets 0007 identity resolution order is
+// --age-key -> ROPS_AGE -> ALHALTE_AGE_KEY
+#[test]
+fn test_age_identity_resolution_precedence() {
+    use alhalte_bistrot::secrets::resolve_age_identity_source;
+
+    // An explicit key always wins and is trimmed.
+    assert_eq!(
+        resolve_age_identity_source(Some("  explicit-key  ")).as_deref(),
+        Some("explicit-key")
+    );
+    // Blank values are treated as unset.
+    assert_ne!(
+        resolve_age_identity_source(Some("   ")).as_deref(),
+        Some("   ")
+    );
+
+    // ALHALTE_AGE_KEY is the last-resort fallback.
+    if std::env::var("ROPS_AGE").is_err() {
+        alhalte_bistrot::ffi::with_scoped_env_var(
+            "ALHALTE_AGE_KEY",
+            "AGE-SECRET-KEY-FROM-ENV",
+            || {
+                assert_eq!(
+                    resolve_age_identity_source(None).as_deref(),
+                    Some("AGE-SECRET-KEY-FROM-ENV")
+                );
+            },
+        );
+    }
+}
+
+// spec: alhalte-bistrot/secrets 0008 the example configuration documents the
+// armored format and contains no plaintext secret
+#[test]
+fn test_example_configuration_is_fail_closed() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let example_path = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("Bistrot.example.toml");
+    let content =
+        std::fs::read_to_string(&example_path).expect("Bistrot.example.toml must be checked in");
+
+    // The template uses placeholders, never a real local development secret.
+    assert!(!content.contains("alhalte-local-"));
+    assert!(content.contains("alhalte-bistrot encrypt-value"));
+
+    // Regardless of the identity, the unedited template cannot be used: without a
+    // key the armored placeholder is reported as such instead of being treated as
+    // a plaintext secret.
+    if std::env::var("ROPS_AGE").is_err() && std::env::var("ALHALTE_AGE_KEY").is_err() {
+        let err = parse_bistrot_toml_with_options(&content, &ParseOptions::default()).unwrap_err();
+        assert!(
+            matches!(err, alhalte_bistrot::BistrotError::AgeKeyMissing),
+            "expected AgeKeyMissing for the template, got {err:?}"
+        );
+    }
 }

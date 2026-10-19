@@ -180,11 +180,11 @@ client 総体 = cutlery
 
 ブラウザ以外の内部書き込み（banquette の部屋状態 persistence）は、ユーザー session を詐称せず `cellar.service-token` を使う。
 
-- `Bistrot.toml` の `[cellar] service-token`（rops 管理）を `maitre-d` と `cellar` に渡す。
-- リポジトリ同梱の `Bistrot.toml` はローカル開発専用の既定値 `service-token = "alhalte-local-service-token"` を設定し、`maitre-d` / 各 banquette / `cellar` が同じ値を使う。本番では rops で暗号化した値に必ず差し替える。
-- `maitre-d` は spawn する banquette に `--service-token` を伝播し、banquette は `X-Alhalte-Service-Token` で cellar に送る。
+- `Bistrot.toml` の `[cellar] service-token`（age armor で値単位暗号化。rops 全体暗号化も後方互換で可）を `maitre-d` と `cellar` に渡す。
+- リポジトリ同梱の `Bistrot.toml` はローカル開発専用の平文既定値 `service-token = "alhalte-local-service-token"` を設定し、`maitre-d` / 各 banquette / `cellar` が同じ値を使う（平文 secret は `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` のときだけ受理）。本番は age armor の値に必ず差し替える（`Bistrot.example.toml` / gitignore 済み `Bistrot.local.toml`）。
+- Bistrot は復号した `client-secret` / `service-token` を `<data-dir>/secrets/` に 0600 で書き、引数には `--client-secret-file` / `--service-token-file` の path だけを渡す。`maitre-d` は spawn する banquette に `--service-token-file` を伝播し、banquette は同じファイルから読んだトークンを `X-Alhalte-Service-Token` で cellar に送る。
 - cellar は提示されたトークンを定数時間比較し、一致すれば内部書き込みを許可する。ユーザー session の検証は公開 proxy / 通常クライアント経路で維持する。
-- トークンはログに出さない。`--client-secret` と同様に引数で渡るため `ps` から読める点は既知の制約で、`EnvironmentFile` 化は今後の課題。
+- トークンと OAuth client secret はログにも `ps` にも systemd unit にも出さない。`--service-token` / `--client-secret` の argv 指定は後方互換のため受理するが、Bistrot は生成しない。
 
 ## 拡張機能
 

@@ -46,6 +46,7 @@ pub mod gateway;
 pub mod labels;
 pub mod oauth;
 pub mod room_id;
+pub mod secret_file;
 pub mod server;
 pub mod session;
 pub mod spawner;
