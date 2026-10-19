@@ -203,11 +203,11 @@ client 総体 = cutlery
 
 ## 実装と仕様の差分（要確認）
 
-設計時の記述と現在の実装が異なる主な点を列挙する。Issue #199 で `banquette` の 4 段階権限（`Denied` / `Viewer` / `Participant` / `Admin`）が main に入り、`maitre-d` の DB role 連携は Issue #200 で置き換える。各項目の詳細はリンク先のモジュール文書を参照。
+設計時の記述と現在の実装が異なる主な点を列挙する。Issue #199 / #200 で `banquette` の 4 段階権限（`Denied` / `Viewer` / `Participant` / `Admin`）と `maitre-d` の権限委譲が main に入った。各項目の詳細はリンク先のモジュール文書を参照。
 
 | 領域 | 設計時の記述 | 現在の実装 |
 | --- | --- | --- |
-| 権限 | 部屋の `done` フラグと `std::admins` | `banquette` の `RoomData.permissions` / `default_permission` が正（4 段階）。`maitre-d` の SQLite `gm/pl/viewer` と `rooms.done` は pre-spawn gate 用の暫定投影で、実行中の部屋へは push しない（#200 で接続）。 |
+| 権限 | 部屋の `done` フラグと `std::admins` | `banquette` の `RoomData.permissions` / `default_permission` が正（4 段階）。`maitre-d` は権限テーブルを持たず、WS / `GET /api/rooms/{id}` / export / HTTP 権限 API で banquette に問い合わせる。旧 `gm/pl/viewer` / `rooms.done` は起動時に拒否する。 |
 | 部屋状態 | 部屋プロセスは揮発 | `maitre-d` の `room_heads` と cellar の `alhalte/banquette` Tin で永続化し、spawn 時に復元する。復元失敗は空部屋にフォールバックしない。 |
 | 内部書き込み | ユーザー session で認可 | `cellar.service-token` による内部認証。合成 session（旧 `system_session_id = 1`）は廃止。 |
 | 拡張 ABI | `process-generast(Generast) -> Generast` | `process_generast(ptr, len) -> i64`。`(Generast, speaker_id)` の Tin を入出力し、`alhalte_abi_version` / `alloc` / `dealloc` / `self_introduction` を持つ。 |
