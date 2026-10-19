@@ -11,6 +11,7 @@
   import type { Character, ExtensionItem, Scene } from '../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
   import type { ConnectionState } from '../../utils/connection.js';
+  import type { AudioManager } from '../../utils/audio.js';
   import { ChunkLogManager } from '../../utils/log.js';
   import type { RoomSocket } from '../../utils/roomSocket.js';
   import type { SceneMovementEvent } from '../../utils/sceneGraph.js';
@@ -66,6 +67,7 @@
     onRefreshCharacters,
     pendingCharacterCount,
     roomSocket = null,
+    audioManager = undefined,
     roomKey,
     connectionState,
     sceneActionPending = null,
@@ -127,6 +129,12 @@
      * `SceneSettingsTab` (acknowledged BGM state changes, Issue #109 / #142).
      */
     roomSocket?: RoomSocket | null;
+    /**
+     * Forwarded to `SceneSettingsTab`: the per-App BGM audio manager
+     * (Issue #164). `App` owns the instance so playback state and the settings
+     * tab share one element per slot.
+     */
+    audioManager?: AudioManager;
     /**
      * Forwarded to `ExtensionManagementTab`: 32-byte room key for the wasm
      * cellar transfer (Issue #109 / sub-issue #145).
@@ -240,6 +248,7 @@
         {onDeleteSceneLogs}
         {onRequestAssetPicker}
         {roomSocket}
+        {audioManager}
         {roomKey}
         {sceneActionPending}
         {sceneActionError}

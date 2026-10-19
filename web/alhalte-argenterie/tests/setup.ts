@@ -192,11 +192,21 @@ if (typeof window !== 'undefined') {
   // Polyfill URL.createObjectURL / URL.revokeObjectURL for jsdom
   if (typeof URL !== 'undefined') {
     if (!URL.createObjectURL) {
-      URL.createObjectURL = () => 'blob:mock-url';
+      let objectUrlCounter = 0;
+      URL.createObjectURL = () => `blob:mock-url-${(objectUrlCounter += 1)}`;
     }
     if (!URL.revokeObjectURL) {
       URL.revokeObjectURL = () => {};
     }
+  }
+
+  // Mock HTMLMediaElement playback (Issue #164). jsdom does not implement
+  // media playback; per-test fakes still override this to assert play / pause.
+  if (typeof HTMLMediaElement !== 'undefined') {
+    HTMLMediaElement.prototype.play = function play(): Promise<void> {
+      return Promise.resolve();
+    };
+    HTMLMediaElement.prototype.pause = function pause(): void {};
   }
 }
 

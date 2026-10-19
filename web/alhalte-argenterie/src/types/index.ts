@@ -67,9 +67,17 @@ export interface Character {
  */
 export interface BgmSlot {
   slot: number; // u32, 1-based index (e.g. 1, 2, 3...)
-  tinId?: string | null; // Option<string>: null or undefined means None (stopped)
+  tinId?: string | null; // Option<string>: null or undefined means no track selected
+  /** MIME type of the selected track (`audio/mpeg` when unknown, Issue #164). */
+  mimeType?: string;
   volume: number; // Volume from 0.0 to 1.0 (represented as 0 to 100 on Slider)
-  isPlaying: boolean; // Playback toggle state
+  /**
+   * Playback intent from the room state (`bgm::<slot>::playing`, Issue #164).
+   *
+   * The track selection itself is independent: stopping keeps `tinId` so the
+   * same track can be resumed from any client.
+   */
+  isPlaying: boolean;
   name?: string; // Optional track name / description
 }
 

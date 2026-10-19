@@ -30,17 +30,20 @@
     type SceneMovementEvent,
   } from '../utils/sceneGraph.js';
   import {
+    buildBgmTrackState,
     createDefaultJuices,
     downloadSceneBackground,
     getNormalizedBgmSlots,
     inheritJuices,
     moveMemberToScene,
+    parseBgmTrackState,
     parseSceneBackgroundState,
     SCENE_BACKGROUND_HEIGHT_STATE_KEY,
     SCENE_BACKGROUND_STATE_KEY,
     SCENE_BACKGROUND_WIDTH_STATE_KEY,
     SCENE_NAME_STATE_KEY,
   } from '../utils/sceneSettings.js';
+  import { createAudioManager, type AudioManager } from '../utils/audio.js';
   import { applyThemeToDocument } from '../utils/theme.js';
   import {
     DEFAULT_OFFICIAL_EXTENSIONS,
@@ -99,6 +102,7 @@
     debugAlwaysShow = false,
     roomSocket: customRoomSocket,
     roomKey,
+    audioManager: audioManagerOverride,
     fetchFn,
   }: {
     initialRoom?: VisitedRoom | null;
@@ -127,9 +131,21 @@
      * URL fragment; tests and embedders can inject one.
      */
     roomKey?: Uint8Array | null;
+    /**
+     * Injectable BGM audio manager (Issue #164). Defaults to a fresh manager
+     * owning one `HTMLAudioElement` per slot; tests inject a fake / mocked one.
+     */
+    audioManager?: AudioManager;
     /** Injectable fetch implementation for the room preflight (tests). */
     fetchFn?: typeof fetch;
   } = $props();
+
+  /**
+   * Per-App BGM manager (Issue #164): state hydration, remote play updates,
+   * scene switches and the settings tab all share this instance, so there is
+   * exactly one element per slot and hydration never doubles playback.
+   */
+  const audioManager = audioManagerOverride ?? createAudioManager();
 
   let activeConnectionManager = $derived(customConnectionManager ?? defaultConnectionManager);
   let currentConnectionState = $state<ConnectionState>(
@@ -1195,6 +1211,9 @@
   /** Scene-state key carrying a slot volume (`bgm::<slot>::volume`). */
   const BGM_VOLUME_STATE_KEY = /^bgm::(\d+)::volume$/;
 
+  /** Scene-state key carrying a slot playback intent (Issue #164). */
+  const BGM_PLAYING_STATE_KEY = /^bgm::(\d+)::playing$/;
+
   /** `piece::<characterId>::placed` and `piece::<characterId>::pos` keys. */
   const PIECE_PLACED_STATE_KEY = /^piece::(.+)::placed$/;
   const PIECE_POS_STATE_KEY = /^piece::(.+)::pos$/;
@@ -1215,7 +1234,11 @@
 
   /** True when a `StateUpdated` / `StateDeleted` key belongs to the BGM schema. */
   function isBgmStateKey(key: string): boolean {
-    return bgmSlotFromStateKey(key) !== null || BGM_VOLUME_STATE_KEY.test(key);
+    return (
+      bgmSlotFromStateKey(key) !== null ||
+      BGM_VOLUME_STATE_KEY.test(key) ||
+      BGM_PLAYING_STATE_KEY.test(key)
+    );
   }
 
   /** Mirrors a slot's tin id (and optionally volume) into the legacy `bgm1..3` fields. */
@@ -1254,11 +1277,72 @@
   }
 
   /**
+   * Reconciles one slot's audio element with the authoritative scene state.
+   *
+   * Only the current scene makes sound. A `blocked` slot waits for the user
+   * gesture affordance instead of retrying `play()` on every state change.
+   */
+  async function syncBgmSlotAudio(
+    sceneId: string,
+    slot: BgmSlot,
+    roomKey: Uint8Array | null,
+  ): Promise<void> {
+    if (sceneId !== currentScene?.id) {
+      audioManager.pause(slot.slot);
+      return;
+    }
+
+    audioManager.setVolume(slot.slot, slot.volume);
+    if (!slot.isPlaying || !slot.tinId) {
+      audioManager.pause(slot.slot);
+      return;
+    }
+
+    const track = buildBgmTrackState({
+      tinId: slot.tinId,
+      mimeType: slot.mimeType,
+      name: slot.name,
+    });
+    if (!track) {
+      audioManager.pause(slot.slot);
+      return;
+    }
+
+    const current = audioManager.getState(slot.slot);
+    // Autoplay policy: keep the prepared source but wait for the click.
+    if (current.status === 'blocked' && current.tinId === track.tinId) return;
+
+    try {
+      await audioManager.prepare(slot.slot, track, roomKey);
+      // A stop / scene switch may have arrived while the tin was downloading:
+      // do not start playback from a stale snapshot.
+      const latestScene = scenes.find((candidate) => candidate.id === sceneId);
+      const latestSlot = latestScene
+        ? getNormalizedBgmSlots(latestScene.juices).find(
+            (candidate) => candidate.slot === slot.slot,
+          )
+        : undefined;
+      if (!latestSlot?.isPlaying || latestSlot.tinId !== track.tinId) {
+        audioManager.pause(slot.slot);
+        return;
+      }
+      // The manager may have been stopped while the tin was loading (unmount /
+      // scene switch): a cleared slot is not a playback error.
+      const prepared = audioManager.getState(slot.slot);
+      if (prepared.tinId !== track.tinId || prepared.status === 'idle') return;
+      await audioManager.play(slot.slot);
+    } catch (error) {
+      console.warn(`[App] Failed to play BGM slot ${slot.slot}:`, error);
+      // The manager exposes the user-facing error to the settings tab.
+    }
+  }
+
+  /**
    * Applies a BGM `StateUpdated` frame.
    *
-   * Track values are the 64-hex cellar tin id; the legacy plain-string form of
-   * `std::bgm` is still accepted. Tin-encoded values are decoded first because
-   * `RoomSocket.subscribe` forwards the raw frame.
+   * Track values are `{ tinId, mimeType, name }` JSON Tin; the legacy bare
+   * 64-hex string is still accepted. `bgm::<slot>::playing` is independent of
+   * the track so a stopped slot keeps its selected track.
    */
   function applyBgmStateUpdated(scene: Scene, key: string, rawValue: unknown) {
     const value = tinToJson(rawValue);
@@ -1275,20 +1359,52 @@
       setNormalizedBgmSlots(scene.juices, slots);
       const updated = slots.find((slot) => slot.slot === slotNum);
       syncLegacyBgmFields(scene.juices, slotNum, updated?.tinId ?? null, clamped);
+      audioManager.setVolume(slotNum, clamped);
+      return;
+    }
+
+    const playingMatch = BGM_PLAYING_STATE_KEY.exec(key);
+    if (playingMatch) {
+      const slotNum = Number(playingMatch[1]);
+      const playing = value === true || value === 'true' || value === 1;
+      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+        slot.slot === slotNum ? { ...slot, isPlaying: playing } : { ...slot },
+      );
+      setNormalizedBgmSlots(scene.juices, slots);
+      const updated = slots.find((slot) => slot.slot === slotNum);
+      if (updated && scene.id === currentScene?.id) {
+        void syncBgmSlotAudio(scene.id, updated, extensionRoomKey);
+      }
       return;
     }
 
     const slotNum = bgmSlotFromStateKey(key);
     if (slotNum === null) return;
-    const tinId = typeof value === 'string' && value.length > 0 ? value : null;
+    const parsed = parseBgmTrackState(value);
     const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
-      slot.slot === slotNum ? { ...slot, tinId, isPlaying: tinId !== null } : { ...slot },
+      slot.slot === slotNum
+        ? {
+            ...slot,
+            tinId: parsed?.tinId ?? null,
+            mimeType: parsed?.mimeType,
+            name: parsed?.name ?? '',
+          }
+        : { ...slot },
     );
     setNormalizedBgmSlots(scene.juices, slots);
-    syncLegacyBgmFields(scene.juices, slotNum, tinId);
+    const updated = slots.find((slot) => slot.slot === slotNum);
+    syncLegacyBgmFields(scene.juices, slotNum, parsed?.tinId ?? null);
+    if (updated && scene.id === currentScene?.id) {
+      void syncBgmSlotAudio(scene.id, updated, extensionRoomKey);
+    }
   }
 
-  /** Applies a BGM `StateDeleted` frame (stopping a slot deletes its state key). */
+  /**
+   * Applies a BGM `StateDeleted` frame.
+   *
+   * Deleting a track key clears the selection; deleting `playing` stops the
+   * slot. Both pause and revoke the slot's object URL.
+   */
   function applyBgmStateDeleted(scene: Scene, key: string) {
     const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
     if (volumeMatch) {
@@ -1299,17 +1415,67 @@
       setNormalizedBgmSlots(scene.juices, slots);
       const updated = slots.find((slot) => slot.slot === slotNum);
       syncLegacyBgmFields(scene.juices, slotNum, updated?.tinId ?? null, 0.8);
+      audioManager.setVolume(slotNum, 0.8);
+      return;
+    }
+
+    const playingMatch = BGM_PLAYING_STATE_KEY.exec(key);
+    if (playingMatch) {
+      const slotNum = Number(playingMatch[1]);
+      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+        slot.slot === slotNum ? { ...slot, isPlaying: false } : { ...slot },
+      );
+      setNormalizedBgmSlots(scene.juices, slots);
+      audioManager.pause(slotNum);
       return;
     }
 
     const slotNum = bgmSlotFromStateKey(key);
     if (slotNum === null) return;
     const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
-      slot.slot === slotNum ? { ...slot, tinId: null, isPlaying: false } : { ...slot },
+      slot.slot === slotNum
+        ? { ...slot, tinId: null, mimeType: undefined, name: undefined, isPlaying: false }
+        : { ...slot },
     );
     setNormalizedBgmSlots(scene.juices, slots);
     syncLegacyBgmFields(scene.juices, slotNum, null);
+    audioManager.pause(slotNum);
   }
+
+  /**
+   * Keeps the current scene's audio elements in sync with the state model
+   * (Issue #164).
+   *
+   * A scene switch first pauses every slot and revokes its object URL, then the
+   * new scene's `playing` slots are prepared and played. Re-applying the same
+   * snapshot is idempotent: the manager keeps one element per slot and skips an
+   * already prepared / playing track.
+   */
+  /** Scene whose playback is currently loaded; a change stops the old track. */
+  let audioSceneId: string | null = null;
+
+  $effect(() => {
+    const scene = currentScene;
+    if (!scene) return;
+    const sceneId = scene.id;
+    const roomKey = extensionRoomKey;
+    const slots = getNormalizedBgmSlots(scene.juices).map((slot) => ({ ...slot }));
+    if (sceneId !== audioSceneId) {
+      audioSceneId = sceneId;
+      audioManager.stopAll();
+    }
+    for (const slot of slots) {
+      audioManager.setVolume(slot.slot, slot.volume);
+      void syncBgmSlotAudio(sceneId, slot, roomKey);
+    }
+  });
+
+  // Unmounting the room UI must not leave a detached audio element playing.
+  $effect(() => {
+    return () => {
+      audioManager.stopAll();
+    };
+  });
 
   // ---------------------------------------------------------------------------
   // Background image / dimensions hydration (Issue #159)
@@ -2674,6 +2840,7 @@
                   {sceneActionError}
                   {chunkManager}
                   {roomSocket}
+                  {audioManager}
                   connectionState={currentConnectionState}
                   onCollapse={() => (isControlSheetOpen = false)}
                   onSelectScene={handleSelectScene}
@@ -2767,6 +2934,7 @@
                 {sceneActionError}
                 {chunkManager}
                 {roomSocket}
+                {audioManager}
                 connectionState={currentConnectionState}
                 onCollapse={() => (isControlSheetOpen = false)}
                 onSelectScene={handleSelectScene}

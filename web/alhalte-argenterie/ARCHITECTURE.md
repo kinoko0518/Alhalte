@@ -152,11 +152,14 @@
 
 ### BGM
 
-- BGM は state とログの両方に書く。state キーは `std::bgm`（slot 1、旧来の互換）、`std::bgm<N>`（任意の slot N >= 2）、音量は `bgm::<slot>::volume`。値は 64 hex の Tin ID（停止・未設定は null / 削除）。
+- BGM は state とログの両方に書く。track は `std::bgm`（slot 1、旧来の互換）/ `std::bgm<N>`（任意の slot N >= 2）に `{ tinId, mimeType, name }` の JSON Tin で保存する。旧形式の裸の 64 hex 文字列も受理し、MIME 不明時は `audio/mpeg` を使う。再生状態は `bgm::<slot>::playing`（boolean）、音量は `bgm::<slot>::volume`。
+- 停止は `bgm::<slot>::playing=false` だけを書き、選択中の track は残す（再開できる）。track の削除は「NONE」を選んだときだけで、`std::bgm<N>` を削除する。
 - slot は 1〜3 固定ではなく任意番号を扱う。`StateSnapshot` / `StateUpdated` に未知の slot 番号が現れたら `bgmSlots` に追加して表示する。`SceneSettingsTab` の「スロット追加」も最大 slot + 1 を使う。
-- `SceneSettingsTab` は再生/停止・選択・音量変更を async 化し、`requestUpdateState(sceneId, key, tinIdOrNull)` と `requestChangeBgm(sceneId, slot, tinIdOrNull)` の両方が成功したときだけローカルの `bgmSlots` / `scene.juices` を確定する。送信中は対象 slot の「BGM選択」アイコンを波線 `CircularProgress` にし、二重実行を防ぐ。
+- `SceneSettingsTab` は再生/停止・選択・音量変更を async 化し、再生/停止は `bgm::<slot>::playing`、選択は `std::bgm<N>`、停止/選択変更は `requestChangeBgm` の ack が揃ったときだけローカルの `bgmSlots` / `scene.juices` を確定する。送信中は対象 slot の「BGM選択」アイコンを波線 `CircularProgress` にし、二重実行を防ぐ。
+- 再生は `utils/audio.ts` の `AudioManager` が担う。slot ごとに `HTMLAudioElement` を 1 つだけ保持し、`downloadTin(tinId, roomKey)` で復号した payload から object URL を作る。`StateSnapshot` / `SceneInfo` / `bgm::<slot>::playing` 更新 / scene 入場で再生を調整し、停止・track 変更・scene 切替・unmount では pause して object URL を revoke する。同じ snapshot の再適用は冪等で、再生や download を重複させない。
+- 音源取得 / 復号に失敗した slot は row 付近にエラーを表示し、`playing` を確定しない（state を書かない）。`play()` が autoplay policy で拒否された場合は「クリックして有効化」を出し、クリックで同じ要素を再生し直す。
 - 失敗時は変更前へ戻し、slot 付近にエラーを出す。キューには積まない（最終状態のみが意味を持つため、再接続時の自動再送をしない）。
-- `App` は `StateUpdated` / `StateDeleted` の BGM キーを `bgmSlots` と旧 `bgm1..3` へ反映する。ルート scene `/` の state 更新は管理者のみで、`PermissionDenied` はそのまま表示する。
+- `App` は `StateUpdated` / `StateDeleted` の BGM キー（track / playing / volume）を `bgmSlots` と旧 `bgm1..3` へ反映し、現在 scene の音声だけを再生する。state 更新の可否はサーバーの権限判定に従い、`PermissionDenied` はそのまま表示する。viewer も他クライアントが開始した BGM は再生する（viewer の操作制限は #158 / #159 のまま）。
 
 ### scene の管理操作
 

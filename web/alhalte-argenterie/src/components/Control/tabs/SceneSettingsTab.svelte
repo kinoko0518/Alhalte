@@ -26,13 +26,24 @@
   import GenericImagePicker from '../GenericImagePicker.svelte';
   import type { BgmSlot, Character, Scene } from '../../../types/index.js';
   import {
+    BGM_AUDIO_MIME_FALLBACK,
+    bgmPlayingStateKey,
+    bgmTrackStateKey,
+    bgmVolumeStateKey,
+    buildBgmTrackState,
     clearSceneBackground,
     getNormalizedBgmSlots,
     SCENE_BACKGROUND_HEIGHT_STATE_KEY,
     SCENE_BACKGROUND_WIDTH_STATE_KEY,
     SCENE_NAME_STATE_KEY,
     uploadSceneBackground,
+    type BgmTrackState,
   } from '../../../utils/sceneSettings.js';
+  import {
+    createAudioManager,
+    type AudioManager,
+    type AudioSlotState,
+  } from '../../../utils/audio.js';
   import { ServerOperationError, type RoomSocket } from '../../../utils/roomSocket.js';
   import {
     applyMenuPosition,
@@ -62,6 +73,7 @@
     onRequestAssetPicker,
     roomSocket = null,
     roomKey,
+    audioManager = undefined,
     sceneActionPending = null,
     sceneActionError = null,
   }: {
@@ -103,6 +115,13 @@
      */
     roomKey?: Uint8Array | null;
     /**
+     * Slot-keyed BGM audio manager (Issue #164). `App` owns the instance so a
+     * scene switch / snapshot / remote play update and this tab share exactly
+     * one `HTMLAudioElement` per slot. Standalone usage (tests / previews)
+     * creates a private manager.
+     */
+    audioManager?: AudioManager;
+    /**
      * Scene action whose control is replaced by a wavy `CircularProgress`
      * (`create` / `delete-logs` / `delete-scene` / `move:<characterId>`),
      * owned by `App` (Issue #109 / sub-issue #143).
@@ -111,6 +130,22 @@
     /** Failure text rendered under the management controls (Issue #109 / #143). */
     sceneActionError?: string | null;
   } = $props();
+
+  /**
+   * BGM audio manager (Issue #164). `App` passes its instance so playback is
+   * shared with scene switches / state snapshots; standalone usage gets a
+   * private manager so the component works without a room.
+   */
+  const bgmAudio = audioManager ?? createAudioManager();
+  /** Per-slot playback state mirrored from the manager for rendering. */
+  let bgmAudioStates = $state<Record<number, AudioSlotState>>({});
+
+  $effect(() => {
+    bgmAudioStates = bgmAudio.getStates();
+    return bgmAudio.subscribe(() => {
+      bgmAudioStates = bgmAudio.getStates();
+    });
+  });
 
   // Asset picker state
   let isAssetPickerOpen = $state(false);
@@ -310,16 +345,18 @@
     }
   }
 
-  // BGM Slots state & synchronization (Issue #53 / Issue #109 sub-issue #142)
+  // BGM Slots state & synchronization (Issue #53 / #109 / #142 / #164)
   //
   // State schema (see the PR 「判断した点」):
   // - track: `std::bgm` (slot 1), `std::bgm2` / `std::bgm3` (slots 2 / 3)
-  //   with the 64-hex cellar tin id as value; stopping deletes the key.
+  //   as JSON Tin `{ tinId, mimeType, name }`; a legacy 64-hex string is still
+  //   accepted. The track stays selected while stopped.
+  // - playing: `bgm::<slot>::playing` boolean, written by play / stop and
+  //   committed locally only after the ack.
   // - volume: `bgm::<slot>::volume` as a number in 0..1, sent on commit only.
   // - the BGM change log is sent through `requestChangeBgm` alongside the state.
   let bgmSlots = $state<BgmSlot[]>(getNormalizedBgmSlots(currentScene.juices));
   let activeBgmSlotPicking = $state<number | null>(null);
-  let lastTinIds = $state<Record<number, string>>({});
   /** Slots with an in-flight server operation; reassigned so Svelte sees the change. */
   let pendingBgmSlots = $state<Set<number>>(new Set());
   /** Per-slot error message rendered under the row with `role="status"`. */
@@ -359,18 +396,18 @@
     }
   }
 
-  /** Room-state key holding the track of a slot (`std::bgm` for slot 1). */
-  function getBgmStateKey(slotNum: number): string {
-    return slotNum === 1 ? 'std::bgm' : `std::bgm${slotNum}`;
-  }
-
-  /** Room-state key holding the volume of a slot. */
-  function getBgmVolumeStateKey(slotNum: number): string {
-    return `bgm::${slotNum}::volume`;
-  }
-
   function findBgmSlot(slotNum: number): BgmSlot | undefined {
     return bgmSlots.find((s) => s.slot === slotNum);
+  }
+
+  /** Converts a slot's state fields into the audio manager track shape. */
+  function getSlotTrack(slot: BgmSlot | undefined): BgmTrackState | null {
+    if (!slot?.tinId) return null;
+    return buildBgmTrackState({
+      tinId: slot.tinId,
+      mimeType: slot.mimeType,
+      name: slot.name,
+    });
   }
 
   function isBgmPending(slotNum: number): boolean {
@@ -397,7 +434,7 @@
     bgmErrors = next;
   }
 
-  /** Legacy `bgm1..3` field of a slot, used when no tin id was remembered yet. */
+  /** Legacy `bgm1..3` field of a slot, used when no slot state was remembered. */
   function getLegacyBgmTinId(slotNum: number): string | undefined {
     if (slotNum === 1) return currentScene.juices.bgm1;
     if (slotNum === 2) return currentScene.juices.bgm2;
@@ -405,13 +442,35 @@
     return undefined;
   }
 
+  /** Legacy `bgm1..3` track as a playable reference (mime type fallback). */
+  function getLegacyBgmTrack(slotNum: number): BgmTrackState | null {
+    const tinId = getLegacyBgmTinId(slotNum)?.trim().toLowerCase();
+    if (!tinId || !TIN_ID_HEX.test(tinId)) return null;
+    return { tinId, mimeType: BGM_AUDIO_MIME_FALLBACK, name: '' };
+  }
+
   /**
-   * Commits a track change to the local scene after the server acknowledged it.
+   * Commits a track / playback change to the local scene after the server
+   * acknowledged it.
    *
    * Called exactly once per successful operation; `onUpdateScene` follows from it.
    */
-  function applyBgmSlotState(slotNum: number, tinId: string | null, isPlaying: boolean) {
-    bgmSlots = bgmSlots.map((s) => (s.slot === slotNum ? { ...s, tinId, isPlaying } : s));
+  function applyBgmSlotState(
+    slotNum: number,
+    track: BgmTrackState | null,
+    isPlaying: boolean,
+  ) {
+    bgmSlots = bgmSlots.map((s) =>
+      s.slot === slotNum
+        ? {
+            ...s,
+            tinId: track?.tinId ?? null,
+            mimeType: track?.mimeType,
+            name: track?.name,
+            isPlaying,
+          }
+        : s,
+    );
     const updated = findBgmSlot(slotNum);
     if (updated) {
       syncSlotToLegacy(updated);
@@ -451,53 +510,199 @@
     setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
   }
 
+  /** Resolves once every request succeeded; rethrows the first failure. */
+  async function throwIfBgmFailure(requests: Promise<unknown>[]): Promise<void> {
+    const results = await Promise.allSettled(requests);
+    const failure = results.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected',
+    );
+    if (failure) throw failure.reason;
+  }
+
   /**
-   * Sends a track change (play / stop / select) to the server and commits it
-   * locally only when both the state update and the BGM change log succeed.
+   * Whether this instance can actually play audio.
    *
-   * A stop is `requestDeleteState` plus `requestChangeBgm(..., null)`. Without a
-   * connected socket the historical local-only behaviour is kept.
+   * `roomKey === undefined` means the key was not resolved (standalone usage,
+   * tests, previews); `null` means a room exists but has no key and is a real
+   * playback error.
    */
-  async function commitBgmChange(
+  function canUseBgmAudio(): boolean {
+    return !isStandalone() && roomKey !== undefined;
+  }
+
+  /**
+   * Prepares the audio element before any state is written.
+   *
+   * A missing / undecryptable tin must never leave the server thinking the slot
+   * is playing: the manager records the user-facing error and this returns
+   * `false` so the caller skips the acknowledgement path.
+   */
+  async function prepareBgmAudio(
     slotNum: number,
-    tinId: string | null,
-    isPlaying: boolean,
-    rememberTinId?: string,
+    track: BgmTrackState,
+  ): Promise<boolean> {
+    if (!canUseBgmAudio()) return true;
+    // Apply the committed (or drafted) volume before the first playback.
+    const volume =
+      draftBgmVolumes[slotNum] ?? findBgmSlot(slotNum)?.volume ?? 0.8;
+    bgmAudio.setVolume(slotNum, volume);
+    try {
+      await bgmAudio.prepare(slotNum, track, roomKey);
+      return true;
+    } catch (error) {
+      console.warn(`[SceneSettingsTab] Failed to prepare BGM slot ${slotNum}:`, error);
+      return false;
+    }
+  }
+
+  /** Starts the prepared element; autoplay rejection is surfaced as `blocked`. */
+  async function playBgmAudio(slotNum: number): Promise<void> {
+    if (!canUseBgmAudio()) return;
+    try {
+      await bgmAudio.play(slotNum);
+    } catch (error) {
+      console.warn(`[SceneSettingsTab] Failed to play BGM slot ${slotNum}:`, error);
+    }
+  }
+
+  /**
+   * Plays a slot and commits `bgm::<slot>::playing = true` after the ack.
+   *
+   * `trackChanged` also writes `std::bgm<N>` as `{ tinId, mimeType, name }`.
+   * Standalone usage (tests / previews) keeps the historical local-only path.
+   */
+  async function commitBgmPlay(
+    slotNum: number,
+    track: BgmTrackState,
+    trackChanged: boolean,
   ) {
     if (isBgmPending(slotNum)) return;
 
     const socket = roomSocket;
     const sceneId = currentScene.id;
     setBgmError(slotNum, null);
-
-    if (!socket || !socket.isConnected) {
-      if (rememberTinId) lastTinIds[slotNum] = rememberTinId;
-      applyBgmSlotState(slotNum, tinId, isPlaying);
-      return;
-    }
-
     setBgmPending(slotNum, true);
     try {
-      const stateRequest =
-        tinId === null
-          ? socket.requestDeleteState(sceneId, getBgmStateKey(slotNum))
-          : socket.requestUpdateState(sceneId, getBgmStateKey(slotNum), tinId);
-      // The track state and the BGM change log are sent together and both must
-      // be acknowledged before the local model changes.
-      const results = await Promise.allSettled([
-        stateRequest,
-        socket.requestChangeBgm(sceneId, slotNum, tinId),
-      ]);
-      const failure = results.find(
-        (result): result is PromiseRejectedResult => result.status === 'rejected',
-      );
-      if (failure) throw failure.reason;
+      if (!(await prepareBgmAudio(slotNum, track))) {
+        // No state write: the slot must not become "playing" without audio.
+        return;
+      }
+
+      if (!socket || !socket.isConnected) {
+        if (!isStandalone()) {
+          setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
+          bgmAudio.pause(slotNum);
+          return;
+        }
+        applyBgmSlotState(slotNum, track, true);
+        await playBgmAudio(slotNum);
+        return;
+      }
+
+      const trackState = buildBgmTrackState(track);
+      if (!trackState) {
+        setBgmError(slotNum, BGM_MISSING_TIN_ERROR);
+        bgmAudio.pause(slotNum);
+        return;
+      }
+
+      const requests: Promise<unknown>[] = [
+        socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), true),
+        socket.requestChangeBgm(sceneId, slotNum, track.tinId),
+      ];
+      if (trackChanged) {
+        requests.push(
+          socket.requestUpdateState(
+            sceneId,
+            bgmTrackStateKey(slotNum),
+            trackState,
+          ),
+        );
+      }
+      await throwIfBgmFailure(requests);
 
       // The user may have switched scenes while the requests were in flight.
-      if (currentScene.id !== sceneId) return;
+      if (currentScene.id !== sceneId) {
+        bgmAudio.pause(slotNum);
+        return;
+      }
+      applyBgmSlotState(slotNum, track, true);
+      await playBgmAudio(slotNum);
+    } catch (error) {
+      reportBgmFailure(slotNum, error);
+      bgmAudio.pause(slotNum);
+    } finally {
+      setBgmPending(slotNum, false);
+    }
+  }
 
-      if (rememberTinId) lastTinIds[slotNum] = rememberTinId;
-      applyBgmSlotState(slotNum, tinId, isPlaying);
+  /**
+   * Stops a slot and commits `bgm::<slot>::playing = false` after the ack.
+   *
+   * The selected track stays in `std::bgm<N>` so it can be resumed from any
+   * client; only selecting NONE deletes the track.
+   */
+  async function commitBgmStop(slotNum: number) {
+    if (isBgmPending(slotNum)) return;
+
+    const socket = roomSocket;
+    const sceneId = currentScene.id;
+    const track =
+      getSlotTrack(findBgmSlot(slotNum)) ?? getLegacyBgmTrack(slotNum);
+    setBgmError(slotNum, null);
+    setBgmPending(slotNum, true);
+    try {
+      if (!socket || !socket.isConnected) {
+        if (!isStandalone()) {
+          setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
+          return;
+        }
+        applyBgmSlotState(slotNum, track, false);
+        bgmAudio.pause(slotNum);
+        return;
+      }
+
+      await throwIfBgmFailure([
+        socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
+        socket.requestChangeBgm(sceneId, slotNum, null),
+      ]);
+      if (currentScene.id !== sceneId) return;
+      applyBgmSlotState(slotNum, track, false);
+      bgmAudio.pause(slotNum);
+    } catch (error) {
+      reportBgmFailure(slotNum, error);
+    } finally {
+      setBgmPending(slotNum, false);
+    }
+  }
+
+  /** Clears a slot (select NONE): delete the track and stop after the ack. */
+  async function commitBgmClear(slotNum: number) {
+    if (isBgmPending(slotNum)) return;
+
+    const socket = roomSocket;
+    const sceneId = currentScene.id;
+    setBgmError(slotNum, null);
+    setBgmPending(slotNum, true);
+    try {
+      if (!socket || !socket.isConnected) {
+        if (!isStandalone()) {
+          setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
+          return;
+        }
+        applyBgmSlotState(slotNum, null, false);
+        bgmAudio.pause(slotNum);
+        return;
+      }
+
+      await throwIfBgmFailure([
+        socket.requestDeleteState(sceneId, bgmTrackStateKey(slotNum)),
+        socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
+        socket.requestChangeBgm(sceneId, slotNum, null),
+      ]);
+      if (currentScene.id !== sceneId) return;
+      applyBgmSlotState(slotNum, null, false);
+      bgmAudio.pause(slotNum);
     } catch (error) {
       reportBgmFailure(slotNum, error);
     } finally {
@@ -511,19 +716,35 @@
     if (!slot) return;
 
     if (slot.isPlaying && slot.tinId) {
-      // 再生中 -> 停止 (None / null): remembered so Play can resume it.
-      void commitBgmChange(slotNum, null, false, slot.tinId);
+      void commitBgmStop(slotNum);
       return;
     }
 
-    // 停止中 -> 再生
-    const prev = lastTinIds[slotNum] || slot.tinId || getLegacyBgmTinId(slotNum);
-    if (!prev) {
+    // 停止中 -> 再生: the selected track is kept while stopped. A track that
+    // only exists in the legacy `bgm1..3` field is migrated to `std::bgm<N>`.
+    const slotTrack = getSlotTrack(slot);
+    const track = slotTrack ?? getLegacyBgmTrack(slotNum);
+    if (!track) {
       // 音源がなければアセット選択を開く
       handleBgmSelect(slotNum);
       return;
     }
-    void commitBgmChange(slotNum, prev, true);
+    void commitBgmPlay(slotNum, track, slotTrack === null);
+  }
+
+  /** Retries playback after the click that satisfies the autoplay policy. */
+  async function handleEnableBgmAudio(slotNum: number) {
+    setBgmError(slotNum, null);
+    try {
+      await bgmAudio.retry(slotNum);
+      return;
+    } catch (error) {
+      console.warn(`[SceneSettingsTab] Autoplay retry failed for slot ${slotNum}:`, error);
+    }
+    const track = getSlotTrack(findBgmSlot(slotNum));
+    if (track && (await prepareBgmAudio(slotNum, track))) {
+      await playBgmAudio(slotNum);
+    }
   }
 
   function handleBgmSelect(slotOrKey: number | 'bgm1' | 'bgm2' | 'bgm3') {
@@ -555,18 +776,18 @@
   /**
    * Handles a picked audio asset.
    *
-   * The room state stores the cellar tin id, never the local data URL. Assets
-   * without a tin id (legacy local-only entries) are rejected with an inline
-   * error instead of writing an unsynchronisable value. Selecting NONE (no
-   * data URL and no asset) stops the slot like the Play/Stop button.
+   * The room state stores the cellar track reference (`{ tinId, mimeType,
+   * name }`), never the local data URL. Assets without a tin id (legacy
+   * local-only entries) are rejected with an inline error instead of writing an
+   * unsynchronisable value. Selecting NONE (no data URL and no asset) clears
+   * the slot's track.
    */
   function handleSlotAssetPicked(slotNum: number, dataUrl?: string, asset?: AssetItem) {
     activeBgmSlotPicking = null;
     if (isBgmPending(slotNum)) return;
 
     if (!dataUrl && !asset) {
-      const previous = findBgmSlot(slotNum)?.tinId ?? undefined;
-      void commitBgmChange(slotNum, null, false, previous);
+      void commitBgmClear(slotNum);
       return;
     }
 
@@ -580,8 +801,19 @@
       return;
     }
     // `dataUrl` is only useful for local preview; the authoritative room state
-    // value is the tin id, so it is deliberately not persisted here.
-    void commitBgmChange(slotNum, tinId, true);
+    // value is the tin reference, so it is deliberately not persisted here.
+    void commitBgmPlay(
+      slotNum,
+      {
+        tinId,
+        mimeType:
+          typeof asset?.mimeType === 'string' && asset.mimeType.startsWith('audio/')
+            ? asset.mimeType
+            : BGM_AUDIO_MIME_FALLBACK,
+        name: typeof asset?.name === 'string' ? asset.name : '',
+      },
+      true,
+    );
   }
 
   function readBgmSliderValue(e: Event): number {
@@ -591,15 +823,20 @@
     return Math.max(0, Math.min(100, hundred)) / 100;
   }
 
-  /** Drag preview: updates the label only; nothing is sent or committed. */
+  /**
+   * Drag preview: updates the label and the live audio element volume.
+   * Nothing is sent to the server until the slider commit.
+   */
   function handleBgmVolumePreview(slotNum: number, volume: number) {
     draftBgmVolumes = { ...draftBgmVolumes, [slotNum]: volume };
+    bgmAudio.setVolume(slotNum, volume);
   }
 
   /** Committed volume change: `input` ticks never reach the server. */
   function handleBgmVolumeCommit(slotNum: number, volume: number) {
     if (isBgmPending(slotNum)) return;
     draftBgmVolumes = { ...draftBgmVolumes, [slotNum]: volume };
+    bgmAudio.setVolume(slotNum, volume);
     setBgmError(slotNum, null);
 
     const socket = roomSocket;
@@ -612,16 +849,19 @@
     void (async () => {
       setBgmPending(slotNum, true);
       try {
-        await socket.requestUpdateState(sceneId, getBgmVolumeStateKey(slotNum), volume);
+        await socket.requestUpdateState(sceneId, bgmVolumeStateKey(slotNum), volume);
         if (currentScene.id !== sceneId) return;
         applyBgmSlotVolume(slotNum, volume);
       } catch (error) {
         reportBgmFailure(slotNum, error);
-        // Drop the preview so the slider shows the last acknowledged volume.
+        // Drop the preview so the slider and the audio element show the last
+        // acknowledged volume.
         if (currentScene.id === sceneId) {
           const nextDrafts = { ...draftBgmVolumes };
           delete nextDrafts[slotNum];
           draftBgmVolumes = nextDrafts;
+          const committed = findBgmSlot(slotNum)?.volume;
+          if (typeof committed === 'number') bgmAudio.setVolume(slotNum, committed);
         }
       } finally {
         setBgmPending(slotNum, false);
@@ -1089,10 +1329,20 @@
             </span>
           </div>
 
-          {#if bgmErrors[slot.slot]}
+          {#if bgmErrors[slot.slot] || bgmAudioStates[slot.slot]?.error}
             <p class="bgm-error-text" role="status" data-testid="bgm-error-{slot.slot}">
-              {bgmErrors[slot.slot]}
+              {bgmErrors[slot.slot] ?? bgmAudioStates[slot.slot]?.error}
             </p>
+          {/if}
+          {#if bgmAudioStates[slot.slot]?.blocked}
+            <button
+              type="button"
+              class="bgm-enable-audio-btn"
+              data-testid="bgm-enable-audio-{slot.slot}"
+              onclick={() => handleEnableBgmAudio(slot.slot)}
+            >
+              クリックして有効化
+            </button>
           {/if}
         </div>
       {/each}
@@ -1619,6 +1869,18 @@
     font-size: 0.8rem;
     line-height: 1.3;
     color: var(--np-color-error);
+  }
+  .bgm-enable-audio-btn {
+    align-self: flex-start;
+    margin-left: 2.5rem;
+    padding: 0.35rem 0.75rem;
+    border: 1px solid var(--np-color-outline, #79747e);
+    border-radius: 999px;
+    background: var(--np-color-secondary-container, #e8def8);
+    color: var(--np-color-on-secondary-container, #1d192b);
+    font: inherit;
+    font-size: 0.8rem;
+    cursor: pointer;
   }
   .scene-state-error {
     margin: 0.25rem 0 0;

@@ -772,12 +772,22 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
     socket.emitFrame({
       StateUpdated: { scene_id: '/', key: 'std::bgm', value: jsonToTin(tinA) },
     });
+    socket.emitFrame({
+      StateUpdated: { scene_id: '/', key: 'bgm::1::playing', value: jsonToTin(true) },
+    });
     await settle();
     expect(play1()?.getAttribute('aria-label')).toBe('BGM停止');
 
-    // New slot keys `std::bgm2` / `std::bgm3`.
+    // New slot keys `std::bgm2` / `std::bgm3` with the current track shape.
     socket.emitFrame({
-      StateUpdated: { scene_id: '/', key: 'std::bgm2', value: jsonToTin(tinB) },
+      StateUpdated: {
+        scene_id: '/',
+        key: 'std::bgm2',
+        value: jsonToTin({ tinId: tinB, mimeType: 'audio/ogg', name: 'b' }),
+      },
+    });
+    socket.emitFrame({
+      StateUpdated: { scene_id: '/', key: 'bgm::2::playing', value: jsonToTin(true) },
     });
     await settle();
     expect(play2()?.getAttribute('aria-label')).toBe('BGM停止');
@@ -785,6 +795,9 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
     // A plain legacy string value is still accepted.
     socket.emitFrame({
       StateUpdated: { scene_id: '/', key: 'std::bgm3', value: tinC },
+    });
+    socket.emitFrame({
+      StateUpdated: { scene_id: '/', key: 'bgm::3::playing', value: jsonToTin(true) },
     });
     await settle();
     expect(play3()?.getAttribute('aria-label')).toBe('BGM停止');
