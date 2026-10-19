@@ -61,8 +61,7 @@ room-scoped route の `{room_id}` は `RoomId`（`crates/alhalte-maitre-d/src/ro
 | 接続先 | 内容 |
 | --- | --- |
 | Google OAuth | `accounts.google.com` の認可 URL、`oauth2.googleapis.com/token`、`tokeninfo`。 |
-| `alhalte-banquette` | UNIX ソケット。`ProcessBanquetteSpawner` または `InProcessBanquetteSpawner` が起動し、長さ前置 postcard で通信する。 |
-| `alhalte-kitchen` | ZIP export のためにライブラリとして呼ぶ。 |
+| `alhalte-banquette` | UNIX ソケット。`ProcessBanquetteSpawner` または `InProcessBanquetteSpawner` が起動し、長さ前置 postcard で通信する。export ZIP も banquette が組み立てる（#193）。 |
 | `alhalte-cellar` | `--cellar-url` を base に `/api/cellar/*` を HTTP で転送する（`CellarProxy`）。 |
 
 `/api/cellar/store`、`/api/cellar/store/{tin_id}` は Axum 既定の 2 MiB を超える Tin（アセット・拡張 wasm）を通すため、`DefaultBodyLimit::max(64 MiB)` を route 単位で設定する。他の route は既定のまま。
@@ -152,12 +151,11 @@ HTTP 権限 API は banquette への薄い proxy で、`QueryPermissions` / `Set
 
 1. `type` が `full` / `logs` 以外なら 400。
 2. account と session が片方だけなら 401。両方あれば session を検証する。
-3. `rooms` を引き、未登録なら **404**。登録済みでも caller に role がなく `done=false` なら **403**。どちらも banquette を起動しない。
-4. bridge の admin は WS と同じく DB の GM / `rooms.creator_account` から決める。
+3. `rooms` を引き、未登録なら **404**。登録済みでも banquette に問い合わせた caller の実効権限が `Denied` なら **403**。どちらも banquette を起動しない。
+4. bridge の admin は WS と同じく `rooms.creator_account` から決める。権限の正は banquette の `RoomData` で、`maitre-d` は権限表を持たない。
 5. `get_or_create_room` で bridge を取得する。banquette が cellar の head alias から部屋を復元してから `ExportRoom` に応答する。復元に失敗した場合は **500** を返し、空の ZIP を返さない。
-6. bridge に `ExportRoom` を送り、banquette から `RoomData` と chunk を受け取る。
-7. `logs` の場合は各 scene の state を空にする。
-8. `alhalte_kitchen::export_room_to_zip` で ZIP を作り、`application/zip` と `Content-Disposition` を付けて返す。
+6. bridge に `ExportRoom { caller_account, include_state: type == "full" }` を送り、banquette が組み立てた ZIP bytes を受け取る。scene の絞り込みと `logs` の state 消去は banquette が行う（#193）。
+7. 受け取った bytes に `application/zip` と `Content-Disposition` を付けて返す。`maitre-d` は ZIP を組み立てない。
 
 ### 部屋 head と復元
 

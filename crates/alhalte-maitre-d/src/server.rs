@@ -2075,24 +2075,13 @@ async fn export_room_zip_handler(
         return response;
     }
 
-    let (mut room_data, chunks) = match bridge.export_room(caller_account).await {
-        Ok(data) => data,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response();
-        }
-    };
-
-    if export_type == "logs" {
-        for scene in room_data.scenes.values_mut() {
-            scene.states.clear();
-        }
-    }
-
-    let zip_bytes = match alhalte_kitchen::export_room_to_zip(&room_data, &chunks, None) {
+    // banquette assembles the ZIP (Issue #193): it is the authority on which
+    // scenes the caller may export, so `type=logs` is honoured there by
+    // emptying every scene state before the archive is written.
+    let zip_bytes = match bridge
+        .export_room(caller_account, export_type == "full")
+        .await
+    {
         Ok(bytes) => bytes,
         Err(e) => {
             return (

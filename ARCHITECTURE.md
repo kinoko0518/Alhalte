@@ -41,10 +41,10 @@ client 総体 = cutlery
                          │ alhalte-maitre-d (axum)      │
                          │ OAuth / account / session    │
                          │ room permission / WS demux   │
-                         └───────┬───────────────┬──────┘
-                                 │ UNIX socket   │ library
-                                 │ postcard      │ alhalte-kitchen
-                                 ▼               │
+                         └───────┬──────────────────────┘
+                                 │ UNIX socket
+                                 │ postcard
+                                 ▼
                          ┌──────────────────────────────┐
                          │ alhalte-banquette (1 room)   │
                          │ scene / log / state / chars  │
@@ -130,8 +130,8 @@ client 総体 = cutlery
 
 1. `maitre-d` の `GET /api/room/<roomId>/export/zip?type=full|logs` は `rooms` を引き、未登録は 404、呼び出し元の権限が `Denied` なら 403 で拒否する。空の部屋を暗黙作成しない。
 2. 許可された場合、`banquette` に `ExportRoom` を送る。bridge が未起動なら作成者を admin として起動する。banquette は cellar の alias `room/<room_id>/head` から部屋を復元してから応答する（#193 で ZIP 化）。復元できない場合は 5xx を返し、空の ZIP を返さない。
-3. banquette は権限のある scene と log chunk を `RoomData` にまとめて返す。
-4. `maitre-d` は `alhalte-kitchen` で ZIP を組み立てて返す。
+3. banquette は権限のある scene の `RoomData` と log chunk を集め、`room.tin` + `chunks/<tin-id>.tin` の ZIP にまとめて bytes で返す。`type=logs` は ZIP 化の前に全 scene の state を空にする。
+4. `maitre-d` は受け取った ZIP bytes を `application/zip` と `Content-Disposition` 付きでそのまま返す。ZIP は組み立てない。
 5. `alhalte-kitchen` CLI は ZIP / tar.gz を読み、`RoomGraph` を作り、HTML5 または EPUB に変換する。
 
 ### 起動

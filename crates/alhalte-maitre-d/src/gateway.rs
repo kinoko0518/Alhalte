@@ -7,11 +7,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use alhalte_banquette::{
-    BanquetteToMaitreD, ClientFrame, LogChunk, MaitreDToBanquette, ProtocolCodec, RoomData,
-    RoomPermissionLevel, ServerFrame,
+    BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, RoomPermissionLevel,
+    ServerFrame,
 };
 use futures_util::{SinkExt, StreamExt};
-use tin::TinId;
 use tokio::net::UnixStream;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::codec::Framed;
@@ -19,8 +18,7 @@ use tokio_util::codec::Framed;
 use crate::error::{MaitreDError, Result};
 use crate::spawner::BanquetteSpawner;
 
-type ExportResponseSender =
-    oneshot::Sender<std::result::Result<(RoomData, Vec<(TinId, LogChunk)>), String>>;
+type ExportResponseSender = oneshot::Sender<std::result::Result<Vec<u8>, String>>;
 
 /// How long a one-shot permission request waits for an answer from banquette.
 ///
@@ -546,11 +544,22 @@ impl RoomBridge {
             .send(MaitreDToBanquette::ClientMessage { client_id, frame });
     }
 
-    /// Requests an export snapshot from the room's `banquette` process.
+    /// Requests the room export ZIP from the room's `banquette` process.
+    ///
+    /// `include_state` selects `type=full` (state included) or `type=logs`
+    /// (state emptied). banquette builds the archive itself, which keeps the
+    /// scene authorization on the side that owns the permission table
+    /// (Issue #193).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the request cannot be delivered, banquette reports
+    /// an export failure, or no response arrives within 30 seconds.
     pub async fn export_room(
         &self,
         caller_account: Option<u64>,
-    ) -> Result<(RoomData, Vec<(TinId, LogChunk)>)> {
+        include_state: bool,
+    ) -> Result<Vec<u8>> {
         let req_id = self.export_counter.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         {
@@ -561,6 +570,7 @@ impl RoomBridge {
         if let Err(e) = self.to_banquette_tx.send(MaitreDToBanquette::ExportRoom {
             request_id: req_id,
             caller_account,
+            include_state,
         }) {
             let mut pending = self.pending_exports.write().await;
             pending.remove(&req_id);
@@ -570,7 +580,7 @@ impl RoomBridge {
         }
 
         match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(Ok(data))) => Ok(data),
+            Ok(Ok(Ok(zip_bytes))) => Ok(zip_bytes),
             Ok(Ok(Err(err_msg))) => Err(MaitreDError::Banquette(err_msg)),
             Ok(Err(_)) => Err(MaitreDError::Banquette(
                 "Export response channel dropped".to_string(),

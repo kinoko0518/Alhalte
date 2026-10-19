@@ -108,6 +108,10 @@ pub enum BanquetteError {
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
+    /// A room export archive could not be built or read.
+    #[error("Archive error: {0}")]
+    Archive(String),
+
     /// General serialization error.
     #[error("Serialization error: {0}")]
     Serialization(String),
