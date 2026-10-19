@@ -11,7 +11,7 @@ use tin::{Tin, TinId};
 use crate::character::Character;
 use crate::error::{BanquetteError, Result};
 use crate::log::{LogBiblio, LogChunk};
-use crate::room::{RoomData, SceneSummary};
+use crate::room::{RoomData, RoomPermissionLevel, SceneSummary};
 
 /// WebRTC signaling payloads exchanged between clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,11 +61,6 @@ pub enum ClientFrame {
     LeaveScene {
         /// Scene ID.
         scene_id: String,
-    },
-    /// Set the room's `done` flag (admin only).
-    SetDone {
-        /// Whether room is fully public.
-        done: bool,
     },
     /// Query all state in a scene. Returns nothing if unpermitted.
     QueryState {
@@ -176,6 +171,35 @@ pub enum ClientFrame {
     },
     /// Response confirming client liveness to a heartbeat ping.
     HeartbeatResponse,
+    /// Sets the permission of a single account (admin only).
+    ///
+    /// Emits [`ServerFrame::PermissionsUpdated`] to the requester on success and
+    /// [`ServerFrame::Error`] with `code = "SetMemberPermissionFailed"`
+    /// otherwise. Demoting the last administrator is rejected.
+    ///
+    /// Declared after the pre-existing variants; Issue #199 intentionally broke
+    /// wire compatibility by removing `SetDone`, so the indices of the frames
+    /// after it shifted by one.
+    SetMemberPermission {
+        /// Target account ID.
+        account_id: u64,
+        /// New permission level for the account.
+        permission: RoomPermissionLevel,
+    },
+    /// Sets the permission used for accounts without an explicit entry (admin only).
+    ///
+    /// Emits [`ServerFrame::PermissionsUpdated`] to the requester on success and
+    /// [`ServerFrame::Error`] with `code = "SetDefaultPermissionFailed"`
+    /// otherwise.
+    SetDefaultPermission {
+        /// New default permission level.
+        permission: RoomPermissionLevel,
+    },
+    /// Requests the current permission table.
+    ///
+    /// Answered with [`ServerFrame::PermissionsSnapshot`]; an account without
+    /// access to the room gets no response, like the other query frames.
+    QueryPermissions,
 }
 
 /// Messages emitted from `banquette` to a client WebSocket.
@@ -334,18 +358,31 @@ pub enum ServerFrame {
         /// Destination scene ID.
         to_scene_id: String,
     },
-    /// Confirmation that the room's `done` flag was changed by an administrator.
+    /// Complete permission table of the room.
     ///
-    /// Sent only after [`crate::room::Room::set_done`] succeeds. A rejected
-    /// request emits [`ServerFrame::Error`] with `code = "SetDoneFailed"`
-    /// instead, and `maitre-d` persists `rooms.done` only after observing this
-    /// success frame.
+    /// The answer to [`ClientFrame::QueryPermissions`]. Also the success
+    /// acknowledgement of [`ClientFrame::SetMemberPermission`] /
+    /// [`ClientFrame::SetDefaultPermission`] is
+    /// [`ServerFrame::PermissionsUpdated`], never a snapshot.
     ///
-    /// Declared last so that the postcard variant indices of pre-existing
-    /// frames stay stable (backward compatibility).
-    DoneUpdated {
-        /// New value of the room's public `done` flag.
-        done: bool,
+    /// Declared after the pre-existing variants; Issue #199 removed
+    /// `DoneUpdated`, so the earlier variant indices are unchanged.
+    PermissionsSnapshot {
+        /// Permission applied to accounts without an explicit entry.
+        default_permission: RoomPermissionLevel,
+        /// Per-account permission overrides.
+        permissions: BTreeMap<u64, RoomPermissionLevel>,
+    },
+    /// The room permission table changed.
+    ///
+    /// Sent to the administrator whose request succeeded. A rejected request
+    /// emits [`ServerFrame::Error`] with `SetMemberPermissionFailed` /
+    /// `SetDefaultPermissionFailed` instead, and nothing changes.
+    PermissionsUpdated {
+        /// Permission applied to accounts without an explicit entry.
+        default_permission: RoomPermissionLevel,
+        /// Per-account permission overrides.
+        permissions: BTreeMap<u64, RoomPermissionLevel>,
     },
 }
 
@@ -382,18 +419,19 @@ pub enum MaitreDToBanquette {
         /// Calling account ID, if authenticated.
         caller_account: Option<u64>,
     },
-    /// Replaces the room's administrator set from the database permission rows.
+    /// Asks the running room for the effective permission of one account.
     ///
-    /// This is an internal control frame: `maitre-d` has already authorized the
-    /// change against `room_permissions`, so `banquette` applies the set without
-    /// a room-client caller check. It is deliberately not reachable from a
-    /// [`ClientFrame`].
+    /// This is how `maitre-d` learns what `banquette` already considers the
+    /// account to be (`RoomData.permissions` is the source of truth, not the
+    /// `maitre-d` database).
     ///
     /// Declared last so that the postcard variant indices of pre-existing
-    /// frames stay stable (backward compatibility).
-    SetAdmins {
-        /// Complete replacement administrator account ID set.
-        admins: Vec<u64>,
+    /// frames stay stable; `SetAdmins` was removed by Issue #199.
+    QueryAccountPermission {
+        /// Request correlation ID.
+        request_id: u64,
+        /// Account ID to look up.
+        account_id: u64,
     },
 }
 
@@ -439,28 +477,29 @@ pub enum BanquetteToMaitreD {
     /// later spawn can restore the room. Sent only after a successful store and
     /// also after the final persist on graceful shutdown.
     ///
-    /// `done` mirrors [`crate::room::RoomData::done`] at store time. It is
-    /// persisted outside the `RoomData` wire schema so the pre-spawn access gate
-    /// still sees the flag after a `maitre-d` restart.
-    ///
-    /// Declared last so that the postcard variant indices of pre-existing frames
-    /// stay stable (backward compatibility).
-    RoomPersisted {
-        /// Tin ID of the stored `RoomData`.
-        tin_id: TinId,
-        /// Whether the stored room is fully public.
-        done: bool,
-    },
-    /// The administrator set from a [`MaitreDToBanquette::SetAdmins`] was applied.
-    ///
-    /// Allows `maitre-d` and tests to observe that a runtime permission change
-    /// took effect in the running room without a restart.
+    /// `default_permission` mirrors [`crate::room::RoomData::default_permission`]
+    /// at store time. `maitre-d` uses it for the pre-spawn membership gate until
+    /// Issue #200 replaces that gate with the room permission table.
     ///
     /// Declared last so that the postcard variant indices of pre-existing
     /// frames stay stable (backward compatibility).
-    AdminsUpdated {
-        /// Administrator account ID set that is now in effect.
-        admins: Vec<u64>,
+    RoomPersisted {
+        /// Tin ID of the stored `RoomData`.
+        tin_id: TinId,
+        /// Permission applied to accounts without an explicit entry.
+        default_permission: RoomPermissionLevel,
+    },
+    /// Answer to [`MaitreDToBanquette::QueryAccountPermission`].
+    ///
+    /// Declared last so that the postcard variant indices of pre-existing
+    /// frames stay stable; `AdminsUpdated` was removed by Issue #199.
+    AccountPermissionResponse {
+        /// Request correlation ID echoed from the query.
+        request_id: u64,
+        /// Account ID that was looked up.
+        account_id: u64,
+        /// Effective permission of the account in this room.
+        permission: RoomPermissionLevel,
     },
 }
 

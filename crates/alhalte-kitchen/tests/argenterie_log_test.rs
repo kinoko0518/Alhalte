@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use alhalte_banquette::character::{CharacterBiblio, set_character_name};
 use alhalte_banquette::log::{LogBiblio, LogChunk};
-use alhalte_banquette::room::RoomData;
+use alhalte_banquette::room::{RoomData, RoomPermissionLevel};
 use alhalte_banquette::scene::SceneData;
 use alhalte_kitchen::{RoomArchive, RoomGraph, SceneEvent, export_room_to_zip};
 use generast::Generast;
@@ -58,7 +58,9 @@ fn room_with_entries(entries: Vec<Option<Tin>>) -> (RoomData, Vec<(tin::TinId, L
 
     let room = RoomData {
         room_id: 161,
-        done: true,
+        default_permission: RoomPermissionLevel::Viewer,
+        permissions: BTreeMap::new(),
+        accessible_scenes: BTreeMap::new(),
         chunk_exponent: 8,
         character_biblio,
         scenes,
@@ -172,7 +174,9 @@ fn test_argenterie_log_record_legacy_and_old_formats() {
     );
     let room = RoomData {
         room_id: 161,
-        done: true,
+        default_permission: RoomPermissionLevel::Viewer,
+        permissions: BTreeMap::new(),
+        accessible_scenes: BTreeMap::new(),
         chunk_exponent: 8,
         character_biblio,
         scenes,

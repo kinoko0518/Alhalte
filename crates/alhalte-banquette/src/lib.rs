@@ -7,16 +7,17 @@
 //! In Alhalte, sessions take place in rooms hosted by `alhalte-banquette` processes.
 //! A room maintains:
 //! - **Scene biblio**: Mapping from `scene-id` (`String`) to [`Scene`], where `"/"` is the root virtual scene.
-//!   `"/"` carries a `done` flag indicating whether all room contents are public.
 //! - **Character biblio**: Mapping from `character-id` (`u64`) to [`Character`] (`HashMap<String, Tin>`).
 //!   Character IDs are generated monotonically without collisions.
 //! - **Scene logs**: Chunked log history of `1 << N` entries per chunk (default $N = 8$, i.e. 256 entries),
 //!   supporting `append`, `edit`, `delete` (tombstone), and `rewind`. When chunks fill up, they are sealed into
 //!   `alhalte/banquette/log/chunk` tins and uploaded to `alhalte-cellar`.
 //! - **Scene state**: High-frequency associative state (`BTreeMap<String, Tin>`) bounded to 4KiB per tin value,
-//!   with reserved keys (`std::admins`) and `::` namespace separation.
-//! - **Access control**: Under non-`done` status, non-administrators without characters present in a scene
-//!   receive **no response** to queries for scene log, state, or name.
+//!   separated by the `::` key namespace.
+//! - **Access control**: Every account has one [`RoomPermissionLevel`]; `Denied` and `Viewer` accounts
+//!   receive **no response** to queries for a scene log, state, or name they may not read, and every
+//!   mutate frame is refused (`Viewer` never writes, `Participant` writes only the scenes an
+//!   administrator moved it into plus `"/"`, `Admin` writes everything).
 //! - **Lifecycle**: Unloading idle scenes when active client counts drop to zero, and periodic 4-minute heartbeats
 //!   with room state persistence, shutting down when idle for 3 consecutive intervals.
 //! - **Persistence**: [`Room::persist`] stores the whole room in cellar and reports the tin ID so
@@ -62,12 +63,11 @@ pub use labels::{
     IDENT_ALHALTE_BANQUETTE, IDENT_ALHALTE_BANQUETTE_LOG_BIBLIO,
     IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, IDENT_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
     IDENT_ALHALTE_BANQUETTE_LOG_CHUNK, IDENT_ALHALTE_BANQUETTE_SCENE,
-    IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID, KEY_STD_ADMINS,
-    KEY_STD_NAME, KEY_STD_OWNER_ACCOUNT, LABEL_ALHALTE_BANQUETTE,
-    LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME,
-    LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE, LABEL_ALHALTE_BANQUETTE_LOG_CHUNK,
-    LABEL_ALHALTE_BANQUETTE_SCENE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
-    LABEL_ALHALTE_MAITRE_D_SESSION_ID,
+    IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID, KEY_STD_NAME,
+    KEY_STD_OWNER_ACCOUNT, LABEL_ALHALTE_BANQUETTE, LABEL_ALHALTE_BANQUETTE_LOG_BIBLIO,
+    LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
+    LABEL_ALHALTE_BANQUETTE_LOG_CHUNK, LABEL_ALHALTE_BANQUETTE_SCENE,
+    LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID,
 };
 pub use log::{
     CharacterCameEvent, CharacterGoneEvent, LogBiblio, LogChunk, LogOperationEvent, SceneLog,
@@ -76,7 +76,9 @@ pub use protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
     WebRtcSignalPayload,
 };
-pub use room::{HeartbeatOutcome, HeartbeatResult, Room, RoomData, SceneSummary};
+pub use room::{
+    HeartbeatOutcome, HeartbeatResult, Room, RoomData, RoomPermissionLevel, SceneSummary,
+};
 pub use scene::{Scene, SceneData};
 pub use server::{BanquetteServer, ConnectedClient, ServerConfig};
 pub use state::{

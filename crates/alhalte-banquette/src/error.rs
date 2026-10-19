@@ -31,6 +31,18 @@ pub enum BanquetteError {
     #[error("Permission denied")]
     PermissionDenied,
 
+    /// The operation would leave the room without a single administrator.
+    #[error("Permission denied: a room must keep at least one administrator")]
+    LastAdminDemotion,
+
+    /// Persisted (or about to be persisted) room data violates a room invariant.
+    ///
+    /// This is also how a `RoomData` written by an incompatible schema is
+    /// rejected: the payload either fails to decode or fails these checks, and
+    /// the caller must refuse to start instead of opening an empty room.
+    #[error("Invalid room data: {0}")]
+    InvalidRoomData(String),
+
     /// Scene not found.
     #[error("Scene '{0}' not found")]
     SceneNotFound(String),
