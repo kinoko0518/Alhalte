@@ -343,7 +343,6 @@ impl BanquetteSpawner for InProcessBanquetteSpawner {
         let config = ServerConfig {
             socket_path: socket_path.clone(),
             heartbeat_interval: self.heartbeat_interval,
-            admin_account,
         };
 
         let server = BanquetteServer::new(config, room, Arc::clone(&self.cellar));

@@ -110,18 +110,31 @@ pub mod opt_hex_bytes {
     }
 }
 
+/// Reference label used for writes authorized by the internal service token.
+///
+/// `owner` is **not** an authorization boundary: sessions and the internal
+/// service token authorize a write, while `owner` only labels the reference row
+/// for attribution, refcounting, and GC. Service-token writes therefore use
+/// this constant instead of a caller-supplied account ID, so no request body can
+/// choose the label of an internal write. `0` is safe as a sentinel because
+/// account IDs are issued starting from `1`.
+pub const SYSTEM_OWNER: u64 = 0;
+
 /// Represents a stored reference to a tin entity in the SQLite database.
 ///
 /// In accordance with ARCHITECTURE.md:
 /// `(tin_id: [u8; 32], owner: u64, wrapped_key: Option<Vec<u8>>)`
 ///
 /// The entity file itself is located by `hex(tin_id)`, so no path is stored.
+/// `owner` is a reference label (see [`SYSTEM_OWNER`]), never an authorization
+/// boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TinReference {
     /// 256-bit Tin ID.
     #[serde(with = "hex_tin_id")]
     pub tin_id: TinId,
-    /// Owner account ID.
+    /// Reference label: the owner account ID for user writes, or
+    /// [`SYSTEM_OWNER`] for service-token writes.
     pub owner: u64,
     /// Nullable wrapped key.
     #[serde(default, with = "opt_hex_bytes")]
@@ -129,11 +142,15 @@ pub struct TinReference {
 }
 
 /// Store metadata request received from a client.
+///
+/// `owner` and `session_id` authenticate user writes. For service-token writes
+/// they are ignored: the reference label is always [`SYSTEM_OWNER`]. The fields
+/// stay in the type until the separate cleanup that removes them (#191).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoreRequest {
-    /// Owner account ID.
+    /// Owner account ID (reference label for user writes; ignored with a service token).
     pub owner: u64,
-    /// Active session ID issued by `maitre-d`.
+    /// Active session ID issued by `maitre-d` (ignored with a service token).
     pub session_id: u64,
     /// 256-bit tin ID.
     #[serde(with = "hex_tin_id")]
@@ -154,9 +171,9 @@ pub struct StoreRequest {
 pub enum StoreStatus {
     /// Client must upload the tin body data.
     UploadRequired,
-    /// Entity already stored by another owner; deduplicated and DB reference added.
+    /// Entity already stored under another reference label; deduplicated and DB reference added.
     Deduplicated,
-    /// Already owned by this owner.
+    /// A reference with the same label already exists.
     AlreadyOwned,
 }
 
@@ -177,7 +194,8 @@ pub struct StoreResult {
     /// 256-bit tin ID.
     #[serde(with = "hex_tin_id")]
     pub tin_id: TinId,
-    /// Owner account ID.
+    /// Reference label actually stored: the session owner for user writes, or
+    /// [`SYSTEM_OWNER`] for service-token writes.
     pub owner: u64,
     /// Whether the file was written to disk (`true`), or the upload was discarded (`false`).
     pub written_to_disk: bool,
@@ -186,11 +204,14 @@ pub struct StoreResult {
 }
 
 /// Unregister request to remove ownership of a tin.
+///
+/// `owner` and `session_id` authenticate user writes. For service-token writes
+/// they are ignored and the [`SYSTEM_OWNER`] reference is removed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnregisterRequest {
-    /// Owner account ID.
+    /// Owner account ID (reference label for user writes; ignored with a service token).
     pub owner: u64,
-    /// Active session ID.
+    /// Active session ID (ignored with a service token).
     pub session_id: u64,
     /// 256-bit tin ID.
     #[serde(with = "hex_tin_id")]

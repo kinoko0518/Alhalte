@@ -490,7 +490,7 @@ async fn test_internal_service_token_store_and_old_head_retention() {
     .unwrap();
 
     // The store succeeds without any user session; only the service token authorizes it.
-    let first_head = room.persist(&sink, ADMIN).await.expect("token store");
+    let first_head = room.persist(&sink).await.expect("token store");
     assert_eq!(room.head_tin, Some(first_head));
     assert!(service.download(&first_head, None).await.is_ok());
 
@@ -502,7 +502,7 @@ async fn test_internal_service_token_store_and_old_head_retention() {
         Tin::from_string("snow"),
     )
     .unwrap();
-    let second_head = room.persist(&sink, ADMIN).await.expect("token store");
+    let second_head = room.persist(&sink).await.expect("token store");
     assert_ne!(first_head, second_head);
     assert!(
         service.download(&first_head, None).await.is_err(),
@@ -534,7 +534,7 @@ async fn test_internal_service_token_store_and_old_head_retention() {
     // A sink without the token is rejected by the cellar verifier (401).
     let untokened = HttpCellarSink::new(format!("http://{addr}"));
     let err = room
-        .persist(&untokened, ADMIN)
+        .persist(&untokened)
         .await
         .expect_err("session-less internal write without a token must fail");
     assert!(
@@ -625,7 +625,7 @@ async fn test_default_bistrot_config_authorizes_room_persistence() {
     let mut room = Room::new(ROOM_ID, ADMIN, config.banquette.chunk_size_exponent).unwrap();
     room.create_scene(ADMIN, "tavern", None).unwrap();
     let head = room
-        .persist(&sink, ADMIN)
+        .persist(&sink)
         .await
         .expect("the default local configuration must authorize persistence");
     assert!(service.download(&head, None).await.is_ok());
@@ -780,7 +780,7 @@ async fn test_restored_room_data_done_is_reflected_in_the_database() {
     // A previously-public room persisted to cellar.
     let mut room = Room::new(ROOM_ID, ADMIN, 8).unwrap();
     room.set_done(ADMIN, true).unwrap();
-    let head = room.persist(cellar.as_ref(), ADMIN).await.unwrap();
+    let head = room.persist(cellar.as_ref()).await.unwrap();
 
     // A fresh maitre-d DB registers the room as private and points at the head.
     let db = Database::new_in_memory().unwrap();
