@@ -187,6 +187,31 @@ describe('App room entry preflight & roles (Issue #156)', () => {
     expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
+  // spec: alhalte-argenterie/入室 サーバー不達では部屋を開かない (Issue #151)
+  it('does not mount the room or open a WebSocket while the server is unreachable', async () => {
+    window.history.replaceState(
+      null,
+      '',
+      `/rooms/1122334455667788#${ROOM_KEY_HEX}`,
+    );
+    // Server down: the preflight never produces a response.
+    const fetchFn = vi.fn(async () => {
+      throw new Error('network down');
+    });
+    const webSocketCtor = vi.fn();
+    vi.stubGlobal('WebSocket', webSocketCtor);
+
+    mountApp({ fetchFn });
+
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalled());
+    await new Promise((r) => setTimeout(r, 60));
+
+    // The room is only entered after the server confirms it: no layout, no socket.
+    expect(target.querySelector('[data-testid="room-layout"]')).toBeNull();
+    expect(target.querySelector('[data-testid="room-preflight-loading"]')).toBeTruthy();
+    expect(webSocketCtor).not.toHaveBeenCalled();
+  });
+
   it('treats a 401 as sign-in guidance and shows the gate screen', async () => {
     window.history.replaceState(
       null,
