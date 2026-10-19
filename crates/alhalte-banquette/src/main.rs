@@ -58,8 +58,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         admin_account: args.admin,
     };
 
+    // Flush the final `RoomData` to cellar when the service manager or an
+    // operator stops the room with SIGTERM / SIGINT. The graceful path
+    // (`run_until_shutdown`) persists once more and reports `RoomPersisted`.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        match wait_for_termination_signal().await {
+            Ok(()) => {
+                tracing::info!(
+                    "SIGTERM/SIGINT received; persisting the final room state and shutting down"
+                );
+                let _ = shutdown_tx.send(true);
+            }
+            Err(e) => {
+                // Keep the sender alive so the server does not mistake this
+                // failure for a shutdown request; the process keeps running
+                // with the platform's default signal behaviour.
+                tracing::error!("Failed to install SIGTERM/SIGINT handlers: {e}");
+                std::future::pending::<()>().await;
+            }
+        }
+    });
+
     let server = BanquetteServer::new(config, room, cellar);
-    server.run().await?;
+    server.run_until_shutdown(shutdown_rx).await?;
+
+    Ok(())
+}
+
+/// Resolves when the process receives `SIGTERM` or `SIGINT`.
+///
+/// Used by the standalone binary only; tests drive [`BanquetteServer::run_until_shutdown`]
+/// directly with the same shutdown channel.
+async fn wait_for_termination_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut sigterm = signal(SignalKind::terminate())?;
+    let mut sigint = signal(SignalKind::interrupt())?;
+
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = sigint.recv() => {}
+    }
 
     Ok(())
 }

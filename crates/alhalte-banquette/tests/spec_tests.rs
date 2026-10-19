@@ -1029,7 +1029,7 @@ async fn test_heartbeat_reports_room_persisted_frame() {
 
     let mut persisted = None;
     for _ in 0..20 {
-        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id }))) =
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done: _ }))) =
             tokio::time::timeout(Duration::from_millis(500), reader.next()).await
         {
             persisted = Some(tin_id);
@@ -1049,13 +1049,16 @@ async fn test_graceful_shutdown_persists_room_head() {
     let sock_path = dir.path().join("banquette.sock");
     let cellar = Arc::new(InMemoryCellarSink::new());
 
+    let mut room = Room::new(2003, 10, 8).unwrap();
+    room.set_done(10, true).unwrap();
+
     let server = BanquetteServer::new(
         ServerConfig {
             socket_path: sock_path.clone(),
             heartbeat_interval: Duration::from_secs(3600),
             admin_account: 10,
         },
-        Room::new(2003, 10, 8).unwrap(),
+        room,
         Arc::clone(&cellar) as Arc<dyn CellarSink>,
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1081,15 +1084,21 @@ async fn test_graceful_shutdown_persists_room_head() {
 
     let mut persisted = None;
     for _ in 0..20 {
-        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id }))) =
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done }))) =
             tokio::time::timeout(Duration::from_millis(500), reader.next()).await
         {
-            persisted = Some(tin_id);
+            persisted = Some((tin_id, done));
             break;
         }
     }
-    let tin_id = persisted.expect("graceful shutdown must report the final room tin");
+    let (tin_id, done) = persisted.expect("graceful shutdown must report the final room tin");
+    assert!(done, "the final persist must report the room's done flag");
     assert!(cellar.contains(&tin_id).await);
+
+    let restored = Room::load_from_cellar(&*cellar, &tin_id, 2003)
+        .await
+        .unwrap();
+    assert!(restored.done);
 
     let _ = server_task.await;
 }
@@ -1109,4 +1118,99 @@ fn test_http_cellar_sink_redacts_service_token() {
 
     let untokened = alhalte_banquette::HttpCellarSink::new("http://127.0.0.1:1");
     assert!(!untokened.has_service_token());
+}
+
+// spec: alhalte-banquette/persistence 0009 SIGTERM runs the graceful final persist
+#[tokio::test]
+async fn test_sigterm_runs_graceful_final_persist() {
+    use alhalte_cellar::{CellarService, InMemorySessionVerifier};
+
+    // A real cellar HTTP service using the shared internal token.
+    let storage = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    let service = Arc::new(
+        CellarService::new_with_in_memory_db(storage.path(), verifier, false)
+            .unwrap()
+            .with_service_token("sigterm-service-token"),
+    );
+    let app = Arc::clone(&service).into_router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cellar_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let dir = tempdir().unwrap();
+    let sock_path = dir.path().join("banquette.sock");
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_alhalte-banquette"))
+        .arg("--room-id")
+        .arg("5151515151515151")
+        .arg("--admin")
+        .arg("10")
+        .arg("--socket")
+        .arg(&sock_path)
+        .arg("--cellar-url")
+        .arg(format!("http://{cellar_addr}"))
+        .arg("--service-token")
+        .arg("sigterm-service-token")
+        .arg("--heartbeat-interval-secs")
+        .arg("3600")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn the banquette binary");
+
+    for _ in 0..100 {
+        if sock_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(sock_path.exists(), "banquette did not bind its UNIX socket");
+
+    let stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (read_half, write_half) = stream.into_split();
+    let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+    let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+    writer.send(MaitreDToBanquette::Ping).await.unwrap();
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
+            Ok(Some(Ok(BanquetteToMaitreD::Pong))) => break,
+            Ok(Some(Ok(_))) => continue,
+            other => panic!("expected Pong from the standalone binary: {other:?}"),
+        }
+    }
+    // Give the spawned signal task a chance to install its handlers.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let pid = child.id().expect("child pid");
+    // SAFETY: `kill(2)` is an FFI call to the OS and `pid` is a live child of
+    // this test; no pointer or Rust memory is involved.
+    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(sent, 0, "failed to send SIGTERM to banquette");
+
+    let mut persisted = None;
+    for _ in 0..40 {
+        if let Ok(Some(Ok(BanquetteToMaitreD::RoomPersisted { tin_id, done }))) =
+            tokio::time::timeout(Duration::from_millis(500), reader.next()).await
+        {
+            persisted = Some((tin_id, done));
+            break;
+        }
+    }
+    let (tin_id, done) = persisted.expect("SIGTERM must trigger the final RoomPersisted");
+    assert!(!done, "a newly created room must not be public");
+    assert!(
+        service.download(&tin_id, None).await.is_ok(),
+        "the final RoomData must be stored in cellar"
+    );
+
+    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
+        .await
+        .expect("banquette must exit after SIGTERM")
+        .unwrap();
+    assert!(
+        status.success(),
+        "banquette must exit cleanly, got {status:?}"
+    );
 }

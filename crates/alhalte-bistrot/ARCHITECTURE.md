@@ -59,7 +59,7 @@ anti-oracle = false
 # maitre-d-url = "http://127.0.0.1:8080"  # 既定は http://{restaurant.host}:{maitre-d.port}
 # maitre-d-socket = ".alhalte/sockets/maitre-d.sock"  # 指定時は url より優先
 # allow-all-sessions = false              # ローカル開発専用。true で全 session を許可
-# service-token = "..."                    # 内部書き込み用。rops で暗号化する秘密値
+# service-token = "alhalte-local-service-token"  # 内部書き込み用。同梱の Bistrot.toml はローカル開発既定値を設定
 
 [banquette]
 chunk-size-exponent = 8
@@ -75,7 +75,7 @@ path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
 enabled = true
 ```
 
-`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。`cellar.service-token` は設定する場合のみ非空でなければならない。
+`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。`cellar.service-token` は設定する場合のみ非空でなければならない。同梱の `Bistrot.toml` はローカル開発用の既定トークンを持つ。
 
 パス省略時の既定:
 
@@ -134,6 +134,6 @@ enabled = true
 - argenterie は開発サーバー（Vite）として起動する。本番配信の unit は未定義。
 - `Bistrot.toml` の `maitre-d` と `cellar` は必須。`restaurant`、`banquette`、`argenterie`、`extensions` は既定値を持つ。
 - `cellar.allow-all-sessions` はローカル開発専用。有効時は `alhalte-cellar` が警告を出し、session 検証をすべて許可する。verifier が未設定でこのフラグも false の場合、`alhalte-cellar` は全拒否の verifier に落ちず起動エラーになる。
-- `cellar.service-token` は rops で暗号化して保持する前提。未設定でも起動できるが、`alhalte-banquette` の部屋状態 persistence は cellar に拒否される（ローカル開発では `allow-all-sessions` で代用できるが、本番では設定する）。
+- `cellar.service-token` は rops で暗号化して保持する前提。リポジトリ同梱の `Bistrot.toml` はローカル開発専用の既定値 `alhalte-local-service-token` を設定し、`maitre-d` / 各 banquette / `cellar` が同じ値を使うため既定の `nix run .#bistrot` でも部屋状態を永続化できる。本番では rops で暗号化した値に必ず差し替える（未設定・空文字は不可、未設定のままでは persistence が cellar に拒否される）。
 - `--service-token` は生成される systemd unit の `ExecStart` に含まれる。`--client-secret` と同じ扱いで、unit ファイルと `ps` から読める点は既知の制約。
 - rops の鍵はファイルに保存せず、`ROPS_AGE` か CLI 引数で渡す前提。

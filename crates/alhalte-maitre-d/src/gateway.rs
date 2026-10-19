@@ -229,8 +229,21 @@ impl RoomBridge {
                 }
             }
             // spec: alhalte-maitre-d/room-head 0001 persist RoomData head pointer
-            BanquetteToMaitreD::RoomPersisted { tin_id } => {
+            // spec: alhalte-maitre-d/room-done 0001 persist the public flag with the head
+            BanquetteToMaitreD::RoomPersisted { tin_id, done } => {
                 let room_id_hex = format!("{room_id:016x}");
+                // `done` lives on the room row (not in `RoomData`) so the
+                // pre-spawn gate survives a maitre-d restart. A successful
+                // persist (including a restored room's first persist) updates it.
+                match db.set_room_done(&room_id_hex, done) {
+                    Ok(true) => {}
+                    Ok(false) => tracing::warn!(
+                        "room {room_id_hex} reported done={done} but is not registered"
+                    ),
+                    Err(e) => {
+                        tracing::error!("Failed to record done for {room_id_hex}: {e}");
+                    }
+                }
                 match db.set_room_head(&room_id_hex, &tin_id, unix_timestamp()) {
                     Ok(previous) => {
                         if let Some(previous) = previous
@@ -391,7 +404,6 @@ pub struct RoomBridgeManager {
     rooms: Arc<RwLock<HashMap<u64, Arc<RoomBridge>>>>,
     spawner: Arc<dyn BanquetteSpawner>,
     db: Database,
-    room_done_status: Arc<RwLock<HashMap<u64, bool>>>,
 }
 
 impl RoomBridgeManager {
@@ -404,7 +416,6 @@ impl RoomBridgeManager {
             rooms: Arc::new(RwLock::new(HashMap::new())),
             spawner,
             db,
-            room_done_status: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -430,13 +441,9 @@ impl RoomBridgeManager {
         let room_id_hex = format!("{room_id:016x}");
         let room_head = self.db.get_room_head(&room_id_hex)?;
 
-        let initial_done = self
-            .room_done_status
-            .read()
-            .await
-            .get(&room_id)
-            .copied()
-            .unwrap_or(false);
+        // The `rooms.done` row is authoritative across restarts; a restored
+        // `RoomData.done` is written back through `RoomPersisted`.
+        let initial_done = self.db.get_room_done(&room_id_hex)?.unwrap_or(false);
 
         let rooms_ref = Arc::clone(&self.rooms);
         let on_term = move |rid: u64| {
@@ -470,22 +477,40 @@ impl RoomBridgeManager {
     }
 
     /// Checks whether a room is marked as done (fully public).
+    ///
+    /// The persisted `rooms.done` row is authoritative so a `maitre-d` restart
+    /// still allows non-members through the pre-spawn gate before any banquette
+    /// process exists. The in-memory bridge is only a fallback if the row is
+    /// missing or cannot be read.
     pub async fn is_room_done(&self, room_id: u64) -> bool {
-        let rooms = self.rooms.read().await;
-        if let Some(bridge) = rooms.get(&room_id) {
-            bridge.is_done()
-        } else {
-            let statuses = self.room_done_status.read().await;
-            statuses.get(&room_id).copied().unwrap_or(false)
+        let room_id_hex = format!("{room_id:016x}");
+        match self.db.get_room_done(&room_id_hex) {
+            Ok(Some(done)) => return done,
+            Ok(None) => {}
+            Err(e) => tracing::error!("Failed to read done for room {room_id_hex}: {e}"),
         }
+
+        let rooms = self.rooms.read().await;
+        rooms
+            .get(&room_id)
+            .map(|bridge| bridge.is_done())
+            .unwrap_or(false)
     }
 
-    /// Sets the done flag for a room in memory.
+    /// Sets the done flag for a room and persists it to the database.
+    ///
+    /// Persisting happens even when no bridge is live (for example before the
+    /// first WebSocket connection) so the flag is visible after a restart.
     pub async fn set_room_done(&self, room_id: u64, done: bool) {
-        {
-            let mut statuses = self.room_done_status.write().await;
-            statuses.insert(room_id, done);
+        let room_id_hex = format!("{room_id:016x}");
+        match self.db.set_room_done(&room_id_hex, done) {
+            Ok(true) => {}
+            Ok(false) => {
+                tracing::warn!("Cannot persist done={done}: room {room_id_hex} is not registered")
+            }
+            Err(e) => tracing::error!("Failed to persist done for room {room_id_hex}: {e}"),
         }
+
         let rooms = self.rooms.read().await;
         if let Some(bridge) = rooms.get(&room_id) {
             bridge.set_done(done);

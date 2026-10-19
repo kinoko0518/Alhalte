@@ -15,6 +15,7 @@ use alhalte_maitre_d::{
     AppState, Database, InProcessBanquetteSpawner, MockOAuthProvider, ProcessBanquetteSpawner,
     RoomBridgeManager, create_router,
 };
+use futures_util::SinkExt;
 use tempfile::tempdir;
 use tin::Tin;
 
@@ -90,6 +91,39 @@ async fn wait_for_room_head(db: &Database) -> [u8; 32] {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("maitre-d did not record a room head");
+}
+
+/// Returns the value following `flag` in an argument vector.
+fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let index = args.iter().position(|arg| arg == flag)?;
+    args.get(index + 1).map(String::as_str)
+}
+
+/// Creates an account and a live session for it.
+fn account_with_session(db: &Database, sub: &str, name: &str) -> (u64, u64) {
+    let account = db.get_or_create_account(sub, name, None, 1000).unwrap();
+    let session = db.create_session(account.account_id, 1000).unwrap();
+    (account.account_id, session.session_id)
+}
+
+/// Serves an [`AppState`] router on an ephemeral loopback port.
+async fn serve_app(state: AppState) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let app = create_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, handle)
+}
+
+/// Reads the repository's default `Bistrot.toml` and returns the parsed config.
+fn default_bistrot_config() -> alhalte_bistrot::BistrotConfig {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("Bistrot.toml");
+    alhalte_bistrot::load_from_path(&path).expect("the default Bistrot.toml must parse")
 }
 
 // spec: alhalte-maitre-d/room-head 0002 whole room survives a banquette restart
@@ -515,4 +549,275 @@ fn test_process_spawner_passes_room_tin_and_service_token() {
         "token leaked in Debug: {debug}"
     );
     assert!(debug.contains("<redacted>"));
+}
+
+// spec: alhalte-bistrot/service-token 0002 the default Bistrot.toml persists room state
+#[tokio::test]
+async fn test_default_bistrot_config_authorizes_room_persistence() {
+    let config = default_bistrot_config();
+    let token = config
+        .cellar
+        .service_token
+        .as_deref()
+        .expect("the default Bistrot.toml must configure an internal service token");
+
+    // `nix run .#bistrot` passes the same token to both long-lived services.
+    let maitre_args = alhalte_bistrot::generate_maitre_d_args(&config);
+    let cellar_args = alhalte_bistrot::generate_cellar_args(&config);
+    assert_eq!(arg_after(&maitre_args, "--service-token"), Some(token));
+    assert_eq!(arg_after(&cellar_args, "--service-token"), Some(token));
+
+    // maitre-d forwards its argv token to every spawned banquette.
+    let spawner = ProcessBanquetteSpawner::new(
+        "/usr/local/bin/alhalte-banquette",
+        "/run/alhalte",
+        "http://127.0.0.1:8081",
+        config.banquette.chunk_size_exponent,
+    )
+    .with_service_token(
+        arg_after(&maitre_args, "--service-token").expect("maitre-d token forwarded to banquette"),
+    );
+    let banquette_args = spawner.command_args(
+        ROOM_ID,
+        ADMIN,
+        std::path::Path::new("/run/alhalte/banquette.sock"),
+        None,
+    );
+    assert_eq!(arg_after(&banquette_args, "--service-token"), Some(token));
+
+    // With the real session verifier and the default token, the internal
+    // RoomData store is accepted (no 401) and restores.
+    let (addr, service, _dir) = spawn_cellar(Some(token)).await;
+    let sink = HttpCellarSink::new(format!("http://{addr}")).with_service_token(
+        arg_after(&banquette_args, "--service-token").expect("banquette receives the token"),
+    );
+    let mut room = Room::new(ROOM_ID, ADMIN, config.banquette.chunk_size_exponent).unwrap();
+    room.create_scene(ADMIN, "tavern", None).unwrap();
+    let head = room
+        .persist(&sink, ADMIN)
+        .await
+        .expect("the default local configuration must authorize persistence");
+    assert!(service.download(&head, None).await.is_ok());
+    let restored = Room::load_from_cellar(&sink, &head, ROOM_ID)
+        .await
+        .expect("the persisted room must restore through the same token");
+    assert!(restored.scene_biblio.contains_key("tavern"));
+}
+
+// spec: alhalte-maitre-d/room-done 0002 done survives a maitre-d restart
+#[tokio::test]
+async fn test_done_persists_across_maitre_d_restart_for_get_and_ws_gate() {
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("maitre-d.sqlite3");
+    let room_id = "1122334455667788";
+    let room_u64 = u64::from_str_radix(room_id, 16).unwrap();
+    // The cellar outlives a maitre-d restart, so any recorded head stays loadable.
+    let cellar: Arc<dyn CellarSink> = Arc::new(InMemoryCellarSink::new());
+
+    let (admin, admin_session, outsider, outsider_session);
+    {
+        let db = Database::open(&db_path).unwrap();
+        let (a, asess) = account_with_session(&db, "sub-done-admin", "Admin");
+        let (o, osess) = account_with_session(&db, "sub-done-outsider", "Outsider");
+        admin = a;
+        admin_session = asess;
+        outsider = o;
+        outsider_session = osess;
+
+        db.create_room(room_id, "Public room", admin, 1000).unwrap();
+        db.set_room_permission(room_id, admin, alhalte_maitre_d::RoomRole::Gm, 1000)
+            .unwrap();
+
+        let spawner = Arc::new(InProcessBanquetteSpawner::new(
+            dir.path().join("sockets-before-restart"),
+            cellar.clone(),
+            8,
+        ));
+        let manager = RoomBridgeManager::new(spawner, db.clone());
+        let state = AppState::new(
+            db.clone(),
+            "salt",
+            Arc::new(MockOAuthProvider::new()),
+            manager,
+        );
+        let (addr, server) = serve_app(state).await;
+
+        // A GM marks the room public through the real WebSocket path.
+        let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+            "ws://{addr}/ws/room/{room_id}?account_id={admin}&session_id={admin_session}"
+        ))
+        .await
+        .expect("admin WebSocket");
+        ws.send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::json!({ "SetDone": { "done": true } })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+        let mut persisted = false;
+        for _ in 0..100 {
+            if db.get_room_done(room_id).unwrap() == Some(true) {
+                persisted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(persisted, "SetDone must persist rooms.done");
+
+        let _ = ws.close(None).await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    // A fresh maitre-d process: only the database survives, with no live bridge.
+    let db = Database::open(&db_path).unwrap();
+    assert_eq!(
+        db.get_room_done(room_id).unwrap(),
+        Some(true),
+        "done must be durable"
+    );
+
+    let spawner = Arc::new(InProcessBanquetteSpawner::new(
+        dir.path().join("sockets-after-restart"),
+        cellar.clone(),
+        8,
+    ));
+    let manager = RoomBridgeManager::new(spawner.clone(), db.clone());
+    assert!(
+        manager.is_room_done(room_u64).await,
+        "the pre-spawn check must read done from the database without a bridge"
+    );
+    let state = AppState::new(
+        db.clone(),
+        "salt",
+        Arc::new(MockOAuthProvider::new()),
+        manager,
+    );
+    let (addr, server) = serve_app(state).await;
+
+    // GET by a non-member is allowed as a viewer.
+    let response = reqwest::Client::new()
+        .get(format!(
+            "http://{addr}/api/rooms/{room_id}?account_id={outsider}&session_id={outsider_session}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let info: alhalte_maitre_d::RoomInfoResponse = response.json().await.unwrap();
+    assert!(info.done);
+    assert_eq!(info.role, alhalte_maitre_d::RoomRole::Viewer);
+
+    // The WebSocket pre-spawn gate also allows the non-member through.
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws/room/{room_id}?account_id={outsider}&session_id={outsider_session}"
+    ))
+    .await
+    .expect("a public room must pass the WS pre-spawn gate after a restart");
+    let _ = ws.close(None).await;
+
+    // A private room must still return 403 before spawning banquette.
+    let private_id = "8877665544332211";
+    db.create_room(private_id, "Private room", admin, 1000)
+        .unwrap();
+    db.set_room_permission(private_id, admin, alhalte_maitre_d::RoomRole::Gm, 1000)
+        .unwrap();
+    match tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/ws/room/{private_id}?account_id={outsider}&session_id={outsider_session}"
+    ))
+    .await
+    {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), axum::http::StatusCode::FORBIDDEN);
+        }
+        other => panic!("expected HTTP 403 for a private room, got {other:?}"),
+    }
+
+    server.abort();
+    let _ = server.await;
+    spawner.shutdown_all().await;
+}
+
+// spec: alhalte-maitre-d/room-done 0003 a restored RoomData.done is written back
+#[tokio::test]
+async fn test_restored_room_data_done_is_reflected_in_the_database() {
+    let temp_dir = tempdir().unwrap();
+    let cellar: Arc<dyn CellarSink> = Arc::new(InMemoryCellarSink::new());
+
+    // A previously-public room persisted to cellar.
+    let mut room = Room::new(ROOM_ID, ADMIN, 8).unwrap();
+    room.set_done(ADMIN, true).unwrap();
+    let head = room.persist(cellar.as_ref(), ADMIN).await.unwrap();
+
+    // A fresh maitre-d DB registers the room as private and points at the head.
+    let db = Database::new_in_memory().unwrap();
+    db.create_room(ROOM_ID_HEX, "Restored room", ADMIN, 1000)
+        .unwrap();
+    db.set_room_head(ROOM_ID_HEX, &head, 1000).unwrap();
+    assert_eq!(db.get_room_done(ROOM_ID_HEX).unwrap(), Some(false));
+
+    let spawner = Arc::new(
+        InProcessBanquetteSpawner::new(temp_dir.path().to_path_buf(), cellar.clone(), 8)
+            .with_heartbeat_interval(Duration::from_millis(50)),
+    );
+    let manager = RoomBridgeManager::new(spawner.clone(), db.clone());
+    let bridge = manager
+        .get_or_create_room(ROOM_ID, ADMIN)
+        .await
+        .expect("the persisted head must restore");
+
+    // The restored RoomData carries done=true.
+    let (room_data, _) = bridge.export_room(Some(ADMIN)).await.unwrap();
+    assert!(room_data.done);
+
+    // The successful persist of the restored room reports done back to maitre-d.
+    let mut reflected = false;
+    for _ in 0..100 {
+        if db.get_room_done(ROOM_ID_HEX).unwrap() == Some(true) {
+            reflected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        reflected,
+        "RoomPersisted.done from the restored room must update rooms.done"
+    );
+    assert!(manager.is_room_done(ROOM_ID).await);
+
+    spawner.shutdown_room(ROOM_ID).await;
+}
+
+// spec: alhalte-maitre-d/room-done 0001 a legacy rooms table gains the done column
+#[test]
+fn test_legacy_rooms_table_is_migrated_with_done() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy.sqlite3");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE rooms (
+                 room_id TEXT PRIMARY KEY,
+                 name TEXT NOT NULL,
+                 creator_account INTEGER NOT NULL,
+                 created_at INTEGER NOT NULL
+             );
+             INSERT INTO rooms (room_id, name, creator_account, created_at)
+             VALUES ('1234567890abcdef', 'Legacy room', 1, 1000);",
+        )
+        .unwrap();
+    }
+
+    // Opening runs the idempotent `done` migration; old rooms default to private.
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.get_room_done("1234567890abcdef").unwrap(), Some(false));
+    assert!(db.set_room_done("1234567890abcdef", true).unwrap());
+    assert_eq!(db.get_room_done("1234567890abcdef").unwrap(), Some(true));
+    assert!(db.get_room("1234567890abcdef").unwrap().unwrap().done);
+
+    // Re-opening is idempotent (the column must not be added twice).
+    let db = Database::open(&path).unwrap();
+    assert_eq!(db.get_room_done("1234567890abcdef").unwrap(), Some(true));
 }

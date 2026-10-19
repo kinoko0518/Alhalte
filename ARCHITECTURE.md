@@ -105,11 +105,11 @@ client 総体 = cutlery
 
 ### 部屋の永続化
 
-1. banquette は heartbeat（既定 4 分）ごとに部屋全体を `alhalte/banquette` Tin として cellar に保存し、成功した tin id を `RoomPersisted` で `maitre-d` へ返す。
-2. `maitre-d` は `room_heads(room_id, tin_id, updated_at)` に head を記録する。
+1. banquette は heartbeat（既定 4 分）ごとに部屋全体を `alhalte/banquette` Tin として cellar に保存し、成功した tin id と `done` を `RoomPersisted { tin_id, done }` で `maitre-d` へ返す。
+2. `maitre-d` は `room_heads(room_id, tin_id, updated_at)` に head を、`rooms.done` に公開フラグを記録する。`done` は `RoomData` の wire schema を変えずに `rooms` へ持つ外部メタデータで、pre-spawn の入場判定が `maitre-d` 再起動後も機能する。
 3. 新 head の保存後、banquette は旧 head の参照を best-effort で unregister し、cellar GC が実体を回収できるようにする。現在の head は削除しない。
-4. idle 終了などの graceful shutdown では、終了直前にもう一度 persist してから終了する。
-5. 次回 spawn 時は head から scenes / state / characters / log biblio / admins / done を復元する。
+4. idle 終了などの graceful shutdown、および standalone banquette の SIGTERM / SIGINT では、終了直前にもう一度 persist してから終了する。シグナルは `run_until_shutdown` の shutdown channel に配線する。
+5. 次回 spawn 時は head から scenes / state / characters / log biblio / admins / done を復元する。復元された `done` は次回の `RoomPersisted` で `rooms.done` に書き戻す。
 
 ### 発言
 
@@ -162,7 +162,7 @@ client 総体 = cutlery
 
 ### 権限
 
-現行 main では、`maitre-d` が SQLite の `rooms(room_id, name, creator_account, created_at)` で部屋を管理し、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保持する。WebSocket 接続時の入場可否と viewer の mutate 遮断を行う。部屋は `POST /api/rooms` で明示的に作成し、未登録の部屋への WS / export は 404 で拒否する。`banquette` 側は `done` フラグと `std::admins` による scene アクセス制御を持つ。部屋状態の永続 head は `room_heads` が持ち、内部書き込みの認可は `cellar.service-token` が担う。
+現行 main では、`maitre-d` が SQLite の `rooms(room_id, name, creator_account, created_at, done)` で部屋を管理し、`room_permissions(room_id, account_id, role)` に `gm` / `pl` / `viewer` を保持する。WebSocket 接続時の入場可否と viewer の mutate 遮断を行う。部屋は `POST /api/rooms` で明示的に作成し、未登録の部屋への WS / export は 404 で拒否する。`banquette` 側は `done` フラグと `std::admins` による scene アクセス制御を持つ。部屋状態の永続 head は `room_heads` が、公開フラグは `rooms.done` が持ち、内部書き込みの認可は `cellar.service-token` が担う。
 
 Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせる構成へ、`banquette` は `Denied` / `Viewer` / `Participant` / `Admin` の 4 段階へ移行中である。移行の詳細と現時点の未接続点は [banquette](crates/alhalte-banquette/ARCHITECTURE.md) と [maitre-d](crates/alhalte-maitre-d/ARCHITECTURE.md) に記す。
 
@@ -178,6 +178,7 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 ブラウザ以外の内部書き込み（banquette の部屋状態 persistence）は、ユーザー session を詐称せず `cellar.service-token` を使う。
 
 - `Bistrot.toml` の `[cellar] service-token`（rops 管理）を `maitre-d` と `cellar` に渡す。
+- リポジトリ同梱の `Bistrot.toml` はローカル開発専用の既定値 `service-token = "alhalte-local-service-token"` を設定し、`maitre-d` / 各 banquette / `cellar` が同じ値を使う。本番では rops で暗号化した値に必ず差し替える。
 - `maitre-d` は spawn する banquette に `--service-token` を伝播し、banquette は `X-Alhalte-Service-Token` で cellar に送る。
 - cellar は提示されたトークンを定数時間比較し、一致すれば内部書き込みを許可する。ユーザー session の検証は公開 proxy / 通常クライアント経路で維持する。
 - トークンはログに出さない。`--client-secret` と同様に引数で渡るため `ps` から読める点は既知の制約で、`EnvironmentFile` 化は今後の課題。
@@ -212,6 +213,9 @@ Issue #114 で、`maitre-d` は権限を持たず `banquette` に問い合わせ
 | kitchen の room key | ランダム 96bit nonce | `export_room_to_zip` / `export_room_to_tar_gz` は Zero Nonce で room-key 暗号化する。 |
 | saignant の WASM 実行 | キャラクター名を解決 | `render_generast_abi` は `NoopCharacterResolver` を使うため、メンションは `Anonymous` になる。 |
 | Markdown | 打ち消し線 `~~` を含む | パーサは `~~` を実装していない（自己紹介文には記載がある）。 |
+
+- 部屋の `done` は `rooms.done` に永続化済み。WS / `GET /api/rooms/{id}` / export の pre-spawn 判定は DB を参照するため、`maitre-d` 再起動後も公開部屋に非メンバーが入れる。`RoomPersisted.done` で復元された `RoomData.done` も書き戻す。
+- standalone の `alhalte-banquette` は SIGTERM / SIGINT を捕捉し、`run_until_shutdown` と同じ graceful shutdown 経路で最終 persist を行う（`crates/alhalte-banquette/tests/spec_tests.rs` の SIGTERM 統合テストで確認）。
 | ディレクトリ名 | `generast-rs` | package 名は `generast`。文書内ではディレクトリ名と package 名を併記する。 |
 
 ## 開発

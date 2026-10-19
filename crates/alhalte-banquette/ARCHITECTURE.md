@@ -40,7 +40,7 @@ CLI（`CliArgs`）:
 | `SceneState` | `BTreeMap<String, Tin>`。4KiB 制限と `::` 名前空間検証。 |
 | `Character` / `CharacterBiblio` | `HashMap<String, Tin>` と所有権。 |
 | `ClientFrame` / `ServerFrame` | クライアントと banquette の論理フレーム。 |
-| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`BanquetteToMaitreD::RoomPersisted` で head を報告する。 |
+| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`BanquetteToMaitreD::RoomPersisted` で head と `done` を報告する。 |
 | `ProtocolCodec<T>` | 長さ前置 postcard コーデック。 |
 | `BanquetteServer` / `ServerConfig` | UNIX ソケットサーバー。`run_until_shutdown` で明示的に停止できる。 |
 | `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。`unregister_tin` を含む。 |
@@ -50,7 +50,7 @@ CLI（`CliArgs`）:
 
 `MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom` を持つ。
 
-`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`RoomPersisted` を持つ。`RoomPersisted { tin_id }` は `RoomData` の store が成功したときだけ送られ、`maitre-d` が `room_heads` を更新する。
+`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse`、`RoomPersisted` を持つ。`RoomPersisted { tin_id, done }` は `RoomData` の store が成功したときだけ送られ、`maitre-d` が `room_heads` と `rooms.done` を更新する。`done` を `RoomData` の外に出すことで wire schema を変えずに pre-spawn gate を永続化できる。
 
 `ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、WebRTC signaling、heartbeat 応答、BGM 変更を持つ。`ServerFrame` はその結果と broadcast を返す。
 
@@ -97,9 +97,9 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 ### 部屋状態の永続化と復元
 
 - heartbeat ごとに `Room::persist` が部屋全体を `alhalte/banquette` Tin（Zstd）として cellar に保存する。内部書き込みは `INTERNAL_WRITE_SESSION_ID = 0` と `X-Alhalte-Service-Token` を使い、合成 session は使わない。
-- 保存に成功した tin id を `HeartbeatResult::persisted_tin` で返し、`RoomPersisted` として接続中の maitre-d へ通知する。保存失敗時は通知せず、ログに残して次周期に再試行する。
+- 保存に成功した tin id と `RoomData.done` を `HeartbeatResult::persisted_tin` と `RoomPersisted { tin_id, done }` で通知する。保存失敗時は通知せず、ログに残して次周期に再試行する。
 - 保存に成功すると、直前の head tin を `CellarSink::unregister_tin` で best-effort に解放する。現在の head は解放しない。解放失敗は警告ログのみで、保存自体は成功扱い。
-- graceful shutdown（idle による `ShouldExit`、または `run_until_shutdown`）では終了直前に `persist` をもう一度行い、`RoomPersisted` を送ってからソケットを閉じる。
+- graceful shutdown（idle による `ShouldExit`、`run_until_shutdown`、または standalone バイナリの SIGTERM / SIGINT）では終了直前に `persist` をもう一度行い、`RoomPersisted` を送ってからソケットを閉じる。SIGTERM / SIGINT は `main.rs` で `watch` channel に配線し、`run_until_shutdown` へ渡す。
 - `room_id → head tin` のポインタは `alhalte-maitre-d` の `room_heads` が持つ。banquette 自身は head を永続化しない。
 
 ### クライアント接続
@@ -171,7 +171,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 - `RoomData` は `HashMap` を含むため、内容が同じでも postcard の map 順序が変わり tin id が変わることがある。heartbeat ごとに head が作り直されるが、旧 head の unregister と GC で回収される。wire schema は変更していない。
 - `persist` の失敗はログのみで、次周期までの再試行はない。メトリクスや専用の再試行キューは持たない。
 - 合成 session（旧 `system_session_id = 1`）は廃止した。`--service-token` が未設定の場合、内部書き込みは cellar の session 検証に失敗する。
-- graceful shutdown は idle 終了と `run_until_shutdown` のみ。SIGTERM / SIGINT は `run` に配線していないため、シグナル終了では最終 persist が走らない。
+- graceful shutdown の経路は idle 終了と `run_until_shutdown`（および standalone バイナリの SIGTERM / SIGINT）。SIGTERM / SIGINT は `main.rs` で捕捉し、最終 persist を含む同じ graceful path に入る。シグナル配線そのものはプロセス起動を伴う統合テスト（`tests/spec_tests.rs` の `test_sigterm_runs_graceful_final_persist`）で確認する。
 - `Room::load_from_cellar` の download は cellar 側で認証されない（現行 cellar の download は session 検証を行わない）。service token は書き込みだけを守る。
 - `maitre-d` が記録した head が別インスタンスの persist で置き換わった場合、`maitre-d` はその旧 head を unregister しない（banquette が自分の直前 head だけを解放する）。
 

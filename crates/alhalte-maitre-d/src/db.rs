@@ -94,6 +94,12 @@ pub struct Room {
     pub creator_account: u64,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: i64,
+    /// Whether the room is fully public (`done`).
+    ///
+    /// Persisted separately from the `RoomData` tin so the pre-spawn access gate
+    /// (WebSocket upgrade, `GET /api/rooms/{id}`, export) keeps working after a
+    /// `maitre-d` restart, before any banquette process has been restored.
+    pub done: bool,
 }
 
 /// Room permission entry returned by query and listing endpoints.
@@ -168,7 +174,8 @@ impl Database {
                 room_id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
                 creator_account INTEGER NOT NULL,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                done INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS room_permissions (
@@ -189,12 +196,33 @@ impl Database {
             ",
         )?;
 
+        // `rooms.done` was added after the registry table shipped. Bring an
+        // existing database forward before any query selects the column.
+        Self::add_rooms_done_column(&conn)?;
+
         // Bring pre-registry data forward: permission rows written before the
         // canonical room ID contract used decimal IDs, and rooms created before
         // this table existed have permission rows but no registry row.
         Self::normalize_legacy_room_permissions(&conn)?;
         Self::backfill_room_registry(&conn)?;
 
+        Ok(())
+    }
+
+    /// Adds the `rooms.done` column to databases created before it existed.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` does not alter an existing table, so the
+    /// column is added explicitly. `pragma_table_info` makes the migration
+    /// idempotent; older rooms default to private (`done = 0`).
+    fn add_rooms_done_column(conn: &Connection) -> Result<()> {
+        let has_done: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('rooms') WHERE name = 'done')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_done {
+            conn.execute_batch("ALTER TABLE rooms ADD COLUMN done INTEGER NOT NULL DEFAULT 0")?;
+        }
         Ok(())
     }
 
@@ -273,8 +301,8 @@ impl Database {
 
         for (room_id, creator_account, created_at) in missing {
             conn.execute(
-                "INSERT OR IGNORE INTO rooms (room_id, name, creator_account, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR IGNORE INTO rooms (room_id, name, creator_account, created_at, done)
+                 VALUES (?1, ?2, ?3, ?4, 0)",
                 params![
                     room_id,
                     Self::RECOVERED_ROOM_NAME,
@@ -696,8 +724,8 @@ impl Database {
 
         let tx = conn.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO rooms (room_id, name, creator_account, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO rooms (room_id, name, creator_account, created_at, done)
+             VALUES (?1, ?2, ?3, ?4, 0)",
             params![room_id, name, creator_account as i64, now],
         )?;
         tx.execute(
@@ -713,6 +741,7 @@ impl Database {
             name: name.to_string(),
             creator_account,
             created_at: now,
+            done: false,
         })
     }
 
@@ -725,22 +754,59 @@ impl Database {
         })?;
 
         let mut stmt = conn.prepare(
-            "SELECT room_id, name, creator_account, created_at FROM rooms WHERE room_id = ?1",
+            "SELECT room_id, name, creator_account, created_at, done
+             FROM rooms WHERE room_id = ?1",
         )?;
 
         let room = stmt
             .query_row(params![room_id], |row| {
                 let creator_account: i64 = row.get(2)?;
+                let done: i64 = row.get(4)?;
                 Ok(Room {
                     room_id: row.get(0)?,
                     name: row.get(1)?,
                     creator_account: creator_account as u64,
                     created_at: row.get(3)?,
+                    done: done != 0,
                 })
             })
             .optional()?;
 
         Ok(room)
+    }
+
+    /// Returns the persisted `done` flag for a room, or `None` when unregistered.
+    pub fn get_room_done(&self, room_id: &str) -> Result<Option<bool>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare("SELECT done FROM rooms WHERE room_id = ?1")?;
+        let done: Option<i64> = stmt
+            .query_row(params![room_id], |row| row.get(0))
+            .optional()?;
+        Ok(done.map(|value| value != 0))
+    }
+
+    /// Persists the room's `done` (fully public) flag.
+    ///
+    /// Returns `true` when a registered room row was updated. The flag is
+    /// separate from the `RoomData` head so the pre-spawn gate keeps working
+    /// before banquette is restored after a `maitre-d` restart.
+    pub fn set_room_done(&self, room_id: &str, done: bool) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let affected = conn.execute(
+            "UPDATE rooms SET done = ?1 WHERE room_id = ?2",
+            params![i64::from(done), room_id],
+        )?;
+        Ok(affected > 0)
     }
 
     /// Retrieves the persisted `RoomData` head tin for a room.

@@ -36,6 +36,7 @@ http = "1.2"
 
 [dev-dependencies]
 alhalte-cellar = { path = "../alhalte-cellar" }
+alhalte-bistrot = { path = "../alhalte-bistrot" }
 tempfile = "3"
 tokio-tungstenite = "0.26"
 http-body-util = "0.1"

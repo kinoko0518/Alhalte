@@ -120,8 +120,11 @@ pub struct BanquetteServer {
     room: Arc<RwLock<Room>>,
     cellar: Arc<dyn CellarSink>,
     clients: Arc<RwLock<HashMap<u64, ConnectedClient>>>,
-    /// Broadcasts successfully stored `RoomData` tin IDs to connected maitre-d links.
-    persisted_tx: broadcast::Sender<TinId>,
+    /// Broadcasts successfully stored `RoomData` heads to connected maitre-d links.
+    ///
+    /// Each entry is `(tin_id, done)`: the stored tin ID together with the
+    /// room's public `done` flag at store time, so maitre-d can persist both.
+    persisted_tx: broadcast::Sender<(TinId, bool)>,
 }
 
 impl BanquetteServer {
@@ -195,7 +198,8 @@ impl BanquetteServer {
                             Ok(result) => {
                                 if let Some(tin_id) = result.persisted_tin {
                                     // Only a successful store advances the head pointer.
-                                    let _ = heartbeat_persisted_tx.send(tin_id);
+                                    let done = room.done;
+                                    let _ = heartbeat_persisted_tx.send((tin_id, done));
                                 }
                                 if result.outcome == HeartbeatOutcome::ShouldExit {
                                     tracing::warn!("3 consecutive missed heartbeats; initiating room shutdown");
@@ -262,15 +266,19 @@ impl BanquetteServer {
     /// delay gives the outgoing writer task a chance to flush `RoomPersisted`
     /// before the socket is torn down.
     async fn persist_and_report_final_head(&self) {
-        let persisted = {
+        let (persisted, done) = {
             let mut room = self.room.write().await;
-            room.persist(self.cellar.as_ref(), self.config.admin_account)
-                .await
+            let done = room.done;
+            (
+                room.persist(self.cellar.as_ref(), self.config.admin_account)
+                    .await,
+                done,
+            )
         };
 
         match persisted {
             Ok(tin_id) => {
-                let _ = self.persisted_tx.send(tin_id);
+                let _ = self.persisted_tx.send((tin_id, done));
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             Err(e) => tracing::error!("Final room persist on shutdown failed: {e:?}"),
@@ -279,15 +287,15 @@ impl BanquetteServer {
 
     /// Handles a single incoming connection from `maitre-d`.
     ///
-    /// `persisted_tx` receives the tin ID of every successfully stored room head;
-    /// each connection forwards those to `maitre-d` as
+    /// `persisted_tx` receives `(tin_id, done)` for every successfully stored
+    /// room head; each connection forwards those to `maitre-d` as
     /// [`BanquetteToMaitreD::RoomPersisted`].
     pub async fn handle_connection(
         stream: UnixStream,
         room: Arc<RwLock<Room>>,
         cellar: Arc<dyn CellarSink>,
         clients: Arc<RwLock<HashMap<u64, ConnectedClient>>>,
-        persisted_tx: broadcast::Sender<TinId>,
+        persisted_tx: broadcast::Sender<(TinId, bool)>,
     ) -> Result<()> {
         let (read_half, write_half) = stream.into_split();
         let mut reader = Framed::new(read_half, ProtocolCodec::<MaitreDToBanquette>::new());
@@ -307,9 +315,9 @@ impl BanquetteServer {
         let mut persisted_rx = persisted_tx.subscribe();
         let persist_out_tx = out_tx.clone();
         let persist_task = tokio::spawn(async move {
-            while let Ok(tin_id) = persisted_rx.recv().await {
+            while let Ok((tin_id, done)) = persisted_rx.recv().await {
                 if persist_out_tx
-                    .send(BanquetteToMaitreD::RoomPersisted { tin_id })
+                    .send(BanquetteToMaitreD::RoomPersisted { tin_id, done })
                     .await
                     .is_err()
                 {

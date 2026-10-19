@@ -419,11 +419,17 @@ pub enum BanquetteToMaitreD {
     /// later spawn can restore the room. Sent only after a successful store and
     /// also after the final persist on graceful shutdown.
     ///
+    /// `done` mirrors [`crate::room::RoomData::done`] at store time. It is
+    /// persisted outside the `RoomData` wire schema so the pre-spawn access gate
+    /// still sees the flag after a `maitre-d` restart.
+    ///
     /// Declared last so that the postcard variant indices of pre-existing frames
     /// stay stable (backward compatibility).
     RoomPersisted {
         /// Tin ID of the stored `RoomData`.
         tin_id: TinId,
+        /// Whether the stored room is fully public.
+        done: bool,
     },
 }
 

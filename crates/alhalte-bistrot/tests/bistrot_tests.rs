@@ -1143,3 +1143,47 @@ service-token = ""
 "#;
     assert!(parse_bistrot_toml(empty).is_err());
 }
+
+// spec: alhalte-bistrot/service-token 0002 the default Bistrot.toml shares the token
+#[test]
+fn test_root_bistrot_toml_shares_the_local_service_token() {
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    // The checked-in local development configuration must set the token so
+    // `nix run .#bistrot` persists room state out of the box.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root_bistrot = manifest_dir
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("Bistrot.toml");
+    let config = load_from_path(&root_bistrot).unwrap();
+    let token = config
+        .cellar
+        .service_token
+        .as_deref()
+        .expect("the default Bistrot.toml must configure cellar.service-token");
+    assert!(!token.trim().is_empty());
+
+    let maitre_d_args = generate_maitre_d_args(&config);
+    let cellar_args = generate_cellar_args(&config);
+    assert_eq!(arg_after(&maitre_d_args, "--service-token"), Some(token));
+    assert_eq!(arg_after(&cellar_args, "--service-token"), Some(token));
+
+    // The generated systemd units carry the same token to both services.
+    let units = generate_systemd_units(&config, &SystemdOptions::default());
+    assert!(
+        units
+            .maitre_d_service
+            .contains(&format!("--service-token {token}"))
+    );
+    assert!(
+        units
+            .cellar_service
+            .contains(&format!("--service-token {token}"))
+    );
+}
