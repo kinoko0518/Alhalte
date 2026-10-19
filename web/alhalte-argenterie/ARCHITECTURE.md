@@ -188,7 +188,10 @@
 ### 拡張機能
 
 - メタデータは `/` scene の state key `extension::<id>` に `{ id, name, description, icon, priority, enabled, tinId }` の JSON Tin で保存する。wasm 本体は cellar に RoomKey 暗号化で置き、`tinId` だけを state に持つ（4KiB 制限を守る）。
-- タブ表示時に `queryState('/')` を発行し、contained `LoadingIndicator` を出す。マージ規則は、サーバーが列挙した id についてはサーバーのメタデータを正とし、サーバーに無い公式既定 id はローカルの wasm ごと保持し、サーバーに無いカスタム id は削除する。同じ id でサーバーの `tinId` が変わった場合だけ wasm を取り直し、それ以外はローカルの `wasmBytes` を保持する。手元に wasm が無い場合は `tinId` から cellar で取得する。
+- **一度だけの seed とサーバー正**: 部屋 root state の `extension::__seeded` を seed 済みマーカーとする。マーカーが無い部屋では、拡張機能タブを開いた GM がサーバーに無い公式既定拡張のメタデータを `requestUpdateState` で書き、最後にマーカーを書く（途中で失敗するとマーカーが無いため、再接続時に残りを seed し直す）。既存 room もマーカーが無ければ移行として一度だけ seed し、すでにサーバーにあるメタデータは上書きしない。GM 以外は seed せず、公式既定を読み取り専用で表示する。
+- マーカーがある場合、サーバー state が正。公式既定 id でもサーバーに無ければ削除済みとして扱い、再入室・再接続で再追加しない。マーカーが無い legacy room に限り、サーバーに無い公式既定 id をローカルの wasm ごと保持する。サーバーに無いカスタム id は削除する。同じ id でサーバーの `tinId` が変わった場合だけ wasm を取り直し、それ以外はローカルの `wasmBytes` を保持する。手元に wasm が無い場合は `tinId` から cellar で取得する。
+- **wasm 欠落**: `loadDefaultExtensions` は manifest にある wasm の取得・instantiate に失敗した拡張を `wasmMissing: true` で返す。`applyRemoteExtensions` は `tinId` の download に失敗した拡張も `wasmMissing: true` にする。タブは該当行に「wasm がありません」を出し、有効化 Switch を無効にする（並べ替え・削除は可能）。`ExtensionPipeline.executePipeline` は wasm の無い有効拡張を黙って skip せず、`getLastWarnings()` / `onWarning` に警告を残す。送信時 pipeline の警告はフッター上部の `pipeline-warning` に表示し、原文（ext-io Tin）はそのまま送信する。
+- タブ表示時に `queryState('/')` を発行し、contained `LoadingIndicator` を出す。
 - toggle / delete / reorder / upload は楽観更新せず、`requestUpdateState` / `requestDeleteState` の成功後にだけローカルへ反映する。送信中は該当行のアイコンを波線 `CircularProgress` にする。
 - タイムアウト / エラー時はタブ上部に「サーバーと通信できませんでした」を出し、管理者でもタブ全体を暗転・`aria-disabled`・`pointer-events: none` で操作不可にする。再接続で `queryState('/')` を再試行する。
 - `.wasm` は検証後に `encodeRoomTin` + `uploadTin` で cellar へ保存し、進捗を表示して完了後に state を更新する。
@@ -209,12 +212,12 @@
 
 ## 既知の差分・制約
 
-- `contentTin` は送信時に一度だけ生成する。pipeline を実行できない場合（wasm 欠落・実行エラー）は `content` のみを保存し、表示は従来どおり render 時 pipeline にフォールバックする。
+- `contentTin` は送信時に一度だけ生成する。pipeline を実行できない場合（実行エラー）は `content` のみを保存し、表示は従来どおり render 時 pipeline にフォールバックする。wasm の無い有効拡張は適用せず、`pipeline-warning` に表示して ext-io Tin をそのまま `contentTin` にする。
 - システムイベント（BGM / 背景 / 入退場）は banquette の Tin に timestamp を持たないため、ログ上の時刻は 0（1970）になる。kitchen は前後の発言から補間する。scene graph は `(chunkIndex, position)` の順で並べ、表示時刻は 0 のままになる。
 - アセットは cellar へ実アップロードするが、`personal` のメタデータは localStorage のみで、他クライアントとは共有されない。アセット本体は RoomKey で暗号化して cellar に置くが、maitre-d proxy と cellar は `Bytes` でリクエストを全量メモリにバッファする（64 MiB 上限）。大きなファイルほどメモリを消費する。
 - アウトボックス flush は at-least-once。ack を受け取れずにタイムアウトした操作は再送されるため、サーバー側で適用済みの場合は重複する可能性がある（冪等キーは持たない）。
 - 拡張機能タブは開いた時点の `queryState('/')` を正とし、開いている間の `StateUpdated` broadcast は反映しない（再接続・再表示で取り直す）。
-- 公式既定拡張の削除はサーバーに `extension::<id>` の削除を送るが、サーバーが列挙しない公式既定 id は常にローカルの wasm ごと保持されるため再表示される。削除の永続性は保証されない。
+- 公式既定拡張の削除の永続性は `extension::__seeded` マーカーに依存する。マーカーは GM が拡張機能タブを最初に開いたときに書かれるため、それ以前に別クライアントが削除した公式既定は seed で復活し得る（seed は「サーバーに無い公式既定を書く」ため）。サーバー正のマージも拡張機能タブを開いた時点で適用され、タブを開く前の送信 pipeline は App のローカル既定を使う。
 - タイムアウトは 8 秒で、権限問い合わせのようにサーバーが黙って破棄する操作では唯一の失敗シグナルになる。`PermissionDenied` が返らない経路はタイムアウトとして扱う。
 - Saignant WASM は v2 で character 名を受け取る。v2 をエクスポートしない古い wasm を読み込んだ場合だけ mention が `Anonymous` になる。committed artifact は `scripts/build-saignant-wasm.sh` で更新する。
 - 開発エントリ（`main.ts`）は `isAdmin` を渡さない。管理者は `GET /api/rooms/{id}` の `role === 'gm'` から決まる。`isAdmin` prop はテスト / プレビュー用の明示 override で、既定は false。`initialRoom` prop も同じくテスト / プレビュー用で preflight をスキップする。

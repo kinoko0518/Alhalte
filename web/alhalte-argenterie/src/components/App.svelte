@@ -48,6 +48,7 @@
   import {
     DEFAULT_OFFICIAL_EXTENSIONS,
     ExtensionPipeline,
+    formatExtensionPipelineWarning,
     loadDefaultExtensions,
     WasmExtensionInstance,
   } from '../wasm/runner.js';
@@ -619,7 +620,12 @@
         extensions = extensions.map((ext) => {
           const official = loadedById.get(ext.id);
           if (!ext.wasmBytes && official?.wasmBytes) {
-            return { ...ext, wasmBytes: official.wasmBytes };
+            return { ...ext, wasmBytes: official.wasmBytes, wasmMissing: false };
+          }
+          // Expose a missing official wasm (`wasm がありません`) instead of
+          // silently keeping a metadata-only row (Issue #165).
+          if (!ext.wasmBytes && official?.wasmMissing) {
+            return { ...ext, wasmMissing: true };
           }
           return ext;
         });
@@ -2652,6 +2658,12 @@
           extensionPipeline,
           characterId,
         );
+        // Issue #165: an enabled extension without a wasm body is skipped with a
+        // warning instead of disappearing silently. The message is still sent.
+        const pipelineWarnings = extensionPipeline.getLastWarnings();
+        if (pipelineWarnings.length > 0) {
+          pipelineWarning = formatExtensionPipelineWarning(pipelineWarnings);
+        }
         if (bytes) {
           contentTin = Array.from(bytes);
         } else {

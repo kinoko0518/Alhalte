@@ -199,6 +199,14 @@ export class FakeRoomSocket {
   /** Scene state answered by `queryState` (already Tin-decoded values). */
   stateSnapshot: Record<string, unknown> = {};
   /**
+   * When `true`, `requestUpdateState` / `requestDeleteState` also mutate
+   * {@link FakeRoomSocket.stateSnapshot} like the server would. A test can then
+   * unmount / remount the App and observe that the persisted room state was the
+   * authority (Issue #165 reload / reconnect checks). Defaults to `false` so
+   * existing tests keep a fixed snapshot.
+   */
+  applyStateWritesToSnapshot = false;
+  /**
    * When `true` (the default) `queryState` resolves immediately with
    * {@link FakeRoomSocket.stateSnapshot}. Set to `false` to hold the tab-open
    * query and settle it through {@link FakeRoomSocket.resolveStateQuery} /
@@ -368,6 +376,9 @@ export class FakeRoomSocket {
    */
   requestUpdateState(sceneId: string, key: string, value: unknown): Promise<unknown> {
     this.requestUpdateStateCalls.push({ sceneId, key, value });
+    if (this.applyStateWritesToSnapshot) {
+      this.stateSnapshot[key] = value;
+    }
     if (this.autoAnswerStateWrites) {
       return Promise.resolve({ scene_id: sceneId, key, value });
     }
@@ -381,6 +392,9 @@ export class FakeRoomSocket {
    */
   requestDeleteState(sceneId: string, key: string): Promise<unknown> {
     this.requestDeleteStateCalls.push({ sceneId, key });
+    if (this.applyStateWritesToSnapshot) {
+      delete this.stateSnapshot[key];
+    }
     if (this.autoAnswerStateWrites) {
       return Promise.resolve({ scene_id: sceneId, key });
     }

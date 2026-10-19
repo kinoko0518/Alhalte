@@ -12,6 +12,8 @@ import {
   deleteExtension,
   encodePostcardStringTuple3,
   decodePostcardStringTuple3,
+  formatExtensionPipelineWarning,
+  loadDefaultExtensions,
 } from '../src/wasm/runner.js';
 import ExtensionManagementTab from '../src/components/Control/tabs/ExtensionManagementTab.svelte';
 import type { ExtensionItem } from '../src/types/index.js';
@@ -403,6 +405,151 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     expect(menu?.style.getPropertyValue('position-anchor')).toBe('--ext-menu-anchor-ext-test');
 
     unmount(instance);
+    target.remove();
+  });
+
+  // spec: Issue #165 executePipeline は wasm の無い有効拡張を警告として残す
+  it('reports enabled extensions without wasm instead of skipping them silently', async () => {
+    const pipeline = new ExtensionPipeline();
+    const validBytes = hexToBytes(VALID_WASM_HEX);
+    const warnings: Array<{ extensionId: string; extensionName: string }> = [];
+
+    const extensions: ExtensionItem[] = [
+      { id: 'missing', name: 'Missing Ext', enabled: true, priority: 0 },
+      { id: 'present', name: 'Present Ext', enabled: true, priority: 1, wasmBytes: validBytes },
+      { id: 'disabled-missing', name: 'Disabled Missing', enabled: false, priority: 2 },
+    ];
+
+    const input = new TextEncoder().encode('Dice');
+    const output = await pipeline.executePipeline(extensions, input, {
+      onWarning: (warning) => warnings.push(warning),
+    });
+
+    // The runnable extension still ran; only the wasm-less one was skipped.
+    expect(new TextDecoder().decode(output)).toBe('Dice!');
+    expect(warnings).toEqual([
+      expect.objectContaining({
+        code: 'missing-wasm',
+        extensionId: 'missing',
+        extensionName: 'Missing Ext',
+      }),
+    ]);
+    const lastWarnings = pipeline.getLastWarnings();
+    expect(lastWarnings).toHaveLength(1);
+    expect(lastWarnings[0].message).toContain('wasm がありません');
+    expect(formatExtensionPipelineWarning(lastWarnings)).toContain('「Missing Ext」');
+    expect(formatExtensionPipelineWarning([])).toBe('');
+
+    // A later successful run clears the previous warnings.
+    await pipeline.executePipeline(
+      [{ id: 'present', name: 'Present Ext', enabled: true, priority: 0, wasmBytes: validBytes }],
+      input,
+    );
+    expect(pipeline.getLastWarnings()).toEqual([]);
+  });
+
+  // spec: Issue #165 loadDefaultExtensions は wasm 取得失敗を wasmMissing として公開する
+  it('exposes manifest entries whose wasm is missing as wasmMissing', async () => {
+    const validBytes = hexToBytes(VALID_WASM_HEX);
+    const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/extensions/manifest.json') {
+        return new Response(
+          JSON.stringify([
+            {
+              id: 'markdown',
+              name: 'Markdown スタイル',
+              url: '/extensions/markdown.wasm',
+              enabled: true,
+              priority: 0,
+            },
+            {
+              id: 'aozora',
+              name: '青空文庫',
+              url: '/extensions/aozora.wasm',
+              enabled: false,
+              priority: 1,
+            },
+            { id: 'no-url', name: 'No URL', enabled: true, priority: 2 },
+          ]),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === '/extensions/markdown.wasm') {
+        return new Response(validBytes, { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const items = await loadDefaultExtensions(fetchFn as unknown as typeof fetch);
+
+    const markdown = items.find((item) => item.id === 'markdown');
+    expect(markdown?.wasmBytes).toEqual(validBytes);
+    expect(markdown?.wasmMissing).toBeUndefined();
+    // Issue #165: a manifest entry without a fetchable wasm must be visible as
+    // `wasm がありません`, not silently listed as if it were runnable.
+    expect(items.find((item) => item.id === 'aozora')?.wasmMissing).toBe(true);
+    expect(items.find((item) => item.id === 'no-url')?.wasmMissing).toBe(true);
+  });
+
+  // spec: Issue #165 拡張機能タブは wasm 欠落行を可視化し有効化を無効にする
+  it('shows wasm がありません and disables enabling for an unavailable row', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const socket = new FakeRoomSocket();
+    socket.stateSnapshot = {
+      'extension::__seeded': true,
+      'extension::broken': {
+        id: 'broken',
+        name: 'Broken Extension',
+        priority: 0,
+        enabled: true,
+      },
+      'extension::ok': {
+        id: 'ok',
+        name: 'OK Extension',
+        priority: 1,
+        enabled: true,
+      },
+    };
+
+    const mounted = mount(ExtensionManagementTab, {
+      target,
+      props: {
+        extensions: [
+          { id: 'broken', name: 'Broken Extension', enabled: true, priority: 0, wasmMissing: true },
+          {
+            id: 'ok',
+            name: 'OK Extension',
+            enabled: true,
+            priority: 1,
+            wasmBytes: hexToBytes(VALID_WASM_HEX),
+          },
+        ],
+        isAdmin: true,
+        roomSocket: asRoomSocket(socket),
+      },
+    });
+    await new Promise((r) => setTimeout(r, 40));
+
+    const missing = target.querySelector<HTMLElement>('[data-testid="ext-wasm-missing-broken"]');
+    expect(missing?.textContent?.trim()).toBe('wasm がありません');
+    expect(
+      target.querySelector('[data-testid="extension-item-broken"]')?.getAttribute('data-wasm-missing'),
+    ).toBe('true');
+    expect(
+      target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-broken"]')?.disabled,
+    ).toBe(true);
+    expect(
+      target.querySelector<HTMLInputElement>('[data-testid="ext-toggle-ok"]')?.disabled,
+    ).toBe(false);
+    // The row can still be deleted, so the admin can clean up the broken entry.
+    expect(
+      target.querySelector<HTMLButtonElement>('[data-testid="ext-more-btn-broken"]')?.disabled,
+    ).toBe(false);
+
+    unmount(mounted);
     target.remove();
   });
 });
