@@ -55,6 +55,13 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
 
 /// Generates CLI arguments for `alhalte-cellar`.
 ///
+/// The session verifier is configured through `--maitre-d-url` (the explicit
+/// `cellar.maitre-d-url`, or the URL derived from `restaurant.host` and
+/// `maitre-d.port`) or through `--maitre-d-socket` when
+/// `cellar.maitre-d-socket` is set. The socket takes precedence, matching
+/// `alhalte-cellar`'s own CLI behavior. `--allow-all-sessions` is emitted only
+/// when explicitly enabled in the configuration.
+///
 /// Deterministic and pure function.
 pub fn generate_cellar_args(config: &BistrotConfig) -> Vec<String> {
     let mut args = vec![
@@ -67,6 +74,18 @@ pub fn generate_cellar_args(config: &BistrotConfig) -> Vec<String> {
         "--db-path".to_string(),
         config.cellar_db_path().display().to_string(),
     ];
+
+    if let Some(ref socket) = config.cellar.maitre_d_socket {
+        args.push("--maitre-d-socket".to_string());
+        args.push(socket.display().to_string());
+    } else {
+        args.push("--maitre-d-url".to_string());
+        args.push(config.cellar_maitre_d_url());
+    }
+
+    if config.cellar.allow_all_sessions {
+        args.push("--allow-all-sessions".to_string());
+    }
 
     if config.cellar.anti_oracle {
         args.push("--anti-oracle".to_string());

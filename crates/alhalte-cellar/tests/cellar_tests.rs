@@ -2,11 +2,14 @@
 
 use std::sync::Arc;
 
+use alhalte_cellar::CellarError;
 use alhalte_cellar::CellarService;
 use alhalte_cellar::db::Database;
 use alhalte_cellar::model::{StoreRequest, StoreStatus, UnregisterRequest, format_tin_id};
 use alhalte_cellar::storage::StorageManager;
-use alhalte_cellar::verifier::{InMemorySessionVerifier, MaitreDVerifier, SessionVerifier};
+use alhalte_cellar::verifier::{
+    InMemorySessionVerifier, MaitreDVerifier, SessionVerifier, VerifierMode,
+};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use http_body_util::BodyExt;
@@ -153,6 +156,141 @@ async fn test_maitre_d_verifier_unix_socket_mock() {
 
     // Invalid session
     assert!(!verifier.verify_session(77, 99).await.unwrap());
+}
+
+// spec: alhalte-cellar/session-verifier (Issue #153)
+#[test]
+fn test_verifier_mode_resolution() {
+    // No endpoint and no explicit allow-all is a startup error, not a silent deny-all.
+    let err = VerifierMode::resolve(None, None, false).unwrap_err();
+    assert!(matches!(err, CellarError::Configuration(_)));
+
+    let allow_all = VerifierMode::resolve(None, None, true).unwrap();
+    assert_eq!(allow_all, VerifierMode::AllowAll);
+    assert!(allow_all.is_allow_all());
+
+    // A UNIX socket takes precedence over an HTTP URL.
+    let socket_path = std::path::PathBuf::from("/run/alhalte/maitre-d.sock");
+    assert_eq!(
+        VerifierMode::resolve(
+            Some("http://127.0.0.1:8080".to_string()),
+            Some(socket_path.clone()),
+            false,
+        )
+        .unwrap(),
+        VerifierMode::UnixSocket(socket_path.clone())
+    );
+
+    let http =
+        VerifierMode::resolve(Some("http://127.0.0.1:8080".to_string()), None, false).unwrap();
+    assert_eq!(
+        http,
+        VerifierMode::Http("http://127.0.0.1:8080".to_string())
+    );
+    assert!(!http.is_allow_all());
+
+    // Startup logging names the selected mode.
+    assert!(allow_all.to_string().contains("allow-all"));
+    assert!(http.to_string().contains("HTTP"));
+    assert!(
+        VerifierMode::UnixSocket(socket_path)
+            .to_string()
+            .contains("UNIX socket")
+    );
+}
+
+// spec: alhalte-cellar/session-verifier + store-210-upload-required (Issue #153)
+#[tokio::test]
+async fn test_store_with_maitre_d_verifier_mock() {
+    // Loopback-only mock of maitre-d's /api/verify-session endpoint.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 1024];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let response =
+                        if request.contains("owner=42") && request.contains("session_id=100") {
+                            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK"
+                        } else {
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 12\r\n\r\nUnauthorized"
+                        };
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        }
+    });
+
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(MaitreDVerifier::new_http(format!("http://{addr}")));
+    let service =
+        Arc::new(CellarService::new_with_in_memory_db(dir.path(), verifier, false).unwrap());
+    let (tin_bytes, tin_id) = create_test_tin("stored through maitre-d verifier");
+
+    // A session accepted by maitre-d can check and upload.
+    let store_req = StoreRequest {
+        owner: 42,
+        session_id: 100,
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+    assert_eq!(
+        service.store_check(&store_req).await.unwrap(),
+        StoreStatus::UploadRequired
+    );
+    let result = service
+        .store_payload(42, 100, tin_id, &tin_bytes, None)
+        .await
+        .unwrap();
+    assert!(result.written_to_disk);
+    assert!(service.storage().has_tin_file(&tin_id));
+
+    // A session rejected by maitre-d is unauthorized for both store phases.
+    let rejected_req = StoreRequest {
+        owner: 42,
+        session_id: 999,
+        tin_id,
+        size: tin_bytes.len() as u64,
+        wrapped_key: None,
+    };
+    let check_err = service.store_check(&rejected_req).await.unwrap_err();
+    assert!(matches!(
+        check_err,
+        CellarError::Unauthorized {
+            owner: 42,
+            session_id: 999
+        }
+    ));
+    let payload_err = service
+        .store_payload(42, 999, [0xAB; 32], b"rejected", None)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        payload_err,
+        CellarError::Unauthorized {
+            owner: 42,
+            session_id: 999
+        }
+    ));
+
+    // The rejection surfaces as HTTP 401 through the router.
+    let app = service.into_router();
+    let req = Request::builder()
+        .method("POST")
+        .uri("/store")
+        .header("Content-Type", "application/json")
+        .body(Body::from(serde_json::to_vec(&rejected_req).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 }
 
 // spec: alhalte-cellar/store-210-upload-required
@@ -623,4 +761,35 @@ fn test_cli_bistrot_argument_compatibility() {
     let args4 = ["alhalte-cellar", "--port", "8081", "--anti-oracle", "false"];
     let parsed4 = alhalte_cellar::parse_cli_args(args4).unwrap();
     assert!(!parsed4.anti_oracle);
+
+    // Session verifier flags generated by bistrot (Issue #153)
+    let args5 = [
+        "alhalte-cellar",
+        "--port",
+        "8081",
+        "--maitre-d-url",
+        "http://127.0.0.1:8080",
+        "--allow-all-sessions",
+    ];
+    let parsed5 = alhalte_cellar::parse_cli_args(args5).unwrap();
+    assert_eq!(
+        parsed5.maitre_d_url.as_deref(),
+        Some("http://127.0.0.1:8080")
+    );
+    assert!(parsed5.allow_all_sessions);
+    assert_eq!(parsed5.maitre_d_socket, None);
+
+    let args6 = [
+        "alhalte-cellar",
+        "--port",
+        "8081",
+        "--maitre-d-socket",
+        "/run/alhalte/maitre-d.sock",
+    ];
+    let parsed6 = alhalte_cellar::parse_cli_args(args6).unwrap();
+    assert_eq!(
+        parsed6.maitre_d_socket,
+        Some(std::path::PathBuf::from("/run/alhalte/maitre-d.sock"))
+    );
+    assert!(!parsed6.allow_all_sessions);
 }

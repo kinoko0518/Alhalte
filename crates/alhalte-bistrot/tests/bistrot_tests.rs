@@ -306,6 +306,9 @@ fn test_generate_maitre_d_args() {
             storage_path: None,
             db_path: None,
             anti_oracle: false,
+            maitre_d_url: None,
+            maitre_d_socket: None,
+            allow_all_sessions: false,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -366,6 +369,9 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             storage_path: Some(PathBuf::from("/custom/tin")),
             db_path: Some(PathBuf::from("/custom/cellar.db")),
             anti_oracle: false,
+            maitre_d_url: None,
+            maitre_d_socket: None,
+            allow_all_sessions: false,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -384,9 +390,12 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             "/custom/tin",
             "--db-path",
             "/custom/cellar.db",
+            "--maitre-d-url",
+            "http://127.0.0.1:8080",
         ]
     );
     assert!(!args_without.contains(&"--anti-oracle".to_string()));
+    assert!(!args_without.contains(&"--allow-all-sessions".to_string()));
 
     // When anti-oracle is true:
     config.cellar.anti_oracle = true;
@@ -402,9 +411,111 @@ fn test_generate_cellar_args_with_and_without_anti_oracle() {
             "/custom/tin",
             "--db-path",
             "/custom/cellar.db",
+            "--maitre-d-url",
+            "http://127.0.0.1:8080",
             "--anti-oracle",
         ]
     );
+}
+
+// spec: alhalte-bistrot/cellar-session-verifier (Issue #153)
+#[test]
+fn test_cellar_session_verifier_config_and_args() {
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        let index = args.iter().position(|arg| arg == flag)?;
+        args.get(index + 1).map(String::as_str)
+    }
+
+    // Defaults: the verifier URL is derived from restaurant.host and maitre-d.port,
+    // and wildcard bind addresses are dialed through loopback.
+    let toml_str = r#"
+[restaurant]
+host = "0.0.0.0"
+
+[maitre-d]
+port = 9000
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+"#;
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(config.cellar.maitre_d_url, None);
+    assert_eq!(config.cellar.maitre_d_socket, None);
+    assert!(!config.cellar.allow_all_sessions);
+    assert_eq!(config.cellar_maitre_d_url(), "http://127.0.0.1:9000");
+
+    let args = generate_cellar_args(&config);
+    assert_eq!(
+        arg_after(&args, "--maitre-d-url"),
+        Some("http://127.0.0.1:9000")
+    );
+    assert!(!args.contains(&"--maitre-d-socket".to_string()));
+    assert!(!args.contains(&"--allow-all-sessions".to_string()));
+
+    // The IPv6 wildcard is also rewritten.
+    let toml_str = r#"
+[restaurant]
+host = "::"
+
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+"#;
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(config.cellar_maitre_d_url(), "http://127.0.0.1:8080");
+
+    // Explicit HTTP URL and the local-development allow-all switch.
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+maitre-d-url = "http://maitre-d.internal:8080"
+allow-all-sessions = true
+"#;
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(
+        config.cellar.maitre_d_url.as_deref(),
+        Some("http://maitre-d.internal:8080")
+    );
+    assert!(config.cellar.allow_all_sessions);
+    let args = generate_cellar_args(&config);
+    assert_eq!(
+        arg_after(&args, "--maitre-d-url"),
+        Some("http://maitre-d.internal:8080")
+    );
+    assert!(args.contains(&"--allow-all-sessions".to_string()));
+
+    // A UNIX socket takes precedence over the derived URL.
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "secret"
+salt = "salt"
+
+[cellar]
+maitre_d_socket = "/run/alhalte/maitre-d.sock"
+allow_all_sessions = false
+"#;
+    let config = parse_bistrot_toml(toml_str).unwrap();
+    assert_eq!(
+        config.cellar.maitre_d_socket,
+        Some(PathBuf::from("/run/alhalte/maitre-d.sock"))
+    );
+    let args = generate_cellar_args(&config);
+    assert_eq!(
+        arg_after(&args, "--maitre-d-socket"),
+        Some("/run/alhalte/maitre-d.sock")
+    );
+    assert!(!args.contains(&"--maitre-d-url".to_string()));
+    assert!(!args.contains(&"--allow-all-sessions".to_string()));
 }
 
 // spec: alhalte-banquette/chunk-size-exponent
@@ -432,6 +543,9 @@ fn test_generate_banquette_args() {
             storage_path: None,
             db_path: None,
             anti_oracle: false,
+            maitre_d_url: None,
+            maitre_d_socket: None,
+            allow_all_sessions: false,
         },
         banquette: BanquetteConfig {
             chunk_size_exponent: 8,
@@ -473,6 +587,9 @@ fn test_generate_all_args_and_module_args() {
             storage_path: None,
             db_path: None,
             anti_oracle: false,
+            maitre_d_url: None,
+            maitre_d_socket: None,
+            allow_all_sessions: false,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -525,6 +642,9 @@ fn test_systemd_generator() {
             storage_path: None,
             db_path: None,
             anti_oracle: true,
+            maitre_d_url: None,
+            maitre_d_socket: None,
+            allow_all_sessions: false,
         },
         banquette: BanquetteConfig::default(),
         argenterie: ArgenterieConfig::default(),
@@ -565,6 +685,7 @@ fn test_systemd_generator() {
             .contains("ExecStart=/opt/alhalte/bin/alhalte-cellar --host 127.0.0.1 --port 8081")
     );
     assert!(cellar_service.contains("--anti-oracle"));
+    assert!(cellar_service.contains("--maitre-d-url http://127.0.0.1:8080"));
     assert!(cellar_service.contains("User=alhalte"));
     assert!(cellar_service.contains("WantedBy=alhalte-bistrot.target"));
 
@@ -666,6 +787,8 @@ chunk-size-exponent = 8
     assert!(stdout.contains("[alhalte-cellar]"));
     assert!(stdout.contains("[alhalte-banquette]"));
     assert!(stdout.contains("--anti-oracle"));
+    assert!(stdout.contains("--maitre-d-url http://127.0.0.1:8080"));
+    assert!(!stdout.contains("--allow-all-sessions"));
 
     // 4. Test systemd command with output-dir
     let units_dir = temp_dir.path().join("systemd_units");
