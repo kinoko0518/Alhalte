@@ -106,6 +106,14 @@ export interface Juices {
   bgm3?: string;
   bgm3Volume: number;
   bgmSlots?: BgmSlot[];
+  /**
+   * Slot numbers explicitly removed from the UI (Issue #226).
+   *
+   * Mirrors the server-authoritative `bgm::<slot>::removed` state keys so a
+   * deleted slot is not re-created from the legacy `bgm1..3` fallback. An
+   * absent field is the same as an empty list.
+   */
+  bgmRemovedSlots?: number[];
 }
 
 /**
