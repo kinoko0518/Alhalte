@@ -771,6 +771,8 @@ describe('Scene management actions — server acknowledgement (Issue #109 / #143
     await settle(0);
 
     expect(socket.requestMoveCharacterCalls).toEqual([{ characterId: 42, toSceneId: 'scene-b' }]);
+    // The destination already exists: no redundant CreateScene (Issue #225).
+    expect(socket.requestCreateSceneCalls).toHaveLength(0);
     expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeTruthy();
     expect(moveBtn.disabled).toBe(true);
     // No optimistic mutation yet.
@@ -828,6 +830,141 @@ describe('Scene management actions — server acknowledgement (Issue #109 / #143
     expect(sceneNameValue(target)).toBe('広場');
     // The state mirror is only sent after the move was acknowledged.
     expect(socket.requestUpdateStateCalls).toHaveLength(0);
+
+    warn.mockRestore();
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/scene-settings 未存在シーンへのメンバー移動はCreateScene.nameを先に送る (Issue #225)
+  it('creates the missing destination with its display name before sending MoveCharacter (Issue #225)', async () => {
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerSceneActions = false;
+    const { target, instance } = mountAppWithSocket(socket);
+    await settle();
+    openSettingsTab(target);
+    await settle(30);
+
+    const targetInput = target.querySelector<HTMLInputElement>(
+      '[data-testid="member-target-input-42"]',
+    )!;
+    targetInput.value = '  新しい島  ';
+    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+
+    target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-42"]')!.click();
+    await settle(0);
+
+    // CreateScene goes first and carries the trimmed display name; the move is
+    // not sent until the creation is acknowledged.
+    expect(socket.requestCreateSceneCalls).toHaveLength(1);
+    const created = socket.requestCreateSceneCalls[0];
+    expect(created.sceneId.startsWith('scene-')).toBe(true);
+    expect(created.inheritJuices).toBe(true);
+    expect(created.name).toBe('新しい島');
+    expect(socket.requestMoveCharacterCalls).toHaveLength(0);
+    expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeTruthy();
+    // Nothing is committed before both acks.
+    expect(memberSceneText(target)).toContain('現在: 広場');
+    expect(sceneNameValue(target)).toBe('広場');
+
+    socket.resolveSceneAction('create');
+    await settle();
+
+    expect(socket.requestMoveCharacterCalls).toEqual([
+      { characterId: 42, toSceneId: created.sceneId },
+    ]);
+    expect(memberSceneText(target)).toContain('現在: 広場');
+    expect(sceneNameValue(target)).toBe('広場');
+
+    socket.resolveSceneAction('move');
+    await settle();
+
+    expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeNull();
+    expect(memberSceneText(target)).toContain('現在: 新しい島');
+    // The local scene keeps the human-readable name, not the internal id.
+    expect(sceneNameValue(target)).toBe('新しい島');
+    expect(target.querySelector('[data-testid="scene-action-error"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/scene-settings 移動先シーンの作成失敗はMoveCharacterを送らずローカル状態も変えない (Issue #225)
+  it('sends no MoveCharacter and keeps the members when creating the destination fails (Issue #225)', async () => {
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerSceneActions = false;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { target, instance } = mountAppWithSocket(socket);
+    await settle();
+    openSettingsTab(target);
+    await settle(30);
+
+    const targetInput = target.querySelector<HTMLInputElement>(
+      '[data-testid="member-target-input-42"]',
+    )!;
+    targetInput.value = '失敗する島';
+    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+
+    target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-42"]')!.click();
+    await settle(0);
+
+    const requestedId = socket.requestCreateSceneCalls[0].sceneId;
+    socket.rejectSceneAction(new ServerOperationError('CreateSceneFailed', 'boom'), 'create');
+    await settle();
+
+    expect(target.querySelector('[data-testid="scene-action-error"]')?.textContent?.trim()).toBe(
+      ERROR_MESSAGE,
+    );
+    expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeNull();
+    // No move follows a failed create, and the local model is untouched.
+    expect(socket.requestMoveCharacterCalls).toHaveLength(0);
+    expect(memberSceneText(target)).toContain('現在: 広場');
+    expect(sceneNameValue(target)).toBe('広場');
+    openSceneSwitcher(target);
+    await settle(30);
+    expect(target.querySelector(`[data-testid="scene-search-item-${requestedId}"]`)).toBeNull();
+
+    warn.mockRestore();
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/scene-settings 作成済みでもMoveCharacter失敗時はローカルの所属・名前を変えない (Issue #225)
+  it('keeps the members when the move fails after the destination was created (Issue #225)', async () => {
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerSceneActions = false;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { target, instance } = mountAppWithSocket(socket);
+    await settle();
+    openSettingsTab(target);
+    await settle(30);
+
+    const targetInput = target.querySelector<HTMLInputElement>(
+      '[data-testid="member-target-input-42"]',
+    )!;
+    targetInput.value = '遅い島';
+    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+
+    target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-42"]')!.click();
+    await settle(0);
+    socket.resolveSceneAction('create');
+    await settle();
+
+    expect(socket.requestMoveCharacterCalls).toHaveLength(1);
+    expect(memberSceneText(target)).toContain('現在: 広場');
+
+    socket.rejectSceneAction(new OperationTimeoutError('moveCharacter', 8000), 'move');
+    await settle();
+
+    expect(target.querySelector('[data-testid="scene-action-error"]')?.textContent?.trim()).toBe(
+      ERROR_MESSAGE,
+    );
+    expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeNull();
+    expect(memberSceneText(target)).toContain('現在: 広場');
+    expect(sceneNameValue(target)).toBe('広場');
 
     warn.mockRestore();
     unmount(instance);

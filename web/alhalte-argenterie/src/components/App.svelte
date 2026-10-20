@@ -2427,14 +2427,21 @@
   }
 
   /**
-   * Moves a character to another scene (Issue #109 / sub-issue #143, #159).
+   * Moves a character to another scene (Issue #109 / sub-issue #143, #159, #225).
    *
    * The target scene id (and the implicitly created scene for an unknown name)
-   * is computed before the request because `MoveCharacter` carries it, but the
-   * local model is only replaced after the ack. Without a connected socket the
-   * move fails instead of mutating the local model. Scene membership is
-   * authoritative on the server (`SceneInfo`) since Issue #160, so no
-   * `character::<id>::scene` state mirror is written.
+   * is computed before the request because `MoveCharacter` carries it. When the
+   * destination does not exist yet, `CreateScene` is sent first with the
+   * human-readable name: banquette writes `CreateScene.name` to `std::name`
+   * atomically, whereas its implicit creation inside `MoveCharacter` has no name
+   * and falls back to the internal scene id (Issue #225). `inherit_juices` stays
+   * `true` because the previous implicit creation inherited from `/`.
+   *
+   * The local model is only replaced after every request succeeded (the create
+   * when needed, then the move). Without a connected socket the move fails
+   * instead of mutating the local model. Scene membership is authoritative on
+   * the server (`SceneInfo`) since Issue #160, so no `character::<id>::scene`
+   * state mirror is written.
    */
   async function handleMoveMember(
     characterId: string,
@@ -2452,6 +2459,17 @@
 
       if (!socket || !socket.isConnected) {
         throw new Error('ルームに接続していないため、メンバーを移動できません');
+      }
+
+      if (result.isNewSceneCreated) {
+        await socket.requestCreateScene(
+          result.targetScene.id,
+          true,
+          result.targetScene.name,
+        );
+        // The server's `SceneList` broadcast may still be in flight; keep the
+        // freshly acknowledged scene until a list actually contains it.
+        pendingSceneListIds.add(result.targetScene.id);
       }
 
       if (!Number.isNaN(numericCharId)) {
