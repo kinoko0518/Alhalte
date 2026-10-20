@@ -1,14 +1,14 @@
 /**
  * menuPosition.ts - Menu positioning utility & actions for noph-ui Menu in Alhalte Argenterie.
  *
- * Solves Issue #124:
+ * Solves Issue #124 and Issue #241:
  * HTML Popover API with CSS Anchor Positioning defaults to top-center of the screen
  * when anchor positioning is unsupported, or centers via `@position-try --np-menu-over-anchor`
  * (`align-self: center`, `position-area: span-all`) when Chrome/Blink anchor positioning
  * detects collision or unsupported anchor features.
  *
  * This utility calculates the anchor's viewport bounding rect and applies
- * explicit inline styles with `!important` to completely override Anchor Positioning
+ * explicit inline styles with `!important` to override Anchor Positioning
  * auto-centering fallbacks and interference:
  *   position: fixed !important;
  *   inset: unset !important;
@@ -18,11 +18,24 @@
  *   align-self: unset !important;
  *   justify-self: unset !important;
  *
- * It binds directly to anchor boundaries:
- *   - bottom placement: `top: ${anchorRect.bottom + offset}px !important;`
- *   - top placement: `bottom: ${(vh - anchorRect.top + offset)}px !important;`
- *   - end placement: `right: ${(vw - anchorRect.right)}px !important;`
- *   - start placement: `left: ${anchorRect.left}px !important;`
+ * `!important` alone does not neutralize the HTML UA stylesheet, though. The UA
+ * sheet gives every `[popover]` element `position: fixed; inset: 0`, and that
+ * `0` still applies to any side that has no author declaration of its own.
+ * For a fixed, `fit-content` box the over-constrained inset resolution then
+ * prefers `left` / `top` in LTR, which collapses the menu to x=0 and/or y=0
+ * (Issue #241). `inset` is a shorthand, and `removeProperty()` on one of its
+ * longhands also drops the author declaration for that side, which lets the UA
+ * `0` leak back in. This utility therefore never removes an inset longhand and
+ * always pins all four sides in every update:
+ *   - bottom placement: `top: <px> !important;` plus `bottom: auto !important;`
+ *   - top placement: `bottom: <px> !important;` plus `top: auto !important;`
+ *   - start placement: `left: <px> !important;` plus `right: auto !important;`
+ *   - end placement: `right: <px> !important;` plus `left: auto !important;`
+ *
+ * Both the string path (`getMenuPositionStyle` -> `computeMenuPosition().styleString`,
+ * rendered into the `style` attribute) and the DOM path (`applyMenuPosition`, run
+ * from a `$effect`) are built from the same declaration list, so a later
+ * re-render cannot reintroduce the missing-side bug (Issue #241).
  *
  * This eliminates size estimation discrepancies (e.g. small delete menus appearing
  * far below the 3-dots button) and prevents right-center or top-center drift.
@@ -67,6 +80,90 @@ export interface ComputedMenuPosition {
 }
 
 /**
+ * One inline declaration, shared by the string path and the DOM path.
+ */
+interface MenuPositionDeclaration {
+  property: string;
+  value: string;
+  important: boolean;
+}
+
+/**
+ * Builds the inline declarations shared by the string path (the `style`
+ * attribute) and the DOM path (`applyMenuPosition`). Using one list guarantees
+ * that both paths pin the same four inset longhands, so a re-render cannot
+ * reintroduce an unpinned side (Issue #241).
+ *
+ * The unused side of each axis is still declared as `auto !important`: without
+ * an author declaration the UA `[popover] { inset: 0 }` rule wins for that side
+ * and Chrome collapses the fixed, `fit-content` menu to x=0 / y=0 (Issue #241).
+ */
+function buildMenuPositionDeclarations(
+  result: ComputedMenuPosition,
+  options: MenuPositionOptions,
+): MenuPositionDeclaration[] {
+  const pin = (value: number | undefined): string =>
+    value === undefined ? 'auto' : `${value}px`;
+
+  const declarations: MenuPositionDeclaration[] = [
+    { property: 'position', value: 'fixed', important: true },
+    // Must come before the longhands: setting the `inset` shorthand resets all
+    // four of them, and the explicit pins below have to win afterwards.
+    { property: 'inset', value: 'unset', important: true },
+    { property: 'top', value: pin(result.top), important: true },
+    { property: 'bottom', value: pin(result.bottom), important: true },
+    { property: 'left', value: pin(result.left), important: true },
+    { property: 'right', value: pin(result.right), important: true },
+    { property: 'margin', value: '0', important: true },
+    { property: 'position-area', value: 'none', important: true },
+    { property: 'position-try-fallbacks', value: 'none', important: true },
+    { property: 'align-self', value: 'unset', important: true },
+    { property: 'justify-self', value: 'unset', important: true },
+  ];
+
+  if (result.maxHeight !== undefined) {
+    declarations.push({
+      property: 'max-height',
+      value: `${result.maxHeight}px`,
+      important: true,
+    });
+    declarations.push({ property: 'overflow-y', value: 'auto', important: true });
+  }
+
+  if (options.anchorName) {
+    declarations.push({
+      property: 'position-anchor',
+      value: options.anchorName,
+      important: false,
+    });
+    declarations.push({
+      property: '--np-menu-position-area',
+      value: result.isTop ? 'top span-right' : 'bottom span-right',
+      important: false,
+    });
+  }
+
+  return declarations;
+}
+
+/**
+ * Serializes {@link buildMenuPositionDeclarations} into the `style` attribute
+ * value used by `getMenuPositionStyle` (Issue #241).
+ */
+function menuPositionStyleString(
+  result: ComputedMenuPosition,
+  options: MenuPositionOptions,
+): string {
+  return (
+    buildMenuPositionDeclarations(result, options)
+      .map(({ property, value, important }) =>
+        `${property}: ${value}${important ? ' !important' : ''}`,
+      )
+      .join('; ') + ';'
+  );
+}
+
+/**
  * Calculates menu position based on anchor element bounds and viewport dimensions.
  */
 export function computeMenuPosition(
@@ -89,25 +186,10 @@ export function computeMenuPosition(
     : 768;
 
   if (!anchor) {
-    const fallbackStyles = [
-      'position: fixed !important',
-      'inset: unset !important',
-      'margin: 0 !important',
-      'position-area: none !important',
-      'position-try-fallbacks: none !important',
-      'align-self: unset !important',
-      'justify-self: unset !important',
-      `top: ${margin}px !important`,
-      `left: ${margin}px !important`,
-    ];
-    if (options.anchorName) {
-      fallbackStyles.push(`position-anchor: ${options.anchorName}`);
-    }
+    const fallback = { top: margin, left: margin, isTop: false, styleString: '' };
     return {
-      top: margin,
-      left: margin,
-      isTop: false,
-      styleString: fallbackStyles.join('; ') + ';',
+      ...fallback,
+      styleString: menuPositionStyleString(fallback, options),
     };
   }
 
@@ -206,48 +288,11 @@ export function computeMenuPosition(
     }
   }
 
-  const styleParts: string[] = [
-    'position: fixed !important',
-    'inset: unset !important',
-    'margin: 0 !important',
-    'position-area: none !important',
-    'position-try-fallbacks: none !important',
-    'align-self: unset !important',
-    'justify-self: unset !important',
-  ];
-
-  if (bottom !== undefined) {
-    styleParts.push(`bottom: ${bottom}px !important`);
-  }
-  if (top !== undefined) {
-    styleParts.push(`top: ${top}px !important`);
-  }
-  if (left !== undefined) {
-    styleParts.push(`left: ${left}px !important`);
-  }
-  if (right !== undefined) {
-    styleParts.push(`right: ${right}px !important`);
-  }
-  if (maxHeight !== undefined) {
-    styleParts.push(`max-height: ${maxHeight}px !important`);
-    styleParts.push('overflow-y: auto !important');
-  }
-
-  if (options.anchorName) {
-    styleParts.push(`position-anchor: ${options.anchorName}`);
-    styleParts.push(
-      `--np-menu-position-area: ${isTop ? 'top span-right' : 'bottom span-right'}`
-    );
-  }
+  const result = { top, bottom, left, right, maxHeight, isTop, styleString: '' };
 
   return {
-    top,
-    bottom,
-    left,
-    right,
-    maxHeight,
-    isTop,
-    styleString: styleParts.join('; ') + ';',
+    ...result,
+    styleString: menuPositionStyleString(result, options),
   };
 }
 
@@ -287,40 +332,12 @@ export function applyMenuPosition(
     if (!menu || !anchor) return;
     const result = computeMenuPosition(anchor, menu, options);
 
-    menu.style.setProperty('position', 'fixed', 'important');
-    menu.style.setProperty('inset', 'unset', 'important');
-    menu.style.setProperty('margin', '0', 'important');
-    menu.style.setProperty('position-area', 'none', 'important');
-    menu.style.setProperty('position-try-fallbacks', 'none', 'important');
-    menu.style.setProperty('align-self', 'unset', 'important');
-    menu.style.setProperty('justify-self', 'unset', 'important');
-
-    if (result.top !== undefined) {
-      menu.style.setProperty('top', `${result.top}px`, 'important');
-      menu.style.removeProperty('bottom');
-    }
-    if (result.bottom !== undefined) {
-      menu.style.setProperty('bottom', `${result.bottom}px`, 'important');
-      menu.style.removeProperty('top');
-    }
-    if (result.left !== undefined) {
-      menu.style.setProperty('left', `${result.left}px`, 'important');
-      menu.style.removeProperty('right');
-    }
-    if (result.right !== undefined) {
-      menu.style.setProperty('right', `${result.right}px`, 'important');
-      menu.style.removeProperty('left');
-    }
-    if (result.maxHeight !== undefined) {
-      menu.style.setProperty('max-height', `${result.maxHeight}px`, 'important');
-      menu.style.setProperty('overflow-y', 'auto', 'important');
-    }
-    if (options.anchorName) {
-      menu.style.setProperty('position-anchor', options.anchorName);
-      menu.style.setProperty(
-        '--np-menu-position-area',
-        result.isTop ? 'top span-right' : 'bottom span-right'
-      );
+    // Same declaration list as `getMenuPositionStyle` -> `styleString`, so the
+    // `$effect` and the `style` attribute never disagree. In particular, do not
+    // `removeProperty()` any inset longhand: that drops the author declaration
+    // for the side and lets the UA popover `inset: 0` collapse the menu (#241).
+    for (const { property, value, important } of buildMenuPositionDeclarations(result, options)) {
+      menu.style.setProperty(property, value, important ? 'important' : '');
     }
   };
 
