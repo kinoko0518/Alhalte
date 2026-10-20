@@ -29,14 +29,17 @@
   import {
     BGM_AUDIO_MIME_FALLBACK,
     bgmPlayingStateKey,
+    bgmRemovedStateKey,
     bgmTrackStateKey,
     bgmVolumeStateKey,
     buildBgmTrackState,
     clearSceneBackground,
     getNormalizedBgmSlots,
+    isBgmSlotRemoved,
     SCENE_BACKGROUND_HEIGHT_STATE_KEY,
     SCENE_BACKGROUND_WIDTH_STATE_KEY,
     SCENE_NAME_STATE_KEY,
+    setBgmSlotRemoved,
     uploadSceneBackground,
     type BgmTrackState,
   } from '../../../utils/sceneSettings.js';
@@ -359,10 +362,17 @@
   // - playing: `bgm::<slot>::playing` boolean, written by play / stop and
   //   committed locally only after the ack.
   // - volume: `bgm::<slot>::volume` as a number in 0..1, sent on commit only.
+  // - removed: `bgm::<slot>::removed` = true while the slot is deleted from the
+  //   UI (Issue #226); cleared when the slot number is added again.
   let bgmSlots = $state<BgmSlot[]>(getNormalizedBgmSlots(currentScene.juices));
   let activeBgmSlotPicking = $state<number | null>(null);
   /** Slots with an in-flight server operation; reassigned so Svelte sees the change. */
   let pendingBgmSlots = $state<Set<number>>(new Set());
+  /**
+   * Re-added slot numbers whose `bgm::<slot>::removed` server marker still has
+   * to be deleted together with the next track write (Issue #226).
+   */
+  let bgmMarkerClearSlots = $state<Set<number>>(new Set());
   /** Per-slot error message rendered under the row with `role="status"`. */
   let bgmErrors = $state<Record<number, string>>({});
   /** Slider drafts: the committed volume lives in `bgmSlots` only after the ack. */
@@ -383,6 +393,7 @@
     if (currentScene.id === bgmSceneId) return;
     bgmSceneId = currentScene.id;
     pendingBgmSlots = new Set();
+    bgmMarkerClearSlots = new Set();
     bgmErrors = {};
     draftBgmVolumes = {};
   });
@@ -436,6 +447,14 @@
       delete next[slotNum];
     }
     bgmErrors = next;
+  }
+
+  /** Drops the pending marker clear of a re-added slot after its ack (Issue #226). */
+  function forgetBgmMarkerClear(slotNum: number) {
+    setBgmSlotRemoved(currentScene.juices, slotNum, false);
+    const next = new Set(bgmMarkerClearSlots);
+    next.delete(slotNum);
+    bgmMarkerClearSlots = next;
   }
 
   /** Legacy `bgm1..3` field of a slot, used when no slot state was remembered. */
@@ -584,6 +603,10 @@
 
     const socket = roomSocket;
     const sceneId = currentScene.id;
+    // A slot added again after deletion still carries the server removal
+    // marker; it must be deleted before the track / playing writes, otherwise
+    // App (and every other client) ignores them for the removed slot.
+    const clearRemovedMarker = bgmMarkerClearSlots.has(slotNum);
     setBgmError(slotNum, null);
     setBgmPending(slotNum, true);
     try {
@@ -598,6 +621,7 @@
           bgmAudio.pause(slotNum);
           return;
         }
+        if (clearRemovedMarker) forgetBgmMarkerClear(slotNum);
         applyBgmSlotState(slotNum, track, true);
         await playBgmAudio(slotNum);
         return;
@@ -608,6 +632,19 @@
         setBgmError(slotNum, BGM_MISSING_TIN_ERROR);
         bgmAudio.pause(slotNum);
         return;
+      }
+
+      // The server processes frames in order, but only across one connection:
+      // the marker deletion must be acknowledged before the track / playing
+      // writes are sent, otherwise a client that still sees the marker ignores
+      // them (Issue #226).
+      if (clearRemovedMarker) {
+        await socket.requestDeleteState(sceneId, bgmRemovedStateKey(slotNum));
+        if (currentScene.id !== sceneId) {
+          bgmAudio.pause(slotNum);
+          return;
+        }
+        forgetBgmMarkerClear(slotNum);
       }
 
       const requests: Promise<unknown>[] = [
@@ -735,16 +772,22 @@
    * Removes a slot locally after every delete ack succeeded (Issue #226).
    *
    * Slot numbers are stable: the remaining rows keep their number, track,
-   * volume and playback state. A later "add slot" still uses max + 1, so the
-   * deleted row is never revived implicitly.
+   * volume and playback state. The removal is recorded in
+   * `juices.bgmRemovedSlots` (mirroring the server `bgm::<slot>::removed`
+   * marker) so later broadcasts cannot re-create the row. A later "add slot"
+   * still uses max + 1, so the deleted row is never revived implicitly.
    */
   function applyBgmSlotRemoval(slotNum: number) {
+    setBgmSlotRemoved(currentScene.juices, slotNum, true);
     bgmSlots = bgmSlots.filter((slot) => slot.slot !== slotNum);
     clearLegacyBgmSlot(slotNum);
     currentScene.juices.bgmSlots = [...bgmSlots];
     const nextDrafts = { ...draftBgmVolumes };
     delete nextDrafts[slotNum];
     draftBgmVolumes = nextDrafts;
+    const nextMarkerClears = new Set(bgmMarkerClearSlots);
+    nextMarkerClears.delete(slotNum);
+    bgmMarkerClearSlots = nextMarkerClears;
     onUpdateScene?.(currentScene);
   }
 
@@ -767,10 +810,12 @@
   /**
    * Deletes a BGM slot (Issue #226).
    *
-   * The Banquette state becomes NONE for the slot: the track and the volume are
-   * deleted and `bgm::<slot>::playing` is set to `false`. The row is removed
-   * only after all acks; on failure the row and the local model stay untouched
-   * and the shared communication error is shown.
+   * The Banquette state becomes NONE for the slot first: the track and the
+   * volume are deleted and `bgm::<slot>::playing` is set to `false`. Only after
+   * all three acks succeed is the persistent `bgm::<slot>::removed` marker
+   * written, so a failed NONE write never hides the slot behind a marker. The
+   * row is removed after the marker ack; on failure the row and the local
+   * model stay untouched and the shared communication error is shown.
    */
   async function commitBgmSlotDelete(slotNum: number) {
     if (isBgmPending(slotNum)) return;
@@ -800,6 +845,11 @@
         socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
         socket.requestDeleteState(sceneId, bgmVolumeStateKey(slotNum)),
       ]);
+      if (currentScene.id !== sceneId) return;
+
+      // Marker last, and as a separate step: one of the NONE writes above may
+      // have failed, in which case the slot must stay visible / retryable.
+      await socket.requestUpdateState(sceneId, bgmRemovedStateKey(slotNum), true);
       if (currentScene.id !== sceneId) return;
       applyBgmSlotRemoval(slotNum);
     } catch (error) {
@@ -977,6 +1027,13 @@
   function handleAddBgmSlot() {
     const maxSlot = bgmSlots.reduce((m, s) => Math.max(m, s.slot), 0);
     const newSlotNum = (maxSlot || 0) + 1;
+    // Adding a previously deleted slot number re-opens it. The local marker is
+    // dropped now so the row renders; the server marker is deleted together
+    // with the next track write in `commitBgmPlay` (Issue #226).
+    if (isBgmSlotRemoved(currentScene.juices, newSlotNum)) {
+      setBgmSlotRemoved(currentScene.juices, newSlotNum, false);
+      bgmMarkerClearSlots = new Set([...bgmMarkerClearSlots, newSlotNum]);
+    }
     const newSlot: BgmSlot = {
       slot: newSlotNum,
       tinId: null,

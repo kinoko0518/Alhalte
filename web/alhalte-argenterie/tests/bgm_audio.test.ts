@@ -273,7 +273,8 @@ describe('BGM audio playback (Issue #164)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.click();
     await settle(30);
 
-    // Track DeleteState + playing=false + volume DeleteState (Issue #226).
+    // Track DeleteState + playing=false + volume DeleteState + removal marker
+    // (Issue #226).
     expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
       'std::bgm',
       'bgm::1::volume',
@@ -281,6 +282,9 @@ describe('BGM audio playback (Issue #164)', () => {
     expect(
       trackStateUpdater(socket.requestUpdateStateCalls, 'bgm::1::playing')?.value,
     ).toBe(false);
+    expect(
+      trackStateUpdater(socket.requestUpdateStateCalls, 'bgm::1::removed')?.value,
+    ).toBe(true);
     // The sound stops immediately and the object URL is revoked.
     expect(audio.elements[0].pause).toHaveBeenCalled();
     expect(audio.elements[0].paused).toBe(true);

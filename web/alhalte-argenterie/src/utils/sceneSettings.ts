@@ -34,17 +34,65 @@ export function createDefaultJuices(): Juices {
 }
 
 /**
+ * Returns the slot numbers explicitly removed from the UI (Issue #226).
+ *
+ * The list mirrors the server-authoritative `bgm::<slot>::removed` markers;
+ * malformed entries are ignored so a bad cached value cannot hide a slot
+ * twice or hide slot 0.
+ */
+export function getBgmRemovedSlots(juices: Juices): number[] {
+  if (!Array.isArray(juices.bgmRemovedSlots)) return [];
+  const slots: number[] = [];
+  for (const value of juices.bgmRemovedSlots) {
+    const slot = typeof value === 'number' ? value : Number(value);
+    if (Number.isInteger(slot) && slot >= 1 && !slots.includes(slot)) {
+      slots.push(slot);
+    }
+  }
+  return slots;
+}
+
+/** True when `slot` carries a removal marker (Issue #226). */
+export function isBgmSlotRemoved(juices: Juices, slot: number): boolean {
+  return getBgmRemovedSlots(juices).includes(slot);
+}
+
+/**
+ * Adds / removes a slot from the local removal marker list (Issue #226).
+ *
+ * The caller is responsible for writing the `bgm::<slot>::removed` state key;
+ * this only keeps the scene model in sync with it.
+ */
+export function setBgmSlotRemoved(
+  juices: Juices,
+  slot: number,
+  removed: boolean,
+): void {
+  if (!Number.isInteger(slot) || slot < 1) return;
+  const slots = new Set(getBgmRemovedSlots(juices));
+  if (removed) {
+    slots.add(slot);
+  } else {
+    slots.delete(slot);
+  }
+  juices.bgmRemovedSlots = [...slots].sort((a, b) => a - b);
+}
+
+/**
  * Returns normalized BgmSlot array from Juices, generating slots from legacy bgm1..3 if needed.
  *
  * An explicitly empty `bgmSlots` array means every slot was deleted (Issue
  * #226) and is authoritative; only an absent field falls back to the legacy
- * `bgm1..3` mirrors.
+ * `bgm1..3` mirrors. Slots carrying a removal marker are always filtered out.
  */
 export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
+  const removed = new Set(getBgmRemovedSlots(juices));
+  const keep = (slots: BgmSlot[]): BgmSlot[] =>
+    slots.filter((slot) => !removed.has(slot.slot));
   if (juices.bgmSlots) {
-    return juices.bgmSlots;
+    return keep(juices.bgmSlots);
   }
-  return [
+  return keep([
     {
       slot: 1,
       tinId: juices.bgm1 ?? null,
@@ -66,7 +114,7 @@ export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
       volume: juices.bgm3Volume ?? 0.8,
       isPlaying: Boolean(juices.bgm3),
     },
-  ];
+  ]);
 }
 
 /**
@@ -90,6 +138,10 @@ export function inheritJuices(source: Juices): Juices {
   if (source.bgmSlots) {
     result.bgmSlots = source.bgmSlots.map((s) => ({ ...s }));
   }
+  // `bgmRemovedSlots` is deliberately not inherited: it is scene-specific
+  // server state, while the inherited `bgmSlots` list already omits deleted
+  // rows. Copying the markers would make the new scene hide slots that have
+  // no server marker of their own.
   return result;
 }
 
@@ -226,6 +278,18 @@ export function bgmVolumeStateKey(slot: number): string {
 /** `bgm::<slot>::playing` state key (Issue #164). */
 export function bgmPlayingStateKey(slot: number): string {
   return `bgm::${slot}::playing`;
+}
+
+/**
+ * `bgm::<slot>::removed` state key (Issue #226).
+ *
+ * A slot deleted in the settings tab is recorded as `true` on the server. The
+ * track / playing / volume keys alone cannot distinguish "deleted" from the
+ * AssetPicker's NONE (which keeps the row), so this marker is the persistent,
+ * server-authoritative signal that hides the slot on every client and reload.
+ */
+export function bgmRemovedStateKey(slot: number): string {
+  return `bgm::${slot}::removed`;
 }
 
 /** Decoded `std::bgm<N>` value. */

@@ -849,7 +849,7 @@ describe('BGM slot deletion (Issue #226)', () => {
     deleteBtn.click();
     await settle(0);
 
-    // The three Banquette writes are in flight; a second press is ignored.
+    // The three NONE writes are in flight; a second press is ignored.
     deleteBtn.click();
     await settle(0);
     expect(socket.pendingStateOperationCount).toBe(3);
@@ -861,17 +861,36 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(socket.requestUpdateStateCalls[0].key).toBe('bgm::1::playing');
     expect(socket.requestUpdateStateCalls[0].value).toBe(false);
     expect(socket.requestDeleteStateCalls[0].sceneId).toBe(scene.id);
+    // Issue #226: the persistent removal marker is only sent after the three
+    // NONE writes succeeded, never in the same batch.
+    expect(
+      socket.requestUpdateStateCalls.some((call) => call.key === 'bgm::1::removed'),
+    ).toBe(false);
 
     // No local removal before every ack succeeded.
     expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
     expect(updateCount).toBe(0);
     expect(scene.juices.bgmSlots?.some((slot) => slot.slot === 1)).toBe(true);
     expect(scene.juices.bgm1).toBe(TIN_ID_A);
+    expect(scene.juices.bgmRemovedSlots ?? []).not.toContain(1);
 
     socket.resolveStateWrite();
     socket.resolveStateWrite();
     await settle();
-    // One ack is still outstanding: the row and the model stay.
+    // One NONE ack is still outstanding: the row and the model stay.
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
+    expect(updateCount).toBe(0);
+
+    socket.resolveStateWrite();
+    await settle(0);
+    // All NONE writes are acknowledged: the marker is sent as a second step,
+    // and the row stays until its own ack arrives.
+    expect(
+      socket.requestUpdateStateCalls.some(
+        (call) => call.key === 'bgm::1::removed' && call.value === true,
+      ),
+    ).toBe(true);
+    expect(socket.pendingStateOperationCount).toBe(1);
     expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
     expect(updateCount).toBe(0);
 
@@ -885,6 +904,7 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeTruthy();
     expect(updateCount).toBe(1);
     expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([2, 3]);
+    expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([1]);
     expect(lastUpdatedScene!.juices.bgm1).toBeUndefined();
     expect(lastUpdatedScene!.juices.bgm1Volume).toBe(0.8);
     expect(lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 2)).toMatchObject({
@@ -912,7 +932,7 @@ describe('BGM slot deletion (Issue #226)', () => {
     await settle(0);
 
     socket.rejectDeleteState(new OperationTimeoutError('deleteState', 8000));
-    // The other two requests settle successfully; the batch still fails.
+    // The other two NONE requests settle successfully; the batch still fails.
     socket.resolveStateWrite();
     socket.resolveStateWrite();
     await settle();
@@ -924,12 +944,76 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 1)?.tinId).toBe(TIN_ID_A);
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 1)?.isPlaying).toBe(true);
     expect(scene.juices.bgm1).toBe(TIN_ID_A);
+    // Issue #226: the removal marker is never sent when a NONE write failed,
+    // and it is not applied locally either.
+    expect(
+      socket.requestUpdateStateCalls.some((call) => call.key === 'bgm::1::removed'),
+    ).toBe(false);
+    expect(scene.juices.bgmRemovedSlots ?? []).not.toContain(1);
     const error = target.querySelector<HTMLElement>('[data-testid="bgm-error-1"]');
     expect(error?.getAttribute('role')).toBe('status');
     expect(error?.textContent).toContain(ERROR_MESSAGE);
     // The button is usable again after the failure.
     expect(
       target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.disabled,
+    ).toBe(false);
+
+    warn.mockRestore();
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls playing更新が失敗したらremovedマーカーを書かない
+  it('does not write the removal marker when the playing update fails', async () => {
+    const scene = playableScene();
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerStateWrites = false;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { target, instance } = mountWithSocket(scene, socket);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.click();
+    await settle(0);
+
+    socket.resolveStateWrite(); // track DeleteState
+    socket.rejectStateWrite(new OperationTimeoutError('updateState', 8000)); // playing
+    socket.resolveStateWrite(); // volume DeleteState
+    await settle();
+
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-error-1"]')?.textContent).toContain(
+      ERROR_MESSAGE,
+    );
+    expect(
+      socket.requestUpdateStateCalls.some((call) => call.key === 'bgm::1::removed'),
+    ).toBe(false);
+
+    warn.mockRestore();
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls volume削除が失敗したらremovedマーカーを書かない
+  it('does not write the removal marker when the volume delete fails', async () => {
+    const scene = playableScene();
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerStateWrites = false;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { target, instance } = mountWithSocket(scene, socket);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.click();
+    await settle(0);
+
+    socket.resolveStateWrite(); // track DeleteState
+    socket.rejectDeleteState(new OperationTimeoutError('deleteState', 8000)); // volume
+    socket.resolveStateWrite(); // playing UpdateState
+    await settle();
+
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-error-1"]')?.textContent).toContain(
+      ERROR_MESSAGE,
+    );
+    expect(
+      socket.requestUpdateStateCalls.some((call) => call.key === 'bgm::1::removed'),
     ).toBe(false);
 
     warn.mockRestore();
@@ -983,6 +1067,7 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeTruthy();
     expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 3]);
+    expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([2]);
     expect(lastUpdatedScene!.juices.bgm2).toBeUndefined();
     expect(lastUpdatedScene!.juices.bgm2Volume).toBe(0.8);
 
@@ -1027,6 +1112,7 @@ describe('BGM slot deletion (Issue #226)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-2"]')!.click();
     await settle();
     expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
+    expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([2]);
 
     target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
     await settle();
@@ -1037,8 +1123,196 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(row4).toBeTruthy();
     expect(target.querySelector('[data-testid="bgm-delete-btn-4"]')).toBeTruthy();
     expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 3, 4]);
+    // The new slot was never removed, so the removal markers stay at [2].
+    expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([2]);
     const slot4 = lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 4);
     expect(slot4).toMatchObject({ tinId: null, isPlaying: false, volume: 0.8 });
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls 再追加したスロットは最初のtrack書き込み前にremovedマーカーを消す
+  it('clears the server removal marker before writing the first track of a re-added slot', async () => {
+    const scene = makeScene({
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [
+          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
+          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
+          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+          {
+            slot: 4,
+            tinId: TIN_ID_A,
+            mimeType: 'audio/ogg',
+            name: 'fourth.ogg',
+            volume: 0.8,
+            isPlaying: false,
+          },
+        ],
+      },
+    });
+    const socket = new FakeRoomSocket();
+    let requestedOptions: any = null;
+    let lastUpdatedScene: Scene | null = null;
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene: scene,
+        allScenes: [scene],
+        roomSocket: asRoomSocket(socket),
+        onRequestAssetPicker: (options) => {
+          requestedOptions = options;
+        },
+        onUpdateScene: (updated) => {
+          lastUpdatedScene = updated;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-4"]')!.click();
+    await settle();
+    expect(scene.juices.bgmRemovedSlots).toEqual([4]);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
+    await settle();
+    // The local marker is dropped immediately so the row renders.
+    expect(scene.juices.bgmRemovedSlots).toEqual([]);
+
+    const audioAsset = addAsset({
+      id: 'bgm-track-readded',
+      name: 'readded.ogg',
+      scope: 'personal',
+      mediaType: 'audio',
+      dataUrl: 'data:audio/ogg;base64,UkVBRA==',
+      mimeType: 'audio/ogg',
+      createdAt: 8000,
+      tinId: TIN_ID_B,
+    });
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-4"]')!.click();
+    await settle();
+    expect(requestedOptions).toBeTruthy();
+    requestedOptions.onSelect(audioAsset.dataUrl, audioAsset);
+    await settle();
+
+    // Issue #226: DeleteState(`bgm::4::removed`) is sent together with the
+    // first track write so the marker cannot hide the re-added row elsewhere.
+    expect(
+      socket.requestDeleteStateCalls.some((call) => call.key === 'bgm::4::removed'),
+    ).toBe(true);
+    expect(
+      socket.requestUpdateStateCalls.some(
+        (call) => call.key === 'bgm::4::playing' && call.value === true,
+      ),
+    ).toBe(true);
+    expect(
+      socket.requestUpdateStateCalls.some((call) => call.key === 'std::bgm4'),
+    ).toBe(true);
+    expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([]);
+    expect(
+      lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 4)?.tinId,
+    ).toBe(TIN_ID_B);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls 再追加時はremovedマーカー削除のack後にtrack/playingを送る
+  it('awaits the removal-marker deletion before sending the re-added track write', async () => {
+    const scene = makeScene({
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [
+          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
+          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
+          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+          {
+            slot: 4,
+            tinId: TIN_ID_A,
+            mimeType: 'audio/ogg',
+            name: 'fourth.ogg',
+            volume: 0.8,
+            isPlaying: false,
+          },
+        ],
+      },
+    });
+    const socket = new FakeRoomSocket();
+    let requestedOptions: any = null;
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene: scene,
+        allScenes: [scene],
+        roomSocket: asRoomSocket(socket),
+        onRequestAssetPicker: (options) => {
+          requestedOptions = options;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-4"]')!.click();
+    await settle();
+    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
+    await settle();
+
+    // Hold the marker deletion so the ordering is observable.
+    socket.autoAnswerStateWrites = false;
+    const updatesBeforeTrackWrite = socket.requestUpdateStateCalls.length;
+    const audioAsset = addAsset({
+      id: 'bgm-track-readded-order',
+      name: 'readded.ogg',
+      scope: 'personal',
+      mediaType: 'audio',
+      dataUrl: 'data:audio/ogg;base64,T1JERVI=',
+      mimeType: 'audio/ogg',
+      createdAt: 8100,
+      tinId: TIN_ID_B,
+    });
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-4"]')!.click();
+    await settle();
+    requestedOptions.onSelect(audioAsset.dataUrl, audioAsset);
+    await settle(0);
+
+    // Only the marker deletion is in flight; the track / playing writes must
+    // not be sent before it is acknowledged.
+    expect(socket.pendingStateOperationCount).toBe(1);
+    expect(
+      socket.requestDeleteStateCalls.filter((call) => call.key === 'bgm::4::removed'),
+    ).toHaveLength(1);
+    const updatesBeforeMarkerAck = socket.requestUpdateStateCalls.slice(
+      updatesBeforeTrackWrite,
+    );
+    expect(
+      updatesBeforeMarkerAck.some((call) => call.key === 'bgm::4::playing'),
+    ).toBe(false);
+    expect(
+      updatesBeforeMarkerAck.some((call) => call.key === 'std::bgm4'),
+    ).toBe(false);
+
+    socket.resolveStateWrite();
+    await settle(0);
+    expect(
+      socket.requestUpdateStateCalls.some(
+        (call) => call.key === 'bgm::4::playing' && call.value === true,
+      ),
+    ).toBe(true);
+    expect(
+      socket.requestUpdateStateCalls.some((call) => call.key === 'std::bgm4'),
+    ).toBe(true);
+    expect(socket.pendingStateOperationCount).toBe(2);
+
+    socket.resolveStateWrite();
+    socket.resolveStateWrite();
+    await settle();
+    expect(scene.juices.bgmRemovedSlots).toEqual([]);
+    expect(
+      scene.juices.bgmSlots?.find((slot) => slot.slot === 4)?.tinId,
+    ).toBe(TIN_ID_B);
 
     unmount(instance);
     target.remove();
@@ -1066,6 +1340,7 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
     expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeNull();
     expect(scene.juices.bgmSlots).toEqual([]);
+    expect(scene.juices.bgmRemovedSlots).toEqual([1, 2, 3]);
 
     target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
     await settle();
@@ -1073,6 +1348,9 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
     expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1]);
     expect(scene.juices.bgmSlots?.[0]).toMatchObject({ tinId: null, isPlaying: false });
+    // Adding slot 1 again re-opens it: the local marker is cleared and the
+    // server marker is deleted with the next track write.
+    expect(scene.juices.bgmRemovedSlots).toEqual([2, 3]);
 
     unmount(instance);
     target.remove();

@@ -42,8 +42,10 @@
     buildBgmTrackState,
     createDefaultJuices,
     downloadSceneBackground,
+    getBgmRemovedSlots,
     getNormalizedBgmSlots,
     inheritJuices,
+    isBgmSlotRemoved,
     moveMemberToScene,
     parseBgmTrackState,
     parseSceneBackgroundState,
@@ -51,6 +53,7 @@
     SCENE_BACKGROUND_STATE_KEY,
     SCENE_BACKGROUND_WIDTH_STATE_KEY,
     SCENE_NAME_STATE_KEY,
+    setBgmSlotRemoved,
   } from '../utils/sceneSettings.js';
   import { createAudioManager, type AudioManager } from '../utils/audio.js';
   import { applyThemeToDocument } from '../utils/theme.js';
@@ -378,10 +381,30 @@
   let sideSheetWidth = $state(440);
   let isResizing = $state(false);
 
+  /**
+   * Applies the persisted BGM removal markers to a scene restored from the
+   * route entry / local cache (Issue #226).
+   *
+   * `initialScenes` can already carry `juices.bgmRemovedSlots` (e.g. a reload
+   * of a scene whose default slots 1..3 were deleted). The scene is mutated in
+   * place so its identity is preserved; the server `StateSnapshot` refreshes
+   * the markers afterwards.
+   */
+  function hydrateSceneBgmRemovalMarkers(scene: Scene): Scene {
+    const removed = getBgmRemovedSlots(scene.juices);
+    if (removed.length === 0) return scene;
+    scene.juices.bgmRemovedSlots = removed;
+    for (const slotNum of removed) {
+      syncLegacyBgmFields(scene.juices, slotNum, null, 0.8);
+    }
+    setNormalizedBgmSlots(scene.juices, getNormalizedBgmSlots(scene.juices));
+    return scene;
+  }
+
   // Default scenes if none provided
   let scenes = $state<Scene[]>(
     initialScenes.length > 0
-      ? initialScenes
+      ? initialScenes.map(hydrateSceneBgmRemovalMarkers)
       : [
           {
             id: '/',
@@ -1355,6 +1378,9 @@
   /** Scene-state key carrying a slot playback intent (Issue #164). */
   const BGM_PLAYING_STATE_KEY = /^bgm::(\d+)::playing$/;
 
+  /** Scene-state key marking a slot as deleted from the UI (Issue #226). */
+  const BGM_REMOVED_STATE_KEY = /^bgm::(\d+)::removed$/;
+
   /** `piece::<characterId>::placed` and `piece::<characterId>::pos` keys. */
   const PIECE_PLACED_STATE_KEY = /^piece::(.+)::placed$/;
   const PIECE_POS_STATE_KEY = /^piece::(.+)::pos$/;
@@ -1378,8 +1404,14 @@
     return (
       bgmSlotFromStateKey(key) !== null ||
       BGM_VOLUME_STATE_KEY.test(key) ||
-      BGM_PLAYING_STATE_KEY.test(key)
+      BGM_PLAYING_STATE_KEY.test(key) ||
+      BGM_REMOVED_STATE_KEY.test(key)
     );
+  }
+
+  /** Decodes the boolean Tins used by `playing` and `removed`. */
+  function isTruthyBgmStateValue(value: unknown): boolean {
+    return value === true || value === 'true' || value === 1;
   }
 
   /** Mirrors a slot's tin id (and optionally volume) into the legacy `bgm1..3` fields. */
@@ -1411,8 +1443,16 @@
    * Returns `slots` with `slotNum` present. Arbitrary slot numbers are created
    * on demand so a `std::bgm4` snapshot hydrates even when the client has only
    * ever rendered slots 1..3.
+   *
+   * A slot carrying the `bgm::<slot>::removed` marker is never re-created
+   * (Issue #226), not even by a later track / playing / volume broadcast.
    */
-  function ensureBgmSlot(slots: BgmSlot[], slotNum: number): BgmSlot[] {
+  function ensureBgmSlot(
+    juices: Scene['juices'],
+    slots: BgmSlot[],
+    slotNum: number,
+  ): BgmSlot[] {
+    if (isBgmSlotRemoved(juices, slotNum)) return slots;
     if (slots.some((slot) => slot.slot === slotNum)) return slots;
     return [...slots, { slot: slotNum, tinId: null, volume: 0.8, isPlaying: false }];
   }
@@ -1479,6 +1519,24 @@
   }
 
   /**
+   * Applies the server-authoritative `bgm::<slot>::removed` marker
+   * (Issue #226).
+   *
+   * Marking the slot removes it from `juices.bgmSlots` and clears its legacy
+   * `bgm1..3` mirror, so a later track / playing / volume broadcast can never
+   * re-create it. Unmarking only drops the filter: the row comes back with the
+   * next track / playing key (add-slot clears the marker before its first
+   * write).
+   */
+  function applyBgmSlotRemovedChange(scene: Scene, slotNum: number, removed: boolean) {
+    setBgmSlotRemoved(scene.juices, slotNum, removed);
+    if (!removed) return;
+    setNormalizedBgmSlots(scene.juices, getNormalizedBgmSlots(scene.juices));
+    syncLegacyBgmFields(scene.juices, slotNum, null, 0.8);
+    if (scene.id === currentScene?.id) audioManager.pause(slotNum);
+  }
+
+  /**
    * Applies a BGM `StateUpdated` frame.
    *
    * Track values are `{ tinId, mimeType, name }` JSON Tin; the legacy bare
@@ -1488,13 +1546,28 @@
   function applyBgmStateUpdated(scene: Scene, key: string, rawValue: unknown) {
     const value = tinToJson(rawValue);
 
+    const removedMatch = BGM_REMOVED_STATE_KEY.exec(key);
+    if (removedMatch) {
+      applyBgmSlotRemovedChange(
+        scene,
+        Number(removedMatch[1]),
+        isTruthyBgmStateValue(value),
+      );
+      return;
+    }
+
     const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
     if (volumeMatch) {
       const slotNum = Number(volumeMatch[1]);
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
       const volume = typeof value === 'number' ? value : Number(value);
       if (!Number.isFinite(volume)) return;
       const clamped = Math.max(0, Math.min(1, volume));
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, volume: clamped } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1507,8 +1580,13 @@
     const playingMatch = BGM_PLAYING_STATE_KEY.exec(key);
     if (playingMatch) {
       const slotNum = Number(playingMatch[1]);
-      const playing = value === true || value === 'true' || value === 1;
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const playing = isTruthyBgmStateValue(value);
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, isPlaying: playing } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1520,9 +1598,13 @@
     }
 
     const slotNum = bgmSlotFromStateKey(key);
-    if (slotNum === null) return;
+    if (slotNum === null || isBgmSlotRemoved(scene.juices, slotNum)) return;
     const parsed = parseBgmTrackState(value);
-    const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+    const slots = ensureBgmSlot(
+      scene.juices,
+      getNormalizedBgmSlots(scene.juices),
+      slotNum,
+    ).map((slot) =>
       slot.slot === slotNum
         ? {
             ...slot,
@@ -1544,13 +1626,26 @@
    * Applies a BGM `StateDeleted` frame.
    *
    * Deleting a track key clears the selection; deleting `playing` stops the
-   * slot. Both pause and revoke the slot's object URL.
+   * slot. Both pause and revoke the slot's object URL. A removed slot ignores
+   * the NONE broadcasts of its own deletion so it is not re-created; deleting
+   * the removal marker itself lifts the filter again.
    */
   function applyBgmStateDeleted(scene: Scene, key: string) {
+    const removedMatch = BGM_REMOVED_STATE_KEY.exec(key);
+    if (removedMatch) {
+      applyBgmSlotRemovedChange(scene, Number(removedMatch[1]), false);
+      return;
+    }
+
     const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
     if (volumeMatch) {
       const slotNum = Number(volumeMatch[1]);
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, volume: 0.8 } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1563,7 +1658,12 @@
     const playingMatch = BGM_PLAYING_STATE_KEY.exec(key);
     if (playingMatch) {
       const slotNum = Number(playingMatch[1]);
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, isPlaying: false } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1572,8 +1672,12 @@
     }
 
     const slotNum = bgmSlotFromStateKey(key);
-    if (slotNum === null) return;
-    const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+    if (slotNum === null || isBgmSlotRemoved(scene.juices, slotNum)) return;
+    const slots = ensureBgmSlot(
+      scene.juices,
+      getNormalizedBgmSlots(scene.juices),
+      slotNum,
+    ).map((slot) =>
       slot.slot === slotNum
         ? { ...slot, tinId: null, mimeType: undefined, name: undefined, isPlaying: false }
         : { ...slot },
@@ -1934,7 +2038,18 @@
     }
 
     pieceStatesByScene.set(sceneId, new Map());
-    for (const [key, value] of Object.entries(states ?? {})) {
+    const entries = Object.entries(states ?? {});
+    // The snapshot is authoritative for the deletion markers too (Issue #226):
+    // rebuild them first so stale track / playing / volume entries for a
+    // removed slot cannot re-create it, regardless of the map order.
+    scene.juices.bgmRemovedSlots = [];
+    for (const [key, value] of entries) {
+      if (BGM_REMOVED_STATE_KEY.test(key)) {
+        applySceneStateEntry(scene, key, value);
+      }
+    }
+    for (const [key, value] of entries) {
+      if (BGM_REMOVED_STATE_KEY.test(key)) continue;
       if (parsePieceStateKey(key)) {
         applyPieceStateEntry(sceneId, key, value);
       } else {
