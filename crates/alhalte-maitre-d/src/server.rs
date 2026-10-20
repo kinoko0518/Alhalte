@@ -2958,6 +2958,12 @@ async fn cellar_store_upload_handler(
 ///
 /// The raw tin bytes and the `X-Alhalte-Wrapped-Key` response header are
 /// forwarded so `pantry` can decrypt with the room key.
+///
+/// Authentication stays here, but no owner / session header reaches cellar:
+/// there `owner` only narrows a reference lookup and the 32-byte tin id is the
+/// capability (confidentiality comes from the room key). Forwarding the
+/// caller's owner turned that label into an ACL, so a tin uploaded by one
+/// account could not be downloaded by another (Issue #245).
 async fn cellar_download_handler(
     State(state): State<AppState>,
     AxumPath(tin_id): AxumPath<String>,
@@ -2976,16 +2982,17 @@ async fn cellar_download_handler(
             .into_response();
     };
 
-    let caller = match resolve_caller(&state, &headers, &query) {
-        Ok(caller) => caller,
-        Err(err) => return auth_error_response(err),
-    };
+    // Issue #245: the caller must still authenticate, but cellar is never told
+    // who they are; it resolves any reference for the tin id.
+    if let Err(err) = resolve_caller(&state, &headers, &query) {
+        return auth_error_response(err);
+    }
 
     forward_cellar_request(
         proxy,
         reqwest::Method::GET,
         &format!("/tin/{tin_id}"),
-        owner_headers(&caller),
+        Vec::new(),
         None,
     )
     .await
