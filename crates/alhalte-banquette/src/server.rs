@@ -1043,9 +1043,11 @@ impl BanquetteServer {
 
                 match r.move_character(account_id, character_id, &to_scene_id) {
                     Ok(()) => {
-                        // Append gone log in each former scene
+                        // Append gone log in each former scene. The event is
+                        // built once so every former scene of one move shares
+                        // the same append timestamp.
+                        let gone_event = CharacterGoneEvent::now(character_id);
                         for fs in &former_scenes {
-                            let gone_event = CharacterGoneEvent { character_id };
                             if let Ok(tin) = gone_event.to_tin() {
                                 let _ = r
                                     .append_log(
@@ -1059,7 +1061,7 @@ impl BanquetteServer {
                             }
                         }
                         // Append came log in destination scene
-                        let came_event = CharacterCameEvent { character_id };
+                        let came_event = CharacterCameEvent::now(character_id);
                         if let Ok(tin) = came_event.to_tin() {
                             let _ = r
                                 .append_log(

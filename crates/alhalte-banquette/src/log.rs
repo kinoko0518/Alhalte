@@ -1,6 +1,7 @@
 //! Log chunk management, biblio definitions, and log event helpers.
 
 use std::collections::HashMap;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -90,23 +91,58 @@ impl LogChunk {
     }
 }
 
+/// Returns the current UNIX time in whole seconds.
+///
+/// Returns `0` when the system clock is set before the UNIX epoch. Reading the
+/// clock must never panic, so the error is folded into the fallback instead of
+/// being unwrapped.
+pub fn unix_timestamp_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 /// Character entered scene event.
 ///
 /// Label: `alhalte/banquette/log/character-came`.
+///
+/// Wire compatibility (Issue #227): the current postcard payload is
+/// `character_id` followed by `timestamp` (two `u64` varints in that order).
+/// Events persisted before the timestamp was added carry only the single
+/// `character_id` varint; [`Self::from_tin`] still decodes them and yields
+/// `timestamp: 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterCameEvent {
     /// 64-bit character ID.
     pub character_id: u64,
+    /// UNIX time (whole seconds) at which the entry was appended.
+    pub timestamp: u64,
 }
 
 impl CharacterCameEvent {
+    /// Creates an event stamped with the current UNIX time.
+    pub fn now(character_id: u64) -> Self {
+        Self {
+            character_id,
+            timestamp: unix_timestamp_now(),
+        }
+    }
+
     /// Encodes this event as a `Tin`.
+    ///
+    /// The payload is the postcard serialization of `(character_id, timestamp)`.
+    /// Readers must also accept the legacy id-only payload (see
+    /// [`Self::from_tin`]).
     pub fn to_tin(&self) -> Result<Tin> {
         Tin::from_postcard_label(LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME, self)
             .map_err(BanquetteError::Tin)
     }
 
     /// Decodes this event from a `Tin`.
+    ///
+    /// Tries the current `character_id` + `timestamp` payload first and falls
+    /// back to the legacy payload that carries only `character_id`, decoding it
+    /// with `timestamp: 0`. A payload that decodes in neither form is an error.
     pub fn from_tin(tin: &Tin) -> Result<Self> {
         if tin.label != LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME {
             return Err(BanquetteError::Tin(tin::TinError::LabelMismatch {
@@ -114,43 +150,87 @@ impl CharacterCameEvent {
                 actual: tin.label,
             }));
         }
-        tin.to_postcard().map_err(BanquetteError::Tin)
+        match tin.to_postcard() {
+            Ok(event) => Ok(event),
+            Err(_) => {
+                let character_id: u64 = tin.to_postcard().map_err(BanquetteError::Tin)?;
+                Ok(Self {
+                    character_id,
+                    timestamp: 0,
+                })
+            }
+        }
     }
 
     /// Duck-typing helper converting this event to `HashMap<String, Tin>`.
+    ///
+    /// The map holds `character_id` and `timestamp` as primitive `u64` tins.
     pub fn to_duck_typed_map(&self) -> HashMap<String, Tin> {
         let mut map = HashMap::new();
         map.insert("character_id".to_string(), Tin::from_u64(self.character_id));
+        map.insert("timestamp".to_string(), Tin::from_u64(self.timestamp));
         map
     }
 
     /// Duck-typing helper reconstructing this event from `HashMap<String, Tin>`.
+    ///
+    /// A missing `timestamp` key (a map written before Issue #227) decodes as
+    /// `0`, matching [`Self::from_tin`]'s legacy fallback.
     pub fn from_duck_typed_map(map: &HashMap<String, Tin>) -> Result<Self> {
         let t = map
             .get("character_id")
             .ok_or_else(|| BanquetteError::Serialization("missing character_id".to_string()))?;
         let character_id = t.as_u64().map_err(BanquetteError::Tin)?;
-        Ok(Self { character_id })
+        let timestamp = match map.get("timestamp") {
+            Some(t) => t.as_u64().map_err(BanquetteError::Tin)?,
+            None => 0,
+        };
+        Ok(Self {
+            character_id,
+            timestamp,
+        })
     }
 }
 
 /// Character left scene event.
 ///
 /// Label: `alhalte/banquette/log/character-gone`.
+///
+/// Wire compatibility (Issue #227): like [`CharacterCameEvent`], the current
+/// payload is `character_id` followed by `timestamp`; legacy id-only payloads
+/// decode with `timestamp: 0`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CharacterGoneEvent {
     /// 64-bit character ID.
     pub character_id: u64,
+    /// UNIX time (whole seconds) at which the entry was appended.
+    pub timestamp: u64,
 }
 
 impl CharacterGoneEvent {
+    /// Creates an event stamped with the current UNIX time.
+    pub fn now(character_id: u64) -> Self {
+        Self {
+            character_id,
+            timestamp: unix_timestamp_now(),
+        }
+    }
+
     /// Encodes this event as a `Tin`.
+    ///
+    /// The payload is the postcard serialization of `(character_id, timestamp)`.
+    /// Readers must also accept the legacy id-only payload (see
+    /// [`Self::from_tin`]).
     pub fn to_tin(&self) -> Result<Tin> {
         Tin::from_postcard_label(LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE, self)
             .map_err(BanquetteError::Tin)
     }
 
     /// Decodes this event from a `Tin`.
+    ///
+    /// Tries the current `character_id` + `timestamp` payload first and falls
+    /// back to the legacy payload that carries only `character_id`, decoding it
+    /// with `timestamp: 0`. A payload that decodes in neither form is an error.
     pub fn from_tin(tin: &Tin) -> Result<Self> {
         if tin.label != LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE {
             return Err(BanquetteError::Tin(tin::TinError::LabelMismatch {
@@ -158,23 +238,45 @@ impl CharacterGoneEvent {
                 actual: tin.label,
             }));
         }
-        tin.to_postcard().map_err(BanquetteError::Tin)
+        match tin.to_postcard() {
+            Ok(event) => Ok(event),
+            Err(_) => {
+                let character_id: u64 = tin.to_postcard().map_err(BanquetteError::Tin)?;
+                Ok(Self {
+                    character_id,
+                    timestamp: 0,
+                })
+            }
+        }
     }
 
     /// Duck-typing helper converting this event to `HashMap<String, Tin>`.
+    ///
+    /// The map holds `character_id` and `timestamp` as primitive `u64` tins.
     pub fn to_duck_typed_map(&self) -> HashMap<String, Tin> {
         let mut map = HashMap::new();
         map.insert("character_id".to_string(), Tin::from_u64(self.character_id));
+        map.insert("timestamp".to_string(), Tin::from_u64(self.timestamp));
         map
     }
 
     /// Duck-typing helper reconstructing this event from `HashMap<String, Tin>`.
+    ///
+    /// A missing `timestamp` key (a map written before Issue #227) decodes as
+    /// `0`, matching [`Self::from_tin`]'s legacy fallback.
     pub fn from_duck_typed_map(map: &HashMap<String, Tin>) -> Result<Self> {
         let t = map
             .get("character_id")
             .ok_or_else(|| BanquetteError::Serialization("missing character_id".to_string()))?;
         let character_id = t.as_u64().map_err(BanquetteError::Tin)?;
-        Ok(Self { character_id })
+        let timestamp = match map.get("timestamp") {
+            Some(t) => t.as_u64().map_err(BanquetteError::Tin)?,
+            None => 0,
+        };
+        Ok(Self {
+            character_id,
+            timestamp,
+        })
     }
 }
 
