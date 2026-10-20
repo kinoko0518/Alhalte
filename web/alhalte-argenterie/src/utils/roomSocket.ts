@@ -24,6 +24,7 @@ import {
   labelHash,
 } from '@alhalte/pantry';
 import type { Character, LogRecord, LogSystemEvent } from '../types/index.js';
+import { normalizeAccountId } from './characterActions.js';
 import type { RoomPermissionLevel } from './session.js';
 import {
   connectionManager as defaultConnectionManager,
@@ -120,6 +121,18 @@ export const LABEL_BANQUETTE_LOG_CHARACTER_CAME = Number(
 export const LABEL_BANQUETTE_LOG_CHARACTER_GONE = Number(
   labelHash('alhalte/banquette/log/character-gone'),
 );
+
+/**
+ * Label of the owning account ID (`alhalte/maitre-d/account-id`).
+ *
+ * Banquette stores the owner of a character in `std::owner_account` with this
+ * label (8-byte little-endian `u64`); `primitive/u64` is also accepted for
+ * compatibility (Issue #228).
+ */
+export const LABEL_OWNER_ACCOUNT = Number(labelHash('alhalte/maitre-d/account-id'));
+
+/** Character attribute key carrying the owner account ID (`std::owner_account`). */
+export const KEY_OWNER_ACCOUNT = 'std::owner_account';
 
 /** Acknowledgement payload of an appended log entry (`LogEventAppended`). */
 export interface LogAppendedAck {
@@ -606,6 +619,32 @@ export function characterToTinMap(
 }
 
 /**
+ * Decodes the reserved `std::owner_account` attribute (Issue #228).
+ *
+ * Banquette accepts either the `alhalte/maitre-d/account-id` label or
+ * `primitive/u64`, and only when the payload is exactly 8 bytes
+ * (`get_character_owner` in `crates/alhalte-banquette/src/character.rs`). The
+ * value is returned as an exact decimal string because an account ID is a
+ * `u64` that may exceed `Number.MAX_SAFE_INTEGER`; a 4-byte / unknown-label
+ * payload is not an owner and decodes to `undefined`.
+ *
+ * Non-Tin values are accepted as-is for duck-typed server data.
+ */
+export function decodeOwnerAccountId(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!isTinJson(value)) {
+    return normalizeAccountId(value) ?? undefined;
+  }
+  const label = Number(value.label);
+  if (label !== LABEL_OWNER_ACCOUNT && label !== Number(LABEL_PRIMITIVE_U64)) {
+    return undefined;
+  }
+  const payload = toByteArray(value.payload);
+  if (payload.length !== 8) return undefined;
+  return readLeBytes(payload, 8).toString();
+}
+
+/**
  * Rebuilds a `Character` model from a banquette character attribute map.
  *
  * Non-Tin values are accepted as-is so duck-typed server data still renders.
@@ -635,6 +674,9 @@ export function tinMapToCharacter(
   const isNarrative = read('isNarrative');
   const placedAsPiece = read('placedAsPiece');
   const piecePosition = read('piecePosition');
+  // `std::owner_account` uses the maitre-d label, which `tinToJson` cannot
+  // decode as a primitive; read it with the dedicated decoder above.
+  const ownerAccountId = decodeOwnerAccountId(source[KEY_OWNER_ACCOUNT]);
 
   return {
     id: String(id),
@@ -656,6 +698,7 @@ export function tinMapToCharacter(
       typeof piecePosition.y === 'number'
         ? { x: piecePosition.x, y: piecePosition.y }
         : undefined,
+    ownerAccountId,
   };
 }
 

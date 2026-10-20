@@ -132,17 +132,6 @@ describe('Room-wide character synchronization (Issue #160)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-characters"]')?.click();
   }
 
-  function openSettings(target: HTMLElement): void {
-    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-settings"]')?.click();
-  }
-
-  function memberScene(target: HTMLElement, characterId: string): string {
-    return (
-      target.querySelector(`[data-testid="member-current-scene-${characterId}"]`)?.textContent?.trim() ??
-      ''
-    );
-  }
-
   // spec: argenterie/character CharacterList / CharacterInfo decode every Tin attribute (Issue #160)
   it('decodes statuses, parameters, palette, icon, color and piece position from the Tin map', () => {
     const socket = new RoomSocket({ roomId: '00000000000000ae' });
@@ -190,7 +179,10 @@ describe('Room-wide character synchronization (Issue #160)', () => {
   it('applies CharacterInfo / CharacterMoved / CharacterDeleted broadcasts on two clients', async () => {
     const socketA = new FakeRoomSocket();
     const socketB = new FakeRoomSocket();
-    const scenes = [makeScene(), makeScene({ id: 'forest', name: '森' })];
+    const scenes = [
+      makeScene({ members: ['42'] }),
+      makeScene({ id: 'forest', name: '森' }),
+    ];
     const a = mountApp(socketA, scenes, []);
     const b = mountApp(socketB, scenes, []);
     await settle(30);
@@ -263,11 +255,10 @@ describe('Room-wide character synchronization (Issue #160)', () => {
     await waitFor(
       () => fieldEntry(a.target, '42') === null && fieldEntry(b.target, '42') === null,
     );
-    openSettings(a.target);
-    openSettings(b.target);
-    await settle(30);
-    expect(memberScene(a.target, '42')).toBe('現在: 森');
-    expect(memberScene(b.target, '42')).toBe('現在: 森');
+    // The character tab's scene view lists the current scene only, so the moved
+    // row disappears from both clients without reloading.
+    expect(card(a.target, '42')).toBeNull();
+    expect(card(b.target, '42')).toBeNull();
 
     // Delete: both clients drop the row.
     for (const socket of [socketA, socketB]) {
@@ -465,32 +456,35 @@ describe('Room-wide character synchronization (Issue #160)', () => {
     expect(reverted?.style.top).toBe('100px');
   });
 
-  // spec: argenterie/offline offline member move fails without mutating members (Issue #160)
-  it('does not apply an offline member move', async () => {
+  // spec: argenterie/offline offline member move fails without mutating members (Issue #160, #228)
+  it('does not apply an offline member move from the character list', async () => {
     const socket = new FakeRoomSocket();
     socket.isConnected = false;
+    // The character tab re-queries the list on mount; keep the fixture row.
+    socket.characterListSnapshot = [{ ...HERO }];
     const scenes = [
       makeScene({ name: '広場', members: ['42'] }),
       makeScene({ id: 'scene-b', name: '森', members: [] }),
     ];
     const { target } = mountApp(socket, scenes, [{ ...HERO }]);
     await settle(30);
-    openSettings(target);
+    openCharacters(target);
     await settle(30);
 
-    const input = target.querySelector<HTMLInputElement>('[data-testid="member-target-input-42"]');
-    expect(input).toBeTruthy();
-    input!.value = '森';
-    input!.dispatchEvent(new Event('input', { bubbles: true }));
+    // 別シーンに配置 → the existing scene, then the failure is reported.
+    target.querySelector<HTMLButtonElement>('[data-testid="move-char-btn-42"]')?.click();
     await settle(20);
-    target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-42"]')?.click();
+    target
+      .querySelector<HTMLElement>('[data-testid="move-char-scene-42-scene-b"]')
+      ?.click();
     await settle(40);
 
-    expect(target.querySelector('[data-testid="scene-action-error"]')?.textContent?.trim()).toBe(
-      ERROR_MESSAGE,
-    );
+    expect(
+      target.querySelector('[data-testid="character-action-error"]')?.textContent?.trim(),
+    ).toBe(ERROR_MESSAGE);
     expect(socket.requestMoveCharacterCalls).toHaveLength(0);
-    expect(memberScene(target, '42')).toContain('現在: 広場');
+    // The member was not moved: the row still belongs to the current scene.
+    expect(card(target, '42')).toBeTruthy();
     vi.restoreAllMocks();
   });
 });
