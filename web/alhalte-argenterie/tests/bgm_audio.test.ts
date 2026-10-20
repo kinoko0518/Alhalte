@@ -34,11 +34,27 @@ import {
   type AudioElementLike,
 } from '../src/utils/audio.js';
 import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
-import type { Scene } from '../src/types/index.js';
+import type { BgmSlot, Scene } from '../src/types/index.js';
 
 const ROOM_KEY = new Uint8Array(32).fill(9);
 const TIN_A = 'a'.repeat(64);
 const TIN_B = 'b'.repeat(64);
+
+/**
+ * A BGM row with a playable track (Issue #249: a row exists iff the slot has a
+ * track, so a test that needs a row has to give it one).
+ */
+function bgmRow(slot: number, tinId: string, overrides: Partial<BgmSlot> = {}): BgmSlot {
+  return {
+    slot,
+    tinId,
+    mimeType: 'audio/ogg',
+    name: `slot-${slot}.ogg`,
+    volume: 0.8,
+    isPlaying: false,
+    ...overrides,
+  };
+}
 
 function settle(ms = 20): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -174,7 +190,7 @@ describe('BGM audio playback (Issue #164)', () => {
   it('downloads the selected track, commits after the ack, and plays one element per slot', async () => {
     const audio = createAudioHarness();
     const socket = new FakeRoomSocket();
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(2, TIN_B)] } });
     let pickerOptions: any = null;
     const { target, instance } = mountSettings(scene, socket, audio, (options) => {
       pickerOptions = options;
@@ -243,18 +259,7 @@ describe('BGM audio playback (Issue #164)', () => {
         ...createDefaultJuices(),
         bgm1: TIN_A,
         bgm1Volume: 0.5,
-        bgmSlots: [
-          {
-            slot: 1,
-            tinId: TIN_A,
-            mimeType: 'audio/ogg',
-            name: 'theme.ogg',
-            volume: 0.5,
-            isPlaying: true,
-          },
-          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
-        ],
+        bgmSlots: [bgmRow(1, TIN_A, { name: 'theme.ogg', volume: 0.5, isPlaying: true })],
       },
     });
     const { target, instance } = mountSettings(scene, socket, audio);
@@ -289,9 +294,9 @@ describe('BGM audio playback (Issue #164)', () => {
     expect(audio.elements[0].pause).toHaveBeenCalled();
     expect(audio.elements[0].paused).toBe(true);
     expect(audio.revokeObjectUrl).toHaveBeenCalledWith('blob:bgm/1');
-    // The row and its legacy mirror are gone; other slots are untouched.
+    // The row and its legacy mirror are gone (Issue #249).
     expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeNull();
-    expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([2, 3]);
+    expect(scene.juices.bgmSlots).toEqual([]);
     expect(scene.juices.bgm1).toBeUndefined();
     expect(scene.juices.bgm1Volume).toBe(0.8);
 
@@ -307,16 +312,7 @@ describe('BGM audio playback (Issue #164)', () => {
       juices: {
         ...createDefaultJuices(),
         bgmSlots: [
-          {
-            slot: 1,
-            tinId: TIN_A,
-            mimeType: 'audio/ogg',
-            name: 'old.ogg',
-            volume: 0.8,
-            isPlaying: true,
-          },
-          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+          bgmRow(1, TIN_A, { name: 'old.ogg', isPlaying: true }),
         ],
       },
     });
@@ -356,18 +352,7 @@ describe('BGM audio playback (Issue #164)', () => {
     const scene = makeScene({
       juices: {
         ...createDefaultJuices(),
-        bgmSlots: [
-          {
-            slot: 1,
-            tinId: TIN_A,
-            mimeType: 'audio/ogg',
-            name: 'theme.ogg',
-            volume: 0.8,
-            isPlaying: true,
-          },
-          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
-        ],
+        bgmSlots: [bgmRow(1, TIN_A, { name: 'theme.ogg', isPlaying: true })],
       },
     });
     const { target, instance } = mountSettings(scene, socket, audio);
@@ -404,7 +389,7 @@ describe('BGM audio playback (Issue #164)', () => {
   it('commits playing without any notice when the browser refuses autoplay', async () => {
     const audio = createAudioHarness({ blockFirstPlay: true });
     const socket = new FakeRoomSocket();
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(1, TIN_B)] } });
     let pickerOptions: any = null;
     const { target, instance } = mountSettings(scene, socket, audio, (options) => {
       pickerOptions = options;
@@ -494,7 +479,7 @@ describe('BGM audio playback (Issue #164)', () => {
   it('shows an error and does not write playing when the track cannot be decrypted', async () => {
     const audio = createAudioHarness({ failDownload: true });
     const socket = new FakeRoomSocket();
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(2, TIN_B)] } });
     let pickerOptions: any = null;
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const { target, instance } = mountSettings(scene, socket, audio, (options) => {
@@ -527,7 +512,7 @@ describe('BGM audio playback (Issue #164)', () => {
   it('shows an error and does not write playing when the room key is missing', async () => {
     const audio = createAudioHarness();
     const socket = new FakeRoomSocket();
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(1, TIN_B)] } });
     let pickerOptions: any = null;
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const target = document.createElement('div');
