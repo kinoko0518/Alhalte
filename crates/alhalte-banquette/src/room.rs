@@ -1020,6 +1020,37 @@ impl Room {
     // Client presence and lifecycle
     // -----------------------------------------------------------------------
 
+    /// Loads `scene_id` from cellar when it is currently unloaded.
+    ///
+    /// A scene keeps only its biblio and membership in `RoomData`; its memory is
+    /// dropped by [`Scene::persist_and_unload`] and rebuilt by
+    /// [`Scene::reload_if_needed`]. Any membership or log write performed while
+    /// the scene is unloaded therefore lives in memory that the next reload
+    /// overwrites, so a caller that mutates a scene it did not enter must load it
+    /// first (Issue #240: a character moved from the character list into a scene
+    /// that is not open became unaffiliated as soon as the destination was
+    /// entered).
+    ///
+    /// A missing scene or an already loaded scene is a no-op: whether a missing
+    /// scene is an error is the caller's decision (`MoveCharacter` creates it
+    /// instead). `caller_account` is the owner used for the cellar download, so
+    /// the reload keeps the same authorization as
+    /// [`Room::client_enter_scene`].
+    pub async fn ensure_scene_loaded(
+        &mut self,
+        scene_id: &str,
+        caller_account: u64,
+        cellar: &dyn CellarSink,
+    ) -> Result<()> {
+        let Some(scene) = self.scene_biblio.get_mut(scene_id) else {
+            return Ok(());
+        };
+        if scene.is_loaded {
+            return Ok(());
+        }
+        scene.reload_if_needed(cellar, Some(caller_account)).await
+    }
+
     /// Handles client entering a scene.
     ///
     /// If the scene was unloaded, restores it from cellar. Entry itself is

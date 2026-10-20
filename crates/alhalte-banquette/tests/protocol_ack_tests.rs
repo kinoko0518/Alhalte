@@ -509,6 +509,185 @@ async fn test_character_move_ack() {
 }
 
 #[tokio::test]
+// spec: alhalte-banquette/scene lifecycle MoveCharacter into an unloaded scene survives EnterScene (Issue #240)
+async fn test_character_move_into_an_unloaded_scene_survives_enter() {
+    let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
+
+    // Create the destination and close it again: the last client leaving
+    // persists and unloads every non-`/` scene.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::CreateScene {
+            scene_id: "dungeon".to_string(),
+            inherit_juices: false,
+            name: None,
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::SceneCreated { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::EnterScene {
+            scene_id: "dungeon".to_string(),
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::StateSnapshot { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::LeaveScene {
+            scene_id: "dungeon".to_string(),
+        },
+    )
+    .await;
+
+    // The character is created while no scene is current, so it joins `/`.
+    let mut data: Character = HashMap::new();
+    set_character_name(&mut data, "Hero");
+    send_frame(&mut sink, 100, ClientFrame::CreateCharacter { data }).await;
+    let (_, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::CharacterCreated { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    let character_id = match frame {
+        ServerFrame::CharacterCreated { character_id } => character_id,
+        other => panic!("expected CharacterCreated, got {other:?}"),
+    };
+
+    // Move it into the closed scene: the server must load the destination before
+    // writing the membership, or the next EnterScene restores the old tin.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::MoveCharacter {
+            character_id,
+            to_scene_id: "dungeon".to_string(),
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::CharacterMoved { .. },
+                ..
+            }
+        )
+    })
+    .await;
+
+    // Opening the destination is what used to discard the move.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::EnterScene {
+            scene_id: "dungeon".to_string(),
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::StateSnapshot { scene_id, .. },
+                ..
+            } if scene_id == "dungeon"
+        )
+    })
+    .await;
+
+    // The summary the character list reads back still knows the membership.
+    send_frame(&mut sink, 100, ClientFrame::ListScenes).await;
+    let (_, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::SceneList { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    match frame {
+        ServerFrame::SceneList { scenes } => {
+            let dungeon = scenes
+                .iter()
+                .find(|s| s.id == "dungeon")
+                .expect("dungeon is listed");
+            assert!(
+                dungeon.present_characters.contains(&character_id),
+                "the move into a closed scene must survive the enter: {dungeon:?}"
+            );
+            let root = scenes.iter().find(|s| s.id == "/").expect("/ is listed");
+            assert!(!root.present_characters.contains(&character_id));
+        }
+        other => panic!("expected SceneList, got {other:?}"),
+    }
+
+    // And the per-scene summary (`SceneInfo`) agrees with it.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::QueryScene {
+            scene_id: "dungeon".to_string(),
+        },
+    )
+    .await;
+    let (_, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::SceneInfo(_),
+                    ..
+                }
+            )
+        })
+        .await,
+    );
+    match frame {
+        ServerFrame::SceneInfo(summary) => {
+            assert_eq!(summary.id, "dungeon");
+            assert!(summary.present_characters.contains(&character_id));
+        }
+        other => panic!("expected SceneInfo, got {other:?}"),
+    }
+
+    server_task.abort();
+}
+
+#[tokio::test]
 // spec: alhalte-banquette/character room-wide CRUD + scene membership (Issue #160)
 async fn test_character_crud_broadcasts_and_scene_membership() {
     let (_dir, mut sink, mut stream, server_task) = start_test_server().await;

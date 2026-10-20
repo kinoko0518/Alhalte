@@ -1029,17 +1029,63 @@ impl BanquetteServer {
                 to_scene_id,
             } => {
                 let mut r = room.write().await;
-                // Find every scene currently holding the character (normally one,
-                // but a legacy room may list it in more than one).
+                // `move_character` implicitly creates the destination scene when missing,
+                // so the room's scene list must be re-broadcast in that case.
+                let destination_created = !r.scene_biblio.contains_key(&to_scene_id);
+
+                // Membership and log writes only touch scene memory, while a later
+                // `reload_if_needed` rebuilds that memory from the persisted tin. A
+                // write into a scene that is not open (and therefore unloaded) would
+                // be discarded on the next `EnterScene`, which is exactly how a
+                // character moved from the character list became unaffiliated
+                // (Issue #240). Load every scene this move touches before mutating
+                // anything. The destination only needs loading when it already
+                // exists: a missing one is created by `move_character` with empty,
+                // loaded state, so there is nothing to restore.
+                let mut scenes_to_load: Vec<String> = r
+                    .scene_biblio
+                    .iter()
+                    .filter(|(_, s)| s.present_characters.contains(&character_id))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                if !destination_created {
+                    scenes_to_load.push(to_scene_id.clone());
+                }
+                scenes_to_load.sort();
+                scenes_to_load.dedup();
+
+                for scene_id in &scenes_to_load {
+                    if let Err(e) = r
+                        .ensure_scene_loaded(scene_id, account_id, cellar.as_ref())
+                        .await
+                    {
+                        // No membership or log entry has been written yet, so the
+                        // character stays where it was instead of being moved into
+                        // a scene whose persisted state could not be read.
+                        send_to_client(
+                            out_tx,
+                            client_id,
+                            ServerFrame::Error {
+                                code: "MoveCharacterFailed".to_string(),
+                                message: e.to_string(),
+                            },
+                        )
+                        .await;
+                        return Ok(());
+                    }
+                }
+
+                // Recompute the sources from the now-loaded scenes: the persisted
+                // tin is authoritative, so a stale in-memory list must not produce a
+                // bogus `character-gone` log or a `SceneInfo` for a scene that does
+                // not actually hold the character (normally one source, but a
+                // legacy room may list it in more than one).
                 let former_scenes: Vec<String> = r
                     .scene_biblio
                     .iter()
                     .filter(|(_, s)| s.present_characters.contains(&character_id))
                     .map(|(id, _)| id.clone())
                     .collect();
-                // `move_character` implicitly creates the destination scene when missing,
-                // so the room's scene list must be re-broadcast in that case.
-                let destination_created = !r.scene_biblio.contains_key(&to_scene_id);
 
                 match r.move_character(account_id, character_id, &to_scene_id) {
                     Ok(()) => {
