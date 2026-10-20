@@ -12,6 +12,9 @@
  *   actions even for admins) and a reconnect retries,
  * - the offline / non-admin shell itself is never dimmed and has no
  *   `pointer-events: none`: the list stays readable and scrollable (Issue #149),
+ * - for non-admins only the row's non-interactive content (name, description,
+ *   icon, priority badge) is dimmed; the shell, the list, the scroll container
+ *   and the notices keep full contrast (Issue #244),
  * - toggle / reorder / delete send the matching state write and update the local
  *   model only after the acknowledgement (wavy `CircularProgress` while pending),
  * - a failed write leaves the list unchanged and flips the tab offline,
@@ -108,7 +111,7 @@ const markdownWasm = fs.readFileSync(
   path.resolve(__dirname, '../public/extensions/markdown.wasm'),
 );
 
-/** Raw component source, used to assert the Issue #149 shell CSS contract. */
+/** Raw component source, used to assert the Issue #149 / #244 CSS contract. */
 const EXTENSION_TAB_SOURCE = fs.readFileSync(
   path.resolve(__dirname, '../src/components/Control/tabs/ExtensionManagementTab.svelte'),
   'utf8',
@@ -119,6 +122,22 @@ function styleRule(selector: string): string | null {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const match = EXTENSION_TAB_SOURCE.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
   return match ? match[1] : null;
+}
+
+/**
+ * All rules whose selector matches `pattern`, with their declaration block.
+ *
+ * Issue #244 needs to prove that every dim declaration is guarded by
+ * `.non-admin-locked`, not just that one selector happens to exist.
+ */
+function styleRules(pattern: RegExp): { selector: string; body: string }[] {
+  const rules: { selector: string; body: string }[] = [];
+  for (const match of EXTENSION_TAB_SOURCE.matchAll(/([^{}]*)\{([^{}]*)\}/g)) {
+    const selector = match[1].trim();
+    if (selector.length === 0 || !pattern.test(selector)) continue;
+    rules.push({ selector, body: match[2] });
+  }
+  return rules;
 }
 
 function tick(ms = 20): Promise<void> {
@@ -562,6 +581,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
   });
 
   // spec: Issue #149 オフライン / 非管理者のシェルと一覧を暗転・クリック透過にしない
+  // spec: Issue #244 暗くしてよいのは行の非操作部分（.ext-name 等）だけで、シェル・一覧・通知は対象外
   it('never dims or makes the offline / non-admin shell inert in CSS', () => {
     for (const selector of [
       '.extension-tab-shell.extensions-offline',
@@ -571,6 +591,19 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
       expect(declarations).not.toMatch(/opacity\s*:/);
       expect(declarations).not.toMatch(/pointer-events\s*:/);
       expect(declarations).not.toMatch(/filter\s*:/);
+    }
+
+    // Issue #244 scoped the non-admin dim to the row content, so the shell, the
+    // list, the scroll container and the notices must still be free of it.
+    for (const selector of [
+      '.extension-tab-shell',
+      '.extension-tab-container',
+      '.extension-list-wrapper',
+      '.extension-list',
+    ]) {
+      expect(styleRule(selector) ?? '').not.toMatch(
+        /opacity\s*:|pointer-events\s*:|filter\s*:/,
+      );
     }
 
     // The list scrolls inside the tab container while the rows stay visible.
@@ -589,6 +622,124 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     // Only the loading overlay is click-through; the shell / list never are.
     expect(EXTENSION_TAB_SOURCE.match(/pointer-events\s*:/g)).toHaveLength(1);
     expect(styleRule('.extension-loading-overlay')).toContain('pointer-events: none');
+  });
+
+  // spec: Issue #244 非管理者向けのグレーアウトは行の非操作部分だけに限定する
+  // spec: ARCHITECTURE.md `### 拡張機能`（Issue #149）— タブ全体の暗転・クリック透過は禁止
+  it('dims only the non-admin row content in CSS', () => {
+    // The row's non-interactive parts are dimmed to roughly 3.6:1 on the
+    // default light theme (noticeably darker, still readable).
+    expect(styleRule('.non-admin-locked .ext-name')).toMatch(
+      /color:\s*color-mix\(in srgb, var\(--np-color-on-surface\) 60%, transparent\)/,
+    );
+    expect(styleRule('.non-admin-locked .ext-description')).toMatch(
+      /color:\s*color-mix\(in srgb, var\(--np-color-on-surface-variant\) 78%, transparent\)/,
+    );
+    expect(styleRule('.non-admin-locked .ext-icon-themed')).toContain('opacity: 0.6');
+    expect(styleRule('.non-admin-locked .priority-badge')).toContain('opacity: 0.6');
+
+    // The disabled controls are left to noph-ui's disabled tokens: dimming the
+    // row containers or the list would dim them twice.
+    for (const selector of [
+      '.non-admin-locked .ext-end-actions',
+      '.non-admin-locked .ext-start-group',
+      '.non-admin-locked .extension-item-row',
+      '.non-admin-locked .extension-list',
+      '.non-admin-locked .extension-tab-container',
+      '.non-admin-locked .extension-tab-shell',
+    ]) {
+      expect(styleRule(selector)).toBeNull();
+    }
+
+    // Scope invariant: every dim declaration that touches the row content is
+    // guarded by `.non-admin-locked`, so the admin view stays pixel-identical.
+    const rowContentRules = styleRules(
+      /\.(?:ext-name|ext-description|ext-icon-themed|priority-badge)\b/,
+    );
+    expect(rowContentRules.length).toBeGreaterThan(0);
+    const dimmedRules = rowContentRules.filter((rule) => /opacity\s*:|color-mix\(/.test(rule.body));
+    expect(dimmedRules).toHaveLength(4);
+    for (const rule of dimmedRules) {
+      expect(rule.selector).toContain('.non-admin-locked');
+    }
+
+    // Full contrast: the shell, the scroll container, the lock indicator, the
+    // offline notice and the "wasm がありません" warning are not dimmed.
+    for (const selector of [
+      '.extension-tab-shell',
+      '.extension-tab-container',
+      '.extension-list-wrapper',
+      '.extension-list',
+      '.extension-offline-notice',
+      '.lock-indicator',
+      '.ext-wasm-missing',
+    ]) {
+      expect(styleRule(selector) ?? '').not.toMatch(
+        /opacity\s*:|pointer-events\s*:|filter\s*:/,
+      );
+    }
+
+    // The dim is a colour change only: no click-through surface is added and
+    // the loading overlay stays the single `pointer-events: none` rule.
+    expect(EXTENSION_TAB_SOURCE.match(/pointer-events\s*:/g)).toHaveLength(1);
+    expect(styleRule('.extension-loading-overlay')).toContain('pointer-events: none');
+  });
+
+  // spec: Issue #244 非管理者（participant）は行の内容が暗くなるが一覧は読める
+  // spec: Issue #149 一覧・通知はスクロールと閲覧ができ、無効なのは操作だけ
+  it('dims the row content for a participant while keeping the list readable', async () => {
+    const socket = new FakeRoomSocket();
+    mountApp(socket, 'connected', [], false);
+    await tick(30);
+    openExtensionsTab();
+    await tick(40);
+
+    const root = extensionTabRoot()!;
+    // The `non-admin-locked` class that scopes the Issue #244 dim.
+    expect(root.classList.contains('non-admin-locked')).toBe(true);
+    // The shell itself is never disabled, dimmed or inert (Issue #149).
+    expect(root.getAttribute('aria-disabled')).toBeNull();
+    expect(root.getAttribute('inert')).toBeNull();
+    expect(root.querySelectorAll('[inert]')).toHaveLength(0);
+    expect(root.querySelector('[data-testid="lock-indicator"]')?.textContent).toContain(
+      '管理者のみ操作可能',
+    );
+
+    // The dim selectors resolve against the rendered rows, and the rows keep
+    // their text (dimmed, not hidden).
+    expect(root.querySelector('.non-admin-locked .ext-name')).toBeTruthy();
+    expect(root.querySelector('.non-admin-locked .ext-description')).toBeTruthy();
+    expect(root.querySelector('.non-admin-locked .ext-icon-themed')).toBeTruthy();
+    expect(root.querySelector('.non-admin-locked .priority-badge')).toBeTruthy();
+    expect(extName('alhalte-dsl')).toBe('Alhalte DSL');
+    expect(
+      target.querySelector('[data-testid="ext-description-alhalte-dsl"]')?.textContent?.trim(),
+    ).toBeTruthy();
+
+    // The list is still inside the scrollable container and not hidden from AT.
+    const list = target.querySelector('[data-testid="extension-list"]');
+    expect(list).toBeTruthy();
+    expect(list?.getAttribute('aria-hidden')).toBeNull();
+    expect(root.querySelector('.extension-tab-container')?.contains(list)).toBe(true);
+
+    // Admin-only mutations are absent; the remaining ones are disabled.
+    expect(target.querySelector('[data-testid="upload-extension-btn"]')).toBeNull();
+    expect(target.querySelector('[data-testid="move-up-btn-alhalte-dsl"]')).toBeNull();
+    expect(target.querySelector('[data-testid="move-down-btn-alhalte-dsl"]')).toBeNull();
+    expect(toggle('alhalte-dsl')?.disabled).toBe(true);
+    expect(toggle('alhalte-dsl')?.getAttribute('aria-disabled')).toBe('true');
+  });
+
+  // spec: Issue #244 管理者ビューには非管理者用の暗転が一切掛からない
+  it('never marks the admin view with the non-admin dim class', async () => {
+    const socket = new FakeRoomSocket();
+    await mountAndOpen(socket);
+
+    const root = extensionTabRoot()!;
+    expect(root.classList.contains('non-admin-locked')).toBe(false);
+    expect(root.querySelector('[data-testid="lock-indicator"]')).toBeNull();
+    expect(root.querySelector('[data-testid="upload-extension-btn"]')).toBeTruthy();
+    expect(toggle('alhalte-dsl')?.disabled).toBe(false);
   });
 
   // spec: Issue #145 アップロードは検証→cellar 保存→state 更新の順で行い、wasm は state に載せない
