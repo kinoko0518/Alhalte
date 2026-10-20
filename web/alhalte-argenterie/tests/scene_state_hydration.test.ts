@@ -223,7 +223,7 @@ describe('Scene state hydration (Issue #159)', () => {
     expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="bgm-slot-block-4"]')).toBeTruthy();
     const slot4Play = target.querySelector<HTMLElement>('[data-testid="bgm-play-btn-4"]');
-    expect(slot4Play?.getAttribute('aria-label')).toBe('BGM停止');
+    expect(slot4Play?.getAttribute('aria-label')).toBe('BGM一時停止');
     expect(inputValue(target, 'bgm-slider-4')).toBe('50');
 
     // Re-applying the same snapshot (reconnect / scene switch) is idempotent:
@@ -272,7 +272,7 @@ describe('Scene state hydration (Issue #159)', () => {
     expect(target.querySelector('[data-testid="bgm-slot-block-3"]')).toBeNull();
     expect(
       target.querySelector('[data-testid="bgm-play-btn-2"]')?.getAttribute('aria-label'),
-    ).toBe('BGM停止');
+    ).toBe('BGM一時停止');
     expect(cellar.downloadTin).toHaveBeenCalledWith(BGM_SLOT_4_TIN, ROOM_KEY);
 
     unmount(instance);

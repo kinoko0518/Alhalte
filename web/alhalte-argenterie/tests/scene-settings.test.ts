@@ -666,7 +666,7 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
       StateUpdated: { scene_id: '/', key: 'bgm::1::playing', value: jsonToTin(true) },
     });
     await settle();
-    expect(play1()?.getAttribute('aria-label')).toBe('BGM停止');
+    expect(play1()?.getAttribute('aria-label')).toBe('BGM一時停止');
 
     // New slot keys `std::bgm2` / `std::bgm3` with the current track shape.
     socket.emitFrame({
@@ -680,7 +680,7 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
       StateUpdated: { scene_id: '/', key: 'bgm::2::playing', value: jsonToTin(true) },
     });
     await settle();
-    expect(play2()?.getAttribute('aria-label')).toBe('BGM停止');
+    expect(play2()?.getAttribute('aria-label')).toBe('BGM一時停止');
 
     // A plain legacy string value is still accepted.
     socket.emitFrame({
@@ -690,7 +690,7 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
       StateUpdated: { scene_id: '/', key: 'bgm::3::playing', value: jsonToTin(true) },
     });
     await settle();
-    expect(play3()?.getAttribute('aria-label')).toBe('BGM停止');
+    expect(play3()?.getAttribute('aria-label')).toBe('BGM一時停止');
 
     // Volume keys update the slot volume shown next to the slider.
     socket.emitFrame({
@@ -707,8 +707,8 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
     await settle();
     expect(play1()).toBeNull();
     // The other slots keep their own row.
-    expect(play2()?.getAttribute('aria-label')).toBe('BGM停止');
-    expect(play3()?.getAttribute('aria-label')).toBe('BGM停止');
+    expect(play2()?.getAttribute('aria-label')).toBe('BGM一時停止');
+    expect(play3()?.getAttribute('aria-label')).toBe('BGM一時停止');
 
     unmount(instance);
     target.remove();
@@ -779,7 +779,7 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
     ).toBe('30%');
     expect(
       target.querySelector('[data-testid="bgm-play-btn-1"]')?.getAttribute('aria-label'),
-    ).toBe('BGM停止');
+    ).toBe('BGM一時停止');
 
     unmount(instance);
     target.remove();

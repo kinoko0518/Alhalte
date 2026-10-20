@@ -89,6 +89,24 @@ export interface BgmSlot {
    */
   isPlaying: boolean;
   name?: string; // Optional track name / description
+  /**
+   * UNIX milliseconds (wall clock) when the current continuous playback started
+   * (`bgm::<slot>::started_at`, Issue #250).
+   *
+   * The playback position is derived from it, so every client joining a playing
+   * slot seeks to the same offset. A legacy room without the key has no
+   * `startedAt` and starts at 0.
+   */
+  startedAt?: number;
+  /**
+   * UNIX milliseconds (wall clock) when the slot was paused
+   * (`bgm::<slot>::paused_at`, Issue #250).
+   *
+   * Deleted while playing, so `undefined` means "playing (or never paused)".
+   * The paused position is `pausedAt - startedAt` and resuming rewrites
+   * `startedAt` to keep it.
+   */
+  pausedAt?: number;
 }
 
 /**

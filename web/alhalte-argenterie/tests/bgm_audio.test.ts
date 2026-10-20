@@ -4,22 +4,23 @@
  * Covers:
  * - selecting a track downloads / decrypts the tin and plays through one
  *   `HTMLAudioElement` per slot after the server ack,
- * - stop pauses and revokes the object URL while keeping the selection,
+ * - pausing stops the sound but keeps the prepared source, so a resume does not
+ *   download the tin again (Issue #250),
  * - volume changes reach `element.volume`,
  * - remote `bgm::<slot>::playing` / track updates apply to App,
- * - a scene switch pauses and revokes the previous scene's audio,
+ * - a scene switch stops and revokes the previous scene's audio,
  * - autoplay rejection is silent: the slot stays prepared and `paused` with no
  *   error and no user-facing notice (Issue #248),
  * - a missing / undecryptable tin shows the error and never writes `playing`,
  * - the legacy bare 64-hex track state still plays,
- * - deleting a slot stops and revokes its playback (Issue #226).
+ * - deleting a slot stops and revokes its playback (Issue #226 / #250).
  *
  * No network: the audio manager is injected with a fake downloader and
  * `HTMLAudioElement`; the socket is `tests/helpers/fakeRoomSocket.ts`.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### BGM`
- * - GitHub Issue #164, GitHub Issue #248
+ * - GitHub Issue #164, GitHub Issue #248, GitHub Issue #250
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
@@ -235,16 +236,24 @@ describe('BGM audio playback (Issue #164)', () => {
     expect(slot2?.tinId).toBe(TIN_A);
     expect(slot2?.isPlaying).toBe(true);
 
-    // Stop: ack `playing=false`, pause and revoke, keep the selection.
+    // Pause: ack `playing=false` + `paused_at`, keep the selection and the
+    // prepared source (Issue #250: a resume must not download again).
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-2"]')!.click();
     await settle(30);
     expect(
       trackStateUpdater(socket.requestUpdateStateCalls, 'bgm::2::playing')?.value,
     ).toBe(false);
     expect(audio.elements[0].pause).toHaveBeenCalled();
-    expect(audio.revokeObjectUrl).toHaveBeenCalledWith(expect.stringContaining('blob:bgm/'));
+    expect(audio.revokeObjectUrl).not.toHaveBeenCalled();
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 2)?.tinId).toBe(TIN_A);
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 2)?.isPlaying).toBe(false);
+    expect(audio.download).toHaveBeenCalledTimes(1);
+
+    // Resume: plays the very same prepared element, without a second download.
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-2"]')!.click();
+    await settle(30);
+    expect(audio.elements[0].play).toHaveBeenCalledTimes(2);
+    expect(audio.download).toHaveBeenCalledTimes(1);
 
     unmount(instance);
     target.remove();
@@ -278,10 +287,12 @@ describe('BGM audio playback (Issue #164)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.click();
     await settle(30);
 
-    // Track DeleteState + playing=false + volume DeleteState + removal marker
-    // (Issue #226).
+    // Track DeleteState + started_at / paused_at deletes + playing=false +
+    // volume DeleteState + removal marker (Issue #226 / #250).
     expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
       'std::bgm',
+      'bgm::1::started_at',
+      'bgm::1::paused_at',
       'bgm::1::volume',
     ]);
     expect(
@@ -586,13 +597,13 @@ describe('BGM audio synchronization (Issue #164)', () => {
     expect(audio.elements[0].src).toContain('blob:bgm/');
     expect(audio.elements[0].volume).toBeCloseTo(0.3, 5);
 
-    // Remote stop: pause + revoke. The track selection is retained, which the
-    // next play proves by reusing the same tin.
+    // Remote pause: the element stops but its prepared source stays, so the
+    // resume below does not download the tin again (Issue #250).
     socket.emitFrame({
       StateUpdated: { scene_id: '/', key: 'bgm::1::playing', value: jsonToTin(false) },
     });
     await waitFor(() => audio.elements[0].pause.mock.calls.length > 0);
-    expect(audio.revokeObjectUrl).toHaveBeenCalled();
+    expect(audio.revokeObjectUrl).not.toHaveBeenCalled();
     expect(
       audio.download.mock.calls.filter((call) => call[0] === TIN_A),
     ).toHaveLength(1);
@@ -600,9 +611,12 @@ describe('BGM audio synchronization (Issue #164)', () => {
     socket.emitFrame({
       StateUpdated: { scene_id: '/', key: 'bgm::1::playing', value: jsonToTin(true) },
     });
-    await waitFor(
-      () => audio.download.mock.calls.filter((call) => call[0] === TIN_A).length === 2,
-    );
+    await waitFor(() => audio.elements[0].play.mock.calls.length >= 2);
+    expect(audio.elements[0].play.mock.calls.length).toBeGreaterThanOrEqual(2);
+    // Still one download: the paused source was reused.
+    expect(
+      audio.download.mock.calls.filter((call) => call[0] === TIN_A),
+    ).toHaveLength(1);
 
     // Remote track change while stopped updates the selection; the next play
     // downloads the new tin instead of the previous one.

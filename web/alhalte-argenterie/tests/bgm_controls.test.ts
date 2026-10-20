@@ -32,6 +32,21 @@ async function settle(ms = 20): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Answers the sequential transport writes of `SceneSettingsTab` (Issue #250):
+ * `started_at` -> delete `paused_at` -> `playing` for a play, one ack at a time.
+ */
+async function answerBgmWrites(socket: FakeRoomSocket, max = 8): Promise<void> {
+  for (let index = 0; index < max; index += 1) {
+    if (socket.pendingStateOperationCount === 0) {
+      await settle(0);
+      if (socket.pendingStateOperationCount === 0) return;
+    }
+    socket.resolveStateWrite();
+    await settle(0);
+  }
+}
+
 function makeScene(overrides?: Partial<Scene>): Scene {
   return {
     id: 'scene-bgm-connected',
@@ -48,8 +63,8 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     clearAssets();
   });
 
-  // spec: argenterie/bgm-controls 制御行レイアウト順序 [停止/再生] [選択] [音量バー] およびボタン幅
-  it('renders BGM control row in order: [Play/Stop button] [Select button] [Volume slider], and Play/Stop button has narrower width', async () => {
+  // spec: Issue #250 接続ボタングループ ( ⏪ ] [ ▶️ ]/[ ⏸️ ] [ 🎵 ) %volume% (🗑️) の構成
+  it('renders the transport as a connected group (restart / play-pause / select), then volume, then delete', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -75,36 +90,59 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     const row1 = target.querySelector<HTMLElement>('[data-testid="bgm-row-1"]');
     expect(row1).toBeTruthy();
 
+    const group = target.querySelector<HTMLElement>('[data-testid="bgm-transport-group-1"]');
+    const restartBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-restart-btn-1"]');
     const playBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]');
     const selectBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-select-btn-1"]');
     const sliderWrapper = target.querySelector<HTMLElement>('[data-testid="bgm-slider-wrapper-1"]');
     const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]');
 
+    expect(group).toBeTruthy();
+    expect(restartBtn).toBeTruthy();
     expect(playBtn).toBeTruthy();
     expect(selectBtn).toBeTruthy();
     expect(sliderWrapper).toBeTruthy();
     expect(deleteBtn).toBeTruthy();
 
-    // Verify DOM order: playBtn -> selectBtn -> sliderWrapper -> deleteBtn
+    // The transport group is the connected M3 ButtonGroup holding the three
+    // icon buttons in the requested order.
+    expect(group!.classList.contains('np-button-group')).toBe(true);
+    expect(group!.classList.contains('connected')).toBe(true);
+    expect(group!.getAttribute('role')).toBe('group');
+    expect(group!.getAttribute('aria-label')).toBe('BGMトランスポート');
+    expect(
+      Array.from(group!.children)
+        .filter((child) => (child as HTMLElement).matches('button'))
+        .map((child) => (child as HTMLElement).dataset.testid),
+    ).toEqual(['bgm-restart-btn-1', 'bgm-play-btn-1', 'bgm-select-btn-1']);
+
+    // Row order: transport group -> volume slider -> delete.
     const children = Array.from(row1!.children);
-    const playIndex = children.indexOf(playBtn!);
-    const selectIndex = children.indexOf(selectBtn!);
+    const groupIndex = children.indexOf(group!);
     const sliderIndex = children.indexOf(sliderWrapper!);
     const deleteIndex = children.indexOf(deleteBtn!);
-
-    expect(playIndex).toBeLessThan(selectIndex);
-    expect(selectIndex).toBeLessThan(sliderIndex);
+    expect(groupIndex).toBeLessThan(sliderIndex);
     expect(sliderIndex).toBeLessThan(deleteIndex);
     // The delete button is the last control in the row (the tooltip element
     // noph-ui renders next to it is not a control).
     expect(Array.from(row1!.querySelectorAll('button')).at(-1)).toBe(deleteBtn);
 
     // Verify M3 IconButton components used
+    expect(restartBtn!.classList.contains('np-icon-button')).toBe(true);
     expect(playBtn!.classList.contains('np-icon-button')).toBe(true);
     expect(selectBtn!.classList.contains('np-icon-button')).toBe(true);
     expect(deleteBtn!.classList.contains('np-icon-button')).toBe(true);
 
-    // Verify narrower width for Play/Stop button compared to 1:1 square Select button
+    // Issue #250: ⏪ replay, ▶️ play_arrow + aria-pressed, 🎵 music_note.
+    expect(restartBtn!.getAttribute('aria-label')).toBe('最初から再生');
+    expect(restartBtn!.textContent).toContain('replay');
+    expect(playBtn!.getAttribute('aria-label')).toBe('BGM再生');
+    expect(playBtn!.getAttribute('aria-pressed')).toBe('false');
+    expect(playBtn!.textContent).toContain('play_arrow');
+    expect(selectBtn!.getAttribute('aria-label')).toBe('BGM選択');
+    expect(selectBtn!.textContent).toContain('music_note');
+
+    // The play/pause button stays narrower than the 1:1 square select button.
     expect(playBtn!.classList.contains('narrow')).toBe(true);
     expect(playBtn!.classList.contains('narrow-btn')).toBe(true);
     expect(selectBtn!.classList.contains('square-btn')).toBe(true);
@@ -174,12 +212,14 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     const playBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]');
     expect(playBtn).toBeTruthy();
 
-    // Currently playing: aria-label is "BGM停止" and icon is "stop"
-    expect(playBtn!.getAttribute('aria-label')).toBe('BGM停止');
-    expect(playBtn!.textContent).toContain('stop');
+    // Currently playing: aria-label is "BGM一時停止", aria-pressed and icon pause
+    expect(playBtn!.getAttribute('aria-label')).toBe('BGM一時停止');
+    expect(playBtn!.getAttribute('aria-pressed')).toBe('true');
+    expect(playBtn!.textContent).toContain('pause');
 
-    // 1. Click to stop -> the selected track stays, isPlaying becomes false
-    //    (Issue #164: stopping no longer deletes `std::bgm`).
+    // 1. Click to pause -> the selected track stays, isPlaying becomes false
+    //    (Issue #164: stopping no longer deletes `std::bgm`; Issue #250: the
+    //    paused position is recorded in `paused_at`).
     playBtn!.click();
     await new Promise((r) => setTimeout(r, 20));
 
@@ -187,20 +227,25 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     const updatedSlot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
     expect(updatedSlot1?.tinId).toBe(TIN_ID_A);
     expect(updatedSlot1?.isPlaying).toBe(false);
+    expect(updatedSlot1?.pausedAt).toBeGreaterThan(0);
 
     // Label and icon toggle to "BGM再生" and "play_arrow"
     expect(playBtn!.getAttribute('aria-label')).toBe('BGM再生');
+    expect(playBtn!.getAttribute('aria-pressed')).toBe('false');
     expect(playBtn!.textContent).toContain('play_arrow');
 
-    // 2. Click to resume play -> the same track starts again
+    // 2. Click to resume play -> the same track starts from the paused position
     playBtn!.click();
     await new Promise((r) => setTimeout(r, 20));
 
     const resumedSlot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
     expect(resumedSlot1?.tinId).toBe(TIN_ID_A);
     expect(resumedSlot1?.isPlaying).toBe(true);
-    expect(playBtn!.getAttribute('aria-label')).toBe('BGM停止');
-    expect(playBtn!.textContent).toContain('stop');
+    expect(resumedSlot1?.pausedAt).toBeUndefined();
+    expect(resumedSlot1?.startedAt).toBeGreaterThan(0);
+    expect(playBtn!.getAttribute('aria-label')).toBe('BGM一時停止');
+    expect(playBtn!.getAttribute('aria-pressed')).toBe('true');
+    expect(playBtn!.textContent).toContain('pause');
 
     unmount(instance);
     target.remove();
@@ -464,7 +509,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     return { target, instance };
   }
 
-  // spec: argenterie/bgm-controls 再生/停止はUpdateState/DeleteStateを送り、ack後にのみローカル確定
+  // spec: Issue #250 再生は track → started_at → paused_at 削除 → playing の順に ack する
   it('sends UpdateState for play, shows the wavy spinner while pending, and commits only after the ack', async () => {
     const scene = makeScene({
       juices: {
@@ -491,36 +536,50 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     playBtn.click();
     await settle(0);
 
-    // The playback intent is in flight and the select icon is the wavy spinner.
-    const playingWrite = socket.requestUpdateStateCalls.find(
-      (call) => call.key === 'bgm::1::playing',
-    );
-    expect(playingWrite?.value).toBe(true);
-    // The track is already stored, so it is not rewritten.
+    // Issue #250: the position (`started_at`) is written before the playback
+    // intent. The track is already stored, so it is not rewritten.
+    expect(socket.requestUpdateStateCalls.map((call) => call.key)).toEqual([
+      'bgm::1::started_at',
+    ]);
+    expect(typeof socket.requestUpdateStateCalls[0].value).toBe('number');
     expect(socket.requestUpdateStateCalls.some((call) => call.key === 'std::bgm')).toBe(false);
+    // The state writes are sequential: exactly one is in flight at a time.
+    expect(socket.pendingStateOperationCount).toBe(1);
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
     expect(selectBtn.disabled).toBe(true);
     expect(playBtn.disabled).toBe(true);
-    // The play/stop icon itself is not replaced.
-    expect(playBtn.textContent).toContain('play_arrow');
+    // Every transport button shows the wavy spinner while the slot is pending
+    // (the play/pause icon is replaced, like the select icon).
+    expect(target.querySelector('[data-testid="bgm-pending-play-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-pending-restart-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-pending-delete-1"]')).toBeTruthy();
     expect(updateCount).toBe(0);
 
-    // The StateUpdated ack arrives: the local model is committed once.
-    socket.resolveStateWrite();
-    await settle();
+    // Every ack arrives: the local model is committed once, and the write order
+    // is `started_at` -> delete `paused_at` -> `playing=true`.
+    await answerBgmWrites(socket);
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeNull();
     expect(updateCount).toBe(1);
+    expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
+      'bgm::1::paused_at',
+    ]);
+    expect(socket.requestUpdateStateCalls.map((call) => call.key)).toEqual([
+      'bgm::1::started_at',
+      'bgm::1::playing',
+    ]);
+    expect(socket.requestUpdateStateCalls[1].value).toBe(true);
     const slot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
     expect(slot1?.tinId).toBe(TIN_ID_A);
     expect(slot1?.isPlaying).toBe(true);
-    expect(playBtn.getAttribute('aria-label')).toBe('BGM停止');
+    expect(slot1?.startedAt).toBeGreaterThan(0);
+    expect(playBtn.getAttribute('aria-label')).toBe('BGM一時停止');
 
     unmount(instance);
     target.remove();
   });
 
-  // spec: argenterie/bgm-controls 停止は bgm::<slot>::playing=false (Issue #164)
-  it('sends playing=false when stopping a playing slot', async () => {
+  // spec: Issue #250 一時停止は paused_at → playing=false の順に書く
+  it('sends paused_at then playing=false when pausing a playing slot', async () => {
     const scene = makeScene({
       juices: {
         ...createDefaultJuices(),
@@ -540,24 +599,32 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     });
 
     const playBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]')!;
-    expect(playBtn.getAttribute('aria-label')).toBe('BGM停止');
+    expect(playBtn.getAttribute('aria-label')).toBe('BGM一時停止');
 
     playBtn.click();
     await settle(0);
 
+    // `paused_at = now` freezes the position before the intent flips.
+    expect(socket.requestUpdateStateCalls.map((call) => call.key)).toEqual([
+      'bgm::1::paused_at',
+    ]);
+    expect(typeof socket.requestUpdateStateCalls[0].value).toBe('number');
     expect(socket.requestDeleteStateCalls).toHaveLength(0);
-    expect(socket.requestUpdateStateCalls).toHaveLength(1);
-    expect(socket.requestUpdateStateCalls[0].key).toBe('bgm::1::playing');
-    expect(socket.requestUpdateStateCalls[0].value).toBe(false);
     expect(lastUpdatedScene).toBeNull();
 
-    socket.resolveStateWrite();
-    await settle();
+    await answerBgmWrites(socket);
 
+    expect(socket.requestUpdateStateCalls.map((call) => call.key)).toEqual([
+      'bgm::1::paused_at',
+      'bgm::1::playing',
+    ]);
+    expect(socket.requestUpdateStateCalls[1].value).toBe(false);
     const slot1 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 1);
-    // Issue #164: the track stays selected while stopped.
+    // Issue #164: the track stays selected while paused; Issue #250: the paused
+    // instant is recorded so every client freezes the same position.
     expect(slot1?.tinId).toBe(TIN_ID_A);
     expect(slot1?.isPlaying).toBe(false);
+    expect(slot1?.pausedAt).toBeGreaterThan(0);
     expect(lastUpdatedScene!.juices.bgm1).toBe(TIN_ID_A);
     expect(playBtn.getAttribute('aria-label')).toBe('BGM再生');
 
@@ -589,6 +656,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]')!.click();
     await settle(0);
 
+    // The first write (`started_at`) fails: the following writes are never sent.
     socket.rejectStateWrite(new OperationTimeoutError('updateState', 8000));
     await settle();
 
@@ -597,13 +665,17 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     const slot1 = scene.juices.bgmSlots?.find((s) => s.slot === 1);
     expect(slot1?.tinId).toBe(TIN_ID_A);
     expect(slot1?.isPlaying).toBe(true);
+    expect(socket.requestUpdateStateCalls.map((call) => call.key)).toEqual([
+      'bgm::1::paused_at',
+    ]);
+    expect(socket.requestDeleteStateCalls).toHaveLength(0);
     const error = target.querySelector<HTMLElement>('[data-testid="bgm-error-1"]');
     expect(error?.getAttribute('role')).toBe('status');
     expect(error?.textContent).toContain(ERROR_MESSAGE);
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeNull();
     expect(
       target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]')!.getAttribute('aria-label'),
-    ).toBe('BGM停止');
+    ).toBe('BGM一時停止');
 
     warn.mockRestore();
     unmount(instance);
@@ -761,29 +833,38 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     requestedOptions.onSelect(audioAsset.dataUrl, audioAsset);
     await settle(0);
 
-    const playingWrite = socket.requestUpdateStateCalls.find(
-      (call) => call.key === 'bgm::2::playing',
-    );
+    // Issue #250: selecting a track writes the new track, then `started_at`,
+    // deletes `paused_at` and finally flips `playing`; one ack at a time.
     const trackWrite = socket.requestUpdateStateCalls.find((call) => call.key === 'std::bgm2');
-    expect(playingWrite?.value).toBe(true);
     expect(trackWrite?.value).toMatchObject({
       tinId: TIN_ID_B,
       mimeType: 'audio/ogg',
       name: 'tin_track.ogg',
     });
     expect(trackWrite?.value).not.toBe(audioAsset.dataUrl);
+    expect(socket.requestUpdateStateCalls.map((call) => call.key)).toEqual(['std::bgm2']);
     expect(target.querySelector('[data-testid="bgm-pending-2"]')).toBeTruthy();
     expect(updateCount).toBe(0);
 
-    socket.resolveStateWrite();
-    socket.resolveStateWrite();
-    await settle();
+    await answerBgmWrites(socket);
+
+    expect(socket.requestUpdateStateCalls.map((call) => call.key)).toEqual([
+      'std::bgm2',
+      'bgm::2::started_at',
+      'bgm::2::playing',
+    ]);
+    expect(socket.requestUpdateStateCalls[2].value).toBe(true);
+    expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
+      'bgm::2::paused_at',
+    ]);
 
     const slot2 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 2);
     expect(slot2?.tinId).toBe(TIN_ID_B);
     expect(slot2?.mimeType).toBe('audio/ogg');
     expect(slot2?.name).toBe('tin_track.ogg');
     expect(slot2?.isPlaying).toBe(true);
+    expect(slot2?.startedAt).toBeGreaterThan(0);
+    expect(slot2?.pausedAt).toBeUndefined();
     expect(updateCount).toBe(1);
 
     unmount(instance);
@@ -880,8 +961,8 @@ describe('BGM slot deletion (Issue #226)', () => {
     return { target, instance };
   }
 
-  // spec: argenterie/bgm-controls 削除はtrack DeleteState / playing=false / volume DeleteStateのack後に確定
-  it('deletes the slot only after the track / playing / volume acks and clears the legacy fields', async () => {
+  // spec: Issue #250 削除は track / started_at / paused_at / volume の削除と playing=false の ack 後に確定
+  it('deletes the slot only after the track / playing / transport / volume acks and clears the legacy fields', async () => {
     const scene = playableScene();
     const socket = new FakeRoomSocket();
     socket.autoAnswerStateWrites = false;
@@ -900,20 +981,22 @@ describe('BGM slot deletion (Issue #226)', () => {
     deleteBtn.click();
     await settle(0);
 
-    // The three NONE writes are in flight; a second press is ignored.
+    // The five NONE writes are in flight; a second press is ignored.
     deleteBtn.click();
     await settle(0);
-    expect(socket.pendingStateOperationCount).toBe(3);
+    expect(socket.pendingStateOperationCount).toBe(5);
     expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
       'std::bgm',
+      'bgm::1::started_at',
+      'bgm::1::paused_at',
       'bgm::1::volume',
     ]);
     expect(socket.requestUpdateStateCalls).toHaveLength(1);
     expect(socket.requestUpdateStateCalls[0].key).toBe('bgm::1::playing');
     expect(socket.requestUpdateStateCalls[0].value).toBe(false);
     expect(socket.requestDeleteStateCalls[0].sceneId).toBe(scene.id);
-    // Issue #226: the persistent removal marker is only sent after the three
-    // NONE writes succeeded, never in the same batch.
+    // Issue #226: the persistent removal marker is only sent after the NONE
+    // writes succeeded, never in the same batch.
     expect(
       socket.requestUpdateStateCalls.some((call) => call.key === 'bgm::1::removed'),
     ).toBe(false);
@@ -925,6 +1008,8 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(scene.juices.bgm1).toBe(TIN_ID_A);
     expect(scene.juices.bgmRemovedSlots ?? []).not.toContain(1);
 
+    socket.resolveStateWrite();
+    socket.resolveStateWrite();
     socket.resolveStateWrite();
     socket.resolveStateWrite();
     await settle();
@@ -979,7 +1064,9 @@ describe('BGM slot deletion (Issue #226)', () => {
     await settle(0);
 
     socket.rejectDeleteState(new OperationTimeoutError('deleteState', 8000));
-    // The other two NONE requests settle successfully; the batch still fails.
+    // The other four NONE requests settle successfully; the batch still fails.
+    socket.resolveStateWrite();
+    socket.resolveStateWrite();
     socket.resolveStateWrite();
     socket.resolveStateWrite();
     await settle();
@@ -1022,6 +1109,8 @@ describe('BGM slot deletion (Issue #226)', () => {
     await settle(0);
 
     socket.resolveStateWrite(); // track DeleteState
+    socket.resolveStateWrite(); // started_at DeleteState
+    socket.resolveStateWrite(); // paused_at DeleteState
     socket.rejectStateWrite(new OperationTimeoutError('updateState', 8000)); // playing
     socket.resolveStateWrite(); // volume DeleteState
     await settle();
@@ -1051,6 +1140,8 @@ describe('BGM slot deletion (Issue #226)', () => {
     await settle(0);
 
     socket.resolveStateWrite(); // track DeleteState
+    socket.resolveStateWrite(); // started_at DeleteState
+    socket.resolveStateWrite(); // paused_at DeleteState
     socket.rejectDeleteState(new OperationTimeoutError('deleteState', 8000)); // volume
     socket.resolveStateWrite(); // playing UpdateState
     await settle();
@@ -1206,10 +1297,12 @@ describe('BGM slot deletion (Issue #226)', () => {
     requestedOptions.onSelect(undefined, undefined);
     await settle();
 
-    // Same writes as 🗑️ (Issue #249): the track / volume / playing keys are
-    // deleted and the persistent tombstone is written.
+    // Same writes as 🗑️ (Issue #249 / #250): the track / volume / transport
+    // timestamp keys are deleted and the persistent tombstone is written.
     expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
       'std::bgm',
+      'bgm::1::started_at',
+      'bgm::1::paused_at',
       'bgm::1::volume',
     ]);
     expect(

@@ -60,7 +60,7 @@
     SCENE_NAME_STATE_KEY,
     setBgmSlotRemoved,
   } from '../utils/sceneSettings.js';
-  import { createAudioManager, type AudioManager } from '../utils/audio.js';
+  import { computeBgmOffsetMs, createAudioManager, type AudioManager } from '../utils/audio.js';
   import { applyThemeToDocument } from '../utils/theme.js';
   import {
     DEFAULT_OFFICIAL_EXTENSIONS,
@@ -1430,6 +1430,12 @@
   /** Scene-state key marking a slot as deleted from the UI (Issue #226). */
   const BGM_REMOVED_STATE_KEY = /^bgm::(\d+)::removed$/;
 
+  /** Scene-state key carrying a slot's wall-clock playback start (Issue #250). */
+  const BGM_STARTED_AT_STATE_KEY = /^bgm::(\d+)::started_at$/;
+
+  /** Scene-state key carrying a slot's wall-clock pause instant (Issue #250). */
+  const BGM_PAUSED_AT_STATE_KEY = /^bgm::(\d+)::paused_at$/;
+
   /** `piece::<characterId>::placed` and `piece::<characterId>::pos` keys. */
   const PIECE_PLACED_STATE_KEY = /^piece::(.+)::placed$/;
   const PIECE_POS_STATE_KEY = /^piece::(.+)::pos$/;
@@ -1454,13 +1460,32 @@
       bgmSlotFromStateKey(key) !== null ||
       BGM_VOLUME_STATE_KEY.test(key) ||
       BGM_PLAYING_STATE_KEY.test(key) ||
-      BGM_REMOVED_STATE_KEY.test(key)
+      BGM_REMOVED_STATE_KEY.test(key) ||
+      BGM_STARTED_AT_STATE_KEY.test(key) ||
+      BGM_PAUSED_AT_STATE_KEY.test(key)
     );
   }
 
   /** Decodes the boolean Tins used by `playing` and `removed`. */
   function isTruthyBgmStateValue(value: unknown): boolean {
     return value === true || value === 'true' || value === 1;
+  }
+
+  /**
+   * Decodes a BGM transport timestamp (UNIX milliseconds, Issue #250).
+   *
+   * Returns `null` for anything that is not a finite number so a malformed
+   * broadcast is ignored instead of poisoning the position arithmetic.
+   */
+  function parseBgmTimestamp(value: unknown): number | null {
+    const timestamp =
+      typeof value === 'number'
+        ? value
+        : typeof value === 'string' && value.trim() !== ''
+          ? Number(value)
+          : Number.NaN;
+    if (!Number.isFinite(timestamp)) return null;
+    return Math.max(0, Math.trunc(timestamp));
   }
 
   /** Mirrors a slot's tin id (and optionally volume) into the legacy `bgm1..3` fields. */
@@ -1500,8 +1525,9 @@
    * Drops a slot's row and its legacy mirror (Issue #249).
    *
    * Used when the slot no longer has a track: an invalid / deleted `std::bgm<N>`
-   * value, or a snapshot that omits the slot. The audio element of the slot is
-   * paused so a removed row can never keep making sound.
+   * value, or a snapshot that omits the slot. The slot's audio source is
+   * disposed (not just paused) so a removed row can never keep its object URL
+   * or make sound (Issue #250).
    */
   function removeBgmSlotRow(scene: Scene, slotNum: number) {
     const slots = getNormalizedBgmSlots(scene.juices).filter(
@@ -1509,8 +1535,40 @@
     );
     setNormalizedBgmSlots(scene.juices, slots);
     syncLegacyBgmFields(scene.juices, slotNum, null, 0.8);
-    if (scene.id === currentScene?.id) audioManager.pause(slotNum);
+    appliedBgmTransport.delete(slotNum);
+    if (scene.id === currentScene?.id) audioManager.stop(slotNum);
   }
+
+  // ---------------------------------------------------------------------------
+  // BGM playback position (Issue #250)
+  // ---------------------------------------------------------------------------
+  /**
+   * Transport identity last applied to each slot's element.
+   *
+   * `startedAt` / `pausedAt` / `tinId` form the identity of one continuous
+   * playback: when none of them changed, a state update carries no new position,
+   * so a playing element is only re-seeked when it drifted (Issue #250).
+   */
+  const appliedBgmTransport = new Map<number, string>();
+
+  /** Identity of the transport state that owns a slot's current position. */
+  function bgmTransportIdentity(slot: BgmSlot, tinId: string): string {
+    return `${tinId}|${slot.startedAt ?? ''}|${slot.pausedAt ?? ''}`;
+  }
+
+  /** Position (ms) the authoritative state implies for a playing slot. */
+  function bgmSlotOffsetMs(slot: BgmSlot, now: number): number {
+    return computeBgmOffsetMs({
+      now,
+      // A playing slot derives its position from `started_at` alone: a stale
+      // `paused_at` broadcast must not freeze the position of a resumed slot.
+      startedAt: slot.startedAt,
+      durationMs: audioManager.getDurationMs(slot.slot),
+    });
+  }
+
+  /** Maximum drift (ms) tolerated before a playing element is re-seeked. */
+  const BGM_DRIFT_TOLERANCE_MS = 1000;
 
   // ---------------------------------------------------------------------------
   // BGM autoplay unlock (Issue #248)
@@ -1557,14 +1615,19 @@
     });
   }
 
-  /** Slots the authoritative current-scene state wants playing. */
-  function intendedBgmSlots(): Array<{ slot: number; tinId: string }> {
+  /** Slots the authoritative current-scene state wants playing, with offsets. */
+  function intendedBgmSlots(): Array<{ slot: number; tinId: string; offsetMs: number }> {
     const scene = currentScene;
     if (!scene) return [];
-    const intended: Array<{ slot: number; tinId: string }> = [];
+    const now = Date.now();
+    const intended: Array<{ slot: number; tinId: string; offsetMs: number }> = [];
     for (const slot of getNormalizedBgmSlots(scene.juices)) {
       if (slot.isPlaying && slot.tinId) {
-        intended.push({ slot: slot.slot, tinId: slot.tinId });
+        intended.push({
+          slot: slot.slot,
+          tinId: slot.tinId,
+          offsetMs: bgmSlotOffsetMs(slot, now),
+        });
       }
     }
     return intended;
@@ -1575,19 +1638,21 @@
    *
    * `AudioManager.play()` reaches `HTMLAudioElement.play()` synchronously when
    * the slot is prepared (no pending download), which is what Safari's
-   * same-task requirement needs. Slots still downloading are skipped; the
+   * same-task requirement needs. The slot's derived offset is passed along, so a
+   * slot that was waiting for the gesture still starts at the authoritative
+   * position instead of 0 (Issue #250). Slots still downloading are skipped; the
    * listener stays armed so the next interaction retries them.
    */
   function handleBgmAutoplayUnlock(): void {
     // `once: true` removed the listener before this callback ran.
     bgmAutoplayUnlockArmed = false;
     const attempts: Promise<unknown>[] = [];
-    for (const { slot, tinId } of intendedBgmSlots()) {
+    for (const { slot, tinId, offsetMs } of intendedBgmSlots()) {
       const state = audioManager.getState(slot);
       // Only a prepared, silent slot can be resumed here. A slot whose source
       // is still downloading (or already playing) waits for the next gesture.
       if (state.tinId !== tinId || state.status !== 'paused') continue;
-      attempts.push(audioManager.play(slot).catch(() => undefined));
+      attempts.push(audioManager.play(slot, offsetMs).catch(() => undefined));
     }
     void settleBgmAutoplayUnlock(attempts);
   }
@@ -1621,9 +1686,20 @@
   /**
    * Reconciles one slot's audio element with the authoritative scene state.
    *
-   * Only the current scene makes sound. An autoplay rejection leaves the slot
-   * prepared and `paused` (not an error); the window-level pointerdown unlock
-   * above replays it on the next interaction (Issue #248).
+   * Only the current scene makes sound. The playback position comes from the
+   * slot's transport state (Issue #250):
+   *
+   * - a prepared, playing element is only re-seeked when the transport identity
+   *   changed (join mid-track / ⏪) or it drifted by more than ~1 second, so an
+   *   unrelated state update never stutters the audio,
+   * - a prepared but silent element (paused, or refused autoplay) is started at
+   *   the derived offset without re-downloading,
+   * - a slot without a prepared source downloads it first.
+   *
+   * An autoplay rejection leaves the slot prepared and `paused` (not an error);
+   * the window-level pointerdown unlock above replays it with the same offset
+   * (Issue #248 / #250). `playing=false` only pauses and keeps the source so a
+   * resume does not download again; a removed scene / slot disposes it.
    */
   async function syncBgmSlotAudio(
     sceneId: string,
@@ -1631,7 +1707,8 @@
     roomKey: Uint8Array | null,
   ): Promise<void> {
     if (sceneId !== currentScene?.id) {
-      audioManager.pause(slot.slot);
+      appliedBgmTransport.delete(slot.slot);
+      audioManager.stop(slot.slot);
       return;
     }
 
@@ -1647,18 +1724,42 @@
       name: slot.name,
     });
     if (!track) {
-      audioManager.pause(slot.slot);
+      appliedBgmTransport.delete(slot.slot);
+      audioManager.stop(slot.slot);
       return;
     }
 
+    const offsetMs = bgmSlotOffsetMs(slot, Date.now());
+    const identity = bgmTransportIdentity(slot, track.tinId);
     const current = audioManager.getState(slot.slot);
-    // Already prepared, or prepared-and-waiting for the user gesture: do not
-    // re-download nor hammer `play()` on every state update. The pointerdown
-    // unlock below replays a paused slot (Issue #248).
-    if (
-      current.tinId === track.tinId &&
-      (current.status === 'playing' || current.status === 'paused')
-    ) {
+
+    if (current.tinId === track.tinId && current.status === 'playing') {
+      const applied = appliedBgmTransport.get(slot.slot);
+      const position = audioManager.getPositionMs(slot.slot);
+      const driftMs = position === null ? 0 : Math.abs(position - offsetMs);
+      if (applied === identity && driftMs <= BGM_DRIFT_TOLERANCE_MS) return;
+      try {
+        // Seeking an already playing element keeps the loop going (⏪ / join).
+        await audioManager.play(slot.slot, offsetMs);
+        appliedBgmTransport.set(slot.slot, identity);
+      } catch (error) {
+        console.warn(`[App] Failed to seek BGM slot ${slot.slot}:`, error);
+      }
+      return;
+    }
+
+    if (current.tinId === track.tinId && current.status === 'paused') {
+      // Prepared and silent (pause, or autoplay refused): start at the shared
+      // position without re-downloading the tin (Issue #250).
+      try {
+        const result = await audioManager.play(slot.slot, offsetMs);
+        appliedBgmTransport.set(slot.slot, identity);
+        // The browser refused autoplay: keep the source and let the next user
+        // gesture retry it (Issue #248). This is not an error.
+        if (result === 'paused') armBgmAutoplayUnlockListener();
+      } catch (error) {
+        console.warn(`[App] Failed to play BGM slot ${slot.slot}:`, error);
+      }
       return;
     }
 
@@ -1673,6 +1774,7 @@
           )
         : undefined;
       if (!latestSlot?.isPlaying || latestSlot.tinId !== track.tinId) {
+        appliedBgmTransport.delete(slot.slot);
         audioManager.pause(slot.slot);
         return;
       }
@@ -1680,7 +1782,14 @@
       // scene switch): a cleared slot is not a playback error.
       const prepared = audioManager.getState(slot.slot);
       if (prepared.tinId !== track.tinId || prepared.status === 'idle') return;
-      const result = await audioManager.play(slot.slot);
+      // The row may have advanced while the tin was downloading, so derive the
+      // offset from the latest authoritative slot.
+      const latestOffsetMs = bgmSlotOffsetMs(latestSlot, Date.now());
+      const result = await audioManager.play(slot.slot, latestOffsetMs);
+      appliedBgmTransport.set(
+        slot.slot,
+        bgmTransportIdentity(latestSlot, track.tinId),
+      );
       // The browser refused autoplay: keep the source and let the next user
       // gesture retry it (Issue #248). This is not an error.
       if (result === 'paused') armBgmAutoplayUnlockListener();
@@ -1704,7 +1813,8 @@
     if (!removed) return;
     setNormalizedBgmSlots(scene.juices, getNormalizedBgmSlots(scene.juices));
     syncLegacyBgmFields(scene.juices, slotNum, null, 0.8);
-    if (scene.id === currentScene?.id) audioManager.pause(slotNum);
+    appliedBgmTransport.delete(slotNum);
+    if (scene.id === currentScene?.id) audioManager.stop(slotNum);
   }
 
   /**
@@ -1769,6 +1879,46 @@
       return;
     }
 
+    const startedAtMatch = BGM_STARTED_AT_STATE_KEY.exec(key);
+    if (startedAtMatch) {
+      const slotNum = Number(startedAtMatch[1]);
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const startedAt = parseBgmTimestamp(value);
+      if (startedAt === null) return;
+      const slots = getNormalizedBgmSlots(scene.juices);
+      // A timestamp without a track has no row to belong to (Issue #249).
+      if (!slots.some((slot) => slot.slot === slotNum)) return;
+      const next = slots.map((slot) =>
+        slot.slot === slotNum ? { ...slot, startedAt } : { ...slot },
+      );
+      setNormalizedBgmSlots(scene.juices, next);
+      const updated = next.find((slot) => slot.slot === slotNum);
+      // A new `started_at` is a join / ⏪ broadcast: the playing element of this
+      // client must follow it (Issue #250).
+      if (updated?.isPlaying && scene.id === currentScene?.id) {
+        void syncBgmSlotAudio(scene.id, updated, extensionRoomKey);
+      }
+      return;
+    }
+
+    const pausedAtMatch = BGM_PAUSED_AT_STATE_KEY.exec(key);
+    if (pausedAtMatch) {
+      const slotNum = Number(pausedAtMatch[1]);
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const pausedAt = parseBgmTimestamp(value);
+      if (pausedAt === null) return;
+      const slots = getNormalizedBgmSlots(scene.juices);
+      // A timestamp without a track has no row to belong to (Issue #249).
+      if (!slots.some((slot) => slot.slot === slotNum)) return;
+      setNormalizedBgmSlots(
+        scene.juices,
+        slots.map((slot) =>
+          slot.slot === slotNum ? { ...slot, pausedAt } : { ...slot },
+        ),
+      );
+      return;
+    }
+
     const slotNum = bgmSlotFromStateKey(key);
     if (slotNum === null || isBgmSlotRemoved(scene.juices, slotNum)) return;
     const parsed = parseBgmTrackState(value);
@@ -1779,7 +1929,7 @@
       return;
     }
     // A track key creates or replaces the row; the transport state of an
-    // existing row (volume / playback intent) is preserved.
+    // existing row (volume / playback intent / position) is preserved.
     const slots = getNormalizedBgmSlots(scene.juices);
     const existing = slots.find((slot) => slot.slot === slotNum);
     const updated: BgmSlot = {
@@ -1789,6 +1939,8 @@
       name: parsed.name,
       volume: existing?.volume ?? 0.8,
       isPlaying: existing?.isPlaying ?? false,
+      ...(existing?.startedAt !== undefined ? { startedAt: existing.startedAt } : {}),
+      ...(existing?.pausedAt !== undefined ? { pausedAt: existing.pausedAt } : {}),
     };
     setNormalizedBgmSlots(scene.juices, [
       ...slots.filter((slot) => slot.slot !== slotNum),
@@ -1849,6 +2001,39 @@
       return;
     }
 
+    const startedAtMatch = BGM_STARTED_AT_STATE_KEY.exec(key);
+    if (startedAtMatch) {
+      // A deleted `started_at` is "this slot never started": the next offset is
+      // 0 until a new timestamp arrives (Issue #250).
+      const slotNum = Number(startedAtMatch[1]);
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const slots = getNormalizedBgmSlots(scene.juices);
+      if (!slots.some((slot) => slot.slot === slotNum)) return;
+      setNormalizedBgmSlots(
+        scene.juices,
+        slots.map((slot) =>
+          slot.slot === slotNum ? { ...slot, startedAt: undefined } : { ...slot },
+        ),
+      );
+      return;
+    }
+
+    const pausedAtMatch = BGM_PAUSED_AT_STATE_KEY.exec(key);
+    if (pausedAtMatch) {
+      // Resuming deletes `paused_at`; the new `started_at` carries the position.
+      const slotNum = Number(pausedAtMatch[1]);
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const slots = getNormalizedBgmSlots(scene.juices);
+      if (!slots.some((slot) => slot.slot === slotNum)) return;
+      setNormalizedBgmSlots(
+        scene.juices,
+        slots.map((slot) =>
+          slot.slot === slotNum ? { ...slot, pausedAt: undefined } : { ...slot },
+        ),
+      );
+      return;
+    }
+
     const slotNum = bgmSlotFromStateKey(key);
     if (slotNum === null || isBgmSlotRemoved(scene.juices, slotNum)) return;
     removeBgmSlotRow(scene, slotNum);
@@ -1856,12 +2041,12 @@
 
   /**
    * Keeps the current scene's audio elements in sync with the state model
-   * (Issue #164).
+   * (Issue #164 / #250).
    *
-   * A scene switch first pauses every slot and revokes its object URL, then the
-   * new scene's `playing` slots are prepared and played. Re-applying the same
-   * snapshot is idempotent: the manager keeps one element per slot and skips an
-   * already prepared / playing track.
+   * A scene switch first stops every slot and revokes its object URL, then the
+   * new scene's `playing` slots are prepared and played at their shared offset.
+   * Re-applying the same snapshot is idempotent: the manager keeps one element
+   * per slot and skips an already prepared / playing track.
    */
   /** Scene whose playback is currently loaded; a change stops the old track. */
   let audioSceneId: string | null = null;
@@ -1874,6 +2059,7 @@
     const slots = getNormalizedBgmSlots(scene.juices).map((slot) => ({ ...slot }));
     if (sceneId !== audioSceneId) {
       audioSceneId = sceneId;
+      appliedBgmTransport.clear();
       audioManager.stopAll();
     }
     for (const slot of slots) {
@@ -1885,6 +2071,7 @@
   // Unmounting the room UI must not leave a detached audio element playing.
   $effect(() => {
     return () => {
+      appliedBgmTransport.clear();
       audioManager.stopAll();
     };
   });
@@ -2193,8 +2380,9 @@
    * The snapshot is authoritative for that scene: every supported key is
    * applied, piece placement is reset for characters that are not listed, and a
    * BGM slot without a track key loses its row (Issue #249). Removal markers are
-   * applied first and track keys before transport keys, so the result does not
-   * depend on the (lexicographic) map order. Applying the same snapshot again
+   * applied first, track keys before transport timestamps (Issue #250) and
+   * transport timestamps before playing / volume, so the result does not depend
+   * on the (lexicographic) map order. Applying the same snapshot again
    * (reconnect / scene switch) is idempotent.
    */
   function applyStateSnapshot(sceneId: string, states: Record<string, unknown> | null | undefined) {
@@ -2231,9 +2419,24 @@
       if (bgmSlotFromStateKey(key) === null) continue;
       applySceneStateEntry(scene, key, value);
     }
+    // Transport timestamps next (Issue #250): they belong to the row the track
+    // pass created, and must be in place before `playing` decides whether the
+    // slot starts / seeks. A timestamp for a slot without a track is ignored.
+    for (const [key, value] of entries) {
+      if (
+        !BGM_STARTED_AT_STATE_KEY.test(key) &&
+        !BGM_PAUSED_AT_STATE_KEY.test(key)
+      ) {
+        continue;
+      }
+      applySceneStateEntry(scene, key, value);
+    }
     for (const [key, value] of entries) {
       if (BGM_REMOVED_STATE_KEY.test(key)) continue;
       if (bgmSlotFromStateKey(key) !== null) continue;
+      if (BGM_STARTED_AT_STATE_KEY.test(key) || BGM_PAUSED_AT_STATE_KEY.test(key)) {
+        continue;
+      }
       if (parsePieceStateKey(key)) {
         applyPieceStateEntry(sceneId, key, value);
       } else {

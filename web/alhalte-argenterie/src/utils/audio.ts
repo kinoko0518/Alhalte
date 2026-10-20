@@ -1,22 +1,24 @@
 /**
- * BGM audio playback manager (Issue #164, Issue #248).
+ * BGM audio playback manager (Issue #164, Issue #248, Issue #250).
  *
  * There is exactly one `HTMLAudioElement` per BGM slot. The manager:
  *
  * - downloads and decrypts a selected track through `downloadTin` with the room
  *   key, then creates an object URL from the decrypted payload,
- * - plays / pauses / changes the volume of that element,
+ * - plays / pauses / changes the volume of that element, looping the track,
+ * - seeks to the shared playback position of the scene state on play
+ *   (Issue #250, see {@link computeBgmOffsetMs}),
  * - revokes the object URL when a slot stops, the track changes, the scene
  *   switches or the component unmounts,
  * - treats a browser autoplay rejection as a prepared-but-`paused` slot: it is
  *   not an error and carries no user-facing notice. `App` retries playback from
  *   the first user gesture (pointerdown), so the user never manages autoplay
- *   (Issue #248),
+ *   (Issue #248), and the retry keeps the derived playback position (#250),
  * - surfaces download / decrypt failure as `error`.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### BGM`
- * - GitHub Issue #164, GitHub Issue #248
+ * - GitHub Issue #164, GitHub Issue #248, GitHub Issue #250
  */
 import { downloadTin } from './cellarTransfer.js';
 import {
@@ -63,14 +65,80 @@ export type AudioPlayResult = 'playing' | 'paused';
  * Minimal structural subset of `HTMLAudioElement` used by the manager.
  *
  * Tests inject a fake implementation so no real media decoding happens.
+ * `loop` / `currentTime` / `duration` are optional: a fake element that omits
+ * them still works, the manager just cannot seek or wrap by the track duration.
  */
 export interface AudioElementLike {
   src: string;
   volume: number;
   paused?: boolean;
+  /** Media duration in **seconds**; `NaN` / `Infinity` while unknown. */
+  duration?: number;
+  /** Playback position in **seconds** (`HTMLAudioElement` semantics). */
+  currentTime?: number;
+  /** Whether the element restarts at 0 when it reaches the end. */
+  loop?: boolean;
   play(): Promise<void> | void;
   pause(): void;
   removeAttribute?(name: string): void;
+}
+
+/** Input of {@link computeBgmOffsetMs}; every timestamp is UNIX **milliseconds**. */
+export interface BgmOffsetInput {
+  /** Wall-clock "now" in UNIX milliseconds. */
+  now: number;
+  /** `bgm::<slot>::started_at`; absent for a legacy room / a never played slot. */
+  startedAt?: number | null;
+  /** `bgm::<slot>::paused_at`; absent while playing. */
+  pausedAt?: number | null;
+  /** Track duration in milliseconds; absent / `NaN` when the browser does not know it. */
+  durationMs?: number | null;
+}
+
+/** True when `value` is a finite, non-negative number. */
+function isFiniteNonNegative(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+}
+
+/** Non-negative modulo; the result is `0 <= result < divisor`. */
+function positiveModulo(value: number, divisor: number): number {
+  return ((value % divisor) + divisor) % divisor;
+}
+
+/**
+ * Derives the shared playback position of a BGM slot from the scene state
+ * (Issue #250).
+ *
+ * The scene state stores only timestamps, never a duration, because the
+ * duration belongs to the audio element of each client. This helper therefore
+ * accepts the known duration and falls back to the raw elapsed time when the
+ * browser has not reported one yet (the element then clamps / loops by itself).
+ *
+ * - playing: `((now - startedAt) mod D + D) mod D`
+ * - paused: `((min(now, pausedAt) - startedAt) mod D + D) mod D`, so the
+ *   position stays frozen at the pause instant even as `now` advances
+ * - a missing / malformed `startedAt` (legacy room, pre-#250 state) is `0`
+ * - a negative / `NaN` input is clamped to `0`
+ *
+ * Every client computes the same value from the same wall-clock state, which is
+ * what lets a client joining mid-track start at the right offset. This assumes
+ * the clients' clocks agree (NTP); see the PR body for the residual risk.
+ */
+export function computeBgmOffsetMs(input: BgmOffsetInput): number {
+  const { startedAt, pausedAt, durationMs } = input;
+  const now = isFiniteNonNegative(input.now) ? input.now : 0;
+  if (!isFiniteNonNegative(startedAt)) return 0;
+
+  const reference = isFiniteNonNegative(pausedAt) ? Math.min(now, pausedAt) : now;
+  // A clock that jumped backwards (or a pause before the start) must not seek to
+  // the end of the loop: the elapsed time is clamped at 0.
+  const elapsed = Math.max(0, reference - startedAt);
+  if (isFiniteNonNegative(durationMs) && durationMs > 0) {
+    return positiveModulo(elapsed, durationMs);
+  }
+  // Unknown duration: the browser clamps / loops by itself, so hand it the raw
+  // non-negative offset.
+  return elapsed;
 }
 
 /** User-facing message when the room key cannot decrypt the audio. */
@@ -219,6 +287,34 @@ export class AudioManager {
   }
 
   /**
+   * Current playback position of a slot in milliseconds (Issue #250).
+   *
+   * `null` when no element exists or the element does not expose `currentTime`;
+   * `App` only re-seeks a playing slot when this differs from the derived
+   * position by more than a second, so an unrelated state update never stutters
+   * the audio.
+   */
+  getPositionMs(slot: number): number | null {
+    const element = this.slots.get(slot)?.element;
+    if (!element || typeof element.currentTime !== 'number') return null;
+    if (!Number.isFinite(element.currentTime)) return null;
+    return element.currentTime * 1000;
+  }
+
+  /**
+   * Track duration of a slot in milliseconds, or `null` while unknown.
+   *
+   * The scene state never stores a duration: this is the browser's own
+   * `HTMLAudioElement.duration`, used to wrap the derived offset (Issue #250).
+   */
+  getDurationMs(slot: number): number | null {
+    const element = this.slots.get(slot)?.element;
+    if (!element || typeof element.duration !== 'number') return null;
+    if (!Number.isFinite(element.duration) || element.duration <= 0) return null;
+    return element.duration * 1000;
+  }
+
+  /**
    * Downloads, decrypts and prepares a slot for playback.
    *
    * The current playback (if any) keeps running until the new payload is ready;
@@ -285,6 +381,9 @@ export class AudioManager {
         }
         element.src = url;
         element.volume = this.volumes.get(slot) ?? 1;
+        // The track loops forever: the shared playback position is derived from
+        // the wall clock and wrapped by the duration (Issue #250).
+        element.loop = true;
         target.tinId = tinId;
         target.mimeType = mimeType;
         target.objectUrl = url;
@@ -306,7 +405,13 @@ export class AudioManager {
   }
 
   /**
-   * Plays the prepared slot.
+   * Plays the prepared slot, optionally seeking to a shared offset.
+   *
+   * `offsetMs` is the position derived from `bgm::<slot>::started_at` /
+   * `::paused_at` (Issue #250): a client joining mid-track starts at the elapsed
+   * position, and ⏪ seeks the already playing element back to 0. It is clamped
+   * to `>= 0` and wrapped by the element's own duration when the browser reports
+   * one; an unknown duration is passed through as the raw offset.
    *
    * A browser autoplay rejection is deliberately not an error (Issue #248): the
    * slot stays `paused` with `error === null` and this resolves to `'paused'`, so
@@ -316,7 +421,7 @@ export class AudioManager {
    * @throws when the slot has no prepared source or `play()` failed for a
    * reason other than the autoplay policy.
    */
-  async play(slot: number): Promise<AudioPlayResult> {
+  async play(slot: number, offsetMs?: number): Promise<AudioPlayResult> {
     const inFlight = this.pending.get(slot);
     if (inFlight) await inFlight.promise;
 
@@ -325,6 +430,9 @@ export class AudioManager {
       this.fail(slot, BGM_AUDIO_LOAD_ERROR);
       throw new Error(BGM_AUDIO_LOAD_ERROR);
     }
+    // Seek before starting so a paused / freshly prepared element resumes at the
+    // authoritative position instead of 0.
+    this.seek(runtime.element, offsetMs);
     if (runtime.status === 'playing') return 'playing';
 
     try {
@@ -346,15 +454,68 @@ export class AudioManager {
   }
 
   /**
-   * Pauses the slot and revokes its object URL.
+   * Sets `element.currentTime` from a millisecond offset.
    *
-   * The audio element itself is kept so a later play reuses the same element
-   * (one element per slot for the manager lifetime).
+   * A missing / malformed offset is a no-op, so an autoplay retry keeps the
+   * position the element already has. The offset is wrapped by the element's own
+   * duration when known (the scene state stores no duration, Issue #250).
+   */
+  private seek(element: AudioElementLike, offsetMs: number | undefined): void {
+    if (typeof offsetMs !== 'number' || !Number.isFinite(offsetMs)) return;
+    let targetMs = Math.max(0, offsetMs);
+    if (
+      typeof element.duration === 'number' &&
+      Number.isFinite(element.duration) &&
+      element.duration > 0
+    ) {
+      targetMs = positiveModulo(targetMs, element.duration * 1000);
+    }
+    try {
+      element.currentTime = targetMs / 1000;
+    } catch {
+      // An element that cannot seek yet simply starts from its current position.
+    }
+  }
+
+  /**
+   * Pauses the slot and keeps its prepared source (Issue #250).
+   *
+   * The `tinId` / object URL stay in place, so resuming after a pause continues
+   * from the paused position without downloading the tin again. Use
+   * {@link stop} when the source is no longer needed (track change, deletion,
+   * scene switch, unmount).
    */
   pause(slot: number): void {
     const runtime = this.slots.get(slot);
     // Cancel an in-flight download even when the slot has no element yet;
     // otherwise a scene switch / unmount could still create an object URL.
+    const hadPending = this.pending.delete(slot);
+    if (!runtime && !hadPending) return;
+    this.generations.set(slot, (this.generations.get(slot) ?? 0) + 1);
+    if (!runtime) return;
+
+    if (runtime.element) {
+      try {
+        runtime.element.pause();
+      } catch {
+        // A pause failure must never break the state update.
+      }
+    }
+    // The source stays prepared: a paused slot is exactly what a resume needs.
+    runtime.status = runtime.objectUrl ? 'paused' : 'idle';
+    runtime.error = null;
+    this.notify();
+  }
+
+  /**
+   * Stops the slot and disposes its source (Issue #250).
+   *
+   * Pauses the element, revokes the object URL and forgets the tin, so the next
+   * play downloads / decrypts again. Used for a track change, a deletion, a
+   * scene switch and unmount.
+   */
+  stop(slot: number): void {
+    const runtime = this.slots.get(slot);
     const hadPending = this.pending.delete(slot);
     if (!runtime && !hadPending) return;
     this.generations.set(slot, (this.generations.get(slot) ?? 0) + 1);
@@ -378,10 +539,10 @@ export class AudioManager {
     this.notify();
   }
 
-  /** Pauses every slot and revokes every object URL (scene switch / unmount). */
+  /** Stops every slot and revokes every object URL (scene switch / unmount). */
   stopAll(): void {
     for (const slot of new Set([...this.slots.keys(), ...this.pending.keys()])) {
-      this.pause(slot);
+      this.stop(slot);
     }
   }
 
