@@ -199,7 +199,7 @@ describe('Character list views and row actions (Issue #228)', () => {
     mountTab({ role: 'participant' });
     expect(target.querySelector('[data-testid="character-view-tabs"]')).toBeTruthy();
     expect(segmentedValues()).toEqual(['scene', 'mine']);
-    expect(segmentedLabels()).toEqual(['シーン内のキャラクター', '自分のキャラクター']);
+    expect(segmentedLabels()).toEqual(['シーン内', '保有中']);
     expect(
       segmented()?.querySelector<HTMLInputElement>('input[value="scene"]')?.checked,
     ).toBe(true);
@@ -209,11 +209,7 @@ describe('Character list views and row actions (Issue #228)', () => {
 
     mountTab({ role: 'admin' });
     expect(segmentedValues()).toEqual(['scene', 'mine', 'all']);
-    expect(segmentedLabels()).toEqual([
-      'シーン内のキャラクター',
-      '自分のキャラクター',
-      'すべてのキャラクター',
-    ]);
+    expect(segmentedLabels()).toEqual(['シーン内', '保有中', 'すべて']);
   });
 
   // spec: Issue #228 シーン内のキャラクターの既定表示と行アクション
