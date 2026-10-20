@@ -242,6 +242,43 @@ describe('Scene state hydration (Issue #159)', () => {
     target.remove();
   });
 
+  // spec: argenterie/scene-settings 旧形式の裸の64hex std::bgm2 は slot 2 の1行だけになる
+  it('hydrates a legacy bare-hex std::bgm2 as the single row of slot 2', async () => {
+    const socket = new FakeRoomSocket();
+    const { target, instance } = mountApp(socket, [makeScene()], [makeCharacter()]);
+    await settle(30);
+    openSettings(target);
+    await settle(30);
+
+    // Issue #249: a scene without a track has no BGM row at all.
+    expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-block-2"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-block-3"]')).toBeNull();
+
+    // An old room stores the bare 64-hex tin id of `std::bgm2`.
+    socket.emitFrame({
+      StateSnapshot: {
+        scene_id: '/',
+        states: {
+          'std::bgm2': jsonToTin(BGM_SLOT_4_TIN),
+          'bgm::2::playing': jsonToTin(true),
+        },
+      },
+    });
+    await settle(40);
+
+    expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-block-2"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-slot-block-3"]')).toBeNull();
+    expect(
+      target.querySelector('[data-testid="bgm-play-btn-2"]')?.getAttribute('aria-label'),
+    ).toBe('BGM停止');
+    expect(cellar.downloadTin).toHaveBeenCalledWith(BGM_SLOT_4_TIN, ROOM_KEY);
+
+    unmount(instance);
+    target.remove();
+  });
+
   // spec: argenterie/scene-settings 名前・背景・寸法は再接続後も残り他クライアントにも見える (Issue #159)
   it('shows the same name / background / dimensions to another client and after reconnect', async () => {
     const socketA = new FakeRoomSocket();

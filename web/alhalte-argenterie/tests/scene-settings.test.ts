@@ -3,6 +3,7 @@ import { mount, unmount } from 'svelte';
 import {
   calculateDimensionsAndCrop,
   createDefaultJuices,
+  getNormalizedBgmSlots,
   inheritJuices,
   moveMemberToScene,
 } from '../src/utils/sceneSettings.js';
@@ -20,6 +21,26 @@ import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
 describe('Scene Settings & Juices', () => {
   beforeEach(() => {
     clearAssets();
+  });
+
+  // spec: Issue #249 既定の空 slot 1..3 を持たない
+  it('creates no BGM rows by default and only renders a row once a slot has a track', () => {
+    const juices = createDefaultJuices();
+    // Issue #249: the legacy bgm1..3 mirrors stay, the empty slot list does not.
+    expect(juices.bgmSlots).toEqual([]);
+    expect(juices.bgm1Volume).toBe(0.8);
+    expect(getNormalizedBgmSlots(juices)).toEqual([]);
+
+    // A legacy scene without `bgmSlots` only yields the slots that are set.
+    const legacy = createDefaultJuices();
+    delete legacy.bgmSlots;
+    legacy.bgm2 = 'b'.repeat(64);
+    expect(getNormalizedBgmSlots(legacy).map((slot) => slot.slot)).toEqual([2]);
+
+    // An explicitly empty list is authoritative even when mirrors linger.
+    const explicit = createDefaultJuices();
+    explicit.bgm1 = 'a'.repeat(64);
+    expect(getNormalizedBgmSlots(explicit)).toEqual([]);
   });
 
   // spec: alhalte-argenterie/scene-settings 背景画像縦横自動計算
@@ -127,7 +148,19 @@ describe('Scene Settings & Juices', () => {
     const currentScene: Scene = {
       id: 'scene-test',
       name: '設定対象シーン',
-      juices: createDefaultJuices(),
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [
+          {
+            slot: 1,
+            tinId: 'a'.repeat(64),
+            mimeType: 'audio/ogg',
+            name: 'theme.ogg',
+            volume: 0.8,
+            isPlaying: false,
+          },
+        ],
+      },
       viewTransform: { x: 0, y: 0, scale: 1 },
       members: [],
     };
@@ -177,20 +210,17 @@ describe('Scene Settings & Juices', () => {
     expect(target.querySelector('[data-testid="bg-width-input"]')).toBeTruthy();
     expect(target.querySelector('[data-testid="bg-height-input"]')).toBeTruthy();
 
-    // Check BGM buttons 1 to 3 use noph-ui IconButton (.np-icon-button) and Sliders use noph-ui Slider (.np-slider) (Issue #53)
+    // Check the BGM row of the slot with a track uses noph-ui IconButton
+    // (.np-icon-button) and Slider (.np-slider) (Issue #53). Issue #249: a slot
+    // without a track has no row, so slots 2 / 3 are absent.
     const select1 = target.querySelector('[data-testid="bgm-select-btn-1"]');
-    const select2 = target.querySelector('[data-testid="bgm-select-btn-2"]');
-    const select3 = target.querySelector('[data-testid="bgm-select-btn-3"]');
     expect(select1?.classList.contains('np-icon-button')).toBe(true);
-    expect(select2?.classList.contains('np-icon-button')).toBe(true);
-    expect(select3?.classList.contains('np-icon-button')).toBe(true);
+    expect(target.querySelector('[data-testid="bgm-select-btn-2"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-select-btn-3"]')).toBeNull();
+    expect(target.querySelector('[data-testid="add-bgm-slot-btn"]')).toBeTruthy();
 
     const slider1 = target.querySelector('[data-testid="bgm-slider-1"]');
-    const slider2 = target.querySelector('[data-testid="bgm-slider-2"]');
-    const slider3 = target.querySelector('[data-testid="bgm-slider-3"]');
     expect(slider1?.closest('.np-slider')).toBeTruthy();
-    expect(slider2?.closest('.np-slider')).toBeTruthy();
-    expect(slider3?.closest('.np-slider')).toBeTruthy();
 
     // Check Management heading, scene name field above create scene, action buttons, and embedded move members section (Issue #92, Issue #123)
     const headingManagement = target.querySelector('[data-testid="heading-management"]');
@@ -375,19 +405,24 @@ describe('Scene Settings & Juices', () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(lastUpdatedScene?.juices.bgImage).toBeUndefined();
 
-    // Open BGM1 picker -> initialMediaType is 'audio'
-    target.querySelector<HTMLButtonElement>('[data-testid="bgm-select-btn-1"]')?.click();
+    // "スロット追加" opens the audio picker for the next slot (Issue #249):
+    // there is no row to click because no slot has a track yet.
+    expect(target.querySelector('[data-testid="bgm-select-btn-1"]')).toBeNull();
+    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
     expect(
       target.querySelector(`[data-testid="asset-card-${personalAudio.id}"]`),
     ).toBeTruthy();
 
-    // Select audio asset for BGM1 -> the tin id (not the data URL) is stored.
+    // Select an audio asset for the new slot 1 -> the tin id (not the data URL)
+    // is stored and the row appears with the ack.
     target.querySelector<HTMLElement>(`[data-testid="asset-card-${personalAudio.id}"]`)?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(lastUpdatedScene?.juices.bgm1).toBe(personalAudio.tinId);
     expect(lastUpdatedScene?.juices.bgm1).not.toBe(personalAudio.dataUrl);
+    expect(lastUpdatedScene?.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1]);
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
 
     unmount(instanceNonAdmin);
 
@@ -617,12 +652,16 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
     const play3 = () =>
       target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-3"]');
 
-    expect(play1()?.getAttribute('aria-label')).toBe('BGM再生');
+    // Issue #249: a scene without a track has no BGM row at all.
+    expect(play1()).toBeNull();
 
-    // Legacy `std::bgm` (slot 1) with a Tin-encoded 64-hex tin id.
+    // Legacy `std::bgm` (slot 1) with a Tin-encoded 64-hex tin id creates the
+    // row; a stopped track is still a row.
     socket.emitFrame({
       StateUpdated: { scene_id: '/', key: 'std::bgm', value: jsonToTin(tinA) },
     });
+    await settle();
+    expect(play1()?.getAttribute('aria-label')).toBe('BGM再生');
     socket.emitFrame({
       StateUpdated: { scene_id: '/', key: 'bgm::1::playing', value: jsonToTin(true) },
     });
@@ -662,10 +701,85 @@ describe('App — BGM StateUpdated / StateDeleted handling (Issue #109 / #142)',
       target.querySelector('[data-testid="bgm-vol-label-2"]')?.textContent?.trim(),
     ).toBe('42%');
 
-    // StateDeleted clears the slot (stop).
+    // Deleting the track removes the row (Issue #249): the slot has no track,
+    // so there is nothing to stop or resume.
     socket.emitFrame({ StateDeleted: { scene_id: '/', key: 'std::bgm' } });
     await settle();
-    expect(play1()?.getAttribute('aria-label')).toBe('BGM再生');
+    expect(play1()).toBeNull();
+    // The other slots keep their own row.
+    expect(play2()?.getAttribute('aria-label')).toBe('BGM停止');
+    expect(play3()?.getAttribute('aria-label')).toBe('BGM停止');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: Issue #249 track の無い slot は行を作らない
+  it('creates no row for a volume-only snapshot and keeps transport values around a track key', async () => {
+    const tinA = 'a'.repeat(64);
+    const socket = new FakeRoomSocket();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: {
+          id: 'room-bgm-state-249',
+          name: 'BGM状態テスト部屋249',
+          url: 'https://alhalte.example/rooms/room-bgm-state-249#abcdef',
+          lastVisited: Date.now(),
+        },
+        initialScenes: [
+          {
+            id: '/',
+            name: 'メインシーン',
+            juices: createDefaultJuices(),
+            viewTransform: { x: 0, y: 0, scale: 1 },
+            members: [],
+          },
+        ],
+        roomSocket: asRoomSocket(socket),
+      },
+    });
+    const settle = (ms = 20) => new Promise((resolve) => setTimeout(resolve, ms));
+    await settle();
+    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-settings"]')?.click();
+    await settle();
+
+    // Volume / playing keys alone never create a row.
+    socket.emitFrame({
+      StateSnapshot: {
+        scene_id: '/',
+        states: {
+          'bgm::1::volume': jsonToTin(0.3),
+          'bgm::1::playing': jsonToTin(true),
+        },
+      },
+    });
+    await settle();
+    expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-block-2"]')).toBeNull();
+
+    // The snapshot map is lexicographic (`bgm::1::*` before `std::bgm`): the
+    // transport values must still land on the row the track key creates.
+    socket.emitFrame({
+      StateSnapshot: {
+        scene_id: '/',
+        states: {
+          'bgm::1::playing': jsonToTin(true),
+          'bgm::1::volume': jsonToTin(0.3),
+          'std::bgm': jsonToTin({ tinId: tinA, mimeType: 'audio/ogg', name: 'a.ogg' }),
+        },
+      },
+    });
+    await settle();
+    expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeTruthy();
+    expect(
+      target.querySelector('[data-testid="bgm-vol-label-1"]')?.textContent?.trim(),
+    ).toBe('30%');
+    expect(
+      target.querySelector('[data-testid="bgm-play-btn-1"]')?.getAttribute('aria-label'),
+    ).toBe('BGM停止');
 
     unmount(instance);
     target.remove();

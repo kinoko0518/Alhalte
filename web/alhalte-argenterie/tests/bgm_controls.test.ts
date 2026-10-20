@@ -5,11 +5,27 @@ import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 import { clearAssets, addAsset } from '../src/utils/assets.js';
 import { OperationTimeoutError, ServerOperationError } from '../src/utils/roomSocket.js';
 import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
-import type { Scene } from '../src/types/index.js';
+import type { BgmSlot, Scene } from '../src/types/index.js';
 
 const TIN_ID_A = 'a'.repeat(64);
 const TIN_ID_B = 'b'.repeat(64);
 const ERROR_MESSAGE = 'サーバーと通信できませんでした';
+
+/**
+ * A BGM row with a playable track (Issue #249: a row exists iff the slot has a
+ * track, so a test that needs a row has to give it one).
+ */
+function bgmRow(slot: number, tinId: string, overrides: Partial<BgmSlot> = {}): BgmSlot {
+  return {
+    slot,
+    tinId,
+    mimeType: 'audio/ogg',
+    name: `slot-${slot}.ogg`,
+    volume: 0.8,
+    isPlaying: false,
+    ...overrides,
+  };
+}
 
 /** Waits for the microtask queue plus Svelte's follow-up render. */
 async function settle(ms = 20): Promise<void> {
@@ -40,7 +56,10 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     const currentScene: Scene = {
       id: 'scene-bgm-test',
       name: 'BGMテストシーン',
-      juices: createDefaultJuices(),
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [bgmRow(1, TIN_ID_A)],
+      },
       viewTransform: { x: 0, y: 0, scale: 1 },
       members: [],
     };
@@ -209,7 +228,10 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     const currentScene: Scene = {
       id: 'scene-select-test',
       name: 'アセット選択テスト',
-      juices: createDefaultJuices(),
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [bgmRow(2, TIN_ID_B)],
+      },
       viewTransform: { x: 0, y: 0, scale: 1 },
       members: [],
     };
@@ -251,6 +273,8 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     expect(updatedSlot2?.tinId).toBe(audioAsset.tinId);
     expect(updatedSlot2?.tinId).not.toBe(audioAsset.dataUrl);
     expect(updatedSlot2?.isPlaying).toBe(true);
+    // Selecting another track replaces the row instead of adding one (Issue #249).
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((s) => s.slot)).toEqual([2]);
 
     unmount(instance);
     target.remove();
@@ -265,7 +289,10 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     const currentScene: Scene = {
       id: 'scene-slider-test',
       name: '音量スライダーテスト',
-      juices: createDefaultJuices(),
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [bgmRow(1, TIN_ID_A)],
+      },
       viewTransform: { x: 0, y: 0, scale: 1 },
       members: [],
     };
@@ -312,12 +339,34 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     target.remove();
   });
 
-  // spec: argenterie/bgm-controls スロット番号(u32)の保持および複数スロット追加・個別制御
-  it('manages u32 slot numbers, supports adding multiple slots, and maintains independent BGM states per slot', async () => {
+  // spec: Issue #249 track の無い slot は行を作らない
+  it('creates no row for a track-less slot and adds max+1 rows only after the selection ack', async () => {
+    const first = addAsset({
+      id: 'bgm-add-first',
+      name: 'first.ogg',
+      scope: 'personal',
+      mediaType: 'audio',
+      dataUrl: 'data:audio/ogg;base64,RklSU1Q=',
+      mimeType: 'audio/ogg',
+      createdAt: 1000,
+      tinId: TIN_ID_A,
+    });
+    const second = addAsset({
+      id: 'bgm-add-second',
+      name: 'second.ogg',
+      scope: 'personal',
+      mediaType: 'audio',
+      dataUrl: 'data:audio/ogg;base64,U0VDT05E',
+      mimeType: 'audio/ogg',
+      createdAt: 2000,
+      tinId: TIN_ID_B,
+    });
+
     const target = document.createElement('div');
     document.body.appendChild(target);
 
     let lastUpdatedScene: Scene | null = null;
+    let requestedOptions: any = null;
     const currentScene: Scene = {
       id: 'scene-multi-slot-test',
       name: '複数スロットテスト',
@@ -334,42 +383,57 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
         onUpdateScene: (sc) => {
           lastUpdatedScene = sc;
         },
+        onRequestAssetPicker: (options) => {
+          requestedOptions = options;
+        },
       },
     });
+    await settle();
 
-    // Issue #226: the slot number badge is gone; every row ends with a delete
-    // button instead.
+    // An empty scene has no BGM row at all (Issue #249).
+    expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-block-2"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-block-3"]')).toBeNull();
+
+    // "スロット追加" opens the picker for slot 1 and creates nothing yet.
+    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
+    await settle();
+    expect(requestedOptions).toBeTruthy();
+    expect(requestedOptions.mediaType).toBe('audio');
+    expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeNull();
+    expect(lastUpdatedScene).toBeNull();
+
+    // The selection ack creates exactly one row.
+    requestedOptions.onSelect(first.dataUrl, first);
+    await settle();
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1]);
+    expect(target.querySelector('[data-testid="bgm-slot-block-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-slot-block-2"]')).toBeNull();
     expect(target.querySelector('[data-testid="bgm-slot-badge-1"]')).toBeNull();
-    expect(target.querySelector('[data-testid="bgm-slot-badge-2"]')).toBeNull();
-    expect(target.querySelector('[data-testid="bgm-slot-badge-3"]')).toBeNull();
-    for (const slot of [1, 2, 3]) {
-      const row = target.querySelector<HTMLElement>(`[data-testid="bgm-row-${slot}"]`);
-      const deleteBtn = target.querySelector<HTMLButtonElement>(
-        `[data-testid="bgm-delete-btn-${slot}"]`,
-      );
-      expect(row).toBeTruthy();
-      expect(deleteBtn).toBeTruthy();
-      expect(row!.contains(deleteBtn!)).toBe(true);
-    }
 
-    // Click "スロット追加" button
-    const addBtn = target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]');
-    expect(addBtn).toBeTruthy();
-    addBtn!.click();
-    await new Promise((r) => setTimeout(r, 20));
+    // The second add uses max + 1 = 2 (not 1, not 3).
+    requestedOptions = null;
+    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
+    await settle();
+    expect(requestedOptions).toBeTruthy();
+    requestedOptions.onSelect(second.dataUrl, second);
+    await settle();
 
-    // Verify slot 4 (u32: 4) is added and rendered
-    expect(lastUpdatedScene).toBeTruthy();
-    const slot4 = lastUpdatedScene!.juices.bgmSlots?.find((s) => s.slot === 4);
-    expect(slot4).toBeTruthy();
-    expect(slot4?.slot).toBe(4);
-    expect(slot4?.tinId).toBeNull();
-    expect(slot4?.volume).toBe(0.8);
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 2]);
+    expect(target.querySelector('[data-testid="bgm-slot-block-2"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-slot-block-3"]')).toBeNull();
+    expect(
+      target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-2"]'),
+    ).toBeTruthy();
 
-    const row4 = target.querySelector<HTMLElement>('[data-testid="bgm-row-4"]');
-    expect(row4).toBeTruthy();
-    expect(target.querySelector('[data-testid="bgm-slot-badge-4"]')).toBeNull();
-    expect(target.querySelector('[data-testid="bgm-delete-btn-4"]')).toBeTruthy();
+    // Re-selecting the track of a row never duplicates it.
+    requestedOptions = null;
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-select-btn-1"]')!.click();
+    await settle();
+    requestedOptions.onSelect(second.dataUrl, second);
+    await settle();
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 2]);
+    expect(target.querySelectorAll('[data-testid="bgm-slot-block-1"]')).toHaveLength(1);
 
     unmount(instance);
     target.remove();
@@ -401,11 +465,13 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
   }
 
   // spec: argenterie/bgm-controls 再生/停止はUpdateState/DeleteStateを送り、ack後にのみローカル確定
-  it('sends UpdateState for play, shows the wavy spinner while pending, and commits only after the acks', async () => {
+  it('sends UpdateState for play, shows the wavy spinner while pending, and commits only after the ack', async () => {
     const scene = makeScene({
       juices: {
         ...createDefaultJuices(),
-        bgm1: TIN_ID_A,
+        // The row already owns the track: resuming writes the playback intent
+        // only (Issue #249 — a row without a track does not exist).
+        bgmSlots: [bgmRow(1, TIN_ID_A)],
       },
     });
     const socket = new FakeRoomSocket();
@@ -425,14 +491,13 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     playBtn.click();
     await settle(0);
 
-    // Both playback intent and the legacy track migration are in flight, and
-    // the select icon is the wavy spinner.
+    // The playback intent is in flight and the select icon is the wavy spinner.
     const playingWrite = socket.requestUpdateStateCalls.find(
       (call) => call.key === 'bgm::1::playing',
     );
-    const trackWrite = socket.requestUpdateStateCalls.find((call) => call.key === 'std::bgm');
     expect(playingWrite?.value).toBe(true);
-    expect(trackWrite?.value).toMatchObject({ tinId: TIN_ID_A, mimeType: 'audio/mpeg' });
+    // The track is already stored, so it is not rewritten.
+    expect(socket.requestUpdateStateCalls.some((call) => call.key === 'std::bgm')).toBe(false);
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
     expect(selectBtn.disabled).toBe(true);
     expect(playBtn.disabled).toBe(true);
@@ -440,13 +505,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     expect(playBtn.textContent).toContain('play_arrow');
     expect(updateCount).toBe(0);
 
-    // The first StateUpdated ack arrives: one write is still outstanding.
-    socket.resolveStateWrite();
-    await settle(0);
-    expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeTruthy();
-    expect(updateCount).toBe(0);
-
-    // The second StateUpdated ack arrives: now the local model is committed once.
+    // The StateUpdated ack arrives: the local model is committed once.
     socket.resolveStateWrite();
     await settle();
     expect(target.querySelector('[data-testid="bgm-pending-1"]')).toBeNull();
@@ -588,7 +647,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
 
   // spec: argenterie/bgm-controls 音量は確定(change)時のみ bgm::<slot>::volume を送る
   it('sends bgm::<slot>::volume only on a committed volume change', async () => {
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(1, TIN_ID_A)] } });
     const socket = new FakeRoomSocket();
 
     let updateCount = 0;
@@ -629,7 +688,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
 
   // spec: argenterie/bgm-controls 音量失敗時はドラフトを戻しエラー表示
   it('reverts the volume preview and shows the error when the volume ack fails', async () => {
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(1, TIN_ID_A)] } });
     const socket = new FakeRoomSocket();
     socket.autoAnswerStateWrites = false;
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -670,7 +729,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
       createdAt: 6000,
       tinId: TIN_ID_B,
     });
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(2, TIN_ID_A)] } });
     const socket = new FakeRoomSocket();
     socket.autoAnswerStateWrites = false;
 
@@ -742,7 +801,7 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
       mimeType: 'audio/ogg',
       createdAt: 7000,
     });
-    const scene = makeScene();
+    const scene = makeScene({ juices: { ...createDefaultJuices(), bgmSlots: [bgmRow(2, TIN_ID_A)] } });
     const socket = new FakeRoomSocket();
     let updateCount = 0;
     let requestedOptions: any = null;
@@ -772,7 +831,8 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
 
     expect(socket.requestUpdateStateCalls).toHaveLength(0);
     expect(updateCount).toBe(0);
-    expect(scene.juices.bgmSlots?.find((s) => s.slot === 2)?.tinId).toBeNull();
+    // The row keeps its previous track (Issue #249).
+    expect(scene.juices.bgmSlots?.find((s) => s.slot === 2)?.tinId).toBe(TIN_ID_A);
     const error = target.querySelector<HTMLElement>('[data-testid="bgm-error-2"]');
     expect(error?.getAttribute('role')).toBe('status');
     expect(error?.textContent).not.toBe('');
@@ -795,16 +855,7 @@ describe('BGM slot deletion (Issue #226)', () => {
         bgm1: TIN_ID_A,
         bgm1Volume: 0.7,
         bgmSlots: [
-          {
-            slot: 1,
-            tinId: TIN_ID_A,
-            mimeType: 'audio/ogg',
-            name: 'theme.ogg',
-            volume: 0.7,
-            isPlaying: true,
-          },
-          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+          bgmRow(1, TIN_ID_A, { name: 'theme.ogg', volume: 0.7, isPlaying: true }),
         ],
       },
     });
@@ -897,20 +948,16 @@ describe('BGM slot deletion (Issue #226)', () => {
     socket.resolveStateWrite();
     await settle();
 
-    // The row is gone; the remaining slots keep their numbers and state.
+    // The row is gone (Issue #249: no track means no row) and the legacy
+    // mirror is cleared so a reload cannot resurrect it.
     expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeNull();
     expect(target.querySelector('[data-testid="bgm-delete-btn-1"]')).toBeNull();
-    expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-controls"]')).toBeTruthy();
     expect(updateCount).toBe(1);
-    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([2, 3]);
+    expect(lastUpdatedScene!.juices.bgmSlots).toEqual([]);
     expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([1]);
     expect(lastUpdatedScene!.juices.bgm1).toBeUndefined();
     expect(lastUpdatedScene!.juices.bgm1Volume).toBe(0.8);
-    expect(lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 2)).toMatchObject({
-      tinId: null,
-      isPlaying: false,
-    });
 
     unmount(instance);
     target.remove();
@@ -940,7 +987,7 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(updateCount).toBe(0);
     const row1 = target.querySelector<HTMLElement>('[data-testid="bgm-row-1"]');
     expect(row1).toBeTruthy();
-    expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 2, 3]);
+    expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1]);
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 1)?.tinId).toBe(TIN_ID_A);
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 1)?.isPlaying).toBe(true);
     expect(scene.juices.bgm1).toBe(TIN_ID_A);
@@ -1028,18 +1075,7 @@ describe('BGM slot deletion (Issue #226)', () => {
         ...createDefaultJuices(),
         bgm2: TIN_ID_B,
         bgm2Volume: 0.4,
-        bgmSlots: [
-          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
-          {
-            slot: 2,
-            tinId: TIN_ID_B,
-            mimeType: 'audio/ogg',
-            name: 'second.ogg',
-            volume: 0.4,
-            isPlaying: false,
-          },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
-        ],
+        bgmSlots: [bgmRow(2, TIN_ID_B, { name: 'second.ogg', volume: 0.4 })],
       },
     });
 
@@ -1064,9 +1100,8 @@ describe('BGM slot deletion (Issue #226)', () => {
 
     expect(updateCount).toBe(1);
     expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
-    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeTruthy();
-    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 3]);
+    // Issue #249: the deleted slot has no track, so it has no row either.
+    expect(lastUpdatedScene!.juices.bgmSlots).toEqual([]);
     expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([2]);
     expect(lastUpdatedScene!.juices.bgm2).toBeUndefined();
     expect(lastUpdatedScene!.juices.bgm2Volume).toBe(0.8);
@@ -1075,27 +1110,28 @@ describe('BGM slot deletion (Issue #226)', () => {
     target.remove();
   });
 
-  // spec: argenterie/bgm-controls 削除後のスロット追加はmax+1で削除行を復活させない
-  it('adds the next slot at max + 1 after a deletion and does not revive the deleted row', async () => {
+  // spec: Issue #249 削除後のスロット追加は削除済み番号を再利用しない
+  it('adds the next slot above a deleted number and never revives the deleted row', async () => {
     const scene = makeScene({
       juices: {
         ...createDefaultJuices(),
-        bgmSlots: [
-          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
-          {
-            slot: 2,
-            tinId: TIN_ID_B,
-            mimeType: 'audio/ogg',
-            name: 'second.ogg',
-            volume: 0.5,
-            isPlaying: false,
-          },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
-        ],
+        bgmSlots: [bgmRow(2, TIN_ID_B, { name: 'second.ogg', volume: 0.5 })],
       },
     });
 
+    const audioAsset = addAsset({
+      id: 'bgm-track-after-delete',
+      name: 'readded.ogg',
+      scope: 'personal',
+      mediaType: 'audio',
+      dataUrl: 'data:audio/ogg;base64,Tk9X',
+      mimeType: 'audio/ogg',
+      createdAt: 9000,
+      tinId: TIN_ID_A,
+    });
+
     let lastUpdatedScene: Scene | null = null;
+    let requestedOptions: any = null;
     const target = document.createElement('div');
     document.body.appendChild(target);
     const instance = mount(SceneSettingsTab, {
@@ -1103,6 +1139,9 @@ describe('BGM slot deletion (Issue #226)', () => {
       props: {
         currentScene: scene,
         allScenes: [scene],
+        onRequestAssetPicker: (options) => {
+          requestedOptions = options;
+        },
         onUpdateScene: (updated) => {
           lastUpdatedScene = updated;
         },
@@ -1114,44 +1153,31 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
     expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([2]);
 
+    // max(rows 0, tombstone 2) + 1 = 3: the deleted 2 is not revived and no
+    // empty row is created before the selection ack.
     target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
     await settle();
-
-    // max(1, 3) + 1 = 4, not the deleted 2.
+    expect(requestedOptions).toBeTruthy();
     expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
-    const row4 = target.querySelector<HTMLElement>('[data-testid="bgm-row-4"]');
-    expect(row4).toBeTruthy();
-    expect(target.querySelector('[data-testid="bgm-delete-btn-4"]')).toBeTruthy();
-    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 3, 4]);
-    // The new slot was never removed, so the removal markers stay at [2].
+    expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeNull();
+
+    requestedOptions.onSelect(audioAsset.dataUrl, audioAsset);
+    await settle();
+
+    expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeTruthy();
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([3]);
+    // The tombstones stay: they are what keeps a stale broadcast from reviving
+    // the deleted row.
     expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([2]);
-    const slot4 = lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 4);
-    expect(slot4).toMatchObject({ tinId: null, isPlaying: false, volume: 0.8 });
 
     unmount(instance);
     target.remove();
   });
 
-  // spec: argenterie/bgm-controls 再追加したスロットは最初のtrack書き込み前にremovedマーカーを消す
-  it('clears the server removal marker before writing the first track of a re-added slot', async () => {
-    const scene = makeScene({
-      juices: {
-        ...createDefaultJuices(),
-        bgmSlots: [
-          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
-          {
-            slot: 4,
-            tinId: TIN_ID_A,
-            mimeType: 'audio/ogg',
-            name: 'fourth.ogg',
-            volume: 0.8,
-            isPlaying: false,
-          },
-        ],
-      },
-    });
+  // spec: Issue #249 NONE と 🗑️ は同じ結果になる（行を消し tombstone を残す）
+  it('removes the row when NONE is picked from the AssetPicker, exactly like the delete button', async () => {
+    const scene = playableScene();
     const socket = new FakeRoomSocket();
     let requestedOptions: any = null;
     let lastUpdatedScene: Scene | null = null;
@@ -1171,156 +1197,49 @@ describe('BGM slot deletion (Issue #226)', () => {
         },
       },
     });
-
-    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-4"]')!.click();
     await settle();
-    expect(scene.juices.bgmRemovedSlots).toEqual([4]);
 
-    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
-    await settle();
-    // The local marker is dropped immediately so the row renders.
-    expect(scene.juices.bgmRemovedSlots).toEqual([]);
-
-    const audioAsset = addAsset({
-      id: 'bgm-track-readded',
-      name: 'readded.ogg',
-      scope: 'personal',
-      mediaType: 'audio',
-      dataUrl: 'data:audio/ogg;base64,UkVBRA==',
-      mimeType: 'audio/ogg',
-      createdAt: 8000,
-      tinId: TIN_ID_B,
-    });
-    target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-4"]')!.click();
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-select-btn-1"]')!.click();
     await settle();
     expect(requestedOptions).toBeTruthy();
-    requestedOptions.onSelect(audioAsset.dataUrl, audioAsset);
+    // NONE carries neither a data URL nor an asset.
+    requestedOptions.onSelect(undefined, undefined);
     await settle();
 
-    // Issue #226: DeleteState(`bgm::4::removed`) is sent together with the
-    // first track write so the marker cannot hide the re-added row elsewhere.
-    expect(
-      socket.requestDeleteStateCalls.some((call) => call.key === 'bgm::4::removed'),
-    ).toBe(true);
+    // Same writes as 🗑️ (Issue #249): the track / volume / playing keys are
+    // deleted and the persistent tombstone is written.
+    expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
+      'std::bgm',
+      'bgm::1::volume',
+    ]);
     expect(
       socket.requestUpdateStateCalls.some(
-        (call) => call.key === 'bgm::4::playing' && call.value === true,
+        (call) => call.key === 'bgm::1::playing' && call.value === false,
       ),
     ).toBe(true);
     expect(
-      socket.requestUpdateStateCalls.some((call) => call.key === 'std::bgm4'),
-    ).toBe(true);
-    expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([]);
-    expect(
-      lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 4)?.tinId,
-    ).toBe(TIN_ID_B);
-
-    unmount(instance);
-    target.remove();
-  });
-
-  // spec: argenterie/bgm-controls 再追加時はremovedマーカー削除のack後にtrack/playingを送る
-  it('awaits the removal-marker deletion before sending the re-added track write', async () => {
-    const scene = makeScene({
-      juices: {
-        ...createDefaultJuices(),
-        bgmSlots: [
-          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
-          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
-          {
-            slot: 4,
-            tinId: TIN_ID_A,
-            mimeType: 'audio/ogg',
-            name: 'fourth.ogg',
-            volume: 0.8,
-            isPlaying: false,
-          },
-        ],
-      },
-    });
-    const socket = new FakeRoomSocket();
-    let requestedOptions: any = null;
-    const target = document.createElement('div');
-    document.body.appendChild(target);
-    const instance = mount(SceneSettingsTab, {
-      target,
-      props: {
-        currentScene: scene,
-        allScenes: [scene],
-        roomSocket: asRoomSocket(socket),
-        onRequestAssetPicker: (options) => {
-          requestedOptions = options;
-        },
-      },
-    });
-
-    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-4"]')!.click();
-    await settle();
-    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
-    await settle();
-
-    // Hold the marker deletion so the ordering is observable.
-    socket.autoAnswerStateWrites = false;
-    const updatesBeforeTrackWrite = socket.requestUpdateStateCalls.length;
-    const audioAsset = addAsset({
-      id: 'bgm-track-readded-order',
-      name: 'readded.ogg',
-      scope: 'personal',
-      mediaType: 'audio',
-      dataUrl: 'data:audio/ogg;base64,T1JERVI=',
-      mimeType: 'audio/ogg',
-      createdAt: 8100,
-      tinId: TIN_ID_B,
-    });
-    target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-4"]')!.click();
-    await settle();
-    requestedOptions.onSelect(audioAsset.dataUrl, audioAsset);
-    await settle(0);
-
-    // Only the marker deletion is in flight; the track / playing writes must
-    // not be sent before it is acknowledged.
-    expect(socket.pendingStateOperationCount).toBe(1);
-    expect(
-      socket.requestDeleteStateCalls.filter((call) => call.key === 'bgm::4::removed'),
-    ).toHaveLength(1);
-    const updatesBeforeMarkerAck = socket.requestUpdateStateCalls.slice(
-      updatesBeforeTrackWrite,
-    );
-    expect(
-      updatesBeforeMarkerAck.some((call) => call.key === 'bgm::4::playing'),
-    ).toBe(false);
-    expect(
-      updatesBeforeMarkerAck.some((call) => call.key === 'std::bgm4'),
-    ).toBe(false);
-
-    socket.resolveStateWrite();
-    await settle(0);
-    expect(
       socket.requestUpdateStateCalls.some(
-        (call) => call.key === 'bgm::4::playing' && call.value === true,
+        (call) => call.key === 'bgm::1::removed' && call.value === true,
       ),
     ).toBe(true);
-    expect(
-      socket.requestUpdateStateCalls.some((call) => call.key === 'std::bgm4'),
-    ).toBe(true);
-    expect(socket.pendingStateOperationCount).toBe(2);
-
-    socket.resolveStateWrite();
-    socket.resolveStateWrite();
-    await settle();
-    expect(scene.juices.bgmRemovedSlots).toEqual([]);
-    expect(
-      scene.juices.bgmSlots?.find((slot) => slot.slot === 4)?.tinId,
-    ).toBe(TIN_ID_B);
+    // The row is gone and no row-less slot is left behind.
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeNull();
+    expect(lastUpdatedScene!.juices.bgmSlots).toEqual([]);
+    expect(lastUpdatedScene!.juices.bgmRemovedSlots).toEqual([1]);
+    expect(lastUpdatedScene!.juices.bgm1).toBeUndefined();
 
     unmount(instance);
     target.remove();
   });
 
   // spec: argenterie/bgm-controls 全スロット削除後も空のスロット一覧を正とする
-  it('keeps the slot list empty when every slot is deleted, and re-adds from slot 1', async () => {
-    const scene = makeScene();
+  it('keeps the slot list empty when every slot is deleted, and adds the next number', async () => {
+    const scene = makeScene({
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [bgmRow(1, TIN_ID_A), bgmRow(2, TIN_ID_B), bgmRow(3, TIN_ID_A)],
+      },
+    });
     const target = document.createElement('div');
     document.body.appendChild(target);
     const instance = mount(SceneSettingsTab, {
@@ -1342,15 +1261,15 @@ describe('BGM slot deletion (Issue #226)', () => {
     expect(scene.juices.bgmSlots).toEqual([]);
     expect(scene.juices.bgmRemovedSlots).toEqual([1, 2, 3]);
 
+    // Adding opens the picker for max(tombstones) + 1 = 4 and creates no row.
     target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
     await settle();
 
-    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
-    expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1]);
-    expect(scene.juices.bgmSlots?.[0]).toMatchObject({ tinId: null, isPlaying: false });
-    // Adding slot 1 again re-opens it: the local marker is cleared and the
-    // server marker is deleted with the next track write.
-    expect(scene.juices.bgmRemovedSlots).toEqual([2, 3]);
+    expect(target.querySelector('[data-testid="asset-picker-modal"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-row-4"]')).toBeNull();
+    expect(scene.juices.bgmSlots).toEqual([]);
+    expect(scene.juices.bgmRemovedSlots).toEqual([1, 2, 3]);
 
     unmount(instance);
     target.remove();

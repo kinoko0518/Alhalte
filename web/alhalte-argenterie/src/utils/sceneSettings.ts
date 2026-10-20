@@ -12,6 +12,10 @@ import { downloadTin, encodeRoomTin, uploadTin } from './cellarTransfer.js';
 
 /**
  * Creates a default Juices object.
+ *
+ * A scene starts without any BGM row (Issue #249): a row only exists once its
+ * slot carries a track. The legacy `bgm1..3` / `bgm1Volume..` fields stay for
+ * compatibility with old cached scenes and old rooms.
  */
 export function createDefaultJuices(): Juices {
   return {
@@ -25,11 +29,7 @@ export function createDefaultJuices(): Juices {
     bgm2Volume: 0.8,
     bgm3: undefined,
     bgm3Volume: 0.8,
-    bgmSlots: [
-      { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
-      { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
-      { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
-    ],
+    bgmSlots: [],
   };
 }
 
@@ -79,42 +79,79 @@ export function setBgmSlotRemoved(
 }
 
 /**
- * Returns normalized BgmSlot array from Juices, generating slots from legacy bgm1..3 if needed.
+ * True when a slot carries a track reference (Issue #249).
  *
- * An explicitly empty `bgmSlots` array means every slot was deleted (Issue
- * #226) and is authoritative; only an absent field falls back to the legacy
- * `bgm1..3` mirrors. Slots carrying a removal marker are always filtered out.
+ * A row exists iff its slot has a valid tin id: a paused track still has one,
+ * a cleared / never selected slot does not. The check is intentionally a
+ * non-empty string test, not a 64-hex test, so a legacy note-like value
+ * (`bgm1: 'march.ogg'` in an old cached scene) still renders a row; the state
+ * parsers ([`parseBgmTrackState`]) are the strict gate for playback.
+ */
+export function hasBgmTrack(slot: Pick<BgmSlot, 'tinId'>): boolean {
+  return typeof slot.tinId === 'string' && slot.tinId.trim().length > 0;
+}
+
+/** Default volume of a BGM slot without a `bgm::<slot>::volume` value. */
+const BGM_DEFAULT_VOLUME = 0.8;
+
+/** Rows derived from the legacy `bgm1..3` fields of a scene without `bgmSlots`. */
+function legacyBgmSlots(juices: Juices): BgmSlot[] {
+  const row = (slot: number, tinId: string | undefined, volume?: number): BgmSlot => ({
+    slot,
+    tinId: tinId ?? null,
+    mimeType: BGM_AUDIO_MIME_FALLBACK,
+    volume: typeof volume === 'number' ? volume : BGM_DEFAULT_VOLUME,
+    // The legacy schema had no playback intent: a stored track was playing.
+    isPlaying: true,
+  });
+  return [
+    row(1, juices.bgm1, juices.bgm1Volume),
+    row(2, juices.bgm2, juices.bgm2Volume),
+    row(3, juices.bgm3, juices.bgm3Volume),
+  ];
+}
+
+/**
+ * Returns the BGM rows of a scene: **one row per slot that has a track**
+ * (Issue #249).
+ *
+ * - An explicitly present `bgmSlots` array is authoritative: rows without a
+ *   valid tin id are dropped, so an untouched scene has no rows and a scene
+ *   whose list is `[]` shows nothing even when the legacy `bgm1..3` mirrors
+ *   linger. Only an absent field falls back to the legacy mirrors, and then
+ *   only the slots whose legacy field is set are returned (no synthetic
+ *   `1..3` null rows).
+ * - Slots carrying a `bgm::<slot>::removed` marker are always filtered out
+ *   (Issue #226 tombstone), regardless of any stale track value.
+ * - The result is sorted by slot and never contains a duplicate slot number.
  */
 export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
   const removed = new Set(getBgmRemovedSlots(juices));
-  const keep = (slots: BgmSlot[]): BgmSlot[] =>
-    slots.filter((slot) => !removed.has(slot.slot));
-  if (juices.bgmSlots) {
-    return keep(juices.bgmSlots);
+  const candidates: BgmSlot[] = Array.isArray(juices.bgmSlots)
+    ? juices.bgmSlots
+    : legacyBgmSlots(juices);
+
+  const bySlot = new Map<number, BgmSlot>();
+  for (const slot of candidates) {
+    if (!slot || typeof slot !== 'object') continue;
+    const slotNum = typeof slot.slot === 'number' ? slot.slot : Number(slot.slot);
+    if (!Number.isInteger(slotNum) || slotNum < 1) continue;
+    if (!hasBgmTrack(slot)) continue;
+    if (removed.has(slotNum)) continue;
+    // A duplicated slot number is a malformed cached value: the first entry wins.
+    if (bySlot.has(slotNum)) continue;
+    const volume =
+      typeof slot.volume === 'number' && Number.isFinite(slot.volume)
+        ? slot.volume
+        : BGM_DEFAULT_VOLUME;
+    bySlot.set(slotNum, {
+      ...slot,
+      slot: slotNum,
+      volume,
+      isPlaying: Boolean(slot.isPlaying),
+    });
   }
-  return keep([
-    {
-      slot: 1,
-      tinId: juices.bgm1 ?? null,
-      mimeType: juices.bgm1 ? BGM_AUDIO_MIME_FALLBACK : undefined,
-      volume: juices.bgm1Volume ?? 0.8,
-      isPlaying: Boolean(juices.bgm1),
-    },
-    {
-      slot: 2,
-      tinId: juices.bgm2 ?? null,
-      mimeType: juices.bgm2 ? BGM_AUDIO_MIME_FALLBACK : undefined,
-      volume: juices.bgm2Volume ?? 0.8,
-      isPlaying: Boolean(juices.bgm2),
-    },
-    {
-      slot: 3,
-      tinId: juices.bgm3 ?? null,
-      mimeType: juices.bgm3 ? BGM_AUDIO_MIME_FALLBACK : undefined,
-      volume: juices.bgm3Volume ?? 0.8,
-      isPlaying: Boolean(juices.bgm3),
-    },
-  ]);
+  return [...bySlot.values()].sort((a, b) => a.slot - b.slot);
 }
 
 /**
@@ -135,8 +172,10 @@ export function inheritJuices(source: Juices): Juices {
     bgm3: source.bgm3,
     bgm3Volume: source.bgm3Volume,
   };
-  if (source.bgmSlots) {
-    result.bgmSlots = source.bgmSlots.map((s) => ({ ...s }));
+  if (Array.isArray(source.bgmSlots)) {
+    // Only rows that carry a track are inherited (Issue #249); the removal
+    // markers themselves are scene-specific (see below).
+    result.bgmSlots = getNormalizedBgmSlots(source).map((s) => ({ ...s }));
   }
   // `bgmRemovedSlots` is deliberately not inherited: it is scene-specific
   // server state, while the inherited `bgmSlots` list already omits deleted
