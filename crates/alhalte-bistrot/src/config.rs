@@ -170,8 +170,40 @@ impl BistrotConfig {
     }
 
     /// Resolves the URL for the `alhalte-argenterie` web frontend in a browser.
+    ///
+    /// This is the **local** URL (used for printing / opening the browser); it
+    /// stays loopback even when `[argenterie] lan` is enabled. Use
+    /// [`crate::lan::detect_lan_urls`] for the best-effort LAN URLs.
     pub fn argenterie_url(&self) -> String {
         format!("http://{}:{}/", self.connect_host(), self.argenterie.port)
+    }
+
+    /// Host the Vite dev server should bind.
+    ///
+    /// Returns `0.0.0.0` when the development-only `[argenterie] lan` switch is
+    /// enabled so phones on the same Ethernet/LAN can reach the UI, and the
+    /// configured `restaurant.host` otherwise (loopback by default, Issue #229).
+    pub fn argenterie_bind_host(&self) -> &str {
+        if self.argenterie.lan {
+            "0.0.0.0"
+        } else {
+            &self.restaurant.host
+        }
+    }
+
+    /// Ports on which `maitre-d` should accept private-network browser origins.
+    ///
+    /// Empty unless `[argenterie] lan` is enabled (development only). When
+    /// enabled, it contains the argenterie port, which `generate_maitre_d_args`
+    /// turns into `--allow-lan-origin-port <port>`; `maitre-d` then accepts
+    /// `http://<private IPv4>:<port>` for CORS and OAuth `return_to` without
+    /// making CORS permissive.
+    pub fn lan_origin_ports(&self) -> Vec<u16> {
+        if self.argenterie.lan {
+            vec![self.argenterie.port]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Public base URL of `alhalte-maitre-d` as seen by browsers.
@@ -563,12 +595,28 @@ pub struct ArgenterieConfig {
     /// Listening HTTP port for argenterie frontend server.
     #[serde(default = "default_argenterie_port")]
     pub port: u16,
+
+    /// Exposes the dev frontend (and its sign-in path) to the local network.
+    ///
+    /// This is a **development-only** switch (Issue #229), disabled by default
+    /// so production and example configurations stay loopback-only:
+    /// - the Vite dev server binds `0.0.0.0` instead of `restaurant.host`
+    ///   (see [`BistrotConfig::argenterie_bind_host`]), and
+    /// - `maitre-d` receives `--allow-lan-origin-port {port}`, which accepts
+    ///   `http://<private IPv4>:<port>` browser origins for CORS and OAuth
+    ///   `return_to` (see [`BistrotConfig::lan_origin_ports`]).
+    ///
+    /// The UI is served over plain HTTP and without authentication beyond
+    /// maitre-d's own login, so never enable this on a public network.
+    #[serde(default, alias = "lan")]
+    pub lan: bool,
 }
 
 impl Default for ArgenterieConfig {
     fn default() -> Self {
         Self {
             port: default_argenterie_port(),
+            lan: false,
         }
     }
 }

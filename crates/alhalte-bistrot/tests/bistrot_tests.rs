@@ -3,7 +3,8 @@
 use age::secrecy::ExposeSecret;
 use age::x25519::Identity;
 use alhalte_bistrot::args::{
-    generate_all_args, generate_cellar_args, generate_maitre_d_args, generate_module_args,
+    generate_all_args, generate_argenterie_args, generate_cellar_args, generate_maitre_d_args,
+    generate_module_args,
 };
 use alhalte_bistrot::config::{
     ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, ExtensionManifestEntry,
@@ -711,6 +712,12 @@ fn test_generate_all_args_and_module_args() {
         all.maitre_d
     );
     assert_eq!(generate_module_args(&config, "cellar").unwrap(), all.cellar);
+    // Issue #229: the runner's fallback uses `args argenterie` so the bind host
+    // is the configured one (loopback unless `[argenterie] lan`).
+    assert_eq!(
+        generate_module_args(&config, "argenterie").unwrap(),
+        generate_argenterie_args(&config)
+    );
     // Banquette is spawned per room by maitre-d and has no static argument list.
     assert!(generate_module_args(&config, "banquette").is_err());
     assert!(generate_module_args(&config, "unknown").is_err());
@@ -1090,6 +1097,153 @@ salt = "salt"
 port = 0
 "#;
     assert!(dev_parse(toml_invalid_port).is_err());
+}
+
+// spec: alhalte-bistrot/lan 0001 LAN exposure is opt-in; defaults stay loopback
+#[test]
+fn test_argenterie_lan_defaults_to_loopback() {
+    let config = dev_parse(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+"#,
+    )
+    .unwrap();
+
+    assert!(!config.argenterie.lan, "LAN must be opt-in");
+    assert!(!ArgenterieConfig::default().lan);
+    assert_eq!(config.argenterie_bind_host(), "127.0.0.1");
+    assert!(config.lan_origin_ports().is_empty());
+
+    // The local URL and the OAuth public URL are unchanged.
+    assert_eq!(config.argenterie_url(), "http://127.0.0.1:5173/");
+    assert_eq!(config.maitre_d_public_url(), "http://127.0.0.1:5173");
+
+    // No LAN origin switch reaches maitre-d, and the CORS list stays explicit.
+    let args = generate_maitre_d_args(&config);
+    assert!(!args.iter().any(|arg| arg == "--allow-lan-origin-port"));
+    assert!(args.contains(&"http://127.0.0.1:5173".to_string()));
+    assert!(
+        !config
+            .cors_origins()
+            .iter()
+            .any(|origin| origin.contains("*"))
+    );
+
+    // The Vite bind host is the configured restaurant host (loopback here).
+    assert_eq!(
+        generate_argenterie_args(&config),
+        vec!["--host", "127.0.0.1", "--port", "5173"]
+    );
+    assert_eq!(
+        generate_module_args(&config, "argenterie").unwrap(),
+        generate_argenterie_args(&config)
+    );
+}
+
+// spec: alhalte-bistrot/lan 0002 the dev switch binds Vite on 0.0.0.0 and
+// scopes the maitre-d private-origin allowance to the argenterie port
+#[test]
+fn test_argenterie_lan_switch_enables_lan_bind_and_origin_port() {
+    let config = dev_parse(
+        r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[argenterie]
+port = 5173
+lan = true
+"#,
+    )
+    .unwrap();
+
+    assert!(config.argenterie.lan);
+    assert_eq!(config.argenterie_bind_host(), "0.0.0.0");
+    assert_eq!(config.lan_origin_ports(), vec![5173]);
+
+    // The browser URL printed/opened locally stays loopback; the LAN URL is a
+    // separate best-effort detection result.
+    assert_eq!(config.argenterie_url(), "http://127.0.0.1:5173/");
+    assert_eq!(config.maitre_d_public_url(), "http://127.0.0.1:5173");
+
+    // maitre-d receives the dev-only private-network origin switch, not a
+    // wildcard CORS origin.
+    let args = generate_maitre_d_args(&config);
+    assert_eq!(arg_after(&args, "--allow-lan-origin-port"), Some("5173"));
+    assert_eq!(
+        args.iter()
+            .filter(|arg| *arg == "--allow-lan-origin-port")
+            .count(),
+        1
+    );
+    assert!(!args.iter().any(|arg| arg == "*" || arg.contains('*')));
+
+    // Vite/runner arguments use the LAN bind host.
+    assert_eq!(
+        generate_argenterie_args(&config),
+        vec!["--host", "0.0.0.0", "--port", "5173"]
+    );
+
+    // The systemd unit uses the same arguments (single source of truth).
+    let options = SystemdOptions::default();
+    let unit = generate_argenterie_service(&config, &options);
+    assert!(unit.contains("ExecStart=pnpm run dev --host 0.0.0.0 --port 5173"));
+
+    // A non-default port is propagated to both the bind and the origin rule.
+    let mut custom = config.clone();
+    custom.argenterie.port = 3000;
+    assert_eq!(custom.lan_origin_ports(), vec![3000]);
+    let custom_args = generate_maitre_d_args(&custom);
+    assert_eq!(
+        arg_after(&custom_args, "--allow-lan-origin-port"),
+        Some("3000")
+    );
+}
+
+// spec: alhalte-bistrot/lan 0003 the bundled dev config enables LAN, the
+// production example keeps the loopback-safe default
+#[test]
+fn test_bundled_dev_config_enables_lan_but_example_stays_loopback() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+
+    let dev_config = dev_load(&repo_root.join("Bistrot.toml"))
+        .expect("the bundled local-development configuration must parse");
+    assert!(
+        dev_config.argenterie.lan,
+        "nix run .#bistrot must expose the UI to the LAN without editing files"
+    );
+    assert_eq!(dev_config.argenterie_bind_host(), "0.0.0.0");
+
+    let example = std::fs::read_to_string(repo_root.join("Bistrot.example.toml"))
+        .expect("Bistrot.example.toml must be checked in");
+    assert!(
+        example.contains("# lan = false"),
+        "the production template must document the loopback-safe default"
+    );
+    assert!(
+        !example
+            .lines()
+            .any(|line| line.trim_start().starts_with("lan = true")),
+        "the production template must not enable LAN exposure"
+    );
+}
+
+// spec: alhalte-bistrot/lan 0004 LAN URLs keep the argenterie port
+#[test]
+fn test_lan_url_formatting_keeps_the_argenterie_port() {
+    assert_eq!(
+        alhalte_bistrot::lan_url(std::net::Ipv4Addr::new(192, 168, 1, 42), 5173),
+        "http://192.168.1.42:5173/"
+    );
 }
 
 // spec: alhalte-bistrot/extensions

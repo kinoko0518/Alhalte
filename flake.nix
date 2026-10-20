@@ -137,7 +137,10 @@
               target/debug/alhalte-maitre-d "''${maitre_args[@]}" &
               read -r -a cellar_args <<< "$(target/debug/alhalte-bistrot --config "$CONFIG" args cellar)"
               target/debug/alhalte-cellar "''${cellar_args[@]}" &
-              (cd "$PWD/web/alhalte-argenterie" && pnpm run dev) &
+              # The bind host / port come from Bistrot.toml (Issue #229), so
+              # `[argenterie] lan` is honored on the fallback path too.
+              read -r -a argenterie_args <<< "$(target/debug/alhalte-bistrot --config "$CONFIG" args argenterie)"
+              (cd "$PWD/web/alhalte-argenterie" && pnpm run dev "''${argenterie_args[@]}") &
             fi
 
             # 6. argenterie の URL を取得し、ポート待受を最大15秒待機後、ブラウザを開く
@@ -157,6 +160,18 @@
               echo "Alhalte Argenterie is running and ready at $URL"
             else
               echo "Warning: Argenterie did not respond within 15 seconds at $URL" >&2
+            fi
+
+            # Issue #229: best-effort LAN URLs for phones on the same Ethernet.
+            # `url --lan` prints nothing when detection fails or LAN is disabled.
+            LAN_URLS="$(target/debug/alhalte-bistrot --config "$CONFIG" url --lan 2>/dev/null || true)"
+            if [ -n "$LAN_URLS" ]; then
+              echo "同一ネットワークの端末からも開けます（同一イーサネット / LAN のみ）:"
+              while IFS= read -r lan_url; do
+                if [ -n "$lan_url" ]; then
+                  echo "  $lan_url"
+                fi
+              done <<< "$LAN_URLS"
             fi
 
             if [ -z "''${ALHALTE_NO_BROWSER:-}" ] && [ "$NO_BROWSER" = false ]; then
