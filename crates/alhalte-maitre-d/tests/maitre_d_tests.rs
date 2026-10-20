@@ -11,12 +11,13 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use alhalte_banquette::{ClientFrame, RoomPermissionLevel, ServerFrame};
 use alhalte_maitre_d::{
-    AccountSearchItem, AppState, BanquetteSpawner, Database, IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID,
-    IDENT_ALHALTE_MAITRE_D_SESSION_ID, InProcessBanquetteSpawner,
-    LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID, LABEL_ALHALTE_MAITRE_D_SESSION_ID, MaitreDError,
-    MockOAuthProvider, RoomBridgeManager, RoomInfoResponse, RoomPermissionItem, RoomRole,
-    SUB_HASH_BYTES, SUB_HASH_HEX_LEN, SetRoomPermissionRequest, SubHash, account_id_from_tin,
-    account_id_to_tin, cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
+    AccountResponse, AccountSearchItem, AppState, AuthResponse, BanquetteSpawner, Database,
+    IDENT_ALHALTE_MAITRE_D_ACCOUNT_ID, IDENT_ALHALTE_MAITRE_D_SESSION_ID,
+    InProcessBanquetteSpawner, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
+    LABEL_ALHALTE_MAITRE_D_SESSION_ID, MaitreDError, MockOAuthProvider, RoomBridgeManager,
+    RoomInfoResponse, RoomPermissionItem, RoomRole, SUB_HASH_BYTES, SUB_HASH_HEX_LEN,
+    SessionResponse, SetRoomPermissionRequest, SubHash, account_id_from_tin, account_id_to_tin,
+    cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
     extract_session_id_from_cookie, hash_sub, is_allowed_return_to_with_lan, parse_cli_args_from,
     parse_session_id_from_cookie_str, previous_4am_local, resolve_banquette_bin,
     session_id_from_tin, session_id_to_tin,
@@ -28,6 +29,57 @@ use alhalte_maitre_d::{
 fn test_sub_hash(sub: &str) -> SubHash {
     let mut sub = sub.to_string();
     hash_sub("test-salt", &mut sub)
+}
+
+// spec: alhalte-maitre-d/session 0010 a 64-bit session ID survives JSON as a string
+#[test]
+fn test_session_ids_are_json_strings_so_browsers_keep_all_64_bits() {
+    let account = AccountResponse {
+        account_id: 7,
+        handle_name: "Alice".to_string(),
+        icon_tin_id: None,
+        created_at: 1000,
+    };
+    // Above `Number.MAX_SAFE_INTEGER`: a JSON number would be rounded by
+    // JavaScript's `JSON.parse` and could never match the stored session
+    // (Issue #220).
+    let session_id: u64 = 0xFEDC_BA98_7654_3210;
+
+    let session = SessionResponse {
+        account: account.clone(),
+        session_id,
+    };
+    let value = serde_json::to_value(&session).unwrap();
+    assert_eq!(
+        value["session_id"].as_str(),
+        Some("18364758544493064720"),
+        "session_id must be a decimal string, not a JS-unsafe JSON number"
+    );
+    assert_eq!(
+        serde_json::from_value::<SessionResponse>(value)
+            .unwrap()
+            .session_id,
+        session_id
+    );
+
+    let auth = AuthResponse {
+        account: account.clone(),
+        session_id,
+    };
+    let value = serde_json::to_value(&auth).unwrap();
+    assert_eq!(value["session_id"].as_str(), Some("18364758544493064720"));
+    assert_eq!(
+        serde_json::from_value::<AuthResponse>(value)
+            .unwrap()
+            .session_id,
+        session_id
+    );
+
+    // Older servers / clients serialized the ID as a JSON number; keep
+    // deserializing that form so the change is backward compatible.
+    let legacy = serde_json::json!({ "account": account, "session_id": session_id });
+    let decoded: SessionResponse = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.session_id, session_id);
 }
 
 // spec: alhalte-maitre-d/rooms registry

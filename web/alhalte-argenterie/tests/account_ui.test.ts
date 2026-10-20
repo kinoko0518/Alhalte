@@ -104,7 +104,7 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
       expect(init?.headers).toBeUndefined();
       return jsonResponse({
         account: { account_id: 42, handle_name: 'Alice', icon_tin_id: null },
-        session_id: 123456789,
+        session_id: '123456789',
       });
     });
 
@@ -122,6 +122,46 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
       '/rooms/1122334455667788?invite=1#room-key',
     );
     expect(sessionStorage.getItem(OAUTH_RETURN_URL_STORAGE_KEY)).toBeNull();
+  });
+
+  // spec: alhalte-argenterie/account 0024 64bit session ID を丸めずに保存
+  it('keeps a 64-bit session ID exact instead of rounding it through a JS number', async () => {
+    sessionStorage.setItem(OAUTH_RETURN_URL_STORAGE_KEY, `${window.location.origin}/`);
+    // Above `Number.MAX_SAFE_INTEGER`: `JSON.parse` would round this.
+    const exact = '18446744073709551614';
+    const fetchFn = vi.fn(async () =>
+      jsonResponse({
+        account: { account_id: 42, handle_name: 'Alice', icon_tin_id: null },
+        session_id: exact,
+      }),
+    );
+
+    const profile = await completeGoogleSignIn({ fetchFn: fetchFn as unknown as typeof fetch });
+
+    expect(profile?.account_id).toBe(42);
+    expect(localStorage.getItem('alhalte:session-id')).toBe(exact);
+    expect(document.cookie).toContain(`session_id=${exact}`);
+  });
+
+  // spec: alhalte-argenterie/account 0025 callback Cookie の正確な session ID を優先
+  it('prefers the exact session cookie over a rounded legacy JSON number', async () => {
+    const exact = '18446744073709551614';
+    // The OAuth callback already set the cookie to the exact value.
+    document.cookie = `session_id=${exact}; path=/; SameSite=Lax`;
+    sessionStorage.setItem(OAUTH_RETURN_URL_STORAGE_KEY, `${window.location.origin}/`);
+    const fetchFn = vi.fn(async () =>
+      jsonResponse({
+        account: { account_id: 42, handle_name: 'Alice', icon_tin_id: null },
+        // Older maitre-d responses used a JSON number, which `JSON.parse`
+        // rounds above 2^53.
+        session_id: 18446744073709552000,
+      }),
+    );
+
+    await completeGoogleSignIn({ fetchFn: fetchFn as unknown as typeof fetch });
+
+    expect(localStorage.getItem('alhalte:session-id')).toBe(exact);
+    expect(document.cookie).toContain(`session_id=${exact}`);
   });
 
   // spec: alhalte-argenterie/account 0022 未サインインへの戻りは交換しない

@@ -25,6 +25,7 @@ import {
   buildAuthHeaders,
   getSavedAccountId,
   getSavedSessionId,
+  getSessionIdFromCookie,
   saveAccountId,
   saveSessionId,
 } from './session.js';
@@ -48,8 +49,15 @@ export interface AccountProfile {
 export interface SessionResponse {
   /** Public account profile for the session owner. */
   account: AccountProfile;
-  /** Session ID resolved from the `session_id` cookie. */
-  session_id: number;
+  /**
+   * Session ID resolved from the `session_id` cookie.
+   *
+   * maitre-d serializes the 64-bit ID as a decimal string: JavaScript numbers
+   * have only 53 bits of integer precision, so a numeric session ID above
+   * `Number.MAX_SAFE_INTEGER` would be rounded and never match the stored
+   * session (Issue #220).
+   */
+  session_id: string;
 }
 
 /** Response payload of `GET /api/server-info`. */
@@ -370,8 +378,15 @@ export async function completeGoogleSignIn(
     throw new Error('Google sign-in response is missing account or session');
   }
 
+  // The callback already set the `session_id` cookie to the exact decimal
+  // value. Prefer that value over the JSON body: an older maitre-d serialized
+  // the 64-bit ID as a JSON number, which `JSON.parse` rounds above
+  // `Number.MAX_SAFE_INTEGER`, and storing the rounded ID would make every
+  // authenticated request fail with 401 (Issue #220).
+  const sessionId = getSessionIdFromCookie() ?? String(data.session_id);
+
   saveAccountId(data.account.account_id);
-  saveSessionId(data.session_id);
+  saveSessionId(sessionId);
 
   const target = restoreTarget(returnUrl, window.location.origin);
   if (target) {

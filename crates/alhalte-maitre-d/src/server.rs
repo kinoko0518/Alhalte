@@ -32,6 +32,67 @@ use crate::gateway::{RoomBridge, RoomBridgeManager};
 use crate::oauth::OAuthProvider;
 use crate::room_id::RoomId;
 
+/// Serde helpers that carry 64-bit session IDs as decimal strings.
+///
+/// JavaScript numbers have 53 bits of integer precision, so a `session_id`
+/// serialized as a JSON number above `Number.MAX_SAFE_INTEGER` is silently
+/// rounded by `JSON.parse`. The browser would then store and send an ID that
+/// matches no session row, making every authenticated request after sign-in fail
+/// with 401 (Issue #220). Serializing the ID as a decimal string preserves all
+/// 64 bits. Deserialization accepts both a string and a number so existing
+/// numeric clients keep working.
+mod session_id_json {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serializes a `u64` session ID as a decimal string.
+    pub fn serialize<S>(value: &u64, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&value.to_string())
+    }
+
+    /// Deserializes a session ID from either a decimal string or a JSON number.
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<u64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrNumber {
+            String(String),
+            Number(u64),
+        }
+
+        match StringOrNumber::deserialize(deserializer)? {
+            StringOrNumber::String(value) => value.parse::<u64>().map_err(serde::de::Error::custom),
+            StringOrNumber::Number(value) => Ok(value),
+        }
+    }
+
+    /// Deserializes an optional session ID from either representation.
+    pub fn deserialize_optional<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StringOrNumber {
+            String(String),
+            Number(u64),
+        }
+
+        match Option::<StringOrNumber>::deserialize(deserializer)? {
+            None => Ok(None),
+            Some(StringOrNumber::String(value)) => value
+                .parse::<u64>()
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+            Some(StringOrNumber::Number(value)) => Ok(Some(value)),
+        }
+    }
+}
+
 /// Default browser origins allowed by CORS in local development.
 ///
 /// Production deployments should pass explicit `--cors-origin` values derived
@@ -317,14 +378,16 @@ pub struct VerifySessionResponse {
     pub valid: bool,
     /// Account ID.
     pub account_id: u64,
-    /// Session ID.
+    /// Session ID, as a decimal string so browsers keep all 64 bits.
+    #[serde(with = "session_id_json")]
     pub session_id: u64,
 }
 
 /// Request payload for heartbeat.
 #[derive(Debug, Deserialize, Default)]
 pub struct HeartbeatRequest {
-    /// Session ID.
+    /// Session ID (decimal string or legacy JSON number).
+    #[serde(default, deserialize_with = "session_id_json::deserialize_optional")]
     pub session_id: Option<u64>,
 }
 
@@ -479,7 +542,8 @@ pub struct OAuthTokenRequest {
 pub struct AuthResponse {
     /// Public account profile.
     pub account: AccountResponse,
-    /// Issued 64-bit session ID.
+    /// Issued 64-bit session ID, as a decimal string so browsers keep all 64 bits.
+    #[serde(with = "session_id_json")]
     pub session_id: u64,
 }
 
@@ -492,14 +556,17 @@ pub struct AuthResponse {
 pub struct SessionResponse {
     /// Public account profile for the session owner.
     pub account: AccountResponse,
-    /// Session ID resolved from the cookie / header / query.
+    /// Session ID resolved from the cookie / header / query, as a decimal string
+    /// so browsers keep all 64 bits.
+    #[serde(with = "session_id_json")]
     pub session_id: u64,
 }
 
 /// Request payload for profile update.
 #[derive(Debug, Deserialize)]
 pub struct UpdateProfileRequest {
-    /// Session ID for authorization.
+    /// Session ID for authorization (decimal string or legacy JSON number).
+    #[serde(default, deserialize_with = "session_id_json::deserialize_optional")]
     pub session_id: Option<u64>,
     /// New handle name.
     pub handle_name: Option<String>,
