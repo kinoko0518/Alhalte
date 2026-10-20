@@ -878,8 +878,9 @@
     gap: 16px;
   }
   /*
-   * Issue #59 / #145 / #149:
+   * Issue #59 / #145 / #149 / #244:
    * 管理者（admin）以外のユーザーが開いた場合もタブは読めるままにし、操作だけを無効化する。
+   * 非管理者には行の非操作部分だけを少し暗くする（下の `.non-admin-locked` 規則）。
    * オフライン時も同じ方針（オフライン通知は通常のコントラストで表示）。
    * 暗転・クリック透過は行わない（再導入しない）。
    */
@@ -1046,6 +1047,32 @@
     padding: 2px 6px;
     border-radius: 4px;
     color: var(--np-color-on-surface-variant);
+  }
+  /*
+   * Issue #244: 非管理者には拡張機能タブをグレーアウトして「操作不能」を一目で伝える。
+   * ただし Issue #149（ARCHITECTURE.md `### 拡張機能`）の「暗転・クリック透過を
+   * タブ全体に掛けない」制約は維持するので、暗くするのは行の非操作部分だけに限定する:
+   * 拡張機能名・説明・アイコン・優先度バッジ。有効化 Switch / その他メニュー /
+   * 並べ替え / アップロードは noph-ui の disabled トークンに任せ、二重に暗くしない。
+   * シェル・タブコンテナ・一覧（スクロール）・オフライン通知・ロック表示
+   * 「（管理者のみ操作可能）」・「wasm がありません」は通常のコントラストを保つ。
+   *
+   * 明るさは M3 の disabled テキスト（on-surface の 38%）だと読みにくいため、
+   * 「少し暗く」の範囲として既定ライトテーマの surface-container-low 上で
+   * おおよそ 3.6:1 になる値にそろえる。on-surface-variant は元のコントラストが
+   * 低いので、同じ見え方になるよう混合率を上げる（60% / 78%）。
+   */
+  .non-admin-locked .ext-name {
+    color: color-mix(in srgb, var(--np-color-on-surface) 60%, transparent);
+  }
+  .non-admin-locked .ext-description {
+    color: color-mix(in srgb, var(--np-color-on-surface-variant) 78%, transparent);
+  }
+  .non-admin-locked .ext-icon-themed {
+    opacity: 0.6;
+  }
+  .non-admin-locked .priority-badge {
+    opacity: 0.6;
   }
   .more-menu-wrapper {
     position: relative;
