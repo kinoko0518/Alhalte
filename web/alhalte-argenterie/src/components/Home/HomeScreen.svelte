@@ -193,8 +193,11 @@
     } catch (error) {
       if (error instanceof RoomApiError) {
         if (error.kind === 'unauthorized') {
+          // Issue #221: the sign-in guidance below already tells the user what
+          // to do, so a second 401 message would be duplicate. Keep `createError`
+          // empty and let only `create-room-signin-guidance` render.
           createNeedsSignIn = true;
-          createError = 'サインインが必要です。右上のアカウントメニューからサインインしてください。';
+          createError = '';
         } else if (error.kind === 'forbidden') {
           createError = '部屋を作成する権限がありません。';
         } else if (error.kind === 'network') {
@@ -451,6 +454,13 @@
             リンクをコピー
           </Button>
         </div>
+
+        <!-- Issue #221: the loss warning must always sit directly below the room
+             URL row and stay visible regardless of sign-in / error state. -->
+        <p class="dialog-warning-centered" data-testid="dialog-warning">
+          このリンクを紛失した場合、部屋へのアクセスは永久に失われます！
+        </p>
+
         {#if copyNotice}
           <div class="copy-notice" data-testid="copy-notice">{copyNotice}</div>
         {/if}
@@ -476,10 +486,6 @@
             {createError}
           </div>
         {/if}
-
-        <p class="dialog-warning-centered" data-testid="dialog-warning">
-          このリンクを紛失した場合、部屋へのアクセスは永久に失われます！
-        </p>
 
         <div class="dialog-actions">
           <Button variant="text" onclick={closeCreateDialog} disabled={isCreating}>
