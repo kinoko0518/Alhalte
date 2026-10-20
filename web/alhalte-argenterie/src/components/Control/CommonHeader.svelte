@@ -7,6 +7,11 @@
    *   The icon follows the hosting surface (`placement`, Issue #223):
    *   `right_panel_close` on the landscape side sheet and `bottom_panel_close`
    *   on the portrait bottom sheet.
+   *   On the portrait bottom sheet only, a second IconButton toggles the sheet
+   *   between half and full (Issue #242): `open_in_full` / `close_fullscreen`.
+   *   noph-ui's own handle only steps when the content grows taller than half
+   *   (it reads `scrollHeight - clientHeight`), so the full state needs an
+   *   explicit, content-independent control.
    * - Center: Search in Docked layout, contained style, displaying scene candidates (existing scenes only)
    * - Right: Gear IconButton opening menu (room ZIP export, log ZIP export, admin actions, horizontal theme color circles)
    *
@@ -14,6 +19,7 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> コントロールパネル共通ヘッダー`
    * - GitHub Issue #89: コントロールパネルに関する複数の提言
    * - GitHub Issue #223: 縦画面のボトムシートは下向きの閉じるアイコンを使う
+   * - GitHub Issue #242: 縦画面のボトムシートに全開（全画面近く）状態を追加する
    */
   import { Button, Divider, IconButton, Item, Menu, MenuItem, Search } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
@@ -43,6 +49,8 @@
     role = 'participant',
     defaultPermission = null,
     placement = 'side',
+    sheetExpanded = false,
+    onToggleSheetExpanded,
     onCollapse,
     onSelectScene,
     onExportZip,
@@ -69,6 +77,17 @@
      * keeps pointing right. Passed explicitly instead of reading the viewport.
      */
     placement?: PanelPlacement;
+    /**
+     * Whether the portrait bottom sheet is currently fully open (Issue #242).
+     * Drives the icon, the label and `aria-expanded` of the expand toggle.
+     */
+    sheetExpanded?: boolean;
+    /**
+     * Toggles the portrait bottom sheet between half and full (Issue #242).
+     * The toggle is only rendered for `placement === 'bottom'` and only when
+     * this callback is provided, so the landscape side sheet is unchanged.
+     */
+    onToggleSheetExpanded?: () => void;
     onCollapse?: () => void;
     onSelectScene?: (sceneId: string) => void;
     onExportZip?: (type: 'full' | 'logs') => void;
@@ -225,6 +244,26 @@
     >
       <Icon>{closeIcon}</Icon>
     </IconButton>
+
+    <!-- Left: portrait-only half ⇄ full toggle (Issue #242). The portrait
+         bottom sheet is sized by its state, so its content never grows past
+         half and noph-ui's handle cannot reach the full state. -->
+    {#if placement === 'bottom' && onToggleSheetExpanded}
+      <IconButton
+        variant="tonal"
+        size="s"
+        shape="square"
+        width="wide"
+        onclick={onToggleSheetExpanded}
+        data-testid="expand-sheet-button"
+        data-panel-placement={placement}
+        aria-expanded={sheetExpanded ? 'true' : 'false'}
+        aria-label={sheetExpanded ? 'ボトムシートを半開に戻す' : 'ボトムシートを全開にする'}
+        title={sheetExpanded ? 'ボトムシートを半開に戻す' : 'ボトムシートを全開にする'}
+      >
+        <Icon>{sheetExpanded ? 'close_fullscreen' : 'open_in_full'}</Icon>
+      </IconButton>
+    {/if}
   </div>
 
   <!-- Center: Search in Docked layout, contained style -->
@@ -425,6 +464,7 @@
   .header-left {
     display: flex;
     align-items: center;
+    gap: 4px;
     flex-shrink: 0;
   }
   .header-center {

@@ -394,6 +394,12 @@
    * The three portrait bottom-sheet states (Issue #223): closed, half (exactly
    * 50dvh) and fully open. Exposed as `data-sheet-state` so the state-sized
    * sheet is assertable without measuring jsdom layout.
+   *
+   * `isControlSheetExpanded` is driven from the portrait header toggle
+   * (Issue #242) as well as noph-ui's handle drag/step. The sheet is sized by
+   * this state, so its content never grows taller than half and noph-ui's
+   * `step()` (which compares `scrollHeight` with `clientHeight`) cannot reach
+   * the full state on its own.
    */
   let controlSheetState = $derived(
     !isControlSheetOpen ? 'closed' : isControlSheetExpanded ? 'full' : 'half',
@@ -3308,6 +3314,8 @@
                 role={effectiveRole}
                 {defaultPermission}
                 placement="bottom"
+                sheetExpanded={isControlSheetExpanded}
+                onToggleSheetExpanded={() => (isControlSheetExpanded = !isControlSheetExpanded)}
                 sending={isSending}
                 {queuedMessages}
                 {sceneActionPending}
