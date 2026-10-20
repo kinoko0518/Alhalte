@@ -779,7 +779,6 @@
   .character-view-tabs {
     display: flex;
     width: 100%;
-    overflow-x: auto;
   }
   .character-view-tabs :global(.np-segmented-buttons) {
     width: 100%;
