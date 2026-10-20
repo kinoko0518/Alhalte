@@ -112,9 +112,11 @@ describe('BGM slot deletion and tombstones (Issue #226 / #249)', () => {
     target.querySelector<HTMLElement>('[data-testid="asset-card-none"]')!.click();
     await settle();
 
-    // Same writes as 🗑️ (Issue #249).
+    // Same writes as 🗑️ (Issue #249 / #250).
     expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
       'std::bgm',
+      'bgm::1::started_at',
+      'bgm::1::paused_at',
       'bgm::1::volume',
     ]);
     expect(

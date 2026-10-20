@@ -94,6 +94,17 @@ export function hasBgmTrack(slot: Pick<BgmSlot, 'tinId'>): boolean {
 /** Default volume of a BGM slot without a `bgm::<slot>::volume` value. */
 const BGM_DEFAULT_VOLUME = 0.8;
 
+/**
+ * Normalizes a BGM transport timestamp (UNIX milliseconds, Issue #250).
+ *
+ * Returns `undefined` for anything that is not a finite number, so a malformed
+ * cached / broadcast value behaves exactly like a legacy room without the key.
+ */
+function normalizeBgmTimestamp(value: unknown): number | undefined {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return undefined;
+  return Math.max(0, Math.trunc(value));
+}
+
 /** Rows derived from the legacy `bgm1..3` fields of a scene without `bgmSlots`. */
 function legacyBgmSlots(juices: Juices): BgmSlot[] {
   const row = (slot: number, tinId: string | undefined, volume?: number): BgmSlot => ({
@@ -144,11 +155,15 @@ export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
       typeof slot.volume === 'number' && Number.isFinite(slot.volume)
         ? slot.volume
         : BGM_DEFAULT_VOLUME;
+    // Transport timestamps are UNIX milliseconds (Issue #250). A malformed
+    // cached value is dropped so a NaN can never reach the offset arithmetic.
     bySlot.set(slotNum, {
       ...slot,
       slot: slotNum,
       volume,
       isPlaying: Boolean(slot.isPlaying),
+      startedAt: normalizeBgmTimestamp(slot.startedAt),
+      pausedAt: normalizeBgmTimestamp(slot.pausedAt),
     });
   }
   return [...bySlot.values()].sort((a, b) => a.slot - b.slot);
@@ -329,6 +344,30 @@ export function bgmPlayingStateKey(slot: number): string {
  */
 export function bgmRemovedStateKey(slot: number): string {
   return `bgm::${slot}::removed`;
+}
+
+/**
+ * `bgm::<slot>::started_at` state key (Issue #250).
+ *
+ * A UNIX millisecond timestamp of when the current continuous playback started.
+ * The playback position of a playing slot is `now - started_at` (modulo the
+ * track duration), so a client that joins mid-track seeks to the same offset and
+ * ⏪ (restart) just rewrites the timestamp to `now` for every client.
+ */
+export function bgmStartedAtStateKey(slot: number): string {
+  return `bgm::${slot}::started_at`;
+}
+
+/**
+ * `bgm::<slot>::paused_at` state key (Issue #250).
+ *
+ * A UNIX millisecond timestamp of when the slot was paused; it is deleted while
+ * playing. A paused slot keeps its position as `paused_at - started_at`, and
+ * resuming rewrites `started_at` to `now - (paused_at - started_at)` before
+ * deleting this key.
+ */
+export function bgmPausedAtStateKey(slot: number): string {
+  return `bgm::${slot}::paused_at`;
 }
 
 /** Decoded `std::bgm<N>` value. */

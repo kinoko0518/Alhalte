@@ -9,8 +9,10 @@
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    * - GitHub Issue #109 / sub-issue #142: BGM状態変更のサーバー送信と送信中インジケーター
    * - GitHub Issue #226: BGMスロット削除 (track / playing / volume をサーバーから消す)
+   * - GitHub Issue #250: BGM の再生位置同期 (started_at / paused_at) とトランスポート UI
    */
   import {
+    ButtonGroup,
     Button,
     Carousel,
     CarouselItem,
@@ -25,8 +27,10 @@
   import type { BgmSlot, Scene } from '../../../types/index.js';
   import {
     BGM_AUDIO_MIME_FALLBACK,
+    bgmPausedAtStateKey,
     bgmPlayingStateKey,
     bgmRemovedStateKey,
+    bgmStartedAtStateKey,
     bgmTrackStateKey,
     bgmVolumeStateKey,
     buildBgmTrackState,
@@ -41,6 +45,7 @@
     type BgmTrackState,
   } from '../../../utils/sceneSettings.js';
   import {
+    computeBgmOffsetMs,
     createAudioManager,
     type AudioManager,
     type AudioSlotState,
@@ -294,7 +299,7 @@
     }
   }
 
-  // BGM Slots state & synchronization (Issue #53 / #109 / #142 / #164)
+  // BGM Slots state & synchronization (Issue #53 / #109 / #142 / #164 / #250)
   //
   // State schema (see the PR 「判断した点」):
   // - track: `std::bgm` (slot 1), `std::bgm2` / `std::bgm3` (slots 2 / 3)
@@ -306,6 +311,13 @@
   // - removed: `bgm::<slot>::removed` = true after the slot is deleted from the
   //   UI (Issue #226); it stays as a tombstone so a stale broadcast cannot
   //   resurrect the row. Slot numbers are never reused, so it is never cleared.
+  // - started_at / paused_at: UNIX ms wall-clock timestamps of the current
+  //   continuous playback (Issue #250). They are what every client derives its
+  //   playback position from; no duration is ever stored.
+  //   - play a new track: `started_at = now`, delete `paused_at`
+  //   - pause: `paused_at = now`
+  //   - resume: `started_at = now - (paused_at - started_at)`, delete `paused_at`
+  //   - restart (⏪): `started_at = now`, delete `paused_at`
   //
   // A row exists iff the slot has a track (Issue #249): there is no empty slot
   // row, so `bgmSlots` only ever holds slots with a selected track.
@@ -354,6 +366,11 @@
     return bgmSlots.find((s) => s.slot === slotNum);
   }
 
+  /** True when the slot is audible (playing intent plus a selected track). */
+  function isBgmPlaying(slot: BgmSlot): boolean {
+    return Boolean(slot.isPlaying && slot.tinId);
+  }
+
   /** Converts a slot's state fields into the audio manager track shape. */
   function getSlotTrack(slot: BgmSlot | undefined): BgmTrackState | null {
     if (!slot?.tinId) return null;
@@ -366,6 +383,17 @@
 
   function isBgmPending(slotNum: number): boolean {
     return pendingBgmSlots.has(slotNum);
+  }
+
+  /**
+   * True when the slot's controls must not be used (Issue #250).
+   *
+   * A viewer / denied role is read-only: it still hears the BGM another client
+   * started, but it cannot write the transport state (the server would reject
+   * the write with `PermissionDenied`).
+   */
+  function isBgmLocked(slotNum: number): boolean {
+    return isBgmPending(slotNum) || !capabilities.canSend;
   }
 
   function setBgmPending(slotNum: number, pending: boolean) {
@@ -404,24 +432,57 @@
   }
 
   /**
+   * Transport timestamps committed with a playback state change (Issue #250).
+   *
+   * An omitted field keeps the existing row value; an explicit `null` clears it
+   * (resuming deletes `paused_at`).
+   */
+  interface BgmTransportPatch {
+    startedAt?: number | null;
+    pausedAt?: number | null;
+  }
+
+  /** Applies a transport patch to a slot row field. */
+  function patchedBgmTimestamp(
+    patch: BgmTransportPatch,
+    field: 'startedAt' | 'pausedAt',
+    existing: number | undefined,
+  ): number | undefined {
+    if (!(field in patch)) return existing;
+    const value = patch[field];
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  }
+
+  /**
    * Commits a track / playback change to the local scene after the server
    * acknowledged it.
    *
    * A track creates the row when the slot has none yet (Issue #249): the row is
    * the only representation of a selected track, so "add slot" needs no empty
-   * placeholder and the row appears with this ack. Called exactly once per
-   * successful operation; `onUpdateScene` follows from it.
+   * placeholder and the row appears with this ack. The transport timestamps are
+   * committed with it and are what every client derives its playback position
+   * from (Issue #250). Called exactly once per successful operation;
+   * `onUpdateScene` follows from it.
    */
   function applyBgmSlotState(
     slotNum: number,
     track: BgmTrackState | null,
     isPlaying: boolean,
+    transport: BgmTransportPatch = {},
   ) {
     const existing = findBgmSlot(slotNum);
+    const startedAt = patchedBgmTimestamp(
+      transport,
+      'startedAt',
+      existing?.startedAt,
+    );
+    const pausedAt = patchedBgmTimestamp(transport, 'pausedAt', existing?.pausedAt);
     if (!track) {
       // A malformed / missing legacy track keeps the row and only updates the
       // playback flag; row removal is `applyBgmSlotRemoval` alone.
-      bgmSlots = bgmSlots.map((s) => (s.slot === slotNum ? { ...s, isPlaying } : s));
+      bgmSlots = bgmSlots.map((s) =>
+        s.slot === slotNum ? { ...s, isPlaying, startedAt, pausedAt } : s,
+      );
     } else {
       const updated: BgmSlot = {
         slot: slotNum,
@@ -430,6 +491,8 @@
         name: track.name,
         volume: draftBgmVolumes[slotNum] ?? existing?.volume ?? 0.8,
         isPlaying,
+        startedAt,
+        pausedAt,
       };
       bgmSlots = [...bgmSlots.filter((s) => s.slot !== slotNum), updated].sort(
         (a, b) => a.slot - b.slot,
@@ -519,21 +582,64 @@
     }
   }
 
-  /** Starts the prepared element; a browser autoplay refusal is not an error. */
-  async function playBgmAudio(slotNum: number): Promise<void> {
+  /**
+   * Starts the prepared element at a shared position (Issue #250).
+   *
+   * A browser autoplay refusal is not an error (`play()` resolves `'paused'`);
+   * the next user gesture retries the same element from the same offset.
+   */
+  async function playBgmAudio(slotNum: number, offsetMs?: number): Promise<void> {
     if (!canUseBgmAudio()) return;
     try {
-      await bgmAudio.play(slotNum);
+      await bgmAudio.play(slotNum, offsetMs);
     } catch (error) {
       console.warn(`[SceneSettingsTab] Failed to play BGM slot ${slotNum}:`, error);
     }
   }
 
+  /** Wall-clock "now" used for the transport timestamps (`started_at` / `paused_at`). */
+  function bgmNowMs(): number {
+    return Date.now();
+  }
+
   /**
-   * Plays a slot and commits `bgm::<slot>::playing = true` after the ack.
+   * `started_at` of a resume (Issue #250).
    *
+   * `started_at = now - (paused_at - started_at)`, so the elapsed part of the
+   * paused playback is kept and every client continues at the paused position.
+   * The elapsed time is clamped at `>= 0`; a legacy paused slot without
+   * `started_at` restarts from 0.
+   */
+  function resumeBgmStartedAt(slot: BgmSlot | undefined, now: number): number {
+    const pausedAt = slot?.pausedAt;
+    if (typeof pausedAt !== 'number' || !Number.isFinite(pausedAt)) return now;
+    const startedAt = slot?.startedAt;
+    const elapsed =
+      typeof startedAt === 'number' && Number.isFinite(startedAt)
+        ? Math.max(0, pausedAt - startedAt)
+        : 0;
+    return now - elapsed;
+  }
+
+  /** Position (ms) a playing slot starts at, derived from its `started_at`. */
+  function bgmPlayOffsetMs(slotNum: number, startedAt: number): number {
+    return computeBgmOffsetMs({
+      now: bgmNowMs(),
+      startedAt,
+      durationMs: bgmAudio.getDurationMs(slotNum),
+    });
+  }
+
+  /**
+   * Plays a slot and commits `bgm::<slot>::playing = true` after the acks
+   * (Issue #250).
+   *
+   * The state writes are acknowledged in order — track (when it changed) →
+   * `started_at` → delete `paused_at` → `playing=true` — so no client observes
+   * "playing" without a position. A paused slot resumes from its paused
+   * position; a new selection / a slot that never started begins at 0.
    * `trackChanged` also writes `std::bgm<N>` as `{ tinId, mimeType, name }`.
-   * Standalone usage (tests / previews) keeps the historical local-only path.
+   * Standalone usage (tests / previews) keeps the local-only path.
    */
   async function commitBgmPlay(
     slotNum: number,
@@ -544,6 +650,12 @@
 
     const socket = roomSocket;
     const sceneId = currentScene.id;
+    const slot = findBgmSlot(slotNum);
+    // Resume keeps the paused position; a new selection / a fresh play starts
+    // the timeline now (offset 0).
+    const now = bgmNowMs();
+    const isResume = !trackChanged && slot?.pausedAt !== undefined;
+    const startedAt = isResume ? resumeBgmStartedAt(slot, now) : now;
     setBgmError(slotNum, null);
     setBgmPending(slotNum, true);
     try {
@@ -558,8 +670,8 @@
           bgmAudio.pause(slotNum);
           return;
         }
-        applyBgmSlotState(slotNum, track, true);
-        await playBgmAudio(slotNum);
+        applyBgmSlotState(slotNum, track, true, { startedAt, pausedAt: null });
+        await playBgmAudio(slotNum, bgmPlayOffsetMs(slotNum, startedAt));
         return;
       }
 
@@ -570,27 +682,30 @@
         return;
       }
 
-      const requests: Promise<unknown>[] = [
-        socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), true),
-      ];
+      // Sequential acks: the timestamp must be committed before the playback
+      // intent, and `paused_at` must be gone before the slot is "playing".
       if (trackChanged) {
-        requests.push(
-          socket.requestUpdateState(
-            sceneId,
-            bgmTrackStateKey(slotNum),
-            trackState,
-          ),
+        await socket.requestUpdateState(
+          sceneId,
+          bgmTrackStateKey(slotNum),
+          trackState,
         );
       }
-      await throwIfBgmFailure(requests);
+      await socket.requestUpdateState(
+        sceneId,
+        bgmStartedAtStateKey(slotNum),
+        startedAt,
+      );
+      await socket.requestDeleteState(sceneId, bgmPausedAtStateKey(slotNum));
+      await socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), true);
 
       // The user may have switched scenes while the requests were in flight.
       if (currentScene.id !== sceneId) {
         bgmAudio.pause(slotNum);
         return;
       }
-      applyBgmSlotState(slotNum, track, true);
-      await playBgmAudio(slotNum);
+      applyBgmSlotState(slotNum, track, true, { startedAt, pausedAt: null });
+      await playBgmAudio(slotNum, bgmPlayOffsetMs(slotNum, startedAt));
     } catch (error) {
       reportBgmFailure(slotNum, error);
       bgmAudio.pause(slotNum);
@@ -600,10 +715,13 @@
   }
 
   /**
-   * Stops a slot and commits `bgm::<slot>::playing = false` after the ack.
+   * Pauses a slot and commits `bgm::<slot>::playing = false` after the acks
+   * (Issue #250).
    *
-   * The selected track stays in `std::bgm<N>` so it can be resumed from any
-   * client; only selecting NONE deletes the track.
+   * `paused_at = now` is written first so every client freezes the same
+   * position; the selected track stays in `std::bgm<N>` and the prepared audio
+   * source is kept, so resuming continues at the paused position without
+   * downloading the tin again. Only selecting NONE / 🗑️ deletes the track.
    */
   async function commitBgmStop(slotNum: number) {
     if (isBgmPending(slotNum)) return;
@@ -612,6 +730,7 @@
     const sceneId = currentScene.id;
     const track =
       getSlotTrack(findBgmSlot(slotNum)) ?? getLegacyBgmTrack(slotNum);
+    const pausedAt = bgmNowMs();
     setBgmError(slotNum, null);
     setBgmPending(slotNum, true);
     try {
@@ -620,19 +739,88 @@
           setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
           return;
         }
-        applyBgmSlotState(slotNum, track, false);
+        applyBgmSlotState(slotNum, track, false, { pausedAt });
         bgmAudio.pause(slotNum);
         return;
       }
 
-      await throwIfBgmFailure([
-        socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
-      ]);
+      // Freeze the position before the playback intent flips (Issue #250).
+      await socket.requestUpdateState(
+        sceneId,
+        bgmPausedAtStateKey(slotNum),
+        pausedAt,
+      );
+      await socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false);
       if (currentScene.id !== sceneId) return;
-      applyBgmSlotState(slotNum, track, false);
+      applyBgmSlotState(slotNum, track, false, { pausedAt });
       bgmAudio.pause(slotNum);
     } catch (error) {
       reportBgmFailure(slotNum, error);
+    } finally {
+      setBgmPending(slotNum, false);
+    }
+  }
+
+  /**
+   * Restarts a slot from 0 on every client (⏪, Issue #250).
+   *
+   * `started_at = now` and `paused_at` is deleted, so every client derives
+   * offset 0; the playback intent becomes `playing=true` when the slot was
+   * paused. The element of this client restarts immediately.
+   */
+  async function commitBgmRestart(slotNum: number) {
+    if (isBgmPending(slotNum)) return;
+
+    const socket = roomSocket;
+    const sceneId = currentScene.id;
+    const slot = findBgmSlot(slotNum);
+    const track = getSlotTrack(slot) ?? getLegacyBgmTrack(slotNum);
+    if (!track) {
+      // The row is shown for a legacy note-like value that cannot be played; a
+      // restart cannot invent a source for it.
+      setBgmError(slotNum, BGM_MISSING_TIN_ERROR);
+      return;
+    }
+    const wasPlaying = Boolean(slot?.isPlaying);
+    const startedAt = bgmNowMs();
+    setBgmError(slotNum, null);
+    setBgmPending(slotNum, true);
+    try {
+      if (!(await prepareBgmAudio(slotNum, track))) return;
+
+      if (!socket || !socket.isConnected) {
+        if (!isStandalone()) {
+          setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
+          bgmAudio.pause(slotNum);
+          return;
+        }
+        applyBgmSlotState(slotNum, track, true, { startedAt, pausedAt: null });
+        await playBgmAudio(slotNum, 0);
+        return;
+      }
+
+      await socket.requestUpdateState(
+        sceneId,
+        bgmStartedAtStateKey(slotNum),
+        startedAt,
+      );
+      await socket.requestDeleteState(sceneId, bgmPausedAtStateKey(slotNum));
+      if (!wasPlaying) {
+        await socket.requestUpdateState(
+          sceneId,
+          bgmPlayingStateKey(slotNum),
+          true,
+        );
+      }
+      if (currentScene.id !== sceneId) {
+        bgmAudio.pause(slotNum);
+        return;
+      }
+      applyBgmSlotState(slotNum, track, true, { startedAt, pausedAt: null });
+      await playBgmAudio(slotNum, 0);
+    } catch (error) {
+      reportBgmFailure(slotNum, error);
+      bgmAudio.pause(slotNum);
     } finally {
       setBgmPending(slotNum, false);
     }
@@ -666,7 +854,8 @@
    * recorded in `juices.bgmRemovedSlots` (mirroring the server
    * `bgm::<slot>::removed` tombstone) so later broadcasts cannot re-create the
    * row. "スロット追加" uses max + 1 over rows and tombstones, so a deleted slot
-   * number is never reused.
+   * number is never reused. The audio source is disposed (not just paused): the
+   * slot, and with it the track timeline, no longer exists (Issue #250).
    */
   function applyBgmSlotRemoval(slotNum: number) {
     setBgmSlotRemoved(currentScene.juices, slotNum, true);
@@ -676,12 +865,16 @@
     const nextDrafts = { ...draftBgmVolumes };
     delete nextDrafts[slotNum];
     draftBgmVolumes = nextDrafts;
+    bgmAudio.stop(slotNum);
     onUpdateScene?.(currentScene);
   }
 
   /**
    * Restores the playback the deletion paused, but only when the delete failed
    * and the local model still says the slot is playing (Issue #226).
+   *
+   * The prepared source is still there (the deletion only paused it), so this
+   * resumes at the slot's derived position without re-downloading (Issue #250).
    */
   async function restoreBgmPlaybackAfterFailedDelete(
     slotNum: number,
@@ -689,21 +882,24 @@
     sceneId: string,
   ) {
     if (!wasPlaying || currentScene.id !== sceneId) return;
-    const track = getSlotTrack(findBgmSlot(slotNum)) ?? getLegacyBgmTrack(slotNum);
+    const slot = findBgmSlot(slotNum);
+    const track = getSlotTrack(slot) ?? getLegacyBgmTrack(slotNum);
     if (track && (await prepareBgmAudio(slotNum, track))) {
-      await playBgmAudio(slotNum);
+      const startedAt = slot?.startedAt ?? bgmNowMs();
+      await playBgmAudio(slotNum, bgmPlayOffsetMs(slotNum, startedAt));
     }
   }
 
   /**
-   * Deletes a BGM slot (Issue #226).
+   * Deletes a BGM slot (Issue #226 / #250).
    *
-   * The Banquette state becomes NONE for the slot first: the track and the
-   * volume are deleted and `bgm::<slot>::playing` is set to `false`. Only after
-   * all three acks succeed is the persistent `bgm::<slot>::removed` marker
-   * written, so a failed NONE write never hides the slot behind a marker. The
-   * row is removed after the marker ack; on failure the row and the local
-   * model stay untouched and the shared communication error is shown.
+   * The Banquette state becomes NONE for the slot first: the track, the volume
+   * and the transport timestamps (`started_at` / `paused_at`) are deleted and
+   * `bgm::<slot>::playing` is set to `false`. Only after all of those acks
+   * succeed is the persistent `bgm::<slot>::removed` marker written, so a failed
+   * NONE write never hides the slot behind a marker. The row is removed after
+   * the marker ack; on failure the row and the local model stay untouched and
+   * the shared communication error is shown.
    */
   async function commitBgmSlotDelete(slotNum: number) {
     if (isBgmPending(slotNum)) return;
@@ -712,7 +908,8 @@
     const sceneId = currentScene.id;
     const wasPlaying = Boolean(findBgmSlot(slotNum)?.isPlaying);
     // The user committed to deleting the slot: stop the sound right away, but
-    // keep the row / model until the server acknowledged every write.
+    // keep the source / row / model until the server acknowledged every write so
+    // a failed deletion can resume without downloading again.
     bgmAudio.pause(slotNum);
     setBgmError(slotNum, null);
     setBgmPending(slotNum, true);
@@ -730,6 +927,8 @@
 
       await throwIfBgmFailure([
         socket.requestDeleteState(sceneId, bgmTrackStateKey(slotNum)),
+        socket.requestDeleteState(sceneId, bgmStartedAtStateKey(slotNum)),
+        socket.requestDeleteState(sceneId, bgmPausedAtStateKey(slotNum)),
         socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
         socket.requestDeleteState(sceneId, bgmVolumeStateKey(slotNum)),
       ]);
@@ -758,7 +957,7 @@
     const slot = findBgmSlot(slotNum);
     if (!slot) return;
 
-    if (slot.isPlaying && slot.tinId) {
+    if (isBgmPlaying(slot)) {
       void commitBgmStop(slotNum);
       return;
     }
@@ -773,6 +972,12 @@
       return;
     }
     void commitBgmPlay(slotNum, track, slotTrack === null);
+  }
+
+  /** ⏪: restart every client at 0 via `started_at = now` (Issue #250). */
+  function handleRestartBgm(slotNum: number) {
+    if (isBgmPending(slotNum)) return;
+    void commitBgmRestart(slotNum);
   }
 
   function handleBgmSelect(slotOrKey: number | 'bgm1' | 'bgm2' | 'bgm3') {
@@ -1262,51 +1467,106 @@
       {#each bgmSlots as slot (slot.slot)}
         <div class="bgm-slot-block" data-testid="bgm-slot-block-{slot.slot}">
           <div class="bgm-row" data-testid="bgm-row-{slot.slot}">
-            <!-- 1. 停止/再生ボタン: M3 IconButton, width="narrow", toggle play/stop -->
-            <IconButton
-              variant="tonal"
+            <!-- トランスポート (Issue #250): ⏪ / ▶️・⏸️ / 🎵 を M3 の接続ボタングループに
+                 まとめ、その右に音量、右端に削除を置く。 -->
+            <ButtonGroup
+              variant="connected"
               size="s"
-              width="narrow"
               shape="round"
-              aria-label={slot.isPlaying && slot.tinId ? 'BGM停止' : 'BGM再生'}
-              onclick={() => handleToggleBgmPlay(slot.slot)}
-              disabled={isBgmPending(slot.slot)}
-              data-testid="bgm-play-btn-{slot.slot}"
-              class="bgm-play-btn narrow-btn"
-              title={slot.isPlaying && slot.tinId ? `スロット${slot.slot}: 停止` : `スロット${slot.slot}: 再生`}
+              aria-label="BGMトランスポート"
+              data-testid="bgm-transport-group-{slot.slot}"
+              class="bgm-transport-group"
             >
-              <Icon>{slot.isPlaying && slot.tinId ? 'stop' : 'play_arrow'}</Icon>
-            </IconButton>
+              <!-- 1. 最初から再生 (⏪): started_at を now にして全クライアントを 0 秒へ -->
+              <IconButton
+                variant="tonal"
+                size="s"
+                shape="round"
+                aria-label="最初から再生"
+                title={`スロット${slot.slot}: 最初から再生`}
+                onclick={() => handleRestartBgm(slot.slot)}
+                disabled={isBgmLocked(slot.slot)}
+                data-testid="bgm-restart-btn-{slot.slot}"
+                class="bgm-transport-btn bgm-restart-btn"
+              >
+                {#if isBgmPending(slot.slot)}
+                  <CircularProgress
+                    indeterminate
+                    wavy
+                    track={false}
+                    class="bgm-pending-progress"
+                    data-testid="bgm-pending-restart-{slot.slot}"
+                    aria-label="送信中"
+                  />
+                {:else}
+                  <Icon>replay</Icon>
+                {/if}
+              </IconButton>
 
-            <!-- 2. 選択ボタン: 縦横比 1:1 の M3 IconButton, library_music アイコン
-                 送信中は波線の CircularProgress に差し替える (Issue #109 / #142) -->
-            <IconButton
-              variant="tonal"
-              size="s"
-              width="default"
-              shape="round"
-              aria-label={isBgmPending(slot.slot) ? 'BGM送信中' : 'BGM選択'}
-              onclick={() => handleBgmSelect(slot.slot)}
-              disabled={isBgmPending(slot.slot)}
-              data-testid="bgm-select-btn-{slot.slot}"
-              class="bgm-select-btn square-btn"
-              title={isBgmPending(slot.slot) ? `スロット${slot.slot}: 送信中` : `スロット${slot.slot}: BGM選択`}
-            >
-              {#if isBgmPending(slot.slot)}
-                <CircularProgress
-                  indeterminate
-                  wavy
-                  track={false}
-                  class="bgm-pending-progress"
-                  data-testid="bgm-pending-{slot.slot}"
-                  aria-label="送信中"
-                />
-              {:else}
-                <Icon>library_music</Icon>
-              {/if}
-            </IconButton>
+              <!-- 2. 再生/一時停止 (▶️ / ⏸️): 一時停止は位置を保持し、再開は停止位置から -->
+              <IconButton
+                variant="tonal"
+                size="s"
+                width="narrow"
+                shape="round"
+                toggle={true}
+                selected={isBgmPlaying(slot)}
+                aria-label={isBgmPlaying(slot) ? 'BGM一時停止' : 'BGM再生'}
+                aria-pressed={isBgmPlaying(slot) ? 'true' : 'false'}
+                onclick={() => handleToggleBgmPlay(slot.slot)}
+                disabled={isBgmLocked(slot.slot)}
+                data-testid="bgm-play-btn-{slot.slot}"
+                class="bgm-transport-btn bgm-play-btn narrow-btn"
+                title={isBgmPlaying(slot)
+                  ? `スロット${slot.slot}: 一時停止`
+                  : `スロット${slot.slot}: 再生`}
+              >
+                {#if isBgmPending(slot.slot)}
+                  <CircularProgress
+                    indeterminate
+                    wavy
+                    track={false}
+                    class="bgm-pending-progress"
+                    data-testid="bgm-pending-play-{slot.slot}"
+                    aria-label="送信中"
+                  />
+                {:else}
+                  <Icon>{isBgmPlaying(slot) ? 'pause' : 'play_arrow'}</Icon>
+                {/if}
+              </IconButton>
 
-            <!-- 3. 音量バー: M3 Slider (0〜100)。確定 (change) 時だけ送信する -->
+              <!-- 3. 選択ボタン: M3 IconButton, music_note アイコン
+                   送信中は波線の CircularProgress に差し替える (Issue #109 / #142) -->
+              <IconButton
+                variant="tonal"
+                size="s"
+                width="default"
+                shape="round"
+                aria-label={isBgmPending(slot.slot) ? 'BGM送信中' : 'BGM選択'}
+                onclick={() => handleBgmSelect(slot.slot)}
+                disabled={isBgmLocked(slot.slot)}
+                data-testid="bgm-select-btn-{slot.slot}"
+                class="bgm-transport-btn bgm-select-btn square-btn"
+                title={isBgmPending(slot.slot)
+                  ? `スロット${slot.slot}: 送信中`
+                  : `スロット${slot.slot}: BGM選択`}
+              >
+                {#if isBgmPending(slot.slot)}
+                  <CircularProgress
+                    indeterminate
+                    wavy
+                    track={false}
+                    class="bgm-pending-progress"
+                    data-testid="bgm-pending-{slot.slot}"
+                    aria-label="送信中"
+                  />
+                {:else}
+                  <Icon>music_note</Icon>
+                {/if}
+              </IconButton>
+            </ButtonGroup>
+
+            <!-- 4. 音量バー: M3 Slider (0〜100)。確定 (change) 時だけ送信する -->
             <div class="slider-wrapper" data-testid="bgm-slider-wrapper-{slot.slot}">
               <Slider
                 min={0}
@@ -1319,7 +1579,7 @@
                 onchange={(e: Event) => {
                   handleBgmVolumeCommit(slot.slot, readBgmSliderValue(e));
                 }}
-                disabled={isBgmPending(slot.slot)}
+                disabled={isBgmLocked(slot.slot)}
                 aria-label="BGM音量"
                 data-testid="bgm-slider-{slot.slot}"
               />
@@ -1328,7 +1588,7 @@
               </span>
             </div>
 
-            <!-- 4. 削除ボタン: M3 Filled tonal IconButton (Issue #226)。
+            <!-- 5. 削除ボタン: M3 Filled tonal IconButton (Issue #226)。
                  押下でスロットを Banquette から NONE にし、行を削除する。
                  アセットピッカーの NONE カードとは独立した操作。 -->
             <IconButton
@@ -1338,11 +1598,22 @@
               aria-label="BGMスロットを削除"
               title="BGMスロットを削除"
               onclick={() => handleDeleteBgmSlot(slot.slot)}
-              disabled={isBgmPending(slot.slot)}
+              disabled={isBgmLocked(slot.slot)}
               data-testid="bgm-delete-btn-{slot.slot}"
               class="bgm-delete-btn"
             >
-              <Icon>delete</Icon>
+              {#if isBgmPending(slot.slot)}
+                <CircularProgress
+                  indeterminate
+                  wavy
+                  track={false}
+                  class="bgm-pending-progress"
+                  data-testid="bgm-pending-delete-{slot.slot}"
+                  aria-label="送信中"
+                />
+              {:else}
+                <Icon>delete</Icon>
+              {/if}
             </IconButton>
           </div>
 
@@ -1756,6 +2027,15 @@
     line-height: 1.3;
     color: var(--np-color-on-surface-variant);
   }
+  /* トランスポート (Issue #250): 接続ボタングループは内容幅に固定し、
+     スライダーには残り幅を渡す。各ボタンは正方形に近い固定幅にする。 */
+  :global(.bgm-transport-group) {
+    flex: 0 0 auto;
+  }
+  :global(.bgm-transport-group .bgm-transport-btn) {
+    flex: 0 0 auto !important;
+    height: 2.5rem !important;
+  }
   /* 停止/再生ボタン: 選択ボタン（1:1）に対してより細い幅 (narrow) */
   :global(.bgm-play-btn.narrow-btn) {
     width: 2rem !important;
@@ -1771,6 +2051,14 @@
     max-width: 2.5rem !important;
     height: 2.5rem !important;
     aspect-ratio: 1 / 1;
+    flex-shrink: 0;
+  }
+  /* 最初から再生ボタン (⏪) */
+  :global(.bgm-restart-btn) {
+    width: 2rem !important;
+    min-width: 2rem !important;
+    max-width: 2rem !important;
+    height: 2.5rem !important;
     flex-shrink: 0;
   }
   .slider-wrapper {
