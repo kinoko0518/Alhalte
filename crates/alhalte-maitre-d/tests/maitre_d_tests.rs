@@ -17,7 +17,7 @@ use alhalte_maitre_d::{
     MockOAuthProvider, RoomBridgeManager, RoomInfoResponse, RoomPermissionItem, RoomRole,
     SUB_HASH_BYTES, SUB_HASH_HEX_LEN, SetRoomPermissionRequest, SubHash, account_id_from_tin,
     account_id_to_tin, cleanup_sessions_at, cleanup_sessions_with_cutoff, create_router,
-    extract_session_id_from_cookie, hash_sub, parse_cli_args_from,
+    extract_session_id_from_cookie, hash_sub, is_allowed_return_to_with_lan, parse_cli_args_from,
     parse_session_id_from_cookie_str, previous_4am_local, resolve_banquette_bin,
     session_id_from_tin, session_id_to_tin,
 };
@@ -1041,6 +1041,65 @@ fn test_oauth_return_to_origin_validation() {
     ));
 }
 
+// spec: alhalte-maitre-d/lan-origins 0001 private-network origins are opt-in
+// and port-scoped (Issue #229)
+#[test]
+fn test_lan_return_to_origins_are_opt_in_and_port_scoped() {
+    let allowed = vec!["http://127.0.0.1:5173".to_string()];
+
+    // Disabled by default: a LAN origin is just another foreign origin, so the
+    // production-safe entry point is unchanged.
+    assert!(!is_allowed_return_to_with_lan(
+        "http://192.168.1.42:5173/rooms/abc",
+        &allowed,
+        &[]
+    ));
+
+    let lan_ports = [5173u16];
+    for accepted in [
+        "http://192.168.1.42:5173/rooms/abc?invite=1#room-key",
+        "http://192.168.1.42:5173",
+        "http://10.0.0.7:5173/",
+        "http://172.16.5.9:5173/rooms/1",
+        "http://127.0.0.1:5173/rooms/1",
+    ] {
+        assert!(
+            is_allowed_return_to_with_lan(accepted, &allowed, &lan_ports),
+            "{accepted:?} must be accepted while the LAN switch is on"
+        );
+    }
+
+    for rejected in [
+        // The port must be one of the listed ports.
+        "http://192.168.1.42:5174/",
+        "http://192.168.1.42/",
+        // Only plain HTTP: the Vite dev server has no TLS.
+        "https://192.168.1.42:5173/",
+        // Host must be a private IPv4 literal, not a public IP or hostname.
+        "http://8.8.8.8:5173/",
+        "http://example.com:5173/",
+        "http://192.168.1.42.evil.example:5173/",
+        "http://192.168.1.42@evil.example:5173/",
+        "http://[::1]:5173/",
+        // The normal open-redirect guards still apply.
+        "//evil.example:5173/",
+        "javascript:alert(1)",
+        "",
+    ] {
+        assert!(
+            !is_allowed_return_to_with_lan(rejected, &allowed, &lan_ports),
+            "{rejected:?} must not be accepted as a LAN return_to"
+        );
+    }
+
+    // An explicit origin stays accepted with or without the switch.
+    assert!(is_allowed_return_to_with_lan(
+        "http://127.0.0.1:5173/rooms/1",
+        &allowed,
+        &[]
+    ));
+}
+
 // spec: alhalte-maitre-d/oauth-cookie
 #[test]
 fn test_session_cookie_header_attributes() {
@@ -1089,6 +1148,22 @@ fn test_cli_bistrot_argument_compatibility() {
     assert_eq!(parsed.salt, "instance-salt-67890");
     assert_eq!(parsed.public_url, "https://auth.example.com");
     assert_eq!(parsed.socket_dir, std::path::PathBuf::from("/run/alhalte"));
+    // Issue #229: the LAN origin switch is off unless Bistrot passes the flag.
+    assert!(parsed.allow_lan_origin_ports.is_empty());
+
+    let repeated = parse_cli_args_from([
+        "alhalte-maitre-d",
+        "--allow-lan-origin-port",
+        "5173",
+        "--allow-lan-origin-port",
+        "3000",
+    ])
+    .unwrap();
+    assert_eq!(repeated.allow_lan_origin_ports, vec![5173, 3000]);
+
+    let comma_separated =
+        parse_cli_args_from(["alhalte-maitre-d", "--allow-lan-origin-port", "5173,3000"]).unwrap();
+    assert_eq!(comma_separated.allow_lan_origin_ports, vec![5173, 3000]);
 }
 
 // spec: alhalte-maitre-d/websocket-demux-and-spawner
@@ -2023,6 +2098,67 @@ async fn test_cors_allows_only_configured_origins() {
     let defaults = alhalte_maitre_d::DEFAULT_ALLOWED_ORIGINS;
     assert!(defaults.contains(&"http://127.0.0.1:5173"));
     assert!(defaults.contains(&"http://localhost:5173"));
+}
+
+// spec: alhalte-maitre-d/cors 0002 LAN origins require the explicit dev switch
+// and are scoped to a private IPv4 literal on the listed port (Issue #229)
+#[tokio::test]
+async fn test_cors_lan_origins_are_opt_in_and_private() {
+    let temp_dir = tempdir().unwrap();
+    let spawner = RecordingSpawner::new(temp_dir.path().to_path_buf());
+    let db = Database::new_in_memory().unwrap();
+    let manager = RoomBridgeManager::new(Arc::new(spawner));
+    let state = AppState::new(db, "salt", Arc::new(MockOAuthProvider::new()), manager)
+        .with_allowed_origins(["http://app.test"])
+        .with_lan_origin_ports([5173]);
+    let app = create_router(state);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = reqwest::Client::new();
+    let preflight = |origin: &'static str| {
+        client
+            .request(
+                reqwest::Method::OPTIONS,
+                format!("http://{addr}/api/accounts/search"),
+            )
+            .header("Origin", origin)
+            .header("Access-Control-Request-Method", "GET")
+            .send()
+    };
+
+    // A phone on the same Ethernet gets the origin echoed back, never `*`.
+    let lan = preflight("http://192.168.1.42:5173").await.unwrap();
+    assert_eq!(lan.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        lan.headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("http://192.168.1.42:5173")
+    );
+
+    for denied_origin in [
+        // Wrong port.
+        "http://192.168.1.42:5174",
+        // Public IP / hostname, not a private IPv4 literal.
+        "http://8.8.8.8:5173",
+        "http://evil.example:5173",
+        // HTTPS is not the Vite dev server.
+        "https://192.168.1.42:5173",
+    ] {
+        let denied = preflight(denied_origin).await.unwrap();
+        assert!(
+            denied
+                .headers()
+                .get("access-control-allow-origin")
+                .is_none(),
+            "{denied_origin} must not receive an allow-origin header"
+        );
+    }
 }
 
 // spec: alhalte-maitre-d/websocket-identity 0001 account-only 401, session-only derives account

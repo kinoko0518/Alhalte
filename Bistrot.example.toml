@@ -77,6 +77,13 @@ chunk-size-exponent = 8
 
 [argenterie]
 port = 5173
+# 開発専用（Issue #229）: 同一イーサネット / LAN 内の端末から UI を開けるようにする。
+#
+# true にすると Vite が 0.0.0.0 で待ち受け、maitre-d が
+# http://<プライベート IPv4>:<argenterie.port> の origin を CORS / return_to に
+# 追加で許可する（ワイルドカードではない）。UI は TLS なしの HTTP なので、
+# 公開ネットワークでは絶対に有効にしない。既定は false（ループバックのみ）。
+# lan = false
 
 [[extensions]]
 id = "alhalte-dsl"
