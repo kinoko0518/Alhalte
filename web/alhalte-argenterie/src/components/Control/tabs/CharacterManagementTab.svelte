@@ -45,6 +45,7 @@
   } from '../../../utils/menuPosition.js';
   import OfflineQueueNotice from '../../OfflineQueueNotice.svelte';
   import CharacterEditModal from '../CharacterEditModal.svelte';
+  import CharacterPieceToggle from '../CharacterPieceToggle.svelte';
 
   let {
     characters = [],
@@ -290,16 +291,6 @@
   let menuAnchors = $state<Record<string, HTMLElement | undefined>>({});
   let menuElements = $state<Record<string, HTMLElement | undefined>>({});
 
-  /**
-   * Piece toggle buttons keyed by character id.
-   *
-   * `IconButton` derives `aria-pressed` from its own `toggle` state, which
-   * would flip optimistically before the server ack. The placement state is
-   * server-authoritative (Issue #160 / #228), so the attribute is applied from
-   * `characters` after every render instead.
-   */
-  let pieceButtons = $state<Record<string, HTMLElement | undefined>>({});
-
   function menuKey(kind: CharacterMenuKind, characterId: string): string {
     return `${kind}-${characterId}`;
   }
@@ -336,24 +327,6 @@
         placement: 'bottom-end',
         anchorName: `--character-menu-anchor-${key}`,
       });
-    }
-  });
-
-  // Re-apply the server-authoritative `aria-pressed` after every render that can
-  // update the piece buttons (Issue #228). `IconButton` fades its own toggle
-  // state, so a click must not flip the attribute before the ack.
-  $effect(() => {
-    // Track the bound map (including keys) and the placement state so the
-    // attribute is applied once `bind:element` populated the entries.
-    const buttons = pieceButtons;
-    void Object.keys(buttons).length;
-    void role;
-    void capabilities.canManageCharacters;
-    void activeView;
-    for (const character of characters) {
-      const button = buttons[character.id];
-      if (!button) continue;
-      button.setAttribute('aria-pressed', character.placedAsPiece ? 'true' : 'false');
     }
   });
 
@@ -479,15 +452,6 @@
     // in the tab-owned panel.
     onCreateCharacter?.(newChar);
     openEdit(newChar);
-  }
-
-  /** Piece toggle label, icon and state (Issue #228). */
-  function pieceLabel(character: Character): string {
-    return character.placedAsPiece ? '盤面から削除' : '駒として配置';
-  }
-
-  function pieceIcon(character: Character): string {
-    return character.placedAsPiece ? 'remove_circle' : 'person_pin_circle';
   }
 </script>
 
@@ -649,17 +613,11 @@
                     <Icon>my_location</Icon>
                   </IconButton>
                 {:else if action === 'piece'}
-                  <IconButton
-                    variant="tonal"
-                    onclick={() => onTogglePiece?.(char.id)}
-                    bind:element={pieceButtons[char.id]}
+                  <CharacterPieceToggle
+                    character={char}
                     disabled={!capabilities.canManageCharacters}
-                    aria-label={pieceLabel(char)}
-                    title={pieceLabel(char)}
-                    data-testid="piece-char-btn-{char.id}"
-                  >
-                    <Icon>{pieceIcon(char)}</Icon>
-                  </IconButton>
+                    onToggle={(characterId) => onTogglePiece?.(characterId)}
+                  />
                 {:else if action === 'more'}
                   <IconButton
                     variant="text"
