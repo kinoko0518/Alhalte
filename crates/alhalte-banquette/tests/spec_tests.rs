@@ -594,6 +594,291 @@ async fn test_scene_unload_and_restore() {
     );
 }
 
+/// Waits for the next frame of a banquette test server with a bounded timeout.
+async fn spec_next_server_frame(
+    stream: &mut Framed<tokio::net::unix::OwnedReadHalf, ProtocolCodec<BanquetteToMaitreD>>,
+) -> BanquetteToMaitreD {
+    match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+        Ok(Some(Ok(frame))) => frame,
+        other => panic!("timed out waiting for a banquette frame: {other:?}"),
+    }
+}
+
+/// Drains frames until `pred` matches, with a bounded number of attempts.
+async fn spec_expect_server_frame(
+    stream: &mut Framed<tokio::net::unix::OwnedReadHalf, ProtocolCodec<BanquetteToMaitreD>>,
+    mut pred: impl FnMut(&BanquetteToMaitreD) -> bool,
+) -> BanquetteToMaitreD {
+    for _ in 0..32 {
+        let frame = spec_next_server_frame(stream).await;
+        if pred(&frame) {
+            return frame;
+        }
+    }
+    panic!("expected frame was not emitted");
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/persistence 0004 MoveCharacter into an unloaded scene keeps membership (Issue #240)
+async fn test_move_character_into_an_unloaded_scene_keeps_membership() {
+    let cellar = InMemoryCellarSink::new();
+    let mut room = Room::new(1001, 42, 8).unwrap();
+    room.create_scene(42, "dungeon", None).unwrap();
+    let character_id = room.create_character(42, HashMap::new()).unwrap();
+    room.assign_character_to_scene(character_id, "/").unwrap();
+
+    // The destination is not open: `/` is the only scene that stays resident, so
+    // visiting "dungeon" and leaving persists and unloads it.
+    room.client_enter_scene(1, 42, "dungeon", &cellar)
+        .await
+        .unwrap();
+    room.client_leave_scene(1, 42, 100, "dungeon", &cellar)
+        .await
+        .unwrap();
+    assert!(!room.scene_biblio.get("dungeon").unwrap().is_loaded);
+
+    // The server loads every scene a move touches before mutating membership
+    // (Issue #240); without this the membership below is written into memory
+    // that the next reload overwrites.
+    room.ensure_scene_loaded("dungeon", 42, &cellar)
+        .await
+        .unwrap();
+    room.move_character(42, character_id, "dungeon").unwrap();
+    assert_eq!(
+        room.scene_summary("dungeon").unwrap().present_characters,
+        vec![character_id]
+    );
+
+    // Unload once more so the new membership is persisted, then enter the
+    // destination: the reload must not drop the character.
+    room.client_enter_scene(2, 42, "dungeon", &cellar)
+        .await
+        .unwrap();
+    room.client_leave_scene(2, 42, 200, "dungeon", &cellar)
+        .await
+        .unwrap();
+    assert!(!room.scene_biblio.get("dungeon").unwrap().is_loaded);
+
+    room.client_enter_scene(3, 42, "dungeon", &cellar)
+        .await
+        .unwrap();
+    assert!(room.scene_biblio.get("dungeon").unwrap().is_loaded);
+    assert_eq!(
+        room.scene_summary("dungeon").unwrap().present_characters,
+        vec![character_id],
+        "a reload must restore the membership written while the scene was closed"
+    );
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/persistence 0004 MoveCharacter out of an unloaded scene keeps the removal (Issue #240)
+async fn test_move_character_out_of_an_unloaded_scene_keeps_the_removal() {
+    let cellar = InMemoryCellarSink::new();
+    let mut room = Room::new(1001, 42, 8).unwrap();
+    room.create_scene(42, "tavern", None).unwrap();
+    room.create_scene(42, "dungeon", None).unwrap();
+    let character_id = room.create_character(42, HashMap::new()).unwrap();
+    room.assign_character_to_scene(character_id, "tavern")
+        .unwrap();
+
+    // "tavern" is unloaded while still holding the character.
+    room.client_enter_scene(1, 42, "tavern", &cellar)
+        .await
+        .unwrap();
+    room.client_leave_scene(1, 42, 100, "tavern", &cellar)
+        .await
+        .unwrap();
+    assert!(!room.scene_biblio.get("tavern").unwrap().is_loaded);
+
+    room.ensure_scene_loaded("tavern", 42, &cellar)
+        .await
+        .unwrap();
+    room.move_character(42, character_id, "dungeon").unwrap();
+
+    // Unload and re-enter the source: the reload must keep the removal.
+    room.client_enter_scene(2, 42, "tavern", &cellar)
+        .await
+        .unwrap();
+    room.client_leave_scene(2, 42, 200, "tavern", &cellar)
+        .await
+        .unwrap();
+    room.client_enter_scene(3, 42, "tavern", &cellar)
+        .await
+        .unwrap();
+    assert_eq!(
+        room.scene_summary("tavern").unwrap().present_characters,
+        Vec::<u64>::new(),
+        "the source must not list the character after the move"
+    );
+    assert_eq!(
+        room.scene_summary("dungeon").unwrap().present_characters,
+        vec![character_id]
+    );
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/persistence 0004 MoveCharacter into an unloaded scene keeps the came log (Issue #240)
+async fn test_move_character_into_an_unloaded_scene_keeps_the_came_log() {
+    let cellar = InMemoryCellarSink::new();
+    let mut room = Room::new(1001, 42, 8).unwrap();
+    room.create_scene(42, "dungeon", None).unwrap();
+    let character_id = room.create_character(42, HashMap::new()).unwrap();
+    room.assign_character_to_scene(character_id, "/").unwrap();
+
+    room.client_enter_scene(1, 42, "dungeon", &cellar)
+        .await
+        .unwrap();
+    room.client_leave_scene(1, 42, 100, "dungeon", &cellar)
+        .await
+        .unwrap();
+    assert!(!room.scene_biblio.get("dungeon").unwrap().is_loaded);
+
+    room.ensure_scene_loaded("dungeon", 42, &cellar)
+        .await
+        .unwrap();
+    room.move_character(42, character_id, "dungeon").unwrap();
+    // The `MoveCharacter` arm appends `character-came` to the destination right
+    // after the move; mirror only that append here.
+    let came = CharacterCameEvent::now(character_id).to_tin().unwrap();
+    room.append_log(42, 100, "dungeon", Some(came), &cellar)
+        .await
+        .unwrap();
+
+    // Entering the destination must not rewind the head: without the pre-move
+    // load the reload restores the persisted biblio and hides the came entry.
+    room.client_enter_scene(2, 42, "dungeon", &cellar)
+        .await
+        .unwrap();
+    let log = &room.scene_biblio.get("dungeon").unwrap().log;
+    assert_eq!(log.head(), (0, 1), "the came append must survive the enter");
+    let entries = log.read_chunk(0, &cellar, Some(42)).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = entries[0].as_ref().expect("the came entry must be present");
+    let decoded = CharacterCameEvent::from_tin(entry).unwrap();
+    assert_eq!(decoded.character_id, character_id);
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/persistence 0004 MoveCharacter reports a failed reload (Issue #240)
+async fn test_move_character_into_an_unloaded_scene_reports_a_reload_failure() {
+    let dir = tempdir().unwrap();
+    let sock_path = dir.path().join("banquette.sock");
+
+    let mut room = Room::new(1001, 10, 8).unwrap();
+    room.create_scene(10, "dungeon", None).unwrap();
+    let character_id = room.create_character(10, HashMap::new()).unwrap();
+    room.assign_character_to_scene(character_id, "/").unwrap();
+
+    let cellar: Arc<dyn CellarSink> = Arc::new(RecordingCellarSink::failing_download());
+    let server = BanquetteServer::new(
+        ServerConfig {
+            socket_path: sock_path.clone(),
+            heartbeat_interval: Duration::from_secs(3600),
+        },
+        room,
+        cellar,
+    );
+    let server_task = tokio::spawn(async move {
+        let _ = server.run().await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let client_stream = UnixStream::connect(&sock_path).await.unwrap();
+    let (read_half, write_half) = client_stream.into_split();
+    let mut stream = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
+    let mut sink = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
+
+    sink.send(MaitreDToBanquette::ClientConnected {
+        client_id: 100,
+        account_id: 10,
+        session_id: 1,
+    })
+    .await
+    .unwrap();
+
+    // Visiting and leaving "dungeon" persists and unloads it, which succeeds:
+    // only the later download fails.
+    for frame in [
+        ClientFrame::EnterScene {
+            scene_id: "dungeon".to_string(),
+        },
+        ClientFrame::LeaveScene {
+            scene_id: "dungeon".to_string(),
+        },
+    ] {
+        sink.send(MaitreDToBanquette::ClientMessage {
+            client_id: 100,
+            frame,
+        })
+        .await
+        .unwrap();
+    }
+    // The unload is persisted before the next message is processed; give the
+    // store a moment so the failure below is the download, not an ordering race.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    sink.send(MaitreDToBanquette::ClientMessage {
+        client_id: 100,
+        frame: ClientFrame::MoveCharacter {
+            character_id,
+            to_scene_id: "dungeon".to_string(),
+        },
+    })
+    .await
+    .unwrap();
+
+    let frame = spec_expect_server_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::Error { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    match frame {
+        BanquetteToMaitreD::SendToClient {
+            frame: ServerFrame::Error { code, .. },
+            ..
+        } => assert_eq!(code, "MoveCharacterFailed"),
+        other => panic!("expected MoveCharacterFailed, got {other:?}"),
+    }
+
+    // No partial mutation: the next frame is the scene list and the character is
+    // still in "/", never in the scene whose reload failed.
+    sink.send(MaitreDToBanquette::ClientMessage {
+        client_id: 100,
+        frame: ClientFrame::ListScenes,
+    })
+    .await
+    .unwrap();
+    let frame = spec_next_server_frame(&mut stream).await;
+    match frame {
+        BanquetteToMaitreD::SendToClient {
+            frame: ServerFrame::SceneList { scenes },
+            ..
+        } => {
+            let root = scenes
+                .iter()
+                .find(|s| s.id == "/")
+                .expect("root summary present");
+            assert_eq!(root.present_characters, vec![character_id]);
+            let dungeon = scenes
+                .iter()
+                .find(|s| s.id == "dungeon")
+                .expect("dungeon summary present");
+            assert!(
+                dungeon.present_characters.is_empty(),
+                "a failed move must not insert the character"
+            );
+        }
+        other => panic!("expected SceneList without any mutation frame, got {other:?}"),
+    }
+
+    server_task.abort();
+}
+
 #[tokio::test]
 // spec: alhalte-banquette/lifecycle 0002 periodic heartbeat and exit after 3 missed ticks
 async fn test_heartbeat_and_idle_exit() {
@@ -780,19 +1065,28 @@ use tin::TinId;
 /// Cellar sink that records the credentials of internal writes.
 ///
 /// `fail_store` makes every store fail so heartbeat failure handling can be
-/// observed.
+/// observed, and `fail_download` makes every reload fail so scene reload errors
+/// can be observed (Issue #240).
 #[derive(Default)]
 struct RecordingCellarSink {
     inner: InMemoryCellarSink,
     stores: std::sync::Mutex<Vec<(u64, u64, TinId)>>,
     unregisters: std::sync::Mutex<Vec<TinId>>,
     fail_store: bool,
+    fail_download: bool,
 }
 
 impl RecordingCellarSink {
     fn failing() -> Self {
         Self {
             fail_store: true,
+            ..Self::default()
+        }
+    }
+
+    fn failing_download() -> Self {
+        Self {
+            fail_download: true,
             ..Self::default()
         }
     }
@@ -831,6 +1125,11 @@ impl CellarSink for RecordingCellarSink {
         tin_id: &TinId,
         owner: Option<u64>,
     ) -> Result<Vec<u8>, PersistenceError> {
+        if self.fail_download {
+            return Err(PersistenceError::Cellar(
+                "simulated download failure".to_string(),
+            ));
+        }
         self.inner.download_tin(tin_id, owner).await
     }
 

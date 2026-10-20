@@ -143,6 +143,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 
 - scene からクライアントがいなくなったら、`/` 以外は `persist_and_unload` で `alhalte/banquette/scene` Tin として cellar に保存し、active chunk と sealed cache を解放する。
 - 再度アクセスされたら `reload_if_needed` で cellar から復元する。
+- 開かれていない scene への membership / log 書き込み（`MoveCharacter` など）は、`Room::ensure_scene_loaded` で対象 scene を先に復元してから行う。未ロードのまま書き込むと次の `reload_if_needed` が tin で上書きするため、書き込みは失われる（#240）。
 - heartbeat では、前回の周期以降にクライアント活動がなければ `missed_heartbeats` を増やす。3 回連続で応答がなければ `HeartbeatOutcome::ShouldExit` を返し、サーバーは終了する。
 
 ### character
