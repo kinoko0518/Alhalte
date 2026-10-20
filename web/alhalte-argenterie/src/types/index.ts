@@ -269,6 +269,19 @@ export interface CropCalculationResult {
   cropHeight: number;
 }
 
+/**
+ * Surface that hosts the control panel (Issue #223).
+ *
+ * - `side`: the landscape side sheet (`placement="end"`); the panel closes to
+ *   the right.
+ * - `bottom`: the portrait bottom sheet (`placement="bottom"`); the panel closes
+ *   downwards.
+ *
+ * It is passed explicitly from `App` through `ControlPanel` to `CommonHeader`
+ * so the close icon never has to guess the viewport from `window`.
+ */
+export type PanelPlacement = 'side' | 'bottom';
+
 export type {
   GenerastAST,
   GenerastStringNode,

@@ -1,7 +1,27 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { mount, unmount } from 'svelte';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import App from '../src/components/App.svelte';
 import type { VisitedRoom } from '../src/types/index.js';
+
+const APP_SOURCE = readFileSync(path.resolve(process.cwd(), 'src/components/App.svelte'), 'utf8');
+const LOG_TAB_SOURCE = readFileSync(
+  path.resolve(process.cwd(), 'src/components/Control/tabs/LogTab.svelte'),
+  'utf8',
+);
+const CONTROL_PANEL_SOURCE = readFileSync(
+  path.resolve(process.cwd(), 'src/components/Control/ControlPanel.svelte'),
+  'utf8',
+);
+
+/** Returns the declaration block of the first rule whose selector starts with `selector`. */
+function ruleDeclarations(source: string, selector: string): string {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = source.match(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`));
+  expect(match, `expected a CSS rule for ${selector}`).toBeTruthy();
+  return match![1];
+}
 
 describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
   const dummyRoom: VisitedRoom = {
@@ -239,6 +259,8 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     // State 1: Half (default open state: 50vh, not expanded)
     expect(bottomSheet?.hasAttribute('open')).toBe(true);
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(false);
+    // Issue #223: the state is explicit, not inferred from the content height.
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
 
     // Mock getBoundingClientRect for sheet element & content so naturalHeight calculation works
     if (bottomSheet) {
@@ -265,11 +287,13 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     handle?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(true);
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('full');
 
     // Clicking handle again steps back to half
     handle?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(false);
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
 
     // State 3: Collapsed (closed)
     // Collapsing via panel collapse button
@@ -278,6 +302,7 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     collapseBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(bottomSheet?.hasAttribute('open')).toBe(false);
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('closed');
 
     // Reopen using floating reopen button returns to half height
     const reopenBtn = target.querySelector<HTMLButtonElement>('[data-testid="reopen-sheet-button"]');
@@ -287,6 +312,7 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
 
     expect(bottomSheet?.hasAttribute('open')).toBe(true);
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(false);
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
 
     unmount(instance);
   });
@@ -393,6 +419,171 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
       expect(contentWrapper?.contains(controlPanel!)).toBe(true);
       expect(controlPanel?.contains(footer!)).toBe(true);
     }
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/control-panel Issue #223: 縦画面は下向きの「パネルを閉じる」アイコン、横画面は右向きのまま
+  it('uses bottom_panel_close for the portrait bottom sheet and keeps right_panel_close on the landscape side sheet', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const portraitInstance = mount(App, {
+      target,
+      props: { initialRoom: dummyRoom },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const portraitBtn = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
+    expect(portraitBtn).toBeTruthy();
+    // A bottom sheet closes downwards.
+    expect(portraitBtn?.textContent).toContain('bottom_panel_close');
+    expect(portraitBtn?.textContent).not.toContain('right_panel_close');
+    expect(portraitBtn?.getAttribute('data-panel-placement')).toBe('bottom');
+    expect(portraitBtn?.getAttribute('aria-label')).toBe('パネルを閉じる');
+    // `title` is consumed by noph-ui as the tooltip text (same label).
+    // The size / tonal / square / wide treatment is shared with the side sheet.
+    expect(portraitBtn?.classList.contains('tonal')).toBe(true);
+    expect(portraitBtn?.classList.contains('square')).toBe(true);
+    expect(portraitBtn?.classList.contains('wide')).toBe(true);
+
+    unmount(portraitInstance);
+    target.innerHTML = '';
+
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1200 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const landscapeInstance = mount(App, {
+      target,
+      props: { initialRoom: dummyRoom },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const landscapeBtn = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
+    expect(landscapeBtn).toBeTruthy();
+    expect(landscapeBtn?.textContent).toContain('right_panel_close');
+    expect(landscapeBtn?.textContent).not.toContain('bottom_panel_close');
+    expect(landscapeBtn?.getAttribute('data-panel-placement')).toBe('side');
+    expect(landscapeBtn?.getAttribute('aria-label')).toBe('パネルを閉じる');
+    expect(landscapeBtn?.classList.contains('tonal')).toBe(true);
+    expect(landscapeBtn?.classList.contains('square')).toBe(true);
+    expect(landscapeBtn?.classList.contains('wide')).toBe(true);
+
+    unmount(landscapeInstance);
+  });
+
+  // spec: alhalte-argenterie/control-panel Issue #223: パネルの高さは閉・半・全画面の状態だけで決まる
+  it('sizes the portrait bottom sheet from its state alone (half 50dvh, full viewport minus the noph-ui top margin)', () => {
+    const portraitRule = ruleDeclarations(
+      APP_SOURCE,
+      '.bottom-sheet-container :global(.portrait-bottom-sheet)',
+    );
+    // Half = exactly 50dvh, independent of the content height.
+    expect(portraitRule).toContain('--np-sheet-half-height: 50dvh');
+    expect(portraitRule).toContain('height: var(--np-sheet-half-height)');
+    expect(portraitRule).toContain('max-height: var(--np-sheet-half-height)');
+    // Full = the viewport less noph-ui's `--_top-margin` (4.5rem below 640px).
+    expect(portraitRule).toContain('--np-sheet-top-margin: 4.5rem');
+    expect(portraitRule).toContain(
+      '--np-sheet-full-height: calc(100dvh - var(--np-sheet-top-margin))',
+    );
+    expect(portraitRule).toMatch(/transition:[\s\S]*height var\(--np-motion/);
+
+    const expandedRule = ruleDeclarations(
+      APP_SOURCE,
+      '.bottom-sheet-container :global(.portrait-bottom-sheet.np-sheet-expanded)',
+    );
+    expect(expandedRule).toContain('height: var(--np-sheet-full-height)');
+    expect(expandedRule).toContain('max-height: var(--np-sheet-full-height)');
+
+    // Above 640px noph-ui raises its top margin to 3.5rem; match it.
+    expect(APP_SOURCE).toMatch(/@media \(width > 640px\)\s*\{[\s\S]*?--np-sheet-top-margin: 3\.5rem/);
+  });
+
+  // spec: alhalte-argenterie/control-panel Issue #223: 縦画面のログ一覧がシート内でスクロールできる高さ連鎖
+  it('keeps a bounded height chain from the portrait sheet content down to the log scroll container', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const instance = mount(App, {
+      target,
+      props: { initialRoom: dummyRoom },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const dialog = target.querySelector<HTMLDialogElement>('[data-testid="portrait-sheet-dialog"]');
+    expect(dialog).toBeTruthy();
+    expect(dialog?.classList.contains('portrait-bottom-sheet')).toBe(true);
+    expect(dialog?.classList.contains('np-sheet-bottom')).toBe(true);
+    expect(dialog?.getAttribute('data-sheet-state')).toBe('half');
+
+    // The scroll chain the CSS bounds: sheet → content → wrapper → panel →
+    // tab area → log tab → messages area → messages list.
+    const sheetContent = Array.from(dialog!.children).find((el) =>
+      el.classList.contains('np-sheet-content'),
+    ) as HTMLElement | undefined;
+    expect(sheetContent).toBeTruthy();
+
+    const contentWrapper = sheetContent!.querySelector<HTMLElement>('.bottom-sheet-content-wrapper');
+    expect(contentWrapper).toBeTruthy();
+
+    const controlPanel = contentWrapper!.querySelector<HTMLElement>('[data-testid="control-panel"]');
+    expect(controlPanel).toBeTruthy();
+    expect(controlPanel?.classList.contains('control-panel-container')).toBe(true);
+
+    const tabContentArea = controlPanel!.querySelector<HTMLElement>('[data-testid="tab-content-area"]');
+    expect(tabContentArea).toBeTruthy();
+    expect(tabContentArea?.classList.contains('tab-content-area')).toBe(true);
+
+    const logTab = tabContentArea!.querySelector<HTMLElement>('[data-testid="log-tab"]');
+    expect(logTab).toBeTruthy();
+    expect(logTab?.classList.contains('log-tab-container')).toBe(true);
+
+    const messagesArea = logTab!.querySelector<HTMLElement>('.messages-area');
+    expect(messagesArea).toBeTruthy();
+
+    const messagesList = messagesArea!.querySelector<HTMLElement>('[data-testid="messages-list"]');
+    expect(messagesList).toBeTruthy();
+    expect(messagesList?.classList.contains('messages-list')).toBe(true);
+    // The log list is the single scroll container of the chain.
+    expect(messagesList?.getAttribute('data-scroll-container')).toBe('log-messages');
+
+    // Every ancestor really contains the next node.
+    expect(sheetContent!.contains(contentWrapper!)).toBe(true);
+    expect(contentWrapper!.contains(controlPanel!)).toBe(true);
+    expect(controlPanel!.contains(tabContentArea!)).toBe(true);
+    expect(tabContentArea!.contains(logTab!)).toBe(true);
+    expect(logTab!.contains(messagesArea!)).toBe(true);
+    expect(messagesArea!.contains(messagesList!)).toBe(true);
+
+    // Definite flex / height chain: the sheet content wrapper and the control
+    // panel are flex items, the sheet clips its content, and the log list is
+    // the only element that scrolls.
+    expect(ruleDeclarations(APP_SOURCE, '.bottom-sheet-content-wrapper')).toMatch(/flex:\s*1/);
+    expect(ruleDeclarations(APP_SOURCE, '.bottom-sheet-content-wrapper')).toMatch(/min-height:\s*0/);
+    expect(
+      ruleDeclarations(
+        APP_SOURCE,
+        '.bottom-sheet-container :global(.bottom-sheet-content-wrapper .control-panel-container)',
+      ),
+    ).toMatch(/flex:\s*1[\s\S]*min-height:\s*0/);
+    expect(
+      ruleDeclarations(APP_SOURCE, '.bottom-sheet-container :global(.portrait-bottom-sheet .np-sheet-content)'),
+    ).toMatch(/overflow:\s*hidden/);
+
+    const tabContentAreaRule = ruleDeclarations(CONTROL_PANEL_SOURCE, '.tab-content-area');
+    expect(tabContentAreaRule).toMatch(/flex:\s*1/);
+    expect(tabContentAreaRule).toMatch(/min-height:\s*0/);
+    expect(ruleDeclarations(CONTROL_PANEL_SOURCE, '.control-panel-container')).toMatch(/height:\s*100%/);
+
+    const messagesAreaRule = ruleDeclarations(LOG_TAB_SOURCE, '.messages-area');
+    expect(messagesAreaRule).toMatch(/flex:\s*1/);
+    expect(messagesAreaRule).toMatch(/min-height:\s*0/);
+
+    const messagesListRule = ruleDeclarations(LOG_TAB_SOURCE, '.messages-list');
+    expect(messagesListRule).toMatch(/flex:\s*1/);
+    expect(messagesListRule).toMatch(/min-height:\s*0/);
+    expect(messagesListRule).toMatch(/overflow-y:\s*auto/);
 
     unmount(instance);
   });

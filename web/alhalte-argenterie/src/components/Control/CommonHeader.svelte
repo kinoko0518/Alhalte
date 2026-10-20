@@ -3,17 +3,21 @@
    * Common Header for Control Panel (Issue #89).
    *
    * Layout adheres to Material 3 Expressive:
-   * - Left: Panel close IconButton (size="s", variant="tonal", shape="square", width="wide", icon="right_panel_close")
+   * - Left: Panel close IconButton (size="s", variant="tonal", shape="square", width="wide").
+   *   The icon follows the hosting surface (`placement`, Issue #223):
+   *   `right_panel_close` on the landscape side sheet and `bottom_panel_close`
+   *   on the portrait bottom sheet.
    * - Center: Search in Docked layout, contained style, displaying scene candidates (existing scenes only)
    * - Right: Gear IconButton opening menu (room ZIP export, log ZIP export, admin actions, horizontal theme color circles)
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> コントロールパネル共通ヘッダー`
    * - GitHub Issue #89: コントロールパネルに関する複数の提言
+   * - GitHub Issue #223: 縦画面のボトムシートは下向きの閉じるアイコンを使う
    */
   import { Button, Divider, IconButton, Item, Menu, MenuItem, Search } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { Character, Scene } from '../../types/index.js';
+  import type { Character, PanelPlacement, Scene } from '../../types/index.js';
   import {
     ROOM_ROLES,
     ROOM_ROLE_LABELS,
@@ -38,6 +42,7 @@
     roomId,
     role = 'participant',
     defaultPermission = null,
+    placement = 'side',
     onCollapse,
     onSelectScene,
     onExportZip,
@@ -58,6 +63,12 @@
     role?: RoomRole;
     /** Current level for accounts without an explicit entry (`null` = unknown). */
     defaultPermission?: RoomRole | null;
+    /**
+     * Hosting surface of the header (Issue #223). `bottom` means the portrait
+     * bottom sheet, so the close button points down; the landscape side sheet
+     * keeps pointing right. Passed explicitly instead of reading the viewport.
+     */
+    placement?: PanelPlacement;
     onCollapse?: () => void;
     onSelectScene?: (sceneId: string) => void;
     onExportZip?: (type: 'full' | 'logs') => void;
@@ -74,6 +85,14 @@
 
   let capabilities = $derived(roomRoleCapabilities(role));
   let isAdmin = $derived(capabilities.isAdmin);
+
+  /**
+   * Material Symbols glyph for the left close button (Issue #223).
+   *
+   * A bottom sheet closes downwards, so it uses `bottom_panel_close`; the
+   * landscape side sheet keeps the right-facing `right_panel_close`.
+   */
+  let closeIcon = $derived(placement === 'bottom' ? 'bottom_panel_close' : 'right_panel_close');
 
   // Search state
   let sceneSearchQuery = $state('');
@@ -191,7 +210,7 @@
 <svelte:window onclick={handleWindowClick} />
 
 <header class="common-header" data-testid="common-header">
-  <!-- Left: Panel Close Icon Button -->
+  <!-- Left: Panel Close Icon Button (Issue #223: downward on the bottom sheet) -->
   <div class="header-left">
     <IconButton
       variant="tonal"
@@ -200,10 +219,11 @@
       width="wide"
       onclick={onCollapse}
       data-testid="collapse-button"
+      data-panel-placement={placement}
       aria-label="パネルを閉じる"
       title="パネルを閉じる"
     >
-      <Icon>right_panel_close</Icon>
+      <Icon>{closeIcon}</Icon>
     </IconButton>
   </div>
 
