@@ -85,6 +85,7 @@
     type SceneSummary,
   } from '../utils/roomSocket.js';
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
+  import { normalizeAccountId } from '../utils/characterActions.js';
   import { resolveRoomKey } from '../utils/cellarTransfer.js';
   import {
     getSavedAccountId,
@@ -232,6 +233,13 @@
   let roomPermissions = $state<RoomPermissionItem[]>([...initialPermissions]);
   /** Level applied to accounts without an explicit entry (`null` = unknown). */
   let defaultPermission = $state<RoomRole | null>(null);
+
+  /**
+   * Saved account ID passed to the character tab for the "自分のキャラクター"
+   * view and `std::owner_account` matching (Issue #228). Read once per mount:
+   * the App is re-created after an account switch.
+   */
+  const currentAccountId: string | null = normalizeAccountId(getSavedAccountId());
 
   /**
    * Join preflight state (Issue #156).
@@ -1049,7 +1057,16 @@
 
   /** Applies an acknowledged creation, replacing the draft id with the server id. */
   function applyCreatedCharacter(draft: Character, serverId: string): void {
-    const created: Character = { ...draft, id: serverId };
+    // Ownership is assigned by banquette (`std::owner_account`); the create ack
+    // and its `CharacterInfo` broadcast do not always carry the attribute yet.
+    // Backfill it from the saved account so a fresh character is immediately
+    // "mine" for a participant (Issue #228). Never re-emitted to the server.
+    const created: Character = {
+      ...draft,
+      id: serverId,
+      ownerAccountId:
+        draft.ownerAccountId ?? normalizeAccountId(getSavedAccountId()) ?? undefined,
+    };
     const index = characters.findIndex((c) => c.id === serverId || c.id === draft.id);
     if (index >= 0) {
       characters = characters.map((c, i) => (i === index ? created : c));
@@ -2406,14 +2423,20 @@
     }
   }
 
-  /** Commits an acknowledged member move to `scenes`, `currentSceneId` and `movements`. */
+  /**
+   * Commits an acknowledged member move to `scenes` and `movements`.
+   *
+   * `currentSceneId` is deliberately left alone (Issue #228): a list-initiated
+   * move must not yank the admin out of the scene they are curating. The
+   * moved character simply leaves the current scene list and its row disappears
+   * from the "シーン内のキャラクター" view.
+   */
   function commitMemberMove(
     characterId: string,
     fromSceneId: string,
     result: ReturnType<typeof moveMemberToScene>,
   ) {
     scenes = result.updatedScenes;
-    currentSceneId = result.targetScene.id;
 
     const char = characters.find((c) => c.id === characterId);
     recordLiveMovement({
@@ -2427,15 +2450,15 @@
   }
 
   /**
-   * Moves a character to another scene (Issue #109 / sub-issue #143, #159, #225).
+   * Moves a character to another scene (Issue #109 / sub-issue #143, #159, #225,
+   * #228).
    *
-   * The target scene id (and the implicitly created scene for an unknown name)
-   * is computed before the request because `MoveCharacter` carries it. When the
-   * destination does not exist yet, `CreateScene` is sent first with the
-   * human-readable name: banquette writes `CreateScene.name` to `std::name`
-   * atomically, whereas its implicit creation inside `MoveCharacter` has no name
-   * and falls back to the internal scene id (Issue #225). `inherit_juices` stays
-   * `true` because the previous implicit creation inherited from `/`.
+   * The target is resolved **id-first**: when `targetSceneId` is given (the
+   * character list's 「別シーンに配置」 menu), only an existing scene with that
+   * id is accepted and no scene is created. Without it the previous name-based
+   * path applies and an unknown name creates the scene first: `MoveCharacter`
+   * alone would let banquette name the implicit scene after its internal id
+   * (Issue #225).
    *
    * The local model is only replaced after every request succeeded (the create
    * when needed, then the move). Without a connected socket the move fails
@@ -2446,6 +2469,7 @@
   async function handleMoveMember(
     characterId: string,
     targetSceneName: string,
+    targetSceneId?: string,
   ): Promise<boolean | void> {
     if (!canManageScenes) return;
     if (!beginSceneAction(`move:${characterId}`)) return;
@@ -2453,7 +2477,16 @@
     try {
       const fromSceneId =
         (scenes.find((scene) => scene.members.includes(characterId)) || currentScene).id;
-      const result = moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
+      const result = targetSceneId
+        ? moveMemberToSceneById(characterId, targetSceneId, scenes)
+        : moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
+      if (!result) {
+        // The id-first path operates on existing scenes only (Issue #228).
+        return failSceneAction(
+          new Error(`Unknown target scene: ${targetSceneId}`),
+          `move:${characterId}`,
+        );
+      }
       const socket = roomSocket;
       const numericCharId = Number(characterId);
 
@@ -2483,6 +2516,46 @@
     } finally {
       sceneActionPending = null;
     }
+  }
+
+  /**
+   * Resolves a member move against an **existing** target scene id.
+   *
+   * Used by the character list's 「別シーンに配置」 menu so two scenes with the
+   * same display name can never be confused and no scene is created implicitly.
+   * Returns `null` when the id is not in the local authoritative list.
+   */
+  function moveMemberToSceneById(
+    characterId: string,
+    targetSceneId: string,
+    existingScenes: Scene[],
+  ): ReturnType<typeof moveMemberToScene> | null {
+    if (!existingScenes.some((scene) => scene.id === targetSceneId)) return null;
+    const updatedScenes = existingScenes.map((scene) => ({
+      ...scene,
+      members: scene.members.filter((id) => id !== characterId),
+    }));
+    const targetScene = updatedScenes.find((scene) => scene.id === targetSceneId);
+    if (!targetScene) return null;
+    if (!targetScene.members.includes(characterId)) {
+      targetScene.members.push(characterId);
+    }
+    return { updatedScenes, targetScene, isNewSceneCreated: false };
+  }
+
+  /**
+   * Entry point for the character tab's 「別シーンに配置」 (Issue #228).
+   *
+   * Resolves the display name of the target scene so the App move path still
+   * carries a human-readable name, but keeps the id authoritative.
+   */
+  function handleCharacterMoveById(
+    characterId: string,
+    targetSceneId: string,
+  ): Promise<boolean | void> {
+    const target = scenes.find((scene) => scene.id === targetSceneId);
+    if (!target) return Promise.resolve(false);
+    return handleMoveMember(characterId, target.name, targetSceneId);
   }
 
   /**
@@ -3023,7 +3096,9 @@
                   onUpdateScene={handleUpdateScene}
                   onCreateScene={handleCreateScene}
                   onDeleteScene={handleDeleteScene}
-                  onMoveMember={handleMoveMember}
+                  onMoveCharacter={handleCharacterMoveById}
+                  onFocusCharacterScene={handleSelectScene}
+                  {currentAccountId}
                   onDeleteCharacter={handleDeleteCharacter}
                   onTogglePiece={handleTogglePiece}
                   onUpdateExtensions={handleUpdateExtensions}
@@ -3117,7 +3192,9 @@
                 onUpdateScene={handleUpdateScene}
                 onCreateScene={handleCreateScene}
                 onDeleteScene={handleDeleteScene}
-                onMoveMember={handleMoveMember}
+                onMoveCharacter={handleCharacterMoveById}
+                onFocusCharacterScene={handleSelectScene}
+                {currentAccountId}
                 onDeleteCharacter={handleDeleteCharacter}
                 onTogglePiece={handleTogglePiece}
                 onUpdateExtensions={handleUpdateExtensions}

@@ -16,8 +16,8 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
     clearAssets();
   });
 
-  // spec: alhalte-argenterie/character M3 List/ListItem 移行と駒配置・削除アイコンボタン
-  it('renders character list with noph-ui List/ListItem, full width, person_pin_circle piece button, and delete button', async () => {
+  // spec: alhalte-argenterie/character M3 List/ListItem 移行と駒配置・削除アイコンボタン (Issue #59, #228)
+  it('renders character list with a segmented List/ListItem, piece button and delete inside その他', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -51,15 +51,17 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
       },
     });
 
-    // Verify List container is rendered
+    // Verify List container is rendered with the segmented treatment (Issue #228).
     const listEl = target.querySelector<HTMLUListElement>('[data-testid="character-list"]');
     expect(listEl).toBeTruthy();
     expect(listEl?.tagName.toLowerCase()).toBe('ul');
+    expect(listEl?.classList.contains('character-segmented-list')).toBe(true);
 
     // Verify ListItem item wrapper
     const itemEl = target.querySelector('[data-testid="character-card-char-warrior"]');
     expect(itemEl).toBeTruthy();
     expect(itemEl?.classList.contains('np-item')).toBe(true);
+    expect(itemEl?.classList.contains('character-segmented-item')).toBe(true);
 
     // Verify avatar button / image
     const avatarBtn = target.querySelector<HTMLButtonElement>('[data-testid="edit-char-btn-char-warrior"]');
@@ -81,14 +83,21 @@ describe('Lists Migration to noph-ui List and ListItem (Issue #59)', () => {
     pieceBtn?.click();
     expect(toggledPieceId).toBe('char-warrior');
 
-    // Verify "キャラクターを削除" IconButton
-    const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-warrior"]');
+    // 削除 is a MenuItem inside the その他 menu (Issue #228).
+    const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="more-char-btn-char-warrior"]');
+    expect(moreBtn).toBeTruthy();
+    expect(moreBtn?.getAttribute('aria-label')).toBe('その他');
+    expect(moreBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('more_vert');
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    const deleteBtn = target.querySelector<HTMLElement>('[data-testid="delete-char-btn-char-warrior"]');
     expect(deleteBtn).toBeTruthy();
-    expect(deleteBtn?.classList.contains('np-icon-button')).toBe(true);
-    expect(deleteBtn?.getAttribute('aria-label')).toBe('キャラクターを削除');
+    expect(deleteBtn?.getAttribute('role')).toBe('menuitem');
     expect(deleteBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('delete');
 
     deleteBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
     expect(deleteConfirmChar).toEqual({ id: 'char-warrior', name: '戦士アルベルト' });
 
     // Item click opens edit panel

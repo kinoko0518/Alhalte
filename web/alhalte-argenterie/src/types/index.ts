@@ -60,6 +60,16 @@ export interface Character {
   isNarrative?: boolean;
   placedAsPiece?: boolean;
   piecePosition?: { x: number; y: number };
+  /**
+   * Owner account ID decoded from the reserved `std::owner_account` attribute
+   * (`alhalte/maitre-d/account-id`, 8-byte little-endian `u64`).
+   *
+   * Kept as an exact decimal string because account IDs may exceed
+   * `Number.MAX_SAFE_INTEGER`. `undefined` means the server did not report an
+   * owner yet (a freshly created character before the ack / broadcast carries
+   * it); such a character is treated as not owned (Issue #228).
+   */
+  ownerAccountId?: string;
 }
 
 /**

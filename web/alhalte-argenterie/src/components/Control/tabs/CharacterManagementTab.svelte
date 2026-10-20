@@ -2,25 +2,61 @@
   /**
    * Character Management Tab & Character Edit Panel.
    *
+   * The list is an M3 Expressive segmented list with a segmented button that
+   * switches between the current scene, the caller's own characters and (for an
+   * admin) every character. The available row actions depend on the role, the
+   * view and `std::owner_account`; that matrix lives in
+   * `utils/characterActions.ts` so the component contains no role branching
+   * beyond rendering the result.
+   *
    * References:
-   * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> キャラクタータブ`
+   * - ARCHITECTURE.md: `## alhalte-argenterie -> ### キャラクター同期`
+   * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 権限 UI`
+   * - GitHub Issue #228: キャラクター一覧画面に関する提言
    */
-  import { Button, IconButton, List, ListItem, LoadingIndicator } from 'noph-ui';
+  import {
+    Button,
+    CircularProgress,
+    IconButton,
+    List,
+    ListItem,
+    LoadingIndicator,
+    Menu,
+    MenuItem,
+    SegmentedButton,
+  } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { Character } from '../../../types/index.js';
+  import type { Character, Scene } from '../../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../../utils/assets.js';
+  import {
+    availableCharacterViews,
+    CHARACTER_VIEW_LABELS,
+    isCharacterOwnedBy,
+    visibleRowActions,
+    type CharacterRowAction,
+    type CharacterView,
+  } from '../../../utils/characterActions.js';
   import { truncateDescription } from '../../../utils/character.js';
   import { roomRoleCapabilities, type RoomRole } from '../../../utils/session.js';
   import type { RoomSocket } from '../../../utils/roomSocket.js';
+  import {
+    applyMenuPosition,
+    getMenuPositionStyle,
+  } from '../../../utils/menuPosition.js';
   import OfflineQueueNotice from '../../OfflineQueueNotice.svelte';
   import CharacterEditModal from '../CharacterEditModal.svelte';
 
   let {
     characters = [],
+    allScenes = [],
+    currentScene = null,
+    currentAccountId = null,
     role = 'participant',
     roomSocket = null,
     roomId,
     pendingCharacterCount,
+    sceneActionPending = null,
+    sceneActionError = null,
     onUpdateCharacter,
     onCreateCharacter,
     onDeleteCharacter,
@@ -30,11 +66,26 @@
     onRequestEditCharacter,
     onRequestCreateCharacter,
     onRefreshCharacters,
+    onFocusCharacterScene,
+    onMoveCharacter,
   }: {
     characters?: Character[];
+    /** Every scene of the room: used for scene labels and the "別シーン" menu. */
+    allScenes?: Scene[];
+    /**
+     * Scene the caller is currently looking at. The default `scene` view lists
+     * its members only. When omitted (standalone usage) every character is
+     * treated as being in the scene.
+     */
+    currentScene?: Scene | null;
+    /**
+     * Account ID of the caller (`App` passes `getSavedAccountId()`). A character
+     * is "mine" only when `std::owner_account` matches this exact decimal value.
+     */
+    currentAccountId?: string | null;
     /**
      * Role of the caller (Issue #201). `viewer` and `denied` cannot create,
-     * edit, delete or place characters; `participant` may manage characters.
+     * edit, delete or place characters; `participant` may manage their own.
      */
     role?: RoomRole;
     /**
@@ -47,6 +98,10 @@
     roomId?: string;
     /** Entries waiting in the durable outbox, forwarded to the queue notice. */
     pendingCharacterCount?: number;
+    /** Scene action in flight in `App` (`move:<characterId>`); drives the spinner. */
+    sceneActionPending?: string | null;
+    /** Failure text owned by `App` (scene move failures); rendered with `localError`. */
+    sceneActionError?: string | null;
     onUpdateCharacter?: (character: Character) => void;
     onCreateCharacter?: (character: Character) => void;
     onDeleteCharacter?: (characterId: string) => void;
@@ -65,7 +120,23 @@
     onRequestCreateCharacter?: (draft: Character) => void;
     /** Receives the authoritative list returned by `ListCharacters`. */
     onRefreshCharacters?: (characters: Character[]) => void;
+    /**
+     * Switches the caller's current scene to the character's scene
+     * (「視点を合わせる」). `App` wires this to `handleSelectScene`.
+     */
+    onFocusCharacterScene?: (sceneId: string) => void;
+    /**
+     * Moves a character to an existing scene by ID (「別シーンに配置」). `App`
+     * resolves the display name and follows the `MoveCharacter` ack path; this
+     * tab never creates a scene.
+     */
+    onMoveCharacter?: (
+      characterId: string,
+      targetSceneId: string,
+    ) => Promise<boolean | void> | boolean | void;
   } = $props();
+
+  const CHARACTER_ACTION_ERROR_MESSAGE = 'サーバーと通信できませんでした';
 
   let isEditOpen = $state(false);
   let editingCharacter = $state<Character>({
@@ -82,6 +153,32 @@
   });
   let isDeleteConfirmOpen = $state(false);
   let characterToDelete = $state<Character | null>(null);
+
+  // ---------------------------------------------------------------------------
+  // Segmented views (Issue #228)
+  // ---------------------------------------------------------------------------
+  let views = $derived(availableCharacterViews(role));
+  let view = $state<CharacterView>('scene');
+
+  // A role change can remove the selected view (e.g. an admin demoted to
+  // participant while `all` is selected); fall back to the always-present scene.
+  $effect(() => {
+    const available = availableCharacterViews(role);
+    if (!available.includes(view)) view = 'scene';
+  });
+
+  /** The view actually rendered; guards a role change in the same tick. */
+  let activeView = $derived<CharacterView>(views.includes(view) ? view : 'scene');
+
+  let viewOptions = $derived(
+    views.map((value) => ({
+      value,
+      label: CHARACTER_VIEW_LABELS[value],
+      selected: view === value,
+    })),
+  );
+
+  let capabilities = $derived(roomRoleCapabilities(role));
 
   /**
    * Lifecycle of the tab-open `ListCharacters` round trip
@@ -109,14 +206,6 @@
    */
   let isQueueing = $derived(loadState === 'queued' || (pendingCharacterCount ?? 0) > 0);
 
-  /**
-   * Queries the latest character list once per socket when the tab is shown.
-   *
-   * `App` unmounts this tab when another tab is selected, so mounting *is* "the
-   * tab was opened". The guard uses a plain (non-reactive) variable so the
-   * state transitions inside {@link queryCharacters} cannot re-trigger the
-   * effect into a query loop.
-   */
   $effect(() => {
     const socket = roomSocket;
     if (!socket) return;
@@ -143,8 +232,199 @@
     }
   }
 
-  let capabilities = $derived(roomRoleCapabilities(role));
+  // ---------------------------------------------------------------------------
+  // Scene membership helpers (Issue #228)
+  // ---------------------------------------------------------------------------
+  /** Scene the character is currently a member of, if known. */
+  function characterScene(characterId: string): Scene | undefined {
+    return (
+      allScenes.find((scene) => scene.members.includes(characterId)) ??
+      (currentScene?.members.includes(characterId) ? currentScene : undefined)
+    );
+  }
 
+  /**
+   * True when the character is in the caller's current scene. Without a
+   * `currentScene` (standalone usage) every character is treated as present, so
+   * no 「視点を合わせる」 is offered.
+   */
+  function isInCurrentScene(characterId: string): boolean {
+    if (!currentScene) return true;
+    return currentScene.members.includes(characterId);
+  }
+
+  /** Scene name shown under the name outside the scene view (`未所属` if none). */
+  function characterSceneLabel(characterId: string): string {
+    return characterScene(characterId)?.name ?? '未所属';
+  }
+
+  let visibleCharacters = $derived.by(() => {
+    if (activeView === 'scene') {
+      if (!currentScene) return characters;
+      return characters.filter((character) => currentScene.members.includes(character.id));
+    }
+    if (activeView === 'mine') {
+      return characters.filter((character) =>
+        isCharacterOwnedBy(character, currentAccountId),
+      );
+    }
+    return characters;
+  });
+
+  function rowActions(character: Character): CharacterRowAction[] {
+    return visibleRowActions({
+      role,
+      view: activeView,
+      character,
+      currentAccountId,
+      inCurrentScene: isInCurrentScene(character.id),
+      hasCharacterScene: characterScene(character.id) !== undefined,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Menus (move / more), one open at a time and closed on outside click
+  // ---------------------------------------------------------------------------
+  type CharacterMenuKind = 'move' | 'more';
+  let openMenu = $state<{ kind: CharacterMenuKind; characterId: string } | null>(null);
+  let menuAnchors = $state<Record<string, HTMLElement | undefined>>({});
+  let menuElements = $state<Record<string, HTMLElement | undefined>>({});
+
+  /**
+   * Piece toggle buttons keyed by character id.
+   *
+   * `IconButton` derives `aria-pressed` from its own `toggle` state, which
+   * would flip optimistically before the server ack. The placement state is
+   * server-authoritative (Issue #160 / #228), so the attribute is applied from
+   * `characters` after every render instead.
+   */
+  let pieceButtons = $state<Record<string, HTMLElement | undefined>>({});
+
+  function menuKey(kind: CharacterMenuKind, characterId: string): string {
+    return `${kind}-${characterId}`;
+  }
+
+  function isMenuOpen(kind: CharacterMenuKind, characterId: string): boolean {
+    return openMenu?.kind === kind && openMenu.characterId === characterId;
+  }
+
+  function toggleMenu(kind: CharacterMenuKind, characterId: string): void {
+    openMenu = isMenuOpen(kind, characterId) ? null : { kind, characterId };
+  }
+
+  function closeMenu(): void {
+    openMenu = null;
+  }
+
+  function handleWindowClick(event: MouseEvent): void {
+    const active = openMenu;
+    if (!active) return;
+    const target = event.target;
+    if (target instanceof Node) {
+      const key = menuKey(active.kind, active.characterId);
+      if (menuAnchors[key]?.contains(target) || menuElements[key]?.contains(target)) return;
+    }
+    openMenu = null;
+  }
+
+  $effect(() => {
+    const active = openMenu;
+    if (!active) return;
+    const key = menuKey(active.kind, active.characterId);
+    if (menuElements[key] && menuAnchors[key]) {
+      return applyMenuPosition(menuElements[key], menuAnchors[key], {
+        placement: 'bottom-end',
+        anchorName: `--character-menu-anchor-${key}`,
+      });
+    }
+  });
+
+  // Re-apply the server-authoritative `aria-pressed` after every render that can
+  // update the piece buttons (Issue #228). `IconButton` fades its own toggle
+  // state, so a click must not flip the attribute before the ack.
+  $effect(() => {
+    // Track the bound map (including keys) and the placement state so the
+    // attribute is applied once `bind:element` populated the entries.
+    const buttons = pieceButtons;
+    void Object.keys(buttons).length;
+    void role;
+    void capabilities.canManageCharacters;
+    void activeView;
+    for (const character of characters) {
+      const button = buttons[character.id];
+      if (!button) continue;
+      button.setAttribute('aria-pressed', character.placedAsPiece ? 'true' : 'false');
+    }
+  });
+
+  /** Existing scenes a character can be moved to (never its current scene). */
+  function moveTargetScenes(characterId: string): Scene[] {
+    const currentSceneId = characterScene(characterId)?.id;
+    return allScenes.filter((scene) => scene.id !== currentSceneId);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Row actions (Issue #228)
+  // ---------------------------------------------------------------------------
+  /** This tab's own pending action, so standalone usage shows the spinner too. */
+  let localPendingAction = $state<string | null>(null);
+  /** Failure text owned by this tab (a callback returned `false` / threw). */
+  let localActionError = $state<string | null>(null);
+
+  let effectiveActionError = $derived(sceneActionError || localActionError);
+  let isAnyActionPending = $derived(localPendingAction !== null);
+
+  function isMovePending(characterId: string): boolean {
+    return (
+      localPendingAction === `move:${characterId}` ||
+      sceneActionPending === `move:${characterId}`
+    );
+  }
+
+  async function runAction(
+    actionId: string,
+    action: (() => Promise<boolean | void> | boolean | void) | undefined,
+  ): Promise<boolean> {
+    if (isAnyActionPending || !action) return false;
+    localActionError = null;
+    localPendingAction = actionId;
+    try {
+      const result = await action();
+      if (result === false) {
+        localActionError = CHARACTER_ACTION_ERROR_MESSAGE;
+        return false;
+      }
+      return true;
+    } catch (error) {
+      console.warn(`[CharacterManagementTab] Character action "${actionId}" failed:`, error);
+      localActionError = CHARACTER_ACTION_ERROR_MESSAGE;
+      return false;
+    } finally {
+      localPendingAction = null;
+    }
+  }
+
+  async function handleMoveCharacter(character: Character, targetSceneId: string): Promise<void> {
+    closeMenu();
+    await runAction(`move:${character.id}`, () =>
+      onMoveCharacter?.(character.id, targetSceneId),
+    );
+  }
+
+  function handleFocusCharacter(character: Character): void {
+    const scene = characterScene(character.id);
+    if (!scene) return;
+    try {
+      onFocusCharacterScene?.(scene.id);
+    } catch (error) {
+      console.warn('[CharacterManagementTab] Failed to focus the character scene:', error);
+      localActionError = CHARACTER_ACTION_ERROR_MESSAGE;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Edit / create / delete (unchanged behaviour)
+  // ---------------------------------------------------------------------------
   function openEdit(char: Character) {
     if (!capabilities.canManageCharacters) return;
     if (onRequestEditCharacter) {
@@ -156,6 +436,7 @@
   }
 
   function openDeleteConfirm(char: Character) {
+    closeMenu();
     if (!capabilities.canManageCharacters) return;
     if (onRequestDeleteCharacter) {
       onRequestDeleteCharacter({ id: char.id, name: char.name });
@@ -199,7 +480,18 @@
     onCreateCharacter?.(newChar);
     openEdit(newChar);
   }
+
+  /** Piece toggle label, icon and state (Issue #228). */
+  function pieceLabel(character: Character): string {
+    return character.placedAsPiece ? '盤面から削除' : '駒として配置';
+  }
+
+  function pieceIcon(character: Character): string {
+    return character.placedAsPiece ? 'remove_circle' : 'person_pin_circle';
+  }
 </script>
+
+<svelte:window onclick={handleWindowClick} />
 
 <div class="character-tab-container" data-testid="character-management-tab">
   <div class="tab-header">
@@ -216,6 +508,19 @@
     </IconButton>
   </div>
 
+  <!-- Segmented button: viewers only have the scene view, so it is hidden. -->
+  {#if views.length > 1}
+    <div class="character-view-tabs" data-testid="character-view-tabs">
+      <SegmentedButton
+        name="character-view"
+        options={viewOptions}
+        bind:group={view}
+        aria-label="キャラクターの表示"
+        data-testid="character-view-segmented"
+      />
+    </div>
+  {/if}
+
   <!-- Queue state: the tab-open query timed out, or a save was queued in the
        durable outbox (Issue #109 / #144). The cached list stays visible. -->
   {#if isQueueing}
@@ -225,20 +530,21 @@
   {/if}
 
   <div class="character-list-container" data-testid="character-list-container">
-    <!-- Character list:
+    <!-- Character list: M3 Expressive segmented list.
       ［
         （キャラクターアイコン ［
           キャラクター名 説明※120文字以降は……として省略
-        ］ 削除ボタン※全画面警告あり 駒として配置ボタン）
+        ］ アクションボタン ※右寄せ・順序固定）
         ...
       ］
     -->
-    <List class="character-list" data-testid="character-list">
-      {#each characters as char (char.id)}
+    <List class="character-list character-segmented-list" data-testid="character-list">
+      {#each visibleCharacters as char (char.id)}
+        {@const actions = rowActions(char)}
         <ListItem
           type="text"
           onclick={() => openEdit(char)}
-          class="character-card-wrapper"
+          class="character-card-wrapper character-segmented-item"
           data-testid="character-card-{char.id}"
         >
           {#snippet avatar()}
@@ -267,30 +573,132 @@
             <span class="char-desc-label" data-testid="char-desc-{char.id}">
               {truncateDescription(char.description)}
             </span>
+            {#if activeView !== 'scene'}
+              <span class="char-scene-label" data-testid="char-scene-{char.id}">
+                {characterSceneLabel(char.id)}
+              </span>
+            {/if}
           {/snippet}
 
           {#snippet end()}
             <div class="char-actions" onclick={(e) => e.stopPropagation()}>
-              <IconButton
-                variant="tonal"
-                onclick={() => onTogglePiece?.(char.id)}
-                disabled={!capabilities.canManageCharacters}
-                aria-label="駒として配置"
-                title="駒として配置"
-                data-testid="piece-char-btn-{char.id}"
-              >
-                <Icon>person_pin_circle</Icon>
-              </IconButton>
-              <IconButton
-                variant="text"
-                onclick={() => openDeleteConfirm(char)}
-                disabled={!capabilities.canManageCharacters}
-                aria-label="キャラクターを削除"
-                title="キャラクターを削除"
-                data-testid="delete-char-btn-{char.id}"
-              >
-                <Icon>delete</Icon>
-              </IconButton>
+              {#each actions as action (action)}
+                {#if action === 'move'}
+                  <IconButton
+                    variant="tonal"
+                    onclick={() => toggleMenu('move', char.id)}
+                    bind:element={menuAnchors[menuKey('move', char.id)]}
+                    disabled={isMovePending(char.id)}
+                    aria-label="別シーンに配置"
+                    title="別シーンに配置"
+                    aria-haspopup="menu"
+                    aria-expanded={isMenuOpen('move', char.id) ? 'true' : 'false'}
+                    data-testid="move-char-btn-{char.id}"
+                  >
+                    {#if isMovePending(char.id)}
+                      <CircularProgress
+                        indeterminate
+                        wavy
+                        track={false}
+                        class="character-action-progress"
+                        data-testid="move-char-pending-{char.id}"
+                        aria-label="送信中"
+                      />
+                    {:else}
+                      <Icon>drive_file_move</Icon>
+                    {/if}
+                  </IconButton>
+                  <Menu
+                    bind:element={menuElements[menuKey('move', char.id)]}
+                    open={isMenuOpen('move', char.id)}
+                    anchor={menuAnchors[menuKey('move', char.id)]}
+                    style={getMenuPositionStyle(menuAnchors[menuKey('move', char.id)], {
+                      placement: 'bottom-end',
+                      anchorName: `--character-menu-anchor-${menuKey('move', char.id)}`,
+                    })}
+                    data-testid="move-char-menu-{char.id}"
+                    class="character-menu"
+                    ontoggle={(e) => {
+                      if (!e.newState || e.newState === 'closed') {
+                        if (isMenuOpen('move', char.id)) closeMenu();
+                      }
+                    }}
+                  >
+                    {#each moveTargetScenes(char.id) as targetScene (targetScene.id)}
+                      <MenuItem
+                        onclick={() => handleMoveCharacter(char, targetScene.id)}
+                        data-testid="move-char-scene-{char.id}-{targetScene.id}"
+                      >
+                        {targetScene.name}
+                      </MenuItem>
+                    {/each}
+                    {#if moveTargetScenes(char.id).length === 0}
+                      <div class="character-menu-empty" data-testid="move-char-menu-empty">
+                        移動できるシーンがありません
+                      </div>
+                    {/if}
+                  </Menu>
+                {:else if action === 'focus'}
+                  <IconButton
+                    variant="text"
+                    onclick={() => handleFocusCharacter(char)}
+                    aria-label="視点を合わせる"
+                    title="視点を合わせる"
+                    data-testid="focus-char-btn-{char.id}"
+                  >
+                    <Icon>my_location</Icon>
+                  </IconButton>
+                {:else if action === 'piece'}
+                  <IconButton
+                    variant="tonal"
+                    onclick={() => onTogglePiece?.(char.id)}
+                    bind:element={pieceButtons[char.id]}
+                    disabled={!capabilities.canManageCharacters}
+                    aria-label={pieceLabel(char)}
+                    title={pieceLabel(char)}
+                    data-testid="piece-char-btn-{char.id}"
+                  >
+                    <Icon>{pieceIcon(char)}</Icon>
+                  </IconButton>
+                {:else if action === 'more'}
+                  <IconButton
+                    variant="text"
+                    onclick={() => toggleMenu('more', char.id)}
+                    bind:element={menuAnchors[menuKey('more', char.id)]}
+                    aria-label="その他"
+                    title="その他"
+                    aria-haspopup="menu"
+                    aria-expanded={isMenuOpen('more', char.id) ? 'true' : 'false'}
+                    data-testid="more-char-btn-{char.id}"
+                  >
+                    <Icon>more_vert</Icon>
+                  </IconButton>
+                  <Menu
+                    bind:element={menuElements[menuKey('more', char.id)]}
+                    open={isMenuOpen('more', char.id)}
+                    anchor={menuAnchors[menuKey('more', char.id)]}
+                    style={getMenuPositionStyle(menuAnchors[menuKey('more', char.id)], {
+                      placement: 'bottom-end',
+                      anchorName: `--character-menu-anchor-${menuKey('more', char.id)}`,
+                    })}
+                    data-testid="character-menu-{char.id}"
+                    class="character-menu"
+                    ontoggle={(e) => {
+                      if (!e.newState || e.newState === 'closed') {
+                        if (isMenuOpen('more', char.id)) closeMenu();
+                      }
+                    }}
+                  >
+                    <MenuItem
+                      onclick={() => openDeleteConfirm(char)}
+                      data-testid="delete-char-btn-{char.id}"
+                    >
+                      {#snippet start()}<Icon>delete</Icon>{/snippet}
+                      削除
+                    </MenuItem>
+                  </Menu>
+                {/if}
+              {/each}
             </div>
           {/snippet}
         </ListItem>
@@ -311,6 +719,13 @@
       </div>
     {/if}
   </div>
+
+  <!-- Action failure (move / focus callback): `App`'s scene action error wins. -->
+  {#if effectiveActionError}
+    <p class="character-action-error" role="status" data-testid="character-action-error">
+      {effectiveActionError}
+    </p>
+  {/if}
 
   <!-- Character Edit Panel Overlay:
     ［
@@ -403,6 +818,15 @@
     font-weight: 700;
     color: var(--np-color-on-surface);
   }
+  .character-view-tabs {
+    display: flex;
+    width: 100%;
+    overflow-x: auto;
+  }
+  .character-view-tabs :global(.np-segmented-buttons) {
+    width: 100%;
+    max-width: 100%;
+  }
   .character-list-container {
     position: relative;
     display: flex;
@@ -430,7 +854,9 @@
     pointer-events: none;
     background-color: color-mix(in srgb, var(--np-color-surface) 72%, transparent);
   }
-  .character-list {
+  /* M3 Expressive segmented list (Issue #228): 8px gap, surface-container-low,
+     outline-variant outline, 12px corner. */
+  :global(.character-segmented-list) {
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -439,16 +865,49 @@
     margin: 0;
     list-style: none;
   }
-  :global(.character-card-wrapper.np-item) {
+  :global(.character-card-wrapper.character-segmented-item.np-item) {
+    display: grid !important;
+    grid-template-columns: auto 1fr;
+    grid-template-rows: auto auto;
+    gap: 8px 12px;
+    align-items: center;
     width: 100%;
+    min-height: unset !important;
+    padding: 12px !important;
     border-radius: var(--np-shape-corner-medium, 12px);
     background: var(--np-color-surface-container-low);
+    border: 1px solid var(--np-color-outline-variant);
     box-sizing: border-box;
     cursor: pointer;
-    transition: background-color var(--np-motion-expressive-fast-effects, 150ms ease);
+    transition: background-color var(--np-motion-expressive-fast-effects, 150ms ease),
+                border-color var(--np-motion-expressive-fast-effects, 150ms ease);
   }
-  :global(.character-card-wrapper.np-item:hover) {
+  :global(.character-card-wrapper.character-segmented-item.np-item:hover) {
     background: var(--np-color-surface-container);
+  }
+  :global(.character-segmented-item .np-item-avatar) {
+    grid-column: 1;
+    grid-row: 1;
+    width: 40px;
+    height: 40px;
+    border-radius: var(--np-shape-corner-full);
+    border: 1px solid var(--np-color-outline-variant);
+    overflow: hidden;
+  }
+  :global(.character-segmented-item .np-item-text) {
+    grid-column: 2;
+    grid-row: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+  :global(.character-segmented-item .np-item-end) {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    display: flex;
+    justify-content: flex-end;
   }
   .char-avatar-btn {
     background: none;
@@ -491,12 +950,36 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  .char-scene-label {
+    font-size: 0.72rem;
+    color: var(--np-color-on-surface-variant);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .char-actions {
     margin-left: auto;
     display: flex;
     align-items: center;
+    justify-content: flex-end;
     gap: 4px;
     flex-shrink: 0;
+  }
+  :global(.character-action-progress) {
+    --np-circular-progress-size: 1.25rem;
+  }
+  .character-menu-empty {
+    padding: 8px 16px;
+    font-size: 0.85rem;
+    color: var(--np-color-on-surface-variant);
+  }
+  .character-action-error {
+    margin: 0;
+    padding: 0 8px;
+    text-align: center;
+    font-size: 0.85rem;
+    line-height: 1.3;
+    color: var(--np-color-error);
   }
 
   .fullscreen-warning-overlay {

@@ -46,7 +46,8 @@ const SCENE: Scene = {
   name: 'メインシーン',
   juices: createDefaultJuices(),
   viewTransform: { x: 0, y: 0, scale: 1 },
-  members: [],
+  // The character tab's default view lists the current scene's members.
+  members: ['42', '43'],
 };
 
 const HERO: Character = {
@@ -488,6 +489,9 @@ describe('Character tab/editor server synchronization (Issue #109 / #144)', () =
     openCharactersTab();
     await tick(30);
 
+    // 削除 lives inside the その他 menu (Issue #228).
+    target.querySelector<HTMLButtonElement>(`[data-testid="more-char-btn-${HERO.id}"]`)?.click();
+    await tick(20);
     target.querySelector<HTMLButtonElement>(`[data-testid="delete-char-btn-${HERO.id}"]`)?.click();
     await tick(30);
     target.querySelector<HTMLButtonElement>('[data-testid="confirm-char-delete-button"]')?.click();
@@ -516,8 +520,21 @@ describe('Character tab/editor server synchronization (Issue #109 / #144)', () =
     await tick(20);
     openCharactersTab();
     await tick(30);
+    // The character list's default view is the current scene; membership is
+    // server-authoritative (Issue #160), so restore it for the local row.
+    socket.emitFrame({
+      SceneInfo: {
+        id: '/',
+        name: 'メインシーン',
+        present_character_count: 1,
+        present_characters: [42],
+      },
+    });
+    await tick(20);
     expect(card(HERO.id)).toBeTruthy();
 
+    target.querySelector<HTMLButtonElement>(`[data-testid="more-char-btn-${HERO.id}"]`)?.click();
+    await tick(20);
     target.querySelector<HTMLButtonElement>(`[data-testid="delete-char-btn-${HERO.id}"]`)?.click();
     await tick(20);
     target.querySelector<HTMLButtonElement>('[data-testid="confirm-char-delete-button"]')?.click();

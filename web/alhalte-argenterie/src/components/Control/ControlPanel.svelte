@@ -44,11 +44,13 @@
     onUpdateScene,
     onCreateScene,
     onDeleteScene,
-    onMoveMember,
     onUpdateCharacter,
     onCreateCharacter,
     onDeleteCharacter,
     onTogglePiece,
+    onMoveCharacter,
+    onFocusCharacterScene,
+    currentAccountId = null,
     onUpdateExtensions,
     onRegisterExtension,
     onExportZip,
@@ -97,7 +99,18 @@
     onUpdateScene?: (scene: Scene) => void;
     onCreateScene?: (name: string, inheritJuice: boolean) => void;
     onDeleteScene?: (sceneId: string) => void;
-    onMoveMember?: (characterId: string, targetSceneName: string) => void;
+    /**
+     * Moves a character to an existing scene by ID (Issue #228). The character
+     * tab has no free-text destination and never creates a scene.
+     */
+    onMoveCharacter?: (
+      characterId: string,
+      targetSceneId: string,
+    ) => Promise<boolean | void> | boolean | void;
+    /** Switches the caller's scene to the character's scene (視点を合わせる). */
+    onFocusCharacterScene?: (sceneId: string) => void;
+    /** Account ID used for the "自分のキャラクター" view and ownership gating. */
+    currentAccountId?: string | null;
     onUpdateCharacter?: (character: Character) => void;
     onCreateCharacter?: (character: Character) => void;
     onDeleteCharacter?: (characterId: string) => void;
@@ -245,14 +258,10 @@
     {:else if activeTab === 'settings'}
       <SceneSettingsTab
         {currentScene}
-        {allScenes}
-        {characters}
         {role}
         {onUpdateScene}
-        {onSelectScene}
         {onCreateScene}
         {onDeleteScene}
-        {onMoveMember}
         {onRequestDeleteScene}
         {onRequestDeleteSceneLogs}
         {onDeleteSceneLogs}
@@ -266,11 +275,18 @@
     {:else if activeTab === 'characters'}
       <CharacterManagementTab
         {characters}
+        {allScenes}
+        {currentScene}
+        {currentAccountId}
         {role}
+        {sceneActionPending}
+        {sceneActionError}
         {onUpdateCharacter}
         {onCreateCharacter}
         {onDeleteCharacter}
         {onTogglePiece}
+        {onMoveCharacter}
+        {onFocusCharacterScene}
         {onRequestDeleteCharacter}
         {onRequestAssetPicker}
         {onRequestEditCharacter}

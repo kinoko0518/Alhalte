@@ -268,6 +268,8 @@ export class FakeRoomSocket {
   readonly requestCreateCharacterCalls: CreateCharacterCall[] = [];
   readonly requestUpdateCharacterCalls: UpdateCharacterCall[] = [];
   readonly requestDeleteCharacterCalls: DeleteCharacterCall[] = [];
+  /** Scene ids passed to `enterScene` (view switches / focus actions, Issue #228). */
+  readonly enterSceneCalls: string[] = [];
   /** Count of `QueryPermissions` requests (Issue #201). */
   requestQueryPermissionsCalls = 0;
   /** Recorded `SetMemberPermission` frames (Issue #201). */
@@ -716,7 +718,9 @@ export class FakeRoomSocket {
     return operation;
   }
 
-  enterScene(): void {}
+  enterScene(sceneId: string): void {
+    this.enterSceneCalls.push(sceneId);
+  }
 
   /**
    * Eager latest-chunk load: records the request and either answers with an
