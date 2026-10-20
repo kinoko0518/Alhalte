@@ -150,7 +150,7 @@ Google から継承するのは `sub` のみ。`sub` はその場で hash 化・
 1. `resolve_caller` が Cookie `session_id` / クエリ / ヘッダから session を解決し、DB から account を引く。リクエストの `owner` / `session_id` は認可に使わない。
 2. `/api/cellar/store` の JSON body は `{ tin_id, size, wrapped_key }` のみを受理し、`X-Alhalte-Owner` / `X-Alhalte-Session-Id` を session 由来の値で付与してから body をそのまま cellar へ送る。body に `owner` / `session_id` が入っていれば 400。クライアントは owner を詐称できない（クエリ / ヘッダの `owner` が session と食い違えば 403）。
 3. `/api/cellar/store/{tin_id}` は `X-Alhalte-Owner` / `X-Alhalte-Session-Id` を付与し、`X-Alhalte-Wrapped-Key` と `Content-Type` を透過する。`tin_id` は 64 hex を検証してから転送する。
-4. `GET /api/cellar/tin/{tin_id}` は `X-Alhalte-Wrapped-Key` をレスポンスへ透過する。
+4. `GET /api/cellar/tin/{tin_id}` は session を検証するが、`X-Alhalte-Owner` / `X-Alhalte-Session-Id` を上流へ転送しない。cellar は tin id に一致する任意の参照を解決する（`owner` は参照ラベルの絞り込みにすぎない）。認証は proxy が担い、機密性は部屋鍵（`X-Alhalte-Wrapped-Key`）が担保するので、`X-Alhalte-Wrapped-Key` をレスポンスへ透過する（Issue #245）。
 5. 上流の status / body はそのまま返し、接続失敗は 502、timeout は 504 に変換して内部 URL を漏らさない。cellar 未設定時は 503。
 
 ### 部屋作成

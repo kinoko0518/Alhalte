@@ -467,7 +467,7 @@ async fn test_cellar_proxy_requires_valid_session() {
     let mock = MockCellar::new();
     let cellar_addr = spawn_mock_cellar(mock.clone()).await;
 
-    let (db, _account_id, _session_id) = test_identity();
+    let (db, account_id, _session_id) = test_identity();
     let proxy = CellarProxy::new(format!("http://{cellar_addr}")).unwrap();
     let addr = spawn_maitre_d(db, Some(proxy)).await;
     let client = reqwest::Client::new();
@@ -484,6 +484,18 @@ async fn test_cellar_proxy_requires_valid_session() {
     let response = client
         .get(format!("http://{addr}/api/cellar/tin/{TIN_ID}"))
         .header("Cookie", cookie_header(999_999))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Issue #245: the download proxy no longer forwards the owner, so a bare
+    // `owner` query cannot stand in for a session either. Authentication still
+    // happens at the proxy before any upstream call.
+    let response = client
+        .get(format!(
+            "http://{addr}/api/cellar/tin/{TIN_ID}?owner={account_id}"
+        ))
         .send()
         .await
         .unwrap();
@@ -620,9 +632,9 @@ async fn test_cellar_proxy_rejects_invalid_tin_id() {
     assert!(mock.calls().is_empty());
 }
 
-// spec: alhalte-maitre-d/cellar-proxy download forwards bytes and wrapped key
+// spec: alhalte-maitre-d/cellar-proxy download is not narrowed by owner (Issue #245)
 #[tokio::test]
-async fn test_cellar_proxy_download_forwards_bytes_and_wrapped_key() {
+async fn test_cellar_proxy_download_forwards_bytes_and_wrapped_key_without_owner() {
     let mock = MockCellar::new();
     let cellar_addr = spawn_mock_cellar(mock.clone()).await;
 
@@ -652,12 +664,21 @@ async fn test_cellar_proxy_download_forwards_bytes_and_wrapped_key() {
     let call = &calls[0];
     assert_eq!(call.method, "GET");
     assert_eq!(call.path, format!("/tin/{TIN_ID}"));
-    // The authenticated owner is injected as a header; the client's query
-    // string (including `owner` / `session_id`) must not reach cellar.
+    // The caller is authenticated here, but cellar only resolves the tin id to
+    // any reference: `owner` there is a label, not an ACL. Forwarding it made
+    // assets uploaded by another account undownloadable (Issue #245).
     assert_eq!(
         call.header("x-alhalte-owner"),
-        Some(account_id.to_string().as_str())
+        None,
+        "download must not be narrowed by owner"
     );
+    assert_eq!(
+        call.header("x-alhalte-session-id"),
+        None,
+        "the download proxy must not forward the session id"
+    );
+    // The client's query string (including `owner` / `session_id`) must not
+    // reach cellar either.
     assert_eq!(call.query, None);
 }
 
@@ -774,6 +795,21 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
 
     let temp = tempfile::tempdir().unwrap();
     let (db, account_id, session_id) = test_identity();
+
+    // A second account that uploaded nothing: Issue #245 is about it being able
+    // to fetch a tin stored by the first account.
+    let other_account = db
+        .get_or_create_account(
+            &test_sub_hash("sub-cellar-other"),
+            "Other Tester",
+            None,
+            1000,
+        )
+        .unwrap();
+    let other_session = db
+        .create_session(other_account.account_id, 1000)
+        .unwrap()
+        .session_id;
 
     // Both addresses must be known before either router is built: the proxy
     // needs the cellar URL and the cellar verifies sessions through maitre-d.
@@ -898,4 +934,18 @@ async fn test_cellar_proxy_end_to_end_with_real_cellar() {
         .await
         .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 6. A different account downloads the tin uploaded by the first one: the
+    //    room key, not the owner label, protects the bytes (Issue #245).
+    let response = client
+        .get(format!("{base}/tin/{TIN_ID}"))
+        .header("Cookie", cookie_header(other_session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.bytes().await.unwrap().as_ref(),
+        wire_bytes.as_slice()
+    );
 }

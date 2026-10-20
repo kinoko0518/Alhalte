@@ -654,6 +654,38 @@ async fn test_download_tin_and_wrapped_key() {
     assert!(service.download(&missing_id, None).await.is_err());
 }
 
+// spec: alhalte-cellar/owner-label download without owner resolves any reference (Issue #198/#245)
+#[tokio::test]
+async fn test_download_without_owner_returns_another_owners_reference() {
+    let dir = tempdir().unwrap();
+    let verifier = Arc::new(InMemorySessionVerifier::new());
+    verifier.allow(100, 1000);
+
+    let service = CellarService::new_with_in_memory_db(dir.path(), verifier, false).unwrap();
+    let (tin_bytes, tin_id) = create_test_tin("tin that only account 100 stored");
+    let wrapped_key = vec![7, 8, 9];
+
+    // Only owner 100 gets a reference row.
+    service
+        .store_payload(
+            tin_id,
+            &tin_bytes,
+            Some(wrapped_key.clone()),
+            WriteCredentials::session(100, 1000),
+        )
+        .await
+        .unwrap();
+
+    // `owner` only narrows the lookup, so omitting it still resolves the row:
+    // anyone holding the 32-byte tin id can fetch the bytes (Issue #245).
+    let (downloaded_bytes, downloaded_key) = service.download(&tin_id, None).await.unwrap();
+    assert_eq!(downloaded_bytes, tin_bytes);
+    assert_eq!(downloaded_key, Some(wrapped_key));
+
+    // A different owner label is not a reference and gets nothing.
+    assert!(service.download(&tin_id, Some(200)).await.is_err());
+}
+
 // spec: alhalte-cellar/unregister
 #[tokio::test]
 async fn test_unregister_removes_ownership_reference() {
