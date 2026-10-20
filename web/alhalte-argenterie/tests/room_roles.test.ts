@@ -38,7 +38,8 @@ function makeScene(overrides: Partial<Scene> = {}): Scene {
     name: 'メインシーン',
     juices: createDefaultJuices(),
     viewTransform: { x: 0, y: 0, scale: 1 },
-    members: [],
+    // The character tab's default view lists the current scene's members.
+    members: ['1'],
     ...overrides,
   };
 }
@@ -53,6 +54,7 @@ function makeCharacter(): Character {
     parameters: [],
     chatPalette: '',
     hideStatus: false,
+    ownerAccountId: '1001',
   };
 }
 
@@ -150,6 +152,14 @@ describe('Four-level room role UI (Issue #201)', () => {
     expect(
       target.querySelector<HTMLButtonElement>('[data-testid="create-character-btn"]')?.disabled,
     ).toBe(false);
+    // Issue #228: an admin gets every view and every scene-view row action.
+    expect(target.querySelector('[data-testid="character-view-tabs"]')).toBeTruthy();
+    expect(
+      target.querySelector('[data-testid="character-view-segmented"] input[value="all"]'),
+    ).toBeTruthy();
+    expect(target.querySelector('[data-testid="move-char-btn-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="piece-char-btn-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="more-char-btn-1"]')).toBeTruthy();
 
     await openTab('extensions');
     expect(
@@ -198,6 +208,19 @@ describe('Four-level room role UI (Issue #201)', () => {
     expect(
       target.querySelector<HTMLButtonElement>('[data-testid="edit-char-btn-1"]')?.disabled,
     ).toBe(false);
+
+    // Issue #228: a participant gets the scene / mine segmented views and the
+    // own character's piece toggle + その他 (but neither 別シーン nor 視点).
+    expect(target.querySelector('[data-testid="character-view-tabs"]')).toBeTruthy();
+    const roleSegmented = target.querySelector('[data-testid="character-view-segmented"]');
+    expect(roleSegmented).toBeTruthy();
+    expect(roleSegmented?.querySelector('input[value="scene"]')).toBeTruthy();
+    expect(roleSegmented?.querySelector('input[value="mine"]')).toBeTruthy();
+    expect(roleSegmented?.querySelector('input[value="all"]')).toBeNull();
+    expect(target.querySelector('[data-testid="move-char-btn-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="focus-char-btn-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="piece-char-btn-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="more-char-btn-1"]')).toBeTruthy();
 
     // Extension management is admin-only.
     await openTab('extensions');
@@ -250,9 +273,15 @@ describe('Four-level room role UI (Issue #201)', () => {
     expect(
       target.querySelector<HTMLButtonElement>('[data-testid="edit-char-btn-1"]')?.disabled,
     ).toBe(true);
-    expect(
-      target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-1"]')?.disabled,
-    ).toBe(true);
+    // Issue #228: a viewer only has the scene view (no segmented button) and no
+    // row actions at all, but the rows themselves are still rendered.
+    expect(target.querySelector('[data-testid="character-view-tabs"]')).toBeNull();
+    expect(target.querySelector('[data-testid="character-card-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="piece-char-btn-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="more-char-btn-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="move-char-btn-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="focus-char-btn-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="delete-char-btn-1"]')).toBeNull();
 
     await openTab('extensions');
     expect(target.querySelector('[data-testid="lock-indicator"]')).toBeTruthy();

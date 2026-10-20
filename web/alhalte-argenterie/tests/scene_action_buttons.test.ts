@@ -53,83 +53,6 @@ describe('Scene Action Buttons & Management Row (Issue #57)', () => {
     resetOutbox();
   });
 
-  // spec: alhalte-argenterie/scene-settings メンバー移動UIのインライン埋め込みと移動実行 (Issue #92)
-  it('embeds "メンバーを移動" UI directly into SceneSettingsTab without modal overlay, and moves member on click', async () => {
-    const target = document.createElement('div');
-    document.body.appendChild(target);
-
-    let movedCharId: string | undefined;
-    let movedTargetScene: string | undefined;
-
-    const instance = mount(SceneSettingsTab, {
-      target,
-      props: {
-        currentScene: scene1,
-        allScenes: [scene1, scene2],
-        characters: [testChar],
-        role: 'admin',
-        onMoveMember: (charId, targetScene) => {
-          movedCharId = charId;
-          movedTargetScene = targetScene;
-        },
-      },
-    });
-
-    await new Promise((r) => setTimeout(r, 20));
-
-    // Verify embedded "メンバーを移動" section and title exist inline in the tab
-    const moveSection = target.querySelector('[data-testid="move-members-section"]');
-    expect(moveSection).toBeTruthy();
-    expect(target.querySelector('[data-testid="move-members-title"]')?.textContent).toContain('メンバーを移動');
-
-    // Dialog overlay is NOT rendered or used
-    expect(target.querySelector('[data-testid="move-members-overlay"]')).toBeNull();
-
-    // Verify members list and member row are rendered directly in tab as M3 Segmented List
-    const moveList = target.querySelector('[data-testid="members-move-list"]');
-    expect(moveList).toBeTruthy();
-    expect(moveList?.tagName.toLowerCase()).toBe('ul');
-    expect(moveList?.classList.contains('members-segmented-list')).toBe(true);
-
-    const moveRow = target.querySelector(`[data-testid="move-row-${testChar.id}"]`);
-    expect(moveRow).toBeTruthy();
-    expect(moveRow?.classList.contains('np-item')).toBe(true);
-    expect(moveRow?.classList.contains('member-segmented-item')).toBe(true);
-
-    // Verify M3 Menu toggle works
-    const splitToggle = target.querySelector<HTMLButtonElement>(`[data-testid="member-split-toggle-${testChar.id}"]`);
-    expect(splitToggle).toBeTruthy();
-    expect(splitToggle?.classList.contains('np-icon-button')).toBe(true);
-    splitToggle?.click();
-    await new Promise((r) => setTimeout(r, 20));
-
-    const menu = target.querySelector(`[data-testid="member-scene-menu-${testChar.id}"]`);
-    expect(menu).toBeTruthy();
-
-    // Select scene from Menu
-    const sceneItem = target.querySelector<HTMLElement>(`[data-testid="member-scene-item-${testChar.id}-${scene2.id}"]`);
-    expect(sceneItem).toBeTruthy();
-    sceneItem?.click();
-    await new Promise((r) => setTimeout(r, 20));
-
-    // Verify target scene is set
-    const targetInput = target.querySelector<HTMLInputElement>(`[data-testid="member-target-input-${testChar.id}"]`);
-    expect(targetInput).toBeTruthy();
-    expect(targetInput?.value).toBe('ダンジョンシーン');
-
-    const applyBtn = target.querySelector<HTMLButtonElement>(`[data-testid="apply-move-btn-${testChar.id}"]`);
-    expect(applyBtn).toBeTruthy();
-    expect(applyBtn?.classList.contains('np-button')).toBe(true);
-    applyBtn?.click();
-    await new Promise((r) => setTimeout(r, 20));
-
-    expect(movedCharId).toBe(testChar.id);
-    expect(movedTargetScene).toBe('ダンジョンシーン');
-
-    unmount(instance);
-    target.remove();
-  });
-
   // spec: alhalte-argenterie/scene-settings 3つのスクエアMアクションボタン群の並び、初期比率、ホバー展開 (Issue #57)
   it('renders 3 Square M action buttons side-by-side with left-larger initial ratio and smooth hover expansion showing text labels', async () => {
     const target = document.createElement('div');
@@ -444,12 +367,6 @@ describe('Scene management actions — server acknowledgement (Issue #109 / #143
     return target.querySelector<HTMLInputElement>('[data-testid="scene-name-input"]')?.value ?? '';
   }
 
-  function memberSceneText(target: HTMLElement): string {
-    return (
-      target.querySelector('[data-testid="member-current-scene-42"]')?.textContent ?? ''
-    );
-  }
-
   function openSceneSwitcher(target: HTMLElement): void {
     target.querySelector<HTMLInputElement>('[data-testid="scene-search-input"]')?.focus();
   }
@@ -749,92 +666,6 @@ describe('Scene management actions — server acknowledgement (Issue #109 / #143
     target.remove();
   });
 
-  // spec: argenterie/scene-settings メンバー移動はCharacterMovedのack後にのみscenes/membersを更新する (Issue #109 / #143)
-  it('sends MoveCharacter for 移動, blocks double activation, and updates members only after the ack', async () => {
-    const socket = new FakeRoomSocket();
-    socket.autoAnswerSceneActions = false;
-    const { target, instance } = mountAppWithSocket(socket);
-    await settle();
-    openSettingsTab(target);
-    await settle(30);
-
-    const targetInput = target.querySelector<HTMLInputElement>(
-      '[data-testid="member-target-input-42"]',
-    )!;
-    expect(targetInput.value).toBe('広場');
-    targetInput.value = '森';
-    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
-    await settle();
-
-    const moveBtn = target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-42"]')!;
-    moveBtn.click();
-    await settle(0);
-
-    expect(socket.requestMoveCharacterCalls).toEqual([{ characterId: 42, toSceneId: 'scene-b' }]);
-    expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeTruthy();
-    expect(moveBtn.disabled).toBe(true);
-    // No optimistic mutation yet.
-    expect(memberSceneText(target)).toContain('現在: 広場');
-    expect(socket.requestUpdateStateCalls).toHaveLength(0);
-
-    // Duplicate activation while pending is a no-op.
-    moveBtn.click();
-    await settle(0);
-    expect(socket.requestMoveCharacterCalls).toHaveLength(1);
-
-    socket.resolveSceneAction('move');
-    await settle();
-
-    expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeNull();
-    expect(memberSceneText(target)).toContain('現在: 森');
-    expect(sceneNameValue(target)).toBe('森');
-    // Scene membership is server-authoritative (`SceneInfo`); since Issue #160 no
-    // `character::<id>::scene` state mirror is written after the move.
-    expect(socket.requestUpdateStateCalls).toHaveLength(0);
-    expect(target.querySelector('[data-testid="scene-action-error"]')).toBeNull();
-
-    unmount(instance);
-    target.remove();
-  });
-
-  // spec: argenterie/scene-settings メンバー移動の失敗は members を変えず中央寄せエラーを出す (Issue #109 / #143)
-  it('shows the centered error and keeps the members when 移動 times out', async () => {
-    const socket = new FakeRoomSocket();
-    socket.autoAnswerSceneActions = false;
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
-    const { target, instance } = mountAppWithSocket(socket);
-    await settle();
-    openSettingsTab(target);
-    await settle(30);
-
-    const targetInput = target.querySelector<HTMLInputElement>(
-      '[data-testid="member-target-input-42"]',
-    )!;
-    targetInput.value = '森';
-    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
-    await settle();
-
-    target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-42"]')!.click();
-    await settle(0);
-
-    socket.rejectSceneAction(new OperationTimeoutError('moveCharacter', 8000), 'move');
-    await settle();
-
-    expect(target.querySelector('[data-testid="scene-action-error"]')?.textContent?.trim()).toBe(
-      ERROR_MESSAGE,
-    );
-    expect(target.querySelector('[data-testid="move-action-pending-42"]')).toBeNull();
-    expect(memberSceneText(target)).toContain('現在: 広場');
-    expect(sceneNameValue(target)).toBe('広場');
-    // The state mirror is only sent after the move was acknowledged.
-    expect(socket.requestUpdateStateCalls).toHaveLength(0);
-
-    warn.mockRestore();
-    unmount(instance);
-    target.remove();
-  });
-
-  // spec: argenterie/scene-settings タブ単体でも非同期コールバックのfalseを失敗として扱う (Issue #109 / #143)
   it('treats a callback returning false as a failure and shows the centered error (standalone tab)', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);

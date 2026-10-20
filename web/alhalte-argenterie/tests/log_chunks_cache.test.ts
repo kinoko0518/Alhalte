@@ -355,6 +355,8 @@ describe('Issue #162 log chunks and cache', () => {
         kind: 'system',
         content: '',
         speaker: 'System',
+        // Issue #227: came/gone carry the append time on the wire.
+        timestamp: 2000,
         event: { type: 'character-came', characterId: '1' },
       }),
     ];
@@ -372,12 +374,15 @@ describe('Issue #162 log chunks and cache', () => {
       source: 'log',
     });
     expect(movements[0].fromSceneId).toBeUndefined();
+    expect(movements[0].timestamp).toBe(1000);
     expect(movements[1]).toMatchObject({
       characterId: '1',
       fromSceneId: '/',
       toSceneId: 'scene-b',
       source: 'log',
     });
+    // The append time decoded from the came event is kept on the movement.
+    expect(movements[1].timestamp).toBe(2000);
 
     // A live CharacterMoved for the same route is not counted twice.
     const live: SceneMovementEvent[] = [

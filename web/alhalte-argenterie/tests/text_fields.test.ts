@@ -317,10 +317,10 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
 
     expect(createdSceneData).toEqual({ name: '地下通路', inheritJuice: true });
 
-    // 4. Move members embedded in tab (Issue #92)
-    const memberTargetInput = target.querySelector<HTMLInputElement>('[data-testid="member-target-input-char-1"]');
-    expect(memberTargetInput).toBeTruthy();
-    expect(memberTargetInput?.closest('.np-field')?.classList.contains('np-field-outlined')).toBe(true);
+    // Issue #228: the scene-management-side member move UI was removed; the
+    // character list owns the move menu now.
+    expect(target.querySelector('[data-testid="move-members-section"]')).toBeNull();
+    expect(target.querySelector('[data-testid="member-target-input-char-1"]')).toBeNull();
 
     unmount(instance);
     target.remove();

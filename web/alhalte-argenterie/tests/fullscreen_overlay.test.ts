@@ -276,8 +276,10 @@ describe('Fullscreen Warnings & Overlays Viewport Hoisting (Issue #60)', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-characters"]')?.click();
     await new Promise((r) => setTimeout(r, 30));
 
-    // Click delete character button
-    const deleteCharBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-1"]');
+    // Open その他 and click 削除 (Issue #228)
+    target.querySelector<HTMLButtonElement>('[data-testid="more-char-btn-char-1"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    const deleteCharBtn = target.querySelector<HTMLElement>('[data-testid="delete-char-btn-char-1"]');
     expect(deleteCharBtn).toBeTruthy();
     deleteCharBtn?.click();
     await new Promise((r) => setTimeout(r, 30));

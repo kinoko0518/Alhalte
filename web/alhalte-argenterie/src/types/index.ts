@@ -60,6 +60,16 @@ export interface Character {
   isNarrative?: boolean;
   placedAsPiece?: boolean;
   piecePosition?: { x: number; y: number };
+  /**
+   * Owner account ID decoded from the reserved `std::owner_account` attribute
+   * (`alhalte/maitre-d/account-id`, 8-byte little-endian `u64`).
+   *
+   * Kept as an exact decimal string because account IDs may exceed
+   * `Number.MAX_SAFE_INTEGER`. `undefined` means the server did not report an
+   * owner yet (a freshly created character before the ack / broadcast carries
+   * it); such a character is treated as not owned (Issue #228).
+   */
+  ownerAccountId?: string;
 }
 
 /**
@@ -96,6 +106,14 @@ export interface Juices {
   bgm3?: string;
   bgm3Volume: number;
   bgmSlots?: BgmSlot[];
+  /**
+   * Slot numbers explicitly removed from the UI (Issue #226).
+   *
+   * Mirrors the server-authoritative `bgm::<slot>::removed` state keys so a
+   * deleted slot is not re-created from the legacy `bgm1..3` fallback. An
+   * absent field is the same as an empty list.
+   */
+  bgmRemovedSlots?: number[];
 }
 
 /**
@@ -268,6 +286,19 @@ export interface CropCalculationResult {
   cropWidth: number;
   cropHeight: number;
 }
+
+/**
+ * Surface that hosts the control panel (Issue #223).
+ *
+ * - `side`: the landscape side sheet (`placement="end"`); the panel closes to
+ *   the right.
+ * - `bottom`: the portrait bottom sheet (`placement="bottom"`); the panel closes
+ *   downwards.
+ *
+ * It is passed explicitly from `App` through `ControlPanel` to `CommonHeader`
+ * so the close icon never has to guess the viewport from `window`.
+ */
+export type PanelPlacement = 'side' | 'bottom';
 
 export type {
   GenerastAST,

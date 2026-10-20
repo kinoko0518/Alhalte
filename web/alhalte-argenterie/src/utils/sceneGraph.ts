@@ -367,8 +367,10 @@ export function buildSceneGraph(
  * chunk position), a `gone` retroactively fills in the origin of the latest
  * came, and a `came` without any `gone` is treated as an initial spawn.
  *
- * System events carry no timestamp, so `order` preserves the log order for the
- * graph / chronological sort.
+ * System events carry an append timestamp since Issue #227, but
+ * `(chunkIndex, position)` stays the authoritative per-scene order and is
+ * compared first; `order` preserves that log order for the graph / chronological
+ * sort.
  */
 export function buildMovementsFromLogRecords(
   records: LogRecord[],

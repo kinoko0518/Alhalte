@@ -1,6 +1,7 @@
 //! HTTP and WebSocket gateway server routes and handlers.
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use alhalte_banquette::{ClientFrame, RoomPermissionLevel};
 
@@ -134,6 +135,13 @@ pub struct AppState {
     /// cross-origin access entirely (same-origin only). The same allow-list
     /// gates OAuth `return_to` values.
     pub allowed_origins: Vec<String>,
+    /// Development-only `http://<private IPv4>:<PORT>` origins (Issue #229).
+    ///
+    /// Empty by default. When non-empty (`--allow-lan-origin-port`), CORS and
+    /// OAuth `return_to` also accept private-network IPv4 origins on these
+    /// ports. This is not a wildcard: HTTPS, hostnames, and public addresses
+    /// are still rejected, and the port must match exactly.
+    pub lan_origin_ports: Vec<u16>,
     /// Public base URL used to build the fixed Google OAuth redirect URI.
     ///
     /// Defaults to [`DEFAULT_PUBLIC_URL`]; `--public-url` replaces it.
@@ -169,6 +177,7 @@ impl AppState {
                 .iter()
                 .map(|origin| (*origin).to_string())
                 .collect(),
+            lan_origin_ports: Vec::new(),
             public_url: DEFAULT_PUBLIC_URL.to_string(),
             client_counter: Arc::new(AtomicU64::new(1)),
         }
@@ -208,6 +217,18 @@ impl AppState {
         origins: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.allowed_origins = origins.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Enables the development-only LAN origin switch (Issue #229).
+    ///
+    /// Each port lets CORS and OAuth `return_to` accept
+    /// `http://<private IPv4>:<port>` in addition to [`Self::allowed_origins`].
+    /// This never makes CORS permissive: the scheme, host range, and port are
+    /// checked. Use only for same-Ethernet testing, never on a public instance.
+    #[must_use]
+    pub fn with_lan_origin_ports(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+        self.lan_origin_ports = ports.into_iter().collect();
         self
     }
 
@@ -749,16 +770,23 @@ pub fn create_router(state: AppState) -> Router {
     }
 
     router
-        .layer(build_cors_layer(&state.allowed_origins))
+        .layer(build_cors_layer(
+            &state.allowed_origins,
+            &state.lan_origin_ports,
+        ))
         .with_state(state)
 }
 
 /// Builds the CORS layer from an explicit origin allow-list.
 ///
-/// Credentials (session cookies / `X-Alhalte-*` headers) are allowed, so the
+/// Credentials (session cookies / `X-alhalte-*` headers) are allowed, so the
 /// origin list must be explicit: [`CorsLayer::permissive`] is never used. An
 /// empty list keeps the layer same-origin only.
-fn build_cors_layer(origins: &[String]) -> CorsLayer {
+///
+/// `lan_origin_ports` is the development-only Issue #229 switch: when non-empty
+/// it additionally accepts `http://<private IPv4>:<port>` through the same
+/// predicate as [`is_allowed_return_to_with_lan`], never a wildcard.
+fn build_cors_layer(origins: &[String], lan_origin_ports: &[u16]) -> CorsLayer {
     // `allow_credentials` is required for the session cookie, and browsers
     // reject `Access-Control-Allow-Headers: *` together with credentials, so
     // the headers the gateways actually use are listed explicitly.
@@ -789,11 +817,26 @@ fn build_cors_layer(origins: &[String]) -> CorsLayer {
         .filter_map(|origin| origin.trim().parse::<HeaderValue>().ok())
         .collect();
 
-    if parsed.is_empty() {
-        layer
-    } else {
-        layer.allow_origin(parsed)
+    if parsed.is_empty() && lan_origin_ports.is_empty() {
+        return layer;
     }
+
+    // `AllowOrigin::predicate` echoes the request origin only when it matches,
+    // which keeps `allow_credentials` valid without ever sending `*`. Normalize
+    // both sides so `http://host:80` and `http://host` compare equal.
+    let allowed: Vec<String> = parsed
+        .iter()
+        .filter_map(|origin| origin.to_str().ok())
+        .map(str::to_string)
+        .collect();
+    let lan_ports = lan_origin_ports.to_vec();
+    layer.allow_origin(AllowOrigin::predicate(
+        move |origin: &HeaderValue, _parts: &axum::http::request::Parts| {
+            origin
+                .to_str()
+                .is_ok_and(|origin| is_allowed_origin(origin, &allowed, &lan_ports))
+        },
+    ))
 }
 
 /// Handles `GET /api/server-info`.
@@ -977,13 +1020,76 @@ fn normalized_origin(value: &str) -> Option<String> {
 /// The allow-list is the same explicit origin list used for CORS. This is the
 /// open-redirect guard for `GET /auth/login`: `//evil.example`, another origin,
 /// and `javascript:` / `data:` URLs are all rejected.
+///
+/// This is the production-safe form (no LAN switch). The HTTP handlers call
+/// [`is_allowed_return_to_with_lan`] with
+/// [`AppState::lan_origin_ports`].
 pub fn is_allowed_return_to(return_to: &str, allowed_origins: &[String]) -> bool {
-    let Some(origin) = normalized_origin(return_to) else {
+    is_allowed_return_to_with_lan(return_to, allowed_origins, &[])
+}
+
+/// Returns true when `value` is an allowed browser origin.
+///
+/// The explicit `allowed_origins` list is always honored. Additionally, when
+/// `allow_lan_origin_ports` is non-empty (the development-only
+/// `--allow-lan-origin-port` switch, Issue #229), an `http://` origin whose
+/// host is a private-network IPv4 literal and whose port is listed is accepted.
+///
+/// The extra rule intentionally rejects:
+/// - non-HTTP(S) schemes (already rejected by [`normalized_origin`]),
+/// - `https://` private origins (the Vite dev server is plain HTTP),
+/// - hostnames (`my-host.local`, `192.168.1.1.evil.example`) and public IPs,
+/// - any other port.
+pub fn is_allowed_return_to_with_lan(
+    value: &str,
+    allowed_origins: &[String],
+    allow_lan_origin_ports: &[u16],
+) -> bool {
+    is_allowed_origin(value, allowed_origins, allow_lan_origin_ports)
+}
+
+/// Shared by the CORS predicate and the `return_to` guard.
+fn is_allowed_origin(value: &str, allowed_origins: &[String], lan_origin_ports: &[u16]) -> bool {
+    let Some(origin) = normalized_origin(value) else {
         return false;
     };
-    allowed_origins
+    if allowed_origins
         .iter()
         .any(|allowed| normalized_origin(allowed).as_deref() == Some(origin.as_str()))
+    {
+        return true;
+    }
+    is_allowed_lan_origin(&origin, lan_origin_ports)
+}
+
+/// Returns true for `http://<private IPv4>:<listed port>` origins.
+///
+/// `origin` must already be normalized by [`normalized_origin`]. Only RFC 1918
+/// ranges and loopback are accepted, so `--allow-lan-origin-port` cannot turn
+/// into a public wildcard.
+fn is_allowed_lan_origin(normalized: &str, lan_origin_ports: &[u16]) -> bool {
+    if lan_origin_ports.is_empty() {
+        return false;
+    }
+    let Ok(uri) = normalized.parse::<http::Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("http") {
+        return false;
+    }
+    let Some(authority) = uri.authority() else {
+        return false;
+    };
+    let Ok(ip) = authority.host().parse::<Ipv4Addr>() else {
+        return false;
+    };
+    let port = authority.port_u16().unwrap_or(80);
+    is_private_network_ipv4(ip) && lan_origin_ports.contains(&port)
+}
+
+/// Returns true for private-network / loopback IPv4 literals.
+fn is_private_network_ipv4(ip: Ipv4Addr) -> bool {
+    ip.is_private() || ip.is_loopback()
 }
 
 /// Returns true for the Google `prompt` values argenterie may request.
@@ -1018,7 +1124,7 @@ async fn oauth_login_handler(
         return error_response(StatusCode::BAD_REQUEST, "Missing return_to");
     };
 
-    if !is_allowed_return_to(return_to, &state.allowed_origins) {
+    if !is_allowed_return_to_with_lan(return_to, &state.allowed_origins, &state.lan_origin_ports) {
         return error_response(StatusCode::BAD_REQUEST, "return_to origin is not allowed");
     }
 
@@ -1097,7 +1203,7 @@ async fn oauth_callback_handler(
         };
 
     // Defense in depth: the allow-list may have changed between login and callback.
-    if !is_allowed_return_to(&return_to, &state.allowed_origins) {
+    if !is_allowed_return_to_with_lan(&return_to, &state.allowed_origins, &state.lan_origin_ports) {
         return error_response(StatusCode::BAD_REQUEST, "return_to origin is not allowed");
     }
 
@@ -1250,7 +1356,7 @@ fn debug_return_to<'a>(
     let Some(return_to) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Err(error_response(StatusCode::BAD_REQUEST, "Missing return_to"));
     };
-    if !is_allowed_return_to(return_to, &state.allowed_origins) {
+    if !is_allowed_return_to_with_lan(return_to, &state.allowed_origins, &state.lan_origin_ports) {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             "return_to origin is not allowed",

@@ -10,7 +10,14 @@
    */
   import { tick, untrack } from 'svelte';
   import { LoadingIndicator } from 'noph-ui';
-  import type { Character, ExtensionItem, LogRecord, QueuedLogMessage, Scene } from '../../../types/index.js';
+  import type {
+    Character,
+    ExtensionItem,
+    LogRecord,
+    PanelPlacement,
+    QueuedLogMessage,
+    Scene,
+  } from '../../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../../utils/assets.js';
   import type { ConnectionState } from '../../../utils/connection.js';
   import {
@@ -55,6 +62,7 @@
     roomSocket = null,
     connectionState,
     queuedMessages = [],
+    placement = 'side',
   }: {
     scene: Scene;
     allScenes?: Scene[];
@@ -98,6 +106,11 @@
      * the loaded messages is dropped so an echo never renders twice.
      */
     queuedMessages?: QueuedLogMessage[];
+    /**
+     * Surface hosting the panel (Issue #223). Forwarded to the inline
+     * `CommonHeader` so a bottom sheet closes downwards.
+     */
+    placement?: PanelPlacement;
   } = $props();
 
   // Messages, animation tracking, & WASM rendering cache
@@ -658,6 +671,7 @@
       {roomId}
       {role}
       {defaultPermission}
+      {placement}
       {onCollapse}
       {onSelectScene}
       {onExportZip}
@@ -688,13 +702,16 @@
     </div>
   {/if}
 
-  <!-- Messages List -->
+  <!-- Messages List: the only scroll container of the log (Issue #223).
+       `min-height: 0` lets the flex item shrink below its content so
+       `overflow-y: auto` actually scrolls inside the bounded sheet. -->
   <div class="messages-area">
     <div
       class="messages-list"
       bind:this={listElement}
       onscroll={handleScroll}
       data-testid="messages-list"
+      data-scroll-container="log-messages"
       aria-busy={isLoading}
     >
       {#if messages.length === 0 && currentQueuedMessages.length === 0 && !isLoading && !isQueueing}
@@ -758,6 +775,11 @@
 
   .messages-list {
     flex: 1;
+    /* Issue #223: a definite, shrinkable flex item is what makes the log
+       scrollable inside the portrait bottom sheet. Without `min-height: 0`
+       the default `min-height: auto` grows the list to its content height and
+       the parent sheet clips it instead of scrolling. */
+    min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
     padding: 16px;

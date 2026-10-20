@@ -161,6 +161,28 @@ pub struct CliArgs {
         value_name = "ORIGIN"
     )]
     pub cors_origins: Vec<String>,
+
+    /// Development-only: also accept `http://<private IPv4>:<PORT>` browser
+    /// origins for CORS and OAuth `return_to`.
+    ///
+    /// The flag takes the argenterie port and is repeatable (comma-separated /
+    /// `ALHALTE_ALLOW_LAN_ORIGIN_PORTS`). Bistrot emits it only when
+    /// `[argenterie] lan = true` in the bundled local-development configuration
+    /// (Issue #229), so phones on the same Ethernet can sign in without making
+    /// CORS permissive:
+    /// - only `http://` (never `https://`) origins are accepted,
+    /// - the host must be an IP literal in a private range (RFC 1918 or
+    ///   loopback), never a hostname or a public address,
+    /// - the port must be one of the listed ports.
+    ///
+    /// Never enable this on a public instance.
+    #[arg(
+        long = "allow-lan-origin-port",
+        env = "ALHALTE_ALLOW_LAN_ORIGIN_PORTS",
+        value_delimiter = ',',
+        value_name = "PORT"
+    )]
+    pub allow_lan_origin_ports: Vec<u16>,
 }
 
 /// Parses CLI arguments from an arbitrary iterator of strings (useful for unit tests).

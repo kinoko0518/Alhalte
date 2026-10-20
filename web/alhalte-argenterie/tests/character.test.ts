@@ -27,8 +27,8 @@ describe('Character Management & Edit Panel', () => {
     expect(truncated.endsWith(DESCRIPTION_ELLIPSIS)).toBe(true);
   });
 
-  // spec: alhalte-argenterie/character CharacterManagementTab コンポーネント編集パネルと削除警告
-  it('renders character list with 120-char ellipsis, edit panel, and full-screen delete warning', async () => {
+  // spec: alhalte-argenterie/character CharacterManagementTab コンポーネント編集パネルと削除警告 (Issue #228)
+  it('renders the segmented character list with 120-char ellipsis, edit panel, and full-screen delete warning', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
 
@@ -47,6 +47,7 @@ describe('Character Management & Edit Panel', () => {
       chatPalette: '1D100<=90 【魔術】',
       hideStatus: false,
       placedAsPiece: false,
+      ownerAccountId: '1001',
     };
 
     let updatedChar: Character | null = null;
@@ -57,6 +58,8 @@ describe('Character Management & Edit Panel', () => {
       target,
       props: {
         characters: [testChar],
+        role: 'participant',
+        currentAccountId: '1001',
         onUpdateCharacter: (c) => {
           updatedChar = c;
         },
@@ -83,15 +86,16 @@ describe('Character Management & Edit Panel', () => {
     expect(createBtn?.classList.contains('np-icon-button')).toBe(true);
     expect(createBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('person_add');
 
-    // Test "駒として配置" and "削除" IconButtons are inside right-aligned .char-actions container (Issue #31)
+    // The participant's own character has the piece toggle and the その他 menu
+    // inside the right-aligned .char-actions container (Issue #228).
     const actionsContainer = target.querySelector('[data-testid="character-card-char-mage"] .char-actions');
     expect(actionsContainer).toBeTruthy();
     const pieceBtn = target.querySelector<HTMLButtonElement>('[data-testid="piece-char-btn-char-mage"]');
-    const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="delete-char-btn-char-mage"]');
+    const moreBtn = target.querySelector<HTMLButtonElement>('[data-testid="more-char-btn-char-mage"]');
     expect(pieceBtn).toBeTruthy();
-    expect(deleteBtn).toBeTruthy();
+    expect(moreBtn).toBeTruthy();
     expect(actionsContainer?.contains(pieceBtn)).toBe(true);
-    expect(actionsContainer?.contains(deleteBtn)).toBe(true);
+    expect(actionsContainer?.contains(moreBtn)).toBe(true);
     expect(pieceBtn?.classList.contains('np-icon-button')).toBe(true);
     expect(pieceBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('person_pin_circle');
     pieceBtn?.click();
@@ -129,10 +133,13 @@ describe('Character Management & Edit Panel', () => {
     expect(updatedChar).toBeTruthy();
     expect(Number(updatedChar?.initiative)).toBe(18);
 
-    // Test Delete IconButton -> opens full-screen warning dialog
+    // その他 → 削除 opens the full-screen warning dialog (Issue #228).
+    moreBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    const deleteBtn = target.querySelector<HTMLElement>('[data-testid="delete-char-btn-char-mage"]');
     expect(deleteBtn).toBeTruthy();
-    expect(deleteBtn?.classList.contains('np-icon-button')).toBe(true);
     expect(deleteBtn?.querySelector('.np-icon')?.textContent?.trim()).toBe('delete');
+    expect(deleteBtn?.textContent).toContain('削除');
     deleteBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
 

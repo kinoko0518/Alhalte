@@ -50,6 +50,18 @@ function testScene(id: string): Scene {
 
 let systemRecordPosition = 0;
 
+/** Encodes a non-negative integer as a postcard `u64` varint (test helper). */
+function postcardVarint(value: number): number[] {
+  const bytes: number[] = [];
+  let remaining = BigInt(value);
+  do {
+    const byte = Number(remaining & 0x7fn);
+    remaining >>= 7n;
+    bytes.push(remaining > 0n ? byte | 0x80 : byte);
+  } while (remaining > 0n);
+  return bytes;
+}
+
 function systemRecord(label: number, payload: number[], id: string) {
   const record = entryToLogRecord('scene-schema', { label, payload }, 0, systemRecordPosition++);
   expect(record).not.toBeNull();
@@ -80,11 +92,14 @@ describe('shared log schema (Issue #161)', () => {
     expect(came.kind).toBe('system');
     expect(came.event).toEqual({ type: 'character-came', characterId: '7' });
     expect(came.content).toBe('');
+    // Legacy id-only payload: no append time on the wire.
+    expect(came.timestamp).toBe(0);
 
     const gone = systemRecord(LABEL_BANQUETTE_LOG_CHARACTER_GONE, [9], 'gone');
     expect(gone.kind).toBe('system');
     expect(gone.event).toEqual({ type: 'character-gone', characterId: '9' });
     expect(gone.content).toBe('');
+    expect(gone.timestamp).toBe(0);
 
     // Unknown labels must still fall back to text, never throw.
     const unknown = entryToLogRecord(
@@ -106,6 +121,7 @@ describe('shared log schema (Issue #161)', () => {
     );
     expect(malformed?.kind).toBe('system');
     expect(malformed?.content).toBe('');
+    expect(malformed?.timestamp).toBe(0);
 
     // `tinToLogRecord` uses the same label-first decode.
     const viaTin = tinToLogRecord(
@@ -114,6 +130,53 @@ describe('shared log schema (Issue #161)', () => {
     );
     expect(viaTin?.kind).toBe('system');
     expect(viaTin?.event).toEqual({ type: 'character-came', characterId: '7' });
+    expect(viaTin?.timestamp).toBe(0);
+  });
+
+  // spec: alhalte-argenterie/内部フロー system event append timestamp (#227)
+  it('uses the banquette came/gone append timestamp for the system log record', () => {
+    const timestamp = 1_700_000_123;
+    const came = systemRecord(
+      LABEL_BANQUETTE_LOG_CHARACTER_CAME,
+      [...postcardVarint(7), ...postcardVarint(timestamp)],
+      'came-timestamped',
+    );
+    expect(came.kind).toBe('system');
+    expect(came.timestamp).toBe(timestamp);
+    expect(came.event).toEqual({ type: 'character-came', characterId: '7' });
+
+    const gone = systemRecord(
+      LABEL_BANQUETTE_LOG_CHARACTER_GONE,
+      [...postcardVarint(9), ...postcardVarint(timestamp + 1)],
+      'gone-timestamped',
+    );
+    expect(gone.kind).toBe('system');
+    expect(gone.timestamp).toBe(timestamp + 1);
+    expect(gone.event).toEqual({ type: 'character-gone', characterId: '9' });
+
+    // The timestamp is also decoded through the Tin wrapper path.
+    const viaTin = tinToLogRecord(
+      {
+        label: LABEL_BANQUETTE_LOG_CHARACTER_CAME,
+        payload: [...postcardVarint(7), ...postcardVarint(timestamp)],
+      },
+      'scene-schema',
+    );
+    expect(viaTin?.timestamp).toBe(timestamp);
+
+    // A truncated timestamp varint must neither throw nor drop the event.
+    const truncated = entryToLogRecord(
+      'scene-schema',
+      {
+        label: LABEL_BANQUETTE_LOG_CHARACTER_GONE,
+        payload: [...postcardVarint(9), 0x80],
+      },
+      0,
+      3,
+    );
+    expect(truncated?.kind).toBe('system');
+    expect(truncated?.timestamp).toBe(0);
+    expect(truncated?.event).toEqual({ type: 'character-gone', characterId: '9' });
   });
 
   // spec: alhalte-argenterie/内部フロー log-record contentTin round trip

@@ -29,6 +29,11 @@ fn test_sub_hash(sub: &str) -> SubHash {
 
 /// Builds the debug-login state used by the HTTP tests.
 fn debug_state(db: Database) -> AppState {
+    debug_state_with_lan_ports(db, &[])
+}
+
+/// Builds the debug-login state with the optional Issue #229 LAN switch.
+fn debug_state_with_lan_ports(db: Database, lan_origin_ports: &[u16]) -> AppState {
     let spawner = Arc::new(InProcessBanquetteSpawner::new_with_in_memory_cellar(
         "/tmp/alhalte-debug-login-tests",
         8,
@@ -37,6 +42,7 @@ fn debug_state(db: Database) -> AppState {
     AppState::new(db, TEST_SALT, Arc::new(MockOAuthProvider::new()), manager)
         .with_public_url("http://maitre-d.test")
         .with_allowed_origins([APP_ORIGIN])
+        .with_lan_origin_ports(lan_origin_ports.iter().copied())
         .with_debug_login()
 }
 
@@ -182,6 +188,61 @@ async fn debug_login_redirects_auth_login_to_the_debug_form() {
             "return_to {bad_return_to:?} must be rejected before the debug redirect"
         );
     }
+}
+
+// spec: alhalte-maitre-d/lan-origins 0002 a LAN phone completes the debug login
+// return_to only while the explicit dev switch is on (Issue #229)
+#[tokio::test]
+async fn debug_login_accepts_a_lan_return_to_only_with_the_dev_switch() {
+    let lan_return_to = "http://192.168.1.42:5173/rooms/abc";
+    let client = no_redirect_client();
+
+    // Switch off: the LAN origin is just another foreign origin.
+    let addr = serve(create_router(debug_state(
+        Database::new_in_memory().unwrap(),
+    )))
+    .await;
+    let blocked = client
+        .get(format!("http://{addr}/auth/debug/login"))
+        .query(&[("return_to", lan_return_to)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Switch on: the form is served, the login succeeds, and the session cookie
+    // is set before redirecting back to the LAN origin. The Vite /auth proxy
+    // makes the response same-origin for the phone.
+    let addr = serve(create_router(debug_state_with_lan_ports(
+        Database::new_in_memory().unwrap(),
+        &[5173],
+    )))
+    .await;
+    let form = client
+        .get(format!("http://{addr}/auth/debug/login"))
+        .query(&[("return_to", lan_return_to)])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(form.status(), reqwest::StatusCode::OK);
+    let body = form.text().await.unwrap();
+    assert!(
+        body.contains(&format!("value=\"{lan_return_to}\"")),
+        "the form must keep the LAN return_to in its hidden field"
+    );
+
+    let response = submit_debug_login(&client, addr, lan_return_to, "Alice").await;
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        lan_return_to
+    );
+    assert!(session_cookie(&response).starts_with("session_id="));
 }
 
 // spec: alhalte-maitre-d/debug-login 0007 the form only asks for an account name

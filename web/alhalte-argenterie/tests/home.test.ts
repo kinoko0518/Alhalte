@@ -29,6 +29,28 @@ function signIn(): void {
   localStorage.setItem('alhalte:session-id', '99');
 }
 
+/** True when `first` precedes `second` in DOM document order. */
+function isBefore(first: Node, second: Node): boolean {
+  return (first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+}
+
+/**
+ * Asserts the loss warning is the immediate next element after the room URL row
+ * and returns both nodes for further ordering checks (Issue #221).
+ */
+function expectWarningDirectlyBelowUrlRow(target: HTMLElement) {
+  const urlRow = target.querySelector<HTMLElement>('.url-copy-row');
+  const urlInput = target.querySelector<HTMLElement>('[data-testid="room-url-input"]');
+  const warning = target.querySelector<HTMLElement>('[data-testid="dialog-warning"]');
+  expect(urlRow).toBeTruthy();
+  expect(urlInput).toBeTruthy();
+  expect(warning).toBeTruthy();
+  expect(urlRow?.contains(urlInput)).toBe(true);
+  expect(urlRow?.nextElementSibling).toBe(warning);
+  expect(target.querySelectorAll('[data-testid="dialog-warning"]')).toHaveLength(1);
+  return { urlRow: urlRow!, urlInput: urlInput!, warning: warning! };
+}
+
 describe('Home Screen & Room URL', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -119,6 +141,25 @@ describe('Home Screen & Room URL', () => {
     expect(resolvedAdmin?.id).toBe('aabbccddeeff0011');
     expect(resolvedAdmin?.name).toBe('GM Room');
     expect(resolvedAdmin?.isAdmin).toBe(true);
+  });
+
+  // spec: alhalte-argenterie/home 直接アクセスの部屋 URL 解決 (#224)
+  it('resolves a directly-opened /rooms/<id>#<64hex> URL and keeps the key in the fragment', () => {
+    const key = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+    const href = `http://127.0.0.1:5173/rooms/f39403e73f32ec91#${key}`;
+
+    // The SPA route is parsed client-side; the key never leaves the fragment.
+    const parsed = parseRoomUrl(href);
+    expect(parsed).toEqual({
+      roomId: 'f39403e73f32ec91',
+      roomKeyHex: key,
+      roomUrl: href,
+    });
+
+    const resolved = resolveRoomFromLocation({ href });
+    expect(resolved?.id).toBe('f39403e73f32ec91');
+    expect(resolved?.url).toBe(href);
+    expect(parseRoomUrl(resolved!.url)?.roomKeyHex).toBe(key);
   });
 
   // spec: alhalte-argenterie/home localStorage保存・取得・管理者除外
@@ -310,6 +351,12 @@ describe('Home Screen & Room URL', () => {
     await new Promise((r) => setTimeout(r, 20));
 
     expect(target.querySelector('[data-testid="create-room-signin-guidance"]')).toBeTruthy();
+    // Issue #221: the signed-out dialog must only show the sign-in guidance,
+    // never a second (`create-room-error`) sign-in warning.
+    expect(target.querySelector('[data-testid="create-room-error"]')).toBeNull();
+    const { warning } = expectWarningDirectlyBelowUrlRow(target);
+    const guidance = target.querySelector('[data-testid="create-room-signin-guidance"]');
+    expect(isBefore(warning, guidance!)).toBe(true);
     const joinBtn = target.querySelector<HTMLButtonElement>(
       '[data-testid="join-created-room-button"]',
     );
@@ -331,8 +378,8 @@ describe('Home Screen & Room URL', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/home 401 はサインイン導線を出す (Issue #156)
-  it('shows sign-in guidance on a 401 and never enters or saves a local room', async () => {
+  // spec: alhalte-argenterie/home 401 はサインイン導線だけを出す (Issue #156 / #221)
+  it('shows only the sign-in guidance on a 401 and never enters or saves a local room', async () => {
     signIn();
     const target = document.createElement('div');
     document.body.appendChild(target);
@@ -355,12 +402,16 @@ describe('Home Screen & Room URL', () => {
     target.querySelector<HTMLButtonElement>('[data-testid="join-created-room-button"]')?.click();
 
     await vi.waitFor(() =>
-      expect(target.querySelector('[data-testid="create-room-error"]')).toBeTruthy(),
+      expect(
+        target.querySelector('[data-testid="create-room-signin-guidance"]'),
+      ).toBeTruthy(),
     );
-    expect(target.querySelector('[data-testid="create-room-signin-guidance"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="create-room-error"]')?.textContent).toContain(
-      'サインインが必要です',
-    );
+    // Issue #221: a 401 must not add a second `create-room-error` warning on top
+    // of the sign-in guidance.
+    expect(target.querySelector('[data-testid="create-room-error"]')).toBeNull();
+    const { warning } = expectWarningDirectlyBelowUrlRow(target);
+    const guidance = target.querySelector('[data-testid="create-room-signin-guidance"]');
+    expect(isBefore(warning, guidance!)).toBe(true);
     expect(enteredRoom).toBeNull();
     expect(getRecentRooms()).toHaveLength(0);
     expect(window.location.pathname).toBe('/');
@@ -399,6 +450,11 @@ describe('Home Screen & Room URL', () => {
         '通信できませんでした',
       ),
     );
+    // Issue #221: the warning stays directly below the URL row even when an
+    // error is shown.
+    const { warning } = expectWarningDirectlyBelowUrlRow(target);
+    const error = target.querySelector('[data-testid="create-room-error"]');
+    expect(isBefore(warning, error!)).toBe(true);
     expect(enteredRoom).toBeNull();
     expect(getRecentRooms()).toHaveLength(0);
 
@@ -433,6 +489,9 @@ describe('Home Screen & Room URL', () => {
         'HTTP 500',
       ),
     );
+    const { warning } = expectWarningDirectlyBelowUrlRow(target);
+    const error = target.querySelector('[data-testid="create-room-error"]');
+    expect(isBefore(warning, error!)).toBe(true);
     expect(enteredRoom).toBeNull();
     expect(getRecentRooms()).toHaveLength(0);
 

@@ -4,9 +4,11 @@
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーン設定タブ`
-   * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成 / メンバーを移動`
+   * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーンを新規作成`
+   * - GitHub Issue #228: メンバー移動 UI はキャラクター一覧へ移設
    * - GitHub Issue #32: Material 3 Expressive Switch, Slider, Carousel, 7:5:3 row & Material Color delete button
    * - GitHub Issue #109 / sub-issue #142: BGM状態変更のサーバー送信と送信中インジケーター
+   * - GitHub Issue #226: BGMスロット削除 (track / playing / volume をサーバーから消す)
    */
   import {
     Button,
@@ -14,28 +16,27 @@
     CarouselItem,
     CircularProgress,
     IconButton,
-    List,
-    ListItem,
-    Menu,
-    MenuItem,
     Slider,
     Switch,
     TextField,
   } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import GenericImagePicker from '../GenericImagePicker.svelte';
-  import type { BgmSlot, Character, Scene } from '../../../types/index.js';
+  import type { BgmSlot, Scene } from '../../../types/index.js';
   import {
     BGM_AUDIO_MIME_FALLBACK,
     bgmPlayingStateKey,
+    bgmRemovedStateKey,
     bgmTrackStateKey,
     bgmVolumeStateKey,
     buildBgmTrackState,
     clearSceneBackground,
     getNormalizedBgmSlots,
+    isBgmSlotRemoved,
     SCENE_BACKGROUND_HEIGHT_STATE_KEY,
     SCENE_BACKGROUND_WIDTH_STATE_KEY,
     SCENE_NAME_STATE_KEY,
+    setBgmSlotRemoved,
     uploadSceneBackground,
     type BgmTrackState,
   } from '../../../utils/sceneSettings.js';
@@ -45,10 +46,6 @@
     type AudioSlotState,
   } from '../../../utils/audio.js';
   import { ServerOperationError, type RoomSocket } from '../../../utils/roomSocket.js';
-  import {
-    applyMenuPosition,
-    getMenuPositionStyle,
-  } from '../../../utils/menuPosition.js';
   import {
     loadAssets,
     subscribeAssets,
@@ -60,13 +57,10 @@
 
   let {
     currentScene,
-    allScenes = [],
-    characters = [],
     role = 'participant',
     onUpdateScene,
     onCreateScene,
     onDeleteScene,
-    onMoveMember,
     onRequestDeleteScene,
     onRequestDeleteSceneLogs,
     onDeleteSceneLogs,
@@ -78,24 +72,17 @@
     sceneActionError = null,
   }: {
     currentScene: Scene;
-    allScenes?: Scene[];
-    characters?: Character[];
     /**
-     * Role of the caller (Issue #201). Scene creation/deletion, log deletion and
-     * member moves are admin-only; `viewer` and `denied` get the read-only tab.
+     * Role of the caller (Issue #201). Scene creation/deletion and log deletion
+     * are admin-only; `viewer` and `denied` get the read-only tab.
      */
     role?: RoomRole;
     onUpdateScene?: (scene: Scene) => void;
-    onSelectScene?: (sceneId: string) => void;
     onCreateScene?: (
       name: string,
       inheritJuice: boolean,
     ) => Promise<boolean | void> | boolean | void;
     onDeleteScene?: (sceneId: string) => Promise<boolean | void> | boolean | void;
-    onMoveMember?: (
-      characterId: string,
-      targetSceneName: string,
-    ) => Promise<boolean | void> | boolean | void;
     onRequestDeleteScene?: (scene: { id: string; name: string }) => void;
     onRequestDeleteSceneLogs?: (scene: { id: string; name: string }) => void;
     onDeleteSceneLogs?: (sceneId: string) => Promise<boolean | void> | boolean | void;
@@ -182,48 +169,6 @@
   let isDeleteConfirmOpen = $state(false);
   let isDeleteLogsConfirmOpen = $state(false);
   let hoveredAction = $state<'create' | 'delete-logs' | 'delete-scene' | null>(null);
-
-  // Per-character member move target names: characterId -> sceneName
-  function initializeMemberTargets(): Record<string, string> {
-    const targets: Record<string, string> = {};
-    for (const char of characters) {
-      const found = allScenes.find((s) => s.members.includes(char.id));
-      targets[char.id] = found ? found.name : currentScene.name;
-    }
-    return targets;
-  }
-
-  let memberTargetSceneNames = $state<Record<string, string>>(initializeMemberTargets());
-  let activeMemberSplitId = $state<string | null>(null);
-  let membersMoveListContainer = $state<HTMLElement | null>(null);
-  let toggleButtons = $state<Record<string, HTMLElement | undefined>>({});
-  let menuElements = $state<Record<string, HTMLElement | undefined>>({});
-
-  $effect(() => {
-    if (
-      activeMemberSplitId &&
-      menuElements[activeMemberSplitId] &&
-      toggleButtons[activeMemberSplitId]
-    ) {
-      return applyMenuPosition(
-        menuElements[activeMemberSplitId],
-        toggleButtons[activeMemberSplitId],
-        {
-          placement: 'bottom-end',
-          anchorName: `--member-scene-anchor-${activeMemberSplitId}`,
-        }
-      );
-    }
-  });
-
-  $effect(() => {
-    for (const char of characters) {
-      if (memberTargetSceneNames[char.id] === undefined) {
-        const found = allScenes.find((s) => s.members.includes(char.id));
-        memberTargetSceneNames[char.id] = found ? found.name : currentScene.name;
-      }
-    }
-  });
 
   // Dimension inputs
   let inputWidth = $state<number | undefined>(undefined);
@@ -358,10 +303,17 @@
   // - playing: `bgm::<slot>::playing` boolean, written by play / stop and
   //   committed locally only after the ack.
   // - volume: `bgm::<slot>::volume` as a number in 0..1, sent on commit only.
+  // - removed: `bgm::<slot>::removed` = true while the slot is deleted from the
+  //   UI (Issue #226); cleared when the slot number is added again.
   let bgmSlots = $state<BgmSlot[]>(getNormalizedBgmSlots(currentScene.juices));
   let activeBgmSlotPicking = $state<number | null>(null);
   /** Slots with an in-flight server operation; reassigned so Svelte sees the change. */
   let pendingBgmSlots = $state<Set<number>>(new Set());
+  /**
+   * Re-added slot numbers whose `bgm::<slot>::removed` server marker still has
+   * to be deleted together with the next track write (Issue #226).
+   */
+  let bgmMarkerClearSlots = $state<Set<number>>(new Set());
   /** Per-slot error message rendered under the row with `role="status"`. */
   let bgmErrors = $state<Record<number, string>>({});
   /** Slider drafts: the committed volume lives in `bgmSlots` only after the ack. */
@@ -382,6 +334,7 @@
     if (currentScene.id === bgmSceneId) return;
     bgmSceneId = currentScene.id;
     pendingBgmSlots = new Set();
+    bgmMarkerClearSlots = new Set();
     bgmErrors = {};
     draftBgmVolumes = {};
   });
@@ -435,6 +388,14 @@
       delete next[slotNum];
     }
     bgmErrors = next;
+  }
+
+  /** Drops the pending marker clear of a re-added slot after its ack (Issue #226). */
+  function forgetBgmMarkerClear(slotNum: number) {
+    setBgmSlotRemoved(currentScene.juices, slotNum, false);
+    const next = new Set(bgmMarkerClearSlots);
+    next.delete(slotNum);
+    bgmMarkerClearSlots = next;
   }
 
   /** Legacy `bgm1..3` field of a slot, used when no slot state was remembered. */
@@ -583,6 +544,10 @@
 
     const socket = roomSocket;
     const sceneId = currentScene.id;
+    // A slot added again after deletion still carries the server removal
+    // marker; it must be deleted before the track / playing writes, otherwise
+    // App (and every other client) ignores them for the removed slot.
+    const clearRemovedMarker = bgmMarkerClearSlots.has(slotNum);
     setBgmError(slotNum, null);
     setBgmPending(slotNum, true);
     try {
@@ -597,6 +562,7 @@
           bgmAudio.pause(slotNum);
           return;
         }
+        if (clearRemovedMarker) forgetBgmMarkerClear(slotNum);
         applyBgmSlotState(slotNum, track, true);
         await playBgmAudio(slotNum);
         return;
@@ -607,6 +573,19 @@
         setBgmError(slotNum, BGM_MISSING_TIN_ERROR);
         bgmAudio.pause(slotNum);
         return;
+      }
+
+      // The server processes frames in order, but only across one connection:
+      // the marker deletion must be acknowledged before the track / playing
+      // writes are sent, otherwise a client that still sees the marker ignores
+      // them (Issue #226).
+      if (clearRemovedMarker) {
+        await socket.requestDeleteState(sceneId, bgmRemovedStateKey(slotNum));
+        if (currentScene.id !== sceneId) {
+          bgmAudio.pause(slotNum);
+          return;
+        }
+        forgetBgmMarkerClear(slotNum);
       }
 
       const requests: Promise<unknown>[] = [
@@ -708,6 +687,123 @@
     } finally {
       setBgmPending(slotNum, false);
     }
+  }
+
+  /**
+   * Clears the legacy `bgm1..3` mirror of a deleted slot (Issue #226).
+   *
+   * `getNormalizedBgmSlots` falls back to the legacy fields when `bgmSlots` is
+   * absent, so leaving the tin id behind would resurrect the deleted track on a
+   * reload / after a scene switch.
+   */
+  function clearLegacyBgmSlot(slotNum: number) {
+    if (slotNum === 1) {
+      currentScene.juices.bgm1 = undefined;
+      currentScene.juices.bgm1Volume = 0.8;
+    } else if (slotNum === 2) {
+      currentScene.juices.bgm2 = undefined;
+      currentScene.juices.bgm2Volume = 0.8;
+    } else if (slotNum === 3) {
+      currentScene.juices.bgm3 = undefined;
+      currentScene.juices.bgm3Volume = 0.8;
+    }
+  }
+
+  /**
+   * Removes a slot locally after every delete ack succeeded (Issue #226).
+   *
+   * Slot numbers are stable: the remaining rows keep their number, track,
+   * volume and playback state. The removal is recorded in
+   * `juices.bgmRemovedSlots` (mirroring the server `bgm::<slot>::removed`
+   * marker) so later broadcasts cannot re-create the row. A later "add slot"
+   * still uses max + 1, so the deleted row is never revived implicitly.
+   */
+  function applyBgmSlotRemoval(slotNum: number) {
+    setBgmSlotRemoved(currentScene.juices, slotNum, true);
+    bgmSlots = bgmSlots.filter((slot) => slot.slot !== slotNum);
+    clearLegacyBgmSlot(slotNum);
+    currentScene.juices.bgmSlots = [...bgmSlots];
+    const nextDrafts = { ...draftBgmVolumes };
+    delete nextDrafts[slotNum];
+    draftBgmVolumes = nextDrafts;
+    const nextMarkerClears = new Set(bgmMarkerClearSlots);
+    nextMarkerClears.delete(slotNum);
+    bgmMarkerClearSlots = nextMarkerClears;
+    onUpdateScene?.(currentScene);
+  }
+
+  /**
+   * Restores the playback the deletion paused, but only when the delete failed
+   * and the local model still says the slot is playing (Issue #226).
+   */
+  async function restoreBgmPlaybackAfterFailedDelete(
+    slotNum: number,
+    wasPlaying: boolean,
+    sceneId: string,
+  ) {
+    if (!wasPlaying || currentScene.id !== sceneId) return;
+    const track = getSlotTrack(findBgmSlot(slotNum)) ?? getLegacyBgmTrack(slotNum);
+    if (track && (await prepareBgmAudio(slotNum, track))) {
+      await playBgmAudio(slotNum);
+    }
+  }
+
+  /**
+   * Deletes a BGM slot (Issue #226).
+   *
+   * The Banquette state becomes NONE for the slot first: the track and the
+   * volume are deleted and `bgm::<slot>::playing` is set to `false`. Only after
+   * all three acks succeed is the persistent `bgm::<slot>::removed` marker
+   * written, so a failed NONE write never hides the slot behind a marker. The
+   * row is removed after the marker ack; on failure the row and the local
+   * model stay untouched and the shared communication error is shown.
+   */
+  async function commitBgmSlotDelete(slotNum: number) {
+    if (isBgmPending(slotNum)) return;
+
+    const socket = roomSocket;
+    const sceneId = currentScene.id;
+    const wasPlaying = Boolean(findBgmSlot(slotNum)?.isPlaying);
+    // The user committed to deleting the slot: stop the sound right away, but
+    // keep the row / model until the server acknowledged every write.
+    bgmAudio.pause(slotNum);
+    setBgmError(slotNum, null);
+    setBgmPending(slotNum, true);
+    try {
+      if (!socket || !socket.isConnected) {
+        if (!isStandalone()) {
+          setBgmError(slotNum, BGM_COMMUNICATION_ERROR);
+          await restoreBgmPlaybackAfterFailedDelete(slotNum, wasPlaying, sceneId);
+          return;
+        }
+        // Standalone usage (tests / previews): no room to write to.
+        applyBgmSlotRemoval(slotNum);
+        return;
+      }
+
+      await throwIfBgmFailure([
+        socket.requestDeleteState(sceneId, bgmTrackStateKey(slotNum)),
+        socket.requestUpdateState(sceneId, bgmPlayingStateKey(slotNum), false),
+        socket.requestDeleteState(sceneId, bgmVolumeStateKey(slotNum)),
+      ]);
+      if (currentScene.id !== sceneId) return;
+
+      // Marker last, and as a separate step: one of the NONE writes above may
+      // have failed, in which case the slot must stay visible / retryable.
+      await socket.requestUpdateState(sceneId, bgmRemovedStateKey(slotNum), true);
+      if (currentScene.id !== sceneId) return;
+      applyBgmSlotRemoval(slotNum);
+    } catch (error) {
+      reportBgmFailure(slotNum, error);
+      await restoreBgmPlaybackAfterFailedDelete(slotNum, wasPlaying, sceneId);
+    } finally {
+      setBgmPending(slotNum, false);
+    }
+  }
+
+  function handleDeleteBgmSlot(slotNum: number) {
+    if (isBgmPending(slotNum)) return;
+    void commitBgmSlotDelete(slotNum);
   }
 
   function handleToggleBgmPlay(slotNum: number) {
@@ -872,6 +968,13 @@
   function handleAddBgmSlot() {
     const maxSlot = bgmSlots.reduce((m, s) => Math.max(m, s.slot), 0);
     const newSlotNum = (maxSlot || 0) + 1;
+    // Adding a previously deleted slot number re-opens it. The local marker is
+    // dropped now so the row renders; the server marker is deleted together
+    // with the next track write in `commitBgmPlay` (Issue #226).
+    if (isBgmSlotRemoved(currentScene.juices, newSlotNum)) {
+      setBgmSlotRemoved(currentScene.juices, newSlotNum, false);
+      bgmMarkerClearSlots = new Set([...bgmMarkerClearSlots, newSlotNum]);
+    }
     const newSlot: BgmSlot = {
       slot: newSlotNum,
       tinId: null,
@@ -1103,18 +1206,6 @@
     );
   }
 
-  async function handleMoveMemberApply(charId: string) {
-    const targetName =
-      memberTargetSceneNames[charId] ||
-      allScenes.find((s) => s.members.includes(charId))?.name ||
-      currentScene.name;
-    if (!targetName || isAnySceneActionPending()) return;
-    await runSceneAction(
-      `move:${charId}`,
-      onMoveMember ? () => onMoveMember(charId, targetName) : undefined,
-    );
-  }
-
   function handleDeleteButtonClick() {
     if (onRequestDeleteScene) {
       onRequestDeleteScene({
@@ -1152,22 +1243,7 @@
       onDeleteSceneLogs ? () => onDeleteSceneLogs(currentScene.id) : undefined,
     );
   }
-
-  function handleWindowClick(e: MouseEvent) {
-    if (!activeMemberSplitId) return;
-    const target = e.target;
-    if (target instanceof Node) {
-      const activeToggle = toggleButtons[activeMemberSplitId];
-      const activeMenu = menuElements[activeMemberSplitId];
-      if (activeToggle?.contains(target) || activeMenu?.contains(target)) {
-        return;
-      }
-    }
-    activeMemberSplitId = null;
-  }
 </script>
-
-<svelte:window onclick={handleWindowClick} />
 
 <div class="scene-settings-container" data-testid="scene-settings-tab">
   <div class="settings-scroll-content">
@@ -1323,10 +1399,22 @@
               </span>
             </div>
 
-            <!-- スロット番号バッジ (u32) -->
-            <span class="slot-badge" data-testid="bgm-slot-badge-{slot.slot}">
-              #{slot.slot}
-            </span>
+            <!-- 4. 削除ボタン: M3 Filled tonal IconButton (Issue #226)。
+                 押下でスロットを Banquette から NONE にし、行を削除する。
+                 アセットピッカーの NONE カードとは独立した操作。 -->
+            <IconButton
+              variant="tonal"
+              size="s"
+              shape="round"
+              aria-label="BGMスロットを削除"
+              title="BGMスロットを削除"
+              onclick={() => handleDeleteBgmSlot(slot.slot)}
+              disabled={isBgmPending(slot.slot)}
+              data-testid="bgm-delete-btn-{slot.slot}"
+              class="bgm-delete-btn"
+            >
+              <Icon>delete</Icon>
+            </IconButton>
           </div>
 
           {#if bgmErrors[slot.slot] || bgmAudioStates[slot.slot]?.error}
@@ -1494,139 +1582,6 @@
         </div>
       </div>
 
-      <!-- メンバーを移動: Material 3 Expressive Segmented List & Menu (Issue #110) -->
-      <div class="move-members-section" data-testid="move-members-section">
-        <div class="move-members-header">
-          <div class="move-members-title-group">
-            <Icon>group</Icon>
-            <span class="move-members-title" data-testid="move-members-title">メンバーを移動</span>
-          </div>
-          <span class="member-count-badge" data-testid="member-count-badge">
-            {characters.length}人
-          </span>
-        </div>
-
-        {#if characters.length === 0}
-          <div class="empty-members-message" data-testid="empty-members-message">
-            部屋にキャラクターがいません
-          </div>
-        {:else}
-          <List
-            class="members-move-list members-segmented-list"
-            bind:element={membersMoveListContainer}
-            data-testid="members-move-list"
-          >
-            {#each characters as char (char.id)}
-              {@const currentSc = allScenes.find((s) => s.members.includes(char.id))}
-              <ListItem
-                type="text"
-                class="member-move-row member-segmented-item"
-                data-testid="move-row-{char.id}"
-              >
-                {#snippet avatar()}
-                  <img
-                    class="member-avatar"
-                    src={char.iconUrl || 'data:image/svg+xml,<svg xmlns="http://www.w3.org/2000/svg"/>'}
-                    alt={char.name}
-                    data-testid="member-avatar-{char.id}"
-                  />
-                {/snippet}
-
-                <span class="member-name" data-testid="member-name-{char.id}">{char.name}</span>
-
-                {#snippet supportingText()}
-                  <span class="member-current-scene" data-testid="member-current-scene-{char.id}">
-                    {currentSc ? `現在: ${currentSc.name}` : '未所属'}
-                  </span>
-                {/snippet}
-
-                {#snippet end()}
-                  <div class="member-move-controls" onclick={(e) => e.stopPropagation()}>
-                    <div class="split-select-wrapper">
-                      <TextField
-                        variant="outlined"
-                        label="移動先"
-                        placeholder="シーン名"
-                        bind:value={memberTargetSceneNames[char.id]}
-                        data-testid="member-target-input-{char.id}"
-                        class="member-target-field"
-                      />
-                      <IconButton
-                        variant="tonal"
-                        size="s"
-                        onclick={(e) => {
-                          e.stopPropagation();
-                          activeMemberSplitId =
-                            activeMemberSplitId === char.id ? null : char.id;
-                        }}
-                        bind:element={toggleButtons[char.id]}
-                        data-testid="member-split-toggle-{char.id}"
-                        aria-label="移動先シーン候補を選択"
-                        title="シーン一覧"
-                        class="member-scene-toggle-btn"
-                      >
-                        <Icon>arrow_drop_down</Icon>
-                      </IconButton>
-
-                      <Menu
-                        bind:element={menuElements[char.id]}
-                        open={activeMemberSplitId === char.id}
-                        anchor={toggleButtons[char.id]}
-                        style={getMenuPositionStyle(toggleButtons[char.id], {
-                          placement: 'bottom-end',
-                          anchorName: `--member-scene-anchor-${char.id}`,
-                        })}
-                        data-testid="member-scene-menu-{char.id}"
-                        class="member-scene-menu"
-                        ontoggle={(e) => {
-                          if (!e.newState || e.newState === 'closed') {
-                            if (activeMemberSplitId === char.id) activeMemberSplitId = null;
-                          }
-                        }}
-                      >
-                        {#each allScenes as sc (sc.id)}
-                          <MenuItem
-                            selected={sc.name === memberTargetSceneNames[char.id]}
-                            onclick={() => {
-                              memberTargetSceneNames[char.id] = sc.name;
-                              activeMemberSplitId = null;
-                            }}
-                            data-testid="member-scene-item-{char.id}-{sc.id}"
-                          >
-                            {sc.name}
-                          </MenuItem>
-                        {/each}
-                      </Menu>
-                    </div>
-
-                    <Button
-                      variant="tonal"
-                      size="m"
-                      class="apply-move-btn"
-                      onclick={() => handleMoveMemberApply(char.id)}
-                      disabled={!canManageScenes || isAnySceneActionPending()}
-                      data-testid="apply-move-btn-{char.id}"
-                    >
-                      {#if isSceneActionPending(`move:${char.id}`)}
-                        <CircularProgress
-                          indeterminate
-                          wavy
-                          track={false}
-                          class="scene-action-progress"
-                          data-testid="move-action-pending-{char.id}"
-                          aria-label="送信中"
-                        />
-                      {:else}
-                        移動
-                      {/if}
-                    </Button>
-                  </div>
-                {/snippet}
-              </ListItem>
-            {/each}
-          </List>
-        {/if}
-      </div>
     </div>
 
     <!-- 管理操作の失敗表示: 管理コントロール群の下に中央寄せで出す (Issue #109 / #143) -->
@@ -1928,13 +1883,8 @@
     color: var(--np-color-on-surface-variant);
     flex-shrink: 0;
   }
-  .slot-badge {
-    font-size: 0.75rem;
-    font-weight: 700;
-    color: var(--np-color-on-surface-variant);
-    background: var(--np-color-surface-container-high);
-    padding: 2px 6px;
-    border-radius: var(--np-shape-corner-extra-small);
+  /* 削除ボタン (Issue #226): 行の右端に固定し、スライダーに押し潰されないようにする */
+  :global(.bgm-delete-btn) {
     flex-shrink: 0;
   }
   .management-buttons {
@@ -1954,46 +1904,6 @@
     font-size: 0.85rem;
     line-height: 1.3;
     color: var(--np-color-error);
-  }
-  .move-members-section {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    background: var(--np-color-surface-container);
-    border: 1px solid var(--np-color-outline-variant);
-    border-radius: var(--np-shape-corner-medium);
-    padding: 12px;
-  }
-  .move-members-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding-bottom: 4px;
-    border-bottom: 1px solid var(--np-color-outline-variant);
-  }
-  .move-members-title-group {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    color: var(--np-color-on-surface);
-  }
-  .move-members-title {
-    font-size: 0.95rem;
-    font-weight: 600;
-  }
-  .member-count-badge {
-    font-size: 0.75rem;
-    font-weight: 600;
-    color: var(--np-color-on-surface-variant);
-    background: var(--np-color-surface-container-high);
-    padding: 2px 8px;
-    border-radius: var(--np-shape-corner-full);
-  }
-  .empty-members-message {
-    padding: 16px 8px;
-    text-align: center;
-    font-size: 0.85rem;
-    color: var(--np-color-on-surface-variant);
   }
   .scene-actions-row {
     display: flex;
@@ -2093,9 +2003,6 @@
     flex-direction: column;
     gap: 16px;
   }
-  .large-dialog {
-    max-width: 640px;
-  }
   .dialog-title-centered {
     margin: 0;
     text-align: center;
@@ -2121,109 +2028,6 @@
     justify-content: flex-end;
     gap: 8px;
     margin-top: 8px;
-  }
-  :global(.members-segmented-list) {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    max-height: 340px;
-    overflow-y: auto;
-    padding: 0;
-    margin: 0;
-    list-style: none;
-  }
-  :global(.member-segmented-item.np-item) {
-    display: grid !important;
-    grid-template-columns: auto 1fr;
-    grid-template-rows: auto auto;
-    gap: 8px 12px;
-    align-items: center;
-    width: 100%;
-    min-height: unset !important;
-    padding: 12px !important;
-    background: var(--np-color-surface-container-low);
-    border: 1px solid var(--np-color-outline-variant);
-    border-radius: var(--np-shape-corner-medium, 12px);
-    box-sizing: border-box;
-    transition: background-color var(--np-motion-expressive-fast-effects, 150ms ease),
-                border-color var(--np-motion-expressive-fast-effects, 150ms ease);
-    cursor: default !important;
-  }
-  :global(.member-segmented-item.np-item:hover) {
-    background: var(--np-color-surface-container);
-  }
-  :global(.member-segmented-item .np-item-avatar) {
-    grid-column: 1;
-    grid-row: 1;
-    width: 36px;
-    height: 36px;
-    border-radius: var(--np-shape-corner-full);
-    border: 1px solid var(--np-color-outline-variant);
-    overflow: hidden;
-  }
-  :global(.member-segmented-item .np-item-text) {
-    grid-column: 2;
-    grid-row: 1;
-    min-width: 0;
-    display: flex;
-    flex-direction: column;
-  }
-  :global(.member-segmented-item .np-item-end) {
-    grid-column: 1 / -1;
-    grid-row: 2;
-    width: 100%;
-    display: flex;
-  }
-  .member-avatar {
-    width: 100%;
-    height: 100%;
-    border-radius: var(--np-shape-corner-full);
-    object-fit: cover;
-    flex-shrink: 0;
-  }
-  .member-name {
-    font-size: 0.9rem;
-    font-weight: 600;
-    color: var(--np-color-on-surface);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .member-current-scene {
-    font-size: 0.75rem;
-    color: var(--np-color-on-surface-variant);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .member-move-controls {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-  }
-  .split-select-wrapper {
-    position: relative;
-    flex: 1;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    min-width: 0;
-  }
-  .split-select-wrapper :global(.member-target-field) {
-    flex: 1;
-    min-width: 0;
-  }
-  :global(.member-scene-toggle-btn) {
-    flex-shrink: 0;
-  }
-  :global(.member-scene-menu) {
-    max-height: 200px;
-    overflow-y: auto;
-  }
-  :global(.apply-move-btn) {
-    flex-shrink: 0;
-    white-space: nowrap;
   }
   .warning-text {
     color: var(--np-color-tertiary);

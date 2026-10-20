@@ -8,7 +8,13 @@
    */
   import { IconButton } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
-  import type { Character, ExtensionItem, QueuedLogMessage, Scene } from '../../types/index.js';
+  import type {
+    Character,
+    ExtensionItem,
+    PanelPlacement,
+    QueuedLogMessage,
+    Scene,
+  } from '../../types/index.js';
   import type { AssetItem, AssetMediaType, AssetScope } from '../../utils/assets.js';
   import type { ConnectionState } from '../../utils/connection.js';
   import type { AudioManager } from '../../utils/audio.js';
@@ -44,11 +50,13 @@
     onUpdateScene,
     onCreateScene,
     onDeleteScene,
-    onMoveMember,
     onUpdateCharacter,
     onCreateCharacter,
     onDeleteCharacter,
     onTogglePiece,
+    onMoveCharacter,
+    onFocusCharacterScene,
+    currentAccountId = null,
     onUpdateExtensions,
     onRegisterExtension,
     onExportZip,
@@ -73,6 +81,7 @@
     connectionState,
     sceneActionPending = null,
     sceneActionError = null,
+    placement = 'side',
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -97,7 +106,18 @@
     onUpdateScene?: (scene: Scene) => void;
     onCreateScene?: (name: string, inheritJuice: boolean) => void;
     onDeleteScene?: (sceneId: string) => void;
-    onMoveMember?: (characterId: string, targetSceneName: string) => void;
+    /**
+     * Moves a character to an existing scene by ID (Issue #228). The character
+     * tab has no free-text destination and never creates a scene.
+     */
+    onMoveCharacter?: (
+      characterId: string,
+      targetSceneId: string,
+    ) => Promise<boolean | void> | boolean | void;
+    /** Switches the caller's scene to the character's scene (視点を合わせる). */
+    onFocusCharacterScene?: (sceneId: string) => void;
+    /** Account ID used for the "自分のキャラクター" view and ownership gating. */
+    currentAccountId?: string | null;
     onUpdateCharacter?: (character: Character) => void;
     onCreateCharacter?: (character: Character) => void;
     onDeleteCharacter?: (characterId: string) => void;
@@ -160,6 +180,12 @@
     sceneActionPending?: string | null;
     /** Forwarded to `SceneSettingsTab`: scene-action failure text (Issue #109 / #143). */
     sceneActionError?: string | null;
+    /**
+     * Surface hosting the panel (Issue #223): `side` for the landscape side
+     * sheet, `bottom` for the portrait bottom sheet. Forwarded to
+     * `CommonHeader` so the close icon points at the closing edge.
+     */
+    placement?: PanelPlacement;
   } = $props();
 
   let activeTab = $state<ActiveTab>('log');
@@ -196,6 +222,7 @@
     {roomId}
     {role}
     {defaultPermission}
+    {placement}
     {onCollapse}
     {onSelectScene}
     {onExportZip}
@@ -226,6 +253,7 @@
         {onSelectScene}
         {onExportZip}
         {onRequestAssetPicker}
+        {placement}
         hideHeader={true}
         onRenameScene={() => (activeTab = 'settings')}
         onDeleteScene={() => (activeTab = 'settings')}
@@ -245,14 +273,10 @@
     {:else if activeTab === 'settings'}
       <SceneSettingsTab
         {currentScene}
-        {allScenes}
-        {characters}
         {role}
         {onUpdateScene}
-        {onSelectScene}
         {onCreateScene}
         {onDeleteScene}
-        {onMoveMember}
         {onRequestDeleteScene}
         {onRequestDeleteSceneLogs}
         {onDeleteSceneLogs}
@@ -266,11 +290,18 @@
     {:else if activeTab === 'characters'}
       <CharacterManagementTab
         {characters}
+        {allScenes}
+        {currentScene}
+        {currentAccountId}
         {role}
+        {sceneActionPending}
+        {sceneActionError}
         {onUpdateCharacter}
         {onCreateCharacter}
         {onDeleteCharacter}
         {onTogglePiece}
+        {onMoveCharacter}
+        {onFocusCharacterScene}
         {onRequestDeleteCharacter}
         {onRequestAssetPicker}
         {onRequestEditCharacter}

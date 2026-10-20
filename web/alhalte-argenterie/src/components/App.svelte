@@ -5,10 +5,14 @@
    * Layout adheres to Material 3 Expressive:
    * - Landscape: Left side field panel, Right side Side Sheet control panel (`Sheet` with `placement="end"`).
    * - Portrait: Full-screen field panel with Bottom Sheet control panel (`Sheet` with `placement="bottom"`).
+   *   The portrait sheet height is a function of its state only (closed, half 50dvh,
+   *   full viewport minus noph-ui's top margin) so the log list inside it scrolls
+   *   (Issue #223).
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie`
    * - GitHub Issue #32: Side sheets (landscape) & Bottom sheets (portrait)
+   * - GitHub Issue #223: portrait bottom sheet sizing, scrolling and close icon
    */
   import 'noph-ui/defaultTheme';
   import { Button, IconButton, Sheet } from 'noph-ui';
@@ -42,8 +46,10 @@
     buildBgmTrackState,
     createDefaultJuices,
     downloadSceneBackground,
+    getBgmRemovedSlots,
     getNormalizedBgmSlots,
     inheritJuices,
+    isBgmSlotRemoved,
     moveMemberToScene,
     parseBgmTrackState,
     parseSceneBackgroundState,
@@ -51,6 +57,7 @@
     SCENE_BACKGROUND_STATE_KEY,
     SCENE_BACKGROUND_WIDTH_STATE_KEY,
     SCENE_NAME_STATE_KEY,
+    setBgmSlotRemoved,
   } from '../utils/sceneSettings.js';
   import { createAudioManager, type AudioManager } from '../utils/audio.js';
   import { applyThemeToDocument } from '../utils/theme.js';
@@ -85,6 +92,7 @@
     type SceneSummary,
   } from '../utils/roomSocket.js';
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
+  import { normalizeAccountId } from '../utils/characterActions.js';
   import { resolveRoomKey } from '../utils/cellarTransfer.js';
   import {
     getSavedAccountId,
@@ -234,6 +242,13 @@
   let defaultPermission = $state<RoomRole | null>(null);
 
   /**
+   * Saved account ID passed to the character tab for the "自分のキャラクター"
+   * view and `std::owner_account` matching (Issue #228). Read once per mount:
+   * the App is re-created after an account switch.
+   */
+  const currentAccountId: string | null = normalizeAccountId(getSavedAccountId());
+
+  /**
    * Join preflight state (Issue #156).
    *
    * `GET /api/rooms/{room_id}` runs before any WebSocket is opened so 403 / 404
@@ -375,13 +390,41 @@
   );
   let isControlSheetOpen = $state(true);
   let isControlSheetExpanded = $state(false);
+  /**
+   * The three portrait bottom-sheet states (Issue #223): closed, half (exactly
+   * 50dvh) and fully open. Exposed as `data-sheet-state` so the state-sized
+   * sheet is assertable without measuring jsdom layout.
+   */
+  let controlSheetState = $derived(
+    !isControlSheetOpen ? 'closed' : isControlSheetExpanded ? 'full' : 'half',
+  );
   let sideSheetWidth = $state(440);
   let isResizing = $state(false);
+
+  /**
+   * Applies the persisted BGM removal markers to a scene restored from the
+   * route entry / local cache (Issue #226).
+   *
+   * `initialScenes` can already carry `juices.bgmRemovedSlots` (e.g. a reload
+   * of a scene whose default slots 1..3 were deleted). The scene is mutated in
+   * place so its identity is preserved; the server `StateSnapshot` refreshes
+   * the markers afterwards.
+   */
+  function hydrateSceneBgmRemovalMarkers(scene: Scene): Scene {
+    const removed = getBgmRemovedSlots(scene.juices);
+    if (removed.length === 0) return scene;
+    scene.juices.bgmRemovedSlots = removed;
+    for (const slotNum of removed) {
+      syncLegacyBgmFields(scene.juices, slotNum, null, 0.8);
+    }
+    setNormalizedBgmSlots(scene.juices, getNormalizedBgmSlots(scene.juices));
+    return scene;
+  }
 
   // Default scenes if none provided
   let scenes = $state<Scene[]>(
     initialScenes.length > 0
-      ? initialScenes
+      ? initialScenes.map(hydrateSceneBgmRemovalMarkers)
       : [
           {
             id: '/',
@@ -1049,7 +1092,16 @@
 
   /** Applies an acknowledged creation, replacing the draft id with the server id. */
   function applyCreatedCharacter(draft: Character, serverId: string): void {
-    const created: Character = { ...draft, id: serverId };
+    // Ownership is assigned by banquette (`std::owner_account`); the create ack
+    // and its `CharacterInfo` broadcast do not always carry the attribute yet.
+    // Backfill it from the saved account so a fresh character is immediately
+    // "mine" for a participant (Issue #228). Never re-emitted to the server.
+    const created: Character = {
+      ...draft,
+      id: serverId,
+      ownerAccountId:
+        draft.ownerAccountId ?? normalizeAccountId(getSavedAccountId()) ?? undefined,
+    };
     const index = characters.findIndex((c) => c.id === serverId || c.id === draft.id);
     if (index >= 0) {
       characters = characters.map((c, i) => (i === index ? created : c));
@@ -1355,6 +1407,9 @@
   /** Scene-state key carrying a slot playback intent (Issue #164). */
   const BGM_PLAYING_STATE_KEY = /^bgm::(\d+)::playing$/;
 
+  /** Scene-state key marking a slot as deleted from the UI (Issue #226). */
+  const BGM_REMOVED_STATE_KEY = /^bgm::(\d+)::removed$/;
+
   /** `piece::<characterId>::placed` and `piece::<characterId>::pos` keys. */
   const PIECE_PLACED_STATE_KEY = /^piece::(.+)::placed$/;
   const PIECE_POS_STATE_KEY = /^piece::(.+)::pos$/;
@@ -1378,8 +1433,14 @@
     return (
       bgmSlotFromStateKey(key) !== null ||
       BGM_VOLUME_STATE_KEY.test(key) ||
-      BGM_PLAYING_STATE_KEY.test(key)
+      BGM_PLAYING_STATE_KEY.test(key) ||
+      BGM_REMOVED_STATE_KEY.test(key)
     );
+  }
+
+  /** Decodes the boolean Tins used by `playing` and `removed`. */
+  function isTruthyBgmStateValue(value: unknown): boolean {
+    return value === true || value === 'true' || value === 1;
   }
 
   /** Mirrors a slot's tin id (and optionally volume) into the legacy `bgm1..3` fields. */
@@ -1411,8 +1472,16 @@
    * Returns `slots` with `slotNum` present. Arbitrary slot numbers are created
    * on demand so a `std::bgm4` snapshot hydrates even when the client has only
    * ever rendered slots 1..3.
+   *
+   * A slot carrying the `bgm::<slot>::removed` marker is never re-created
+   * (Issue #226), not even by a later track / playing / volume broadcast.
    */
-  function ensureBgmSlot(slots: BgmSlot[], slotNum: number): BgmSlot[] {
+  function ensureBgmSlot(
+    juices: Scene['juices'],
+    slots: BgmSlot[],
+    slotNum: number,
+  ): BgmSlot[] {
+    if (isBgmSlotRemoved(juices, slotNum)) return slots;
     if (slots.some((slot) => slot.slot === slotNum)) return slots;
     return [...slots, { slot: slotNum, tinId: null, volume: 0.8, isPlaying: false }];
   }
@@ -1479,6 +1548,24 @@
   }
 
   /**
+   * Applies the server-authoritative `bgm::<slot>::removed` marker
+   * (Issue #226).
+   *
+   * Marking the slot removes it from `juices.bgmSlots` and clears its legacy
+   * `bgm1..3` mirror, so a later track / playing / volume broadcast can never
+   * re-create it. Unmarking only drops the filter: the row comes back with the
+   * next track / playing key (add-slot clears the marker before its first
+   * write).
+   */
+  function applyBgmSlotRemovedChange(scene: Scene, slotNum: number, removed: boolean) {
+    setBgmSlotRemoved(scene.juices, slotNum, removed);
+    if (!removed) return;
+    setNormalizedBgmSlots(scene.juices, getNormalizedBgmSlots(scene.juices));
+    syncLegacyBgmFields(scene.juices, slotNum, null, 0.8);
+    if (scene.id === currentScene?.id) audioManager.pause(slotNum);
+  }
+
+  /**
    * Applies a BGM `StateUpdated` frame.
    *
    * Track values are `{ tinId, mimeType, name }` JSON Tin; the legacy bare
@@ -1488,13 +1575,28 @@
   function applyBgmStateUpdated(scene: Scene, key: string, rawValue: unknown) {
     const value = tinToJson(rawValue);
 
+    const removedMatch = BGM_REMOVED_STATE_KEY.exec(key);
+    if (removedMatch) {
+      applyBgmSlotRemovedChange(
+        scene,
+        Number(removedMatch[1]),
+        isTruthyBgmStateValue(value),
+      );
+      return;
+    }
+
     const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
     if (volumeMatch) {
       const slotNum = Number(volumeMatch[1]);
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
       const volume = typeof value === 'number' ? value : Number(value);
       if (!Number.isFinite(volume)) return;
       const clamped = Math.max(0, Math.min(1, volume));
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, volume: clamped } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1507,8 +1609,13 @@
     const playingMatch = BGM_PLAYING_STATE_KEY.exec(key);
     if (playingMatch) {
       const slotNum = Number(playingMatch[1]);
-      const playing = value === true || value === 'true' || value === 1;
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const playing = isTruthyBgmStateValue(value);
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, isPlaying: playing } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1520,9 +1627,13 @@
     }
 
     const slotNum = bgmSlotFromStateKey(key);
-    if (slotNum === null) return;
+    if (slotNum === null || isBgmSlotRemoved(scene.juices, slotNum)) return;
     const parsed = parseBgmTrackState(value);
-    const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+    const slots = ensureBgmSlot(
+      scene.juices,
+      getNormalizedBgmSlots(scene.juices),
+      slotNum,
+    ).map((slot) =>
       slot.slot === slotNum
         ? {
             ...slot,
@@ -1544,13 +1655,26 @@
    * Applies a BGM `StateDeleted` frame.
    *
    * Deleting a track key clears the selection; deleting `playing` stops the
-   * slot. Both pause and revoke the slot's object URL.
+   * slot. Both pause and revoke the slot's object URL. A removed slot ignores
+   * the NONE broadcasts of its own deletion so it is not re-created; deleting
+   * the removal marker itself lifts the filter again.
    */
   function applyBgmStateDeleted(scene: Scene, key: string) {
+    const removedMatch = BGM_REMOVED_STATE_KEY.exec(key);
+    if (removedMatch) {
+      applyBgmSlotRemovedChange(scene, Number(removedMatch[1]), false);
+      return;
+    }
+
     const volumeMatch = BGM_VOLUME_STATE_KEY.exec(key);
     if (volumeMatch) {
       const slotNum = Number(volumeMatch[1]);
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, volume: 0.8 } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1563,7 +1687,12 @@
     const playingMatch = BGM_PLAYING_STATE_KEY.exec(key);
     if (playingMatch) {
       const slotNum = Number(playingMatch[1]);
-      const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+      if (isBgmSlotRemoved(scene.juices, slotNum)) return;
+      const slots = ensureBgmSlot(
+        scene.juices,
+        getNormalizedBgmSlots(scene.juices),
+        slotNum,
+      ).map((slot) =>
         slot.slot === slotNum ? { ...slot, isPlaying: false } : { ...slot },
       );
       setNormalizedBgmSlots(scene.juices, slots);
@@ -1572,8 +1701,12 @@
     }
 
     const slotNum = bgmSlotFromStateKey(key);
-    if (slotNum === null) return;
-    const slots = ensureBgmSlot(getNormalizedBgmSlots(scene.juices), slotNum).map((slot) =>
+    if (slotNum === null || isBgmSlotRemoved(scene.juices, slotNum)) return;
+    const slots = ensureBgmSlot(
+      scene.juices,
+      getNormalizedBgmSlots(scene.juices),
+      slotNum,
+    ).map((slot) =>
       slot.slot === slotNum
         ? { ...slot, tinId: null, mimeType: undefined, name: undefined, isPlaying: false }
         : { ...slot },
@@ -1934,7 +2067,18 @@
     }
 
     pieceStatesByScene.set(sceneId, new Map());
-    for (const [key, value] of Object.entries(states ?? {})) {
+    const entries = Object.entries(states ?? {});
+    // The snapshot is authoritative for the deletion markers too (Issue #226):
+    // rebuild them first so stale track / playing / volume entries for a
+    // removed slot cannot re-create it, regardless of the map order.
+    scene.juices.bgmRemovedSlots = [];
+    for (const [key, value] of entries) {
+      if (BGM_REMOVED_STATE_KEY.test(key)) {
+        applySceneStateEntry(scene, key, value);
+      }
+    }
+    for (const [key, value] of entries) {
+      if (BGM_REMOVED_STATE_KEY.test(key)) continue;
       if (parsePieceStateKey(key)) {
         applyPieceStateEntry(sceneId, key, value);
       } else {
@@ -2406,14 +2550,20 @@
     }
   }
 
-  /** Commits an acknowledged member move to `scenes`, `currentSceneId` and `movements`. */
+  /**
+   * Commits an acknowledged member move to `scenes` and `movements`.
+   *
+   * `currentSceneId` is deliberately left alone (Issue #228): a list-initiated
+   * move must not yank the admin out of the scene they are curating. The
+   * moved character simply leaves the current scene list and its row disappears
+   * from the "シーン内のキャラクター" view.
+   */
   function commitMemberMove(
     characterId: string,
     fromSceneId: string,
     result: ReturnType<typeof moveMemberToScene>,
   ) {
     scenes = result.updatedScenes;
-    currentSceneId = result.targetScene.id;
 
     const char = characters.find((c) => c.id === characterId);
     recordLiveMovement({
@@ -2427,18 +2577,26 @@
   }
 
   /**
-   * Moves a character to another scene (Issue #109 / sub-issue #143, #159).
+   * Moves a character to another scene (Issue #109 / sub-issue #143, #159, #225,
+   * #228).
    *
-   * The target scene id (and the implicitly created scene for an unknown name)
-   * is computed before the request because `MoveCharacter` carries it, but the
-   * local model is only replaced after the ack. Without a connected socket the
-   * move fails instead of mutating the local model. Scene membership is
-   * authoritative on the server (`SceneInfo`) since Issue #160, so no
-   * `character::<id>::scene` state mirror is written.
+   * The target is resolved **id-first**: when `targetSceneId` is given (the
+   * character list's 「別シーンに配置」 menu), only an existing scene with that
+   * id is accepted and no scene is created. Without it the previous name-based
+   * path applies and an unknown name creates the scene first: `MoveCharacter`
+   * alone would let banquette name the implicit scene after its internal id
+   * (Issue #225).
+   *
+   * The local model is only replaced after every request succeeded (the create
+   * when needed, then the move). Without a connected socket the move fails
+   * instead of mutating the local model. Scene membership is authoritative on
+   * the server (`SceneInfo`) since Issue #160, so no `character::<id>::scene`
+   * state mirror is written.
    */
   async function handleMoveMember(
     characterId: string,
     targetSceneName: string,
+    targetSceneId?: string,
   ): Promise<boolean | void> {
     if (!canManageScenes) return;
     if (!beginSceneAction(`move:${characterId}`)) return;
@@ -2446,12 +2604,32 @@
     try {
       const fromSceneId =
         (scenes.find((scene) => scene.members.includes(characterId)) || currentScene).id;
-      const result = moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
+      const result = targetSceneId
+        ? moveMemberToSceneById(characterId, targetSceneId, scenes)
+        : moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
+      if (!result) {
+        // The id-first path operates on existing scenes only (Issue #228).
+        return failSceneAction(
+          new Error(`Unknown target scene: ${targetSceneId}`),
+          `move:${characterId}`,
+        );
+      }
       const socket = roomSocket;
       const numericCharId = Number(characterId);
 
       if (!socket || !socket.isConnected) {
         throw new Error('ルームに接続していないため、メンバーを移動できません');
+      }
+
+      if (result.isNewSceneCreated) {
+        await socket.requestCreateScene(
+          result.targetScene.id,
+          true,
+          result.targetScene.name,
+        );
+        // The server's `SceneList` broadcast may still be in flight; keep the
+        // freshly acknowledged scene until a list actually contains it.
+        pendingSceneListIds.add(result.targetScene.id);
       }
 
       if (!Number.isNaN(numericCharId)) {
@@ -2465,6 +2643,46 @@
     } finally {
       sceneActionPending = null;
     }
+  }
+
+  /**
+   * Resolves a member move against an **existing** target scene id.
+   *
+   * Used by the character list's 「別シーンに配置」 menu so two scenes with the
+   * same display name can never be confused and no scene is created implicitly.
+   * Returns `null` when the id is not in the local authoritative list.
+   */
+  function moveMemberToSceneById(
+    characterId: string,
+    targetSceneId: string,
+    existingScenes: Scene[],
+  ): ReturnType<typeof moveMemberToScene> | null {
+    if (!existingScenes.some((scene) => scene.id === targetSceneId)) return null;
+    const updatedScenes = existingScenes.map((scene) => ({
+      ...scene,
+      members: scene.members.filter((id) => id !== characterId),
+    }));
+    const targetScene = updatedScenes.find((scene) => scene.id === targetSceneId);
+    if (!targetScene) return null;
+    if (!targetScene.members.includes(characterId)) {
+      targetScene.members.push(characterId);
+    }
+    return { updatedScenes, targetScene, isNewSceneCreated: false };
+  }
+
+  /**
+   * Entry point for the character tab's 「別シーンに配置」 (Issue #228).
+   *
+   * Resolves the display name of the target scene so the App move path still
+   * carries a human-readable name, but keeps the id authoritative.
+   */
+  function handleCharacterMoveById(
+    characterId: string,
+    targetSceneId: string,
+  ): Promise<boolean | void> {
+    const target = scenes.find((scene) => scene.id === targetSceneId);
+    if (!target) return Promise.resolve(false);
+    return handleMoveMember(characterId, target.name, targetSceneId);
   }
 
   /**
@@ -2991,6 +3209,7 @@
                   {selectedCharacterId}
                   role={effectiveRole}
                   {defaultPermission}
+                  placement="side"
                   sending={isSending}
                   {queuedMessages}
                   {sceneActionPending}
@@ -3005,7 +3224,9 @@
                   onUpdateScene={handleUpdateScene}
                   onCreateScene={handleCreateScene}
                   onDeleteScene={handleDeleteScene}
-                  onMoveMember={handleMoveMember}
+                  onMoveCharacter={handleCharacterMoveById}
+                  onFocusCharacterScene={handleSelectScene}
+                  {currentAccountId}
                   onDeleteCharacter={handleDeleteCharacter}
                   onTogglePiece={handleTogglePiece}
                   onUpdateExtensions={handleUpdateExtensions}
@@ -3072,6 +3293,7 @@
             handleLabel="シートの開閉"
             class="portrait-bottom-sheet"
             data-testid="portrait-sheet-dialog"
+            data-sheet-state={controlSheetState}
           >
             <div class="bottom-sheet-content-wrapper">
               <ControlPanel
@@ -3085,6 +3307,7 @@
                 {selectedCharacterId}
                 role={effectiveRole}
                 {defaultPermission}
+                placement="bottom"
                 sending={isSending}
                 {queuedMessages}
                 {sceneActionPending}
@@ -3099,7 +3322,9 @@
                 onUpdateScene={handleUpdateScene}
                 onCreateScene={handleCreateScene}
                 onDeleteScene={handleDeleteScene}
-                onMoveMember={handleMoveMember}
+                onMoveCharacter={handleCharacterMoveById}
+                onFocusCharacterScene={handleSelectScene}
+                {currentAccountId}
                 onDeleteCharacter={handleDeleteCharacter}
                 onTogglePiece={handleTogglePiece}
                 onUpdateExtensions={handleUpdateExtensions}
@@ -3563,9 +3788,31 @@
     right: 0;
     z-index: 500;
   }
+  /*
+   * Portrait bottom sheet sizing (Issue #223).
+   *
+   * noph-ui sizes a bottom sheet from its content, capped by `--np-sheet-size`,
+   * so a short log made the half state short and a long one made it tall. The
+   * portrait sheet is sized by its state alone:
+   *
+   * - closed: the Sheet's own closed state (`display: none` / off screen).
+   * - half:   exactly 50dvh.
+   * - full:   the viewport less the same top margin noph-ui keeps free in
+   *           `np-sheet-bottom` (`--_top-margin`: 4.5rem, 3.5rem above 640px).
+   *
+   * A definite height is also what makes the inner scroll chain work: the flex
+   * children (`.np-sheet-content` → `.bottom-sheet-content-wrapper` →
+   * `.control-panel-container` → `.tab-content-area` → `.messages-list`) can
+   * only bound the log list when the sheet itself has a used height.
+   */
   .bottom-sheet-container :global(.portrait-bottom-sheet) {
-    --np-sheet-size: 50vh;
+    --np-sheet-size: 50dvh;
     --np-sheet-max-width: 100%;
+    --np-sheet-top-margin: 4.5rem;
+    --np-sheet-half-height: 50dvh;
+    --np-sheet-full-height: calc(100dvh - var(--np-sheet-top-margin));
+    height: var(--np-sheet-half-height);
+    max-height: var(--np-sheet-half-height);
     width: 100% !important;
     max-width: 100% !important;
     inset-inline: 0 !important;
@@ -3573,12 +3820,20 @@
     box-shadow: var(--np-elevation-3);
     transition:
       translate var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
+      height var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
       max-height var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
       display var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete,
       overlay var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete;
   }
   .bottom-sheet-container :global(.portrait-bottom-sheet.np-sheet-expanded) {
-    max-height: calc(100dvh - 3.5rem);
+    height: var(--np-sheet-full-height);
+    max-height: var(--np-sheet-full-height);
+  }
+  /* noph-ui raises its top margin from 4.5rem to 3.5rem above 640dp. */
+  @media (width > 640px) {
+    .bottom-sheet-container :global(.portrait-bottom-sheet) {
+      --np-sheet-top-margin: 3.5rem;
+    }
   }
   .bottom-sheet-container :global(.portrait-bottom-sheet .np-sheet-content) {
     padding: 0;
@@ -3596,6 +3851,16 @@
     flex-direction: column;
     flex: 1;
     overflow: hidden;
+  }
+  /*
+   * The control panel fills the sheet content wrapper instead of relying on a
+   * percentage of an auto-height parent (Issue #223). From here the definite
+   * height continues through `ControlPanel`'s `.tab-content-area` and
+   * `LogTab`'s `.messages-area` / `.messages-list`.
+   */
+  .bottom-sheet-container :global(.bottom-sheet-content-wrapper .control-panel-container) {
+    flex: 1;
+    min-height: 0;
   }
   .reopen-sheet-floating.portrait-reopen {
     position: fixed;

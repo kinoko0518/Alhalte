@@ -91,6 +91,15 @@ pub fn generate_maitre_d_args(config: &BistrotConfig) -> Vec<String> {
         args.push(origin);
     }
 
+    // Issue #229: `[argenterie] lan` opts into `http://<private IPv4>:<port>`
+    // browser origins for the same Ethernet/LAN. This is not a wildcard:
+    // maitre-d only accepts private-network IP literals on the listed port.
+    // Production configurations leave the switch off, so no flag is emitted.
+    for port in config.lan_origin_ports() {
+        args.push("--allow-lan-origin-port".to_string());
+        args.push(port.to_string());
+    }
+
     // Issue #150: debug login is opt-in. maitre-d then picks the isolated
     // `<data-dir>/maitre-d-debug.sqlite3` database itself, so no extra path is
     // passed here.
@@ -150,6 +159,24 @@ pub fn generate_cellar_args(config: &BistrotConfig) -> Vec<String> {
     args
 }
 
+/// Generates CLI arguments for the `alhalte-argenterie` Vite dev server.
+///
+/// The bind host comes from [`BistrotConfig::argenterie_bind_host`]: loopback
+/// (or the configured `restaurant.host`) unless the development-only
+/// `[argenterie] lan` switch makes it `0.0.0.0`. The systemd unit and the
+/// `nix run .#bistrot` fallback both use these arguments, so `package.json`
+/// does not hard-code a host that could disagree with the configuration.
+///
+/// Deterministic and pure function.
+pub fn generate_argenterie_args(config: &BistrotConfig) -> Vec<String> {
+    vec![
+        "--host".to_string(),
+        config.argenterie_bind_host().to_string(),
+        "--port".to_string(),
+        config.argenterie.port.to_string(),
+    ]
+}
+
 /// Generates CLI arguments for all long-lived Alhalte services.
 pub fn generate_all_args(config: &BistrotConfig) -> ModuleArgs {
     ModuleArgs {
@@ -160,9 +187,9 @@ pub fn generate_all_args(config: &BistrotConfig) -> ModuleArgs {
 
 /// Generates CLI arguments for a named module.
 ///
-/// Supported module names: `"maitre-d"` (or `"maitre_d"`) and `"cellar"`.
-/// `alhalte-banquette` is spawned per room by `alhalte-maitre-d`, so it has no
-/// static argument list here.
+/// Supported module names: `"maitre-d"` (or `"maitre_d"`), `"cellar"`, and
+/// `"argenterie"`. `alhalte-banquette` is spawned per room by
+/// `alhalte-maitre-d`, so it has no static argument list here.
 ///
 /// # Errors
 ///
@@ -171,6 +198,7 @@ pub fn generate_module_args(config: &BistrotConfig, module_name: &str) -> Result
     match module_name.to_lowercase().replace('_', "-").as_str() {
         "maitre-d" => Ok(generate_maitre_d_args(config)),
         "cellar" => Ok(generate_cellar_args(config)),
+        "argenterie" => Ok(generate_argenterie_args(config)),
         other => Err(BistrotError::UnknownModule(other.to_string())),
     }
 }

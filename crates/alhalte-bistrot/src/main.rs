@@ -77,7 +77,14 @@ enum Commands {
     },
 
     /// Print the argenterie frontend URL.
-    Url,
+    Url {
+        /// Print the best-effort LAN URL instead of the loopback URL.
+        ///
+        /// Prints nothing (and exits successfully) when no LAN address can be
+        /// detected. Only meaningful with `[argenterie] lan = true`.
+        #[arg(long)]
+        lan: bool,
+    },
 
     /// Validate configuration and print parsed summary.
     Validate,
@@ -205,9 +212,20 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
                 println!("=== alhalte-bistrot.target ===\n{}", units.bistrot_target);
             }
         }
-        Commands::Url => {
+        Commands::Url { lan } => {
             let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
-            println!("{}", config.argenterie_url());
+            if lan {
+                // Best-effort: print every detected LAN URL, one per line, and
+                // say nothing when detection fails (the runner treats empty
+                // output as "no LAN URL").
+                if config.argenterie.lan {
+                    for url in alhalte_bistrot::detect_lan_urls(config.argenterie.port) {
+                        println!("{url}");
+                    }
+                }
+            } else {
+                println!("{}", config.argenterie_url());
+            }
         }
         Commands::Validate => {
             let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
@@ -219,6 +237,15 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             println!("  maitre-d port: {}", config.maitre_d.port);
             println!("  cellar port:   {}", config.cellar.port);
             println!("  argenterie port: {}", config.argenterie.port);
+            println!("  argenterie bind: {}", config.argenterie_bind_host());
+            println!(
+                "  argenterie lan:  {}",
+                if config.argenterie.lan {
+                    "enabled (development only)"
+                } else {
+                    "disabled"
+                }
+            );
             println!("  argenterie url:  {}", config.argenterie_url());
             println!(
                 "  banquette N:   {} (chunk size: {})",
