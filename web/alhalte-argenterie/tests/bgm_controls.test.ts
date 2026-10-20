@@ -59,28 +59,45 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
     const playBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-play-btn-1"]');
     const selectBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-select-btn-1"]');
     const sliderWrapper = target.querySelector<HTMLElement>('[data-testid="bgm-slider-wrapper-1"]');
+    const deleteBtn = target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]');
 
     expect(playBtn).toBeTruthy();
     expect(selectBtn).toBeTruthy();
     expect(sliderWrapper).toBeTruthy();
+    expect(deleteBtn).toBeTruthy();
 
-    // Verify DOM order: playBtn -> selectBtn -> sliderWrapper
+    // Verify DOM order: playBtn -> selectBtn -> sliderWrapper -> deleteBtn
     const children = Array.from(row1!.children);
     const playIndex = children.indexOf(playBtn!);
     const selectIndex = children.indexOf(selectBtn!);
     const sliderIndex = children.indexOf(sliderWrapper!);
+    const deleteIndex = children.indexOf(deleteBtn!);
 
     expect(playIndex).toBeLessThan(selectIndex);
     expect(selectIndex).toBeLessThan(sliderIndex);
+    expect(sliderIndex).toBeLessThan(deleteIndex);
+    // The delete button is the last control in the row (the tooltip element
+    // noph-ui renders next to it is not a control).
+    expect(Array.from(row1!.querySelectorAll('button')).at(-1)).toBe(deleteBtn);
 
     // Verify M3 IconButton components used
     expect(playBtn!.classList.contains('np-icon-button')).toBe(true);
     expect(selectBtn!.classList.contains('np-icon-button')).toBe(true);
+    expect(deleteBtn!.classList.contains('np-icon-button')).toBe(true);
 
     // Verify narrower width for Play/Stop button compared to 1:1 square Select button
     expect(playBtn!.classList.contains('narrow')).toBe(true);
     expect(playBtn!.classList.contains('narrow-btn')).toBe(true);
     expect(selectBtn!.classList.contains('square-btn')).toBe(true);
+
+    // Issue #226: the slot number badge is gone; a filled tonal delete button
+    // takes its place at the right end of the row.
+    expect(target.querySelector('[data-testid="bgm-slot-badge-1"]')).toBeNull();
+    expect(deleteBtn!.classList.contains('tonal')).toBe(true);
+    expect(deleteBtn!.classList.contains('s')).toBe(true);
+    expect(deleteBtn!.classList.contains('round')).toBe(true);
+    expect(deleteBtn!.getAttribute('aria-label')).toBe('BGMスロットを削除');
+    expect(deleteBtn!.textContent).toContain('delete');
 
     unmount(instance);
     target.remove();
@@ -320,13 +337,20 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
       },
     });
 
-    // Check initial slots 1, 2, 3 have badges #1, #2, #3
-    const badge1 = target.querySelector<HTMLElement>('[data-testid="bgm-slot-badge-1"]');
-    const badge2 = target.querySelector<HTMLElement>('[data-testid="bgm-slot-badge-2"]');
-    const badge3 = target.querySelector<HTMLElement>('[data-testid="bgm-slot-badge-3"]');
-    expect(badge1?.textContent?.trim()).toBe('#1');
-    expect(badge2?.textContent?.trim()).toBe('#2');
-    expect(badge3?.textContent?.trim()).toBe('#3');
+    // Issue #226: the slot number badge is gone; every row ends with a delete
+    // button instead.
+    expect(target.querySelector('[data-testid="bgm-slot-badge-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-badge-2"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-slot-badge-3"]')).toBeNull();
+    for (const slot of [1, 2, 3]) {
+      const row = target.querySelector<HTMLElement>(`[data-testid="bgm-row-${slot}"]`);
+      const deleteBtn = target.querySelector<HTMLButtonElement>(
+        `[data-testid="bgm-delete-btn-${slot}"]`,
+      );
+      expect(row).toBeTruthy();
+      expect(deleteBtn).toBeTruthy();
+      expect(row!.contains(deleteBtn!)).toBe(true);
+    }
 
     // Click "スロット追加" button
     const addBtn = target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]');
@@ -344,8 +368,8 @@ describe('BGM Controls (Issue #53: Reconstructed slot-aware controls)', () => {
 
     const row4 = target.querySelector<HTMLElement>('[data-testid="bgm-row-4"]');
     expect(row4).toBeTruthy();
-    const badge4 = target.querySelector<HTMLElement>('[data-testid="bgm-slot-badge-4"]');
-    expect(badge4?.textContent?.trim()).toBe('#4');
+    expect(target.querySelector('[data-testid="bgm-slot-badge-4"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-delete-btn-4"]')).toBeTruthy();
 
     unmount(instance);
     target.remove();
@@ -754,6 +778,302 @@ describe('BGM Controls — server acknowledgement (Issue #109 / #142)', () => {
     expect(error?.textContent).not.toBe('');
 
     warn.mockRestore();
+    unmount(instance);
+    target.remove();
+  });
+});
+
+describe('BGM slot deletion (Issue #226)', () => {
+  beforeEach(() => {
+    clearAssets();
+  });
+
+  function playableScene(): Scene {
+    return makeScene({
+      juices: {
+        ...createDefaultJuices(),
+        bgm1: TIN_ID_A,
+        bgm1Volume: 0.7,
+        bgmSlots: [
+          {
+            slot: 1,
+            tinId: TIN_ID_A,
+            mimeType: 'audio/ogg',
+            name: 'theme.ogg',
+            volume: 0.7,
+            isPlaying: true,
+          },
+          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
+          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+        ],
+      },
+    });
+  }
+
+  function mountWithSocket(
+    scene: Scene,
+    socket: FakeRoomSocket,
+    onUpdateScene?: (updated: Scene) => void,
+  ) {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene: scene,
+        allScenes: [scene],
+        roomSocket: asRoomSocket(socket),
+        ...(onUpdateScene ? { onUpdateScene } : {}),
+      },
+    });
+    return { target, instance };
+  }
+
+  // spec: argenterie/bgm-controls 削除はtrack DeleteState / playing=false / volume DeleteStateのack後に確定
+  it('deletes the slot only after the track / playing / volume acks and clears the legacy fields', async () => {
+    const scene = playableScene();
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerStateWrites = false;
+
+    let updateCount = 0;
+    let lastUpdatedScene: Scene | null = null;
+    const { target, instance } = mountWithSocket(scene, socket, (updated) => {
+      updateCount += 1;
+      lastUpdatedScene = updated;
+    });
+
+    const deleteBtn =
+      target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!;
+    expect(deleteBtn.getAttribute('aria-label')).toBe('BGMスロットを削除');
+
+    deleteBtn.click();
+    await settle(0);
+
+    // The three Banquette writes are in flight; a second press is ignored.
+    deleteBtn.click();
+    await settle(0);
+    expect(socket.pendingStateOperationCount).toBe(3);
+    expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
+      'std::bgm',
+      'bgm::1::volume',
+    ]);
+    expect(socket.requestUpdateStateCalls).toHaveLength(1);
+    expect(socket.requestUpdateStateCalls[0].key).toBe('bgm::1::playing');
+    expect(socket.requestUpdateStateCalls[0].value).toBe(false);
+    expect(socket.requestDeleteStateCalls[0].sceneId).toBe(scene.id);
+
+    // No local removal before every ack succeeded.
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
+    expect(updateCount).toBe(0);
+    expect(scene.juices.bgmSlots?.some((slot) => slot.slot === 1)).toBe(true);
+    expect(scene.juices.bgm1).toBe(TIN_ID_A);
+
+    socket.resolveStateWrite();
+    socket.resolveStateWrite();
+    await settle();
+    // One ack is still outstanding: the row and the model stay.
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
+    expect(updateCount).toBe(0);
+
+    socket.resolveStateWrite();
+    await settle();
+
+    // The row is gone; the remaining slots keep their numbers and state.
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-delete-btn-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeTruthy();
+    expect(updateCount).toBe(1);
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([2, 3]);
+    expect(lastUpdatedScene!.juices.bgm1).toBeUndefined();
+    expect(lastUpdatedScene!.juices.bgm1Volume).toBe(0.8);
+    expect(lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 2)).toMatchObject({
+      tinId: null,
+      isPlaying: false,
+    });
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls 削除失敗時は行を残しBGM通信エラーを表示する
+  it('keeps the row and shows the BGM error when a delete ack is rejected', async () => {
+    const scene = playableScene();
+    const socket = new FakeRoomSocket();
+    socket.autoAnswerStateWrites = false;
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    let updateCount = 0;
+    const { target, instance } = mountWithSocket(scene, socket, () => {
+      updateCount += 1;
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.click();
+    await settle(0);
+
+    socket.rejectDeleteState(new OperationTimeoutError('deleteState', 8000));
+    // The other two requests settle successfully; the batch still fails.
+    socket.resolveStateWrite();
+    socket.resolveStateWrite();
+    await settle();
+
+    expect(updateCount).toBe(0);
+    const row1 = target.querySelector<HTMLElement>('[data-testid="bgm-row-1"]');
+    expect(row1).toBeTruthy();
+    expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 2, 3]);
+    expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 1)?.tinId).toBe(TIN_ID_A);
+    expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 1)?.isPlaying).toBe(true);
+    expect(scene.juices.bgm1).toBe(TIN_ID_A);
+    const error = target.querySelector<HTMLElement>('[data-testid="bgm-error-1"]');
+    expect(error?.getAttribute('role')).toBe('status');
+    expect(error?.textContent).toContain(ERROR_MESSAGE);
+    // The button is usable again after the failure.
+    expect(
+      target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.disabled,
+    ).toBe(false);
+
+    warn.mockRestore();
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls standaloneではサーバー書き込みなしでローカル削除する
+  it('removes the slot locally without server writes in standalone usage', async () => {
+    const scene = makeScene({
+      juices: {
+        ...createDefaultJuices(),
+        bgm2: TIN_ID_B,
+        bgm2Volume: 0.4,
+        bgmSlots: [
+          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
+          {
+            slot: 2,
+            tinId: TIN_ID_B,
+            mimeType: 'audio/ogg',
+            name: 'second.ogg',
+            volume: 0.4,
+            isPlaying: false,
+          },
+          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+        ],
+      },
+    });
+
+    let updateCount = 0;
+    let lastUpdatedScene: Scene | null = null;
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene: scene,
+        allScenes: [scene],
+        onUpdateScene: (updated) => {
+          updateCount += 1;
+          lastUpdatedScene = updated;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-2"]')!.click();
+    await settle();
+
+    expect(updateCount).toBe(1);
+    expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeTruthy();
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 3]);
+    expect(lastUpdatedScene!.juices.bgm2).toBeUndefined();
+    expect(lastUpdatedScene!.juices.bgm2Volume).toBe(0.8);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls 削除後のスロット追加はmax+1で削除行を復活させない
+  it('adds the next slot at max + 1 after a deletion and does not revive the deleted row', async () => {
+    const scene = makeScene({
+      juices: {
+        ...createDefaultJuices(),
+        bgmSlots: [
+          { slot: 1, tinId: null, volume: 0.8, isPlaying: false },
+          {
+            slot: 2,
+            tinId: TIN_ID_B,
+            mimeType: 'audio/ogg',
+            name: 'second.ogg',
+            volume: 0.5,
+            isPlaying: false,
+          },
+          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+        ],
+      },
+    });
+
+    let lastUpdatedScene: Scene | null = null;
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene: scene,
+        allScenes: [scene],
+        onUpdateScene: (updated) => {
+          lastUpdatedScene = updated;
+        },
+      },
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-2"]')!.click();
+    await settle();
+    expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
+
+    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
+    await settle();
+
+    // max(1, 3) + 1 = 4, not the deleted 2.
+    expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
+    const row4 = target.querySelector<HTMLElement>('[data-testid="bgm-row-4"]');
+    expect(row4).toBeTruthy();
+    expect(target.querySelector('[data-testid="bgm-delete-btn-4"]')).toBeTruthy();
+    expect(lastUpdatedScene!.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1, 3, 4]);
+    const slot4 = lastUpdatedScene!.juices.bgmSlots?.find((slot) => slot.slot === 4);
+    expect(slot4).toMatchObject({ tinId: null, isPlaying: false, volume: 0.8 });
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-controls 全スロット削除後も空のスロット一覧を正とする
+  it('keeps the slot list empty when every slot is deleted, and re-adds from slot 1', async () => {
+    const scene = makeScene();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene: scene,
+        allScenes: [scene],
+      },
+    });
+
+    for (const slot of [1, 2, 3]) {
+      target.querySelector<HTMLButtonElement>(`[data-testid="bgm-delete-btn-${slot}"]`)!.click();
+      await settle();
+    }
+
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-row-2"]')).toBeNull();
+    expect(target.querySelector('[data-testid="bgm-row-3"]')).toBeNull();
+    expect(scene.juices.bgmSlots).toEqual([]);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="add-bgm-slot-btn"]')!.click();
+    await settle();
+
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeTruthy();
+    expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([1]);
+    expect(scene.juices.bgmSlots?.[0]).toMatchObject({ tinId: null, isPlaying: false });
+
     unmount(instance);
     target.remove();
   });

@@ -11,7 +11,8 @@
  * - autoplay rejection shows the click-to-enable affordance and the gesture
  *   retries playback,
  * - a missing / undecryptable tin shows the error and never writes `playing`,
- * - the legacy bare 64-hex track state still plays.
+ * - the legacy bare 64-hex track state still plays,
+ * - deleting a slot stops and revokes its playback (Issue #226).
  *
  * No network: the audio manager is injected with a fake downloader and
  * `HTMLAudioElement`; the socket is `tests/helpers/fakeRoomSocket.ts`.
@@ -228,6 +229,67 @@ describe('BGM audio playback (Issue #164)', () => {
     expect(audio.revokeObjectUrl).toHaveBeenCalledWith(expect.stringContaining('blob:bgm/'));
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 2)?.tinId).toBe(TIN_A);
     expect(scene.juices.bgmSlots?.find((slot) => slot.slot === 2)?.isPlaying).toBe(false);
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: argenterie/bgm-audio スロット削除は再生中の音源をpause/revokeする (Issue #226)
+  it('pauses and revokes a playing slot when the slot is deleted', async () => {
+    const audio = createAudioHarness();
+    const socket = new FakeRoomSocket();
+    const scene = makeScene({
+      juices: {
+        ...createDefaultJuices(),
+        bgm1: TIN_A,
+        bgm1Volume: 0.5,
+        bgmSlots: [
+          {
+            slot: 1,
+            tinId: TIN_A,
+            mimeType: 'audio/ogg',
+            name: 'theme.ogg',
+            volume: 0.5,
+            isPlaying: true,
+          },
+          { slot: 2, tinId: null, volume: 0.8, isPlaying: false },
+          { slot: 3, tinId: null, volume: 0.8, isPlaying: false },
+        ],
+      },
+    });
+    const { target, instance } = mountSettings(scene, socket, audio);
+    await settle();
+
+    audio.manager.setVolume(1, 0.5);
+    await audio.manager.prepare(
+      1,
+      { tinId: TIN_A, mimeType: 'audio/ogg', name: 'theme.ogg' },
+      ROOM_KEY,
+    );
+    await audio.manager.play(1);
+    expect(audio.elements).toHaveLength(1);
+    expect(audio.elements[0].paused).toBe(false);
+
+    target.querySelector<HTMLButtonElement>('[data-testid="bgm-delete-btn-1"]')!.click();
+    await settle(30);
+
+    // Track DeleteState + playing=false + volume DeleteState (Issue #226).
+    expect(socket.requestDeleteStateCalls.map((call) => call.key)).toEqual([
+      'std::bgm',
+      'bgm::1::volume',
+    ]);
+    expect(
+      trackStateUpdater(socket.requestUpdateStateCalls, 'bgm::1::playing')?.value,
+    ).toBe(false);
+    // The sound stops immediately and the object URL is revoked.
+    expect(audio.elements[0].pause).toHaveBeenCalled();
+    expect(audio.elements[0].paused).toBe(true);
+    expect(audio.revokeObjectUrl).toHaveBeenCalledWith('blob:bgm/1');
+    // The row and its legacy mirror are gone; other slots are untouched.
+    expect(target.querySelector('[data-testid="bgm-row-1"]')).toBeNull();
+    expect(scene.juices.bgmSlots?.map((slot) => slot.slot)).toEqual([2, 3]);
+    expect(scene.juices.bgm1).toBeUndefined();
+    expect(scene.juices.bgm1Volume).toBe(0.8);
 
     unmount(instance);
     target.remove();

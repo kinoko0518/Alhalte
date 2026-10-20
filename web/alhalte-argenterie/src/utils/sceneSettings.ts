@@ -35,9 +35,13 @@ export function createDefaultJuices(): Juices {
 
 /**
  * Returns normalized BgmSlot array from Juices, generating slots from legacy bgm1..3 if needed.
+ *
+ * An explicitly empty `bgmSlots` array means every slot was deleted (Issue
+ * #226) and is authoritative; only an absent field falls back to the legacy
+ * `bgm1..3` mirrors.
  */
 export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
-  if (juices.bgmSlots && juices.bgmSlots.length > 0) {
+  if (juices.bgmSlots) {
     return juices.bgmSlots;
   }
   return [
