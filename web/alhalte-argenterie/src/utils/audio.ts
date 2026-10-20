@@ -1,5 +1,5 @@
 /**
- * BGM audio playback manager (Issue #164).
+ * BGM audio playback manager (Issue #164, Issue #248).
  *
  * There is exactly one `HTMLAudioElement` per BGM slot. The manager:
  *
@@ -8,12 +8,15 @@
  * - plays / pauses / changes the volume of that element,
  * - revokes the object URL when a slot stops, the track changes, the scene
  *   switches or the component unmounts,
- * - surfaces autoplay rejection as `blocked` (the UI offers a click-to-enable
- *   affordance) and download / decrypt failure as `error`.
+ * - treats a browser autoplay rejection as a prepared-but-`paused` slot: it is
+ *   not an error and carries no user-facing notice. `App` retries playback from
+ *   the first user gesture (pointerdown), so the user never manages autoplay
+ *   (Issue #248),
+ * - surfaces download / decrypt failure as `error`.
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### BGM`
- * - GitHub Issue #164
+ * - GitHub Issue #164, GitHub Issue #248
  */
 import { downloadTin } from './cellarTransfer.js';
 import {
@@ -21,14 +24,20 @@ import {
   type BgmTrackState,
 } from './sceneSettings.js';
 
-/** Playback status of one BGM slot. */
-export type AudioSlotStatus =
-  | 'idle'
-  | 'loading'
-  | 'playing'
-  | 'paused'
-  | 'blocked'
-  | 'error';
+/**
+ * Playback status of one BGM slot.
+ *
+ * - `idle`: no source is prepared (initial state, stopped, or cleared).
+ * - `loading`: reserved for an in-flight preparation; `prepare()` keeps `idle`
+ *   until the payload is ready.
+ * - `paused`: a source is prepared and nothing is audible. A browser autoplay
+ *   rejection also lands here — prepared, silent, and *not* an error
+ *   (Issue #248).
+ * - `playing`: the element is playing.
+ * - `error`: download / decrypt failed; {@link AudioSlotState.error} carries the
+ *   user-facing message.
+ */
+export type AudioSlotStatus = 'idle' | 'loading' | 'playing' | 'paused' | 'error';
 
 /** Observable snapshot of one slot. */
 export interface AudioSlotState {
@@ -39,12 +48,16 @@ export interface AudioSlotState {
   volume: number;
   /** User-facing failure message; `null` when the slot is healthy. */
   error: string | null;
-  /** True after `play()` was rejected by the autoplay policy. */
-  blocked: boolean;
 }
 
-/** Result of {@link AudioManager.play}. */
-export type AudioPlayResult = 'playing' | 'blocked';
+/**
+ * Result of {@link AudioManager.play}.
+ *
+ * - `playing`: the element started.
+ * - `paused`: the browser's autoplay policy refused the call. The slot stays
+ *   prepared and silent; replay it from inside a user gesture (Issue #248).
+ */
+export type AudioPlayResult = 'playing' | 'paused';
 
 /**
  * Minimal structural subset of `HTMLAudioElement` used by the manager.
@@ -86,7 +99,6 @@ interface SlotRuntime {
   objectUrl: string | null;
   status: AudioSlotStatus;
   error: string | null;
-  blocked: boolean;
 }
 
 interface PendingLoad {
@@ -94,8 +106,15 @@ interface PendingLoad {
   promise: Promise<void>;
 }
 
-/** True when a `play()` rejection means the browser blocked autoplay. */
-export function isAutoplayBlockedError(error: unknown): boolean {
+/**
+ * True when a `play()` rejection is the browser's autoplay policy.
+ *
+ * `NotAllowedError` is the specified rejection; some engines only expose a
+ * message, so both are inspected. Deliberately not exported: since Issue #248 an
+ * autoplay rejection is an internal "prepared but paused" condition rather than
+ * a user-facing state.
+ */
+function isAutoplayPolicyRejection(error: unknown): boolean {
   if (!error || typeof error !== 'object') return false;
   const name = (error as { name?: unknown }).name;
   if (name === 'NotAllowedError') return true;
@@ -188,7 +207,6 @@ export class AudioManager {
       mimeType: runtime?.mimeType ?? null,
       volume: this.volumes.get(slot) ?? 1,
       error: runtime?.error ?? null,
-      blocked: runtime?.blocked ?? false,
     };
   }
 
@@ -272,7 +290,6 @@ export class AudioManager {
         target.objectUrl = url;
         target.status = 'paused';
         target.error = null;
-        target.blocked = false;
         if (previousUrl && previousUrl !== url) this.revokeObjectUrl(previousUrl);
         this.notify();
       } catch (error) {
@@ -291,9 +308,13 @@ export class AudioManager {
   /**
    * Plays the prepared slot.
    *
-   * A browser autoplay rejection is not an error: the slot becomes `blocked`
-   * and the UI offers a click-to-enable affordance. Any other failure records
-   * `error` and rejects.
+   * A browser autoplay rejection is deliberately not an error (Issue #248): the
+   * slot stays `paused` with `error === null` and this resolves to `'paused'`, so
+   * the caller can replay it from inside a user gesture. Any other failure
+   * records `error` and rejects.
+   *
+   * @throws when the slot has no prepared source or `play()` failed for a
+   * reason other than the autoplay policy.
    */
   async play(slot: number): Promise<AudioPlayResult> {
     const inFlight = this.pending.get(slot);
@@ -309,26 +330,19 @@ export class AudioManager {
     try {
       await runtime.element.play();
       runtime.status = 'playing';
-      runtime.blocked = false;
       runtime.error = null;
       this.notify();
       return 'playing';
     } catch (error) {
-      if (isAutoplayBlockedError(error)) {
-        runtime.status = 'blocked';
-        runtime.blocked = true;
+      if (isAutoplayPolicyRejection(error)) {
+        runtime.status = 'paused';
         runtime.error = null;
         this.notify();
-        return 'blocked';
+        return 'paused';
       }
       this.fail(slot, BGM_AUDIO_LOAD_ERROR);
       throw error;
     }
-  }
-
-  /** Retries playback after the user gesture that satisfies the autoplay policy. */
-  async retry(slot: number): Promise<AudioPlayResult> {
-    return this.play(slot);
   }
 
   /**
@@ -361,7 +375,6 @@ export class AudioManager {
     runtime.mimeType = null;
     runtime.status = 'idle';
     runtime.error = null;
-    runtime.blocked = false;
     this.notify();
   }
 
@@ -377,7 +390,6 @@ export class AudioManager {
     const runtime = this.runtime(slot);
     runtime.status = 'error';
     runtime.error = message;
-    runtime.blocked = false;
     this.notify();
   }
 
@@ -391,7 +403,6 @@ export class AudioManager {
         objectUrl: null,
         status: 'idle',
         error: null,
-        blocked: false,
       };
       this.slots.set(slot, runtime);
     }

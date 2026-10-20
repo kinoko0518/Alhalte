@@ -8,8 +8,8 @@
  * - volume changes reach `element.volume`,
  * - remote `bgm::<slot>::playing` / track updates apply to App,
  * - a scene switch pauses and revokes the previous scene's audio,
- * - autoplay rejection shows the click-to-enable affordance and the gesture
- *   retries playback,
+ * - autoplay rejection is silent: the slot stays prepared and `paused` with no
+ *   error and no user-facing notice (Issue #248),
  * - a missing / undecryptable tin shows the error and never writes `playing`,
  * - the legacy bare 64-hex track state still plays,
  * - deleting a slot stops and revokes its playback (Issue #226).
@@ -19,7 +19,7 @@
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### BGM`
- * - GitHub Issue #164
+ * - GitHub Issue #164, GitHub Issue #248
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
@@ -400,8 +400,8 @@ describe('BGM audio playback (Issue #164)', () => {
     target.remove();
   });
 
-  // spec: argenterie/bgm-audio autoplay制限はクリックして有効化を出し操作で再開する (Issue #164)
-  it('shows the click-to-enable affordance when play() is blocked and retries on the gesture', async () => {
+  // spec: Issue #248 autoplay 拒否はタブに通知を出さず paused のままにする
+  it('commits playing without any notice when the browser refuses autoplay', async () => {
     const audio = createAudioHarness({ blockFirstPlay: true });
     const socket = new FakeRoomSocket();
     const scene = makeScene();
@@ -416,28 +416,78 @@ describe('BGM audio playback (Issue #164)', () => {
     pickerOptions.onSelect(undefined, {
       tinId: TIN_A,
       mimeType: 'audio/ogg',
-      name: 'blocked.ogg',
+      name: 'refused.ogg',
     });
-    await waitFor(
-      () => target.querySelector('[data-testid="bgm-enable-audio-1"]') !== null,
-    );
+    await waitFor(() => audio.elements[0]?.play.mock.calls.length > 0);
+    await settle();
 
-    // Playback intent is committed; only the browser autoplay policy is blocked.
+    // Playback intent is committed; only the browser autoplay policy refused.
     expect(
       trackStateUpdater(socket.requestUpdateStateCalls, 'bgm::1::playing')?.value,
     ).toBe(true);
-    const enable = target.querySelector<HTMLButtonElement>(
-      '[data-testid="bgm-enable-audio-1"]',
-    );
-    expect(enable?.textContent).toContain('クリックして有効化');
-
-    enable!.click();
-    await settle(30);
-    expect(audio.elements[0].play).toHaveBeenCalledTimes(2);
-    expect(target.querySelector('[data-testid="bgm-enable-audio-1"]')).toBeNull();
+    const state = audio.manager.getState(1);
+    expect(state.status).toBe('paused');
+    expect(state.error).toBeNull();
+    // The user never sees a "click to enable" affordance (Issue #248).
+    expect(target.querySelector('[data-testid^="bgm-enable-audio"]')).toBeNull();
+    expect(target.textContent).not.toContain('クリックして有効化');
 
     unmount(instance);
     target.remove();
+  });
+
+  // spec: Issue #248 autoplay 拒否はエラーにせず paused のままにする
+  it('keeps a slot paused without an error when play() is rejected by the autoplay policy', async () => {
+    const element = new FakeAudioElement();
+    element.play.mockRejectedValueOnce(
+      Object.assign(new Error('play blocked'), { name: 'NotAllowedError' }),
+    );
+    const manager = new AudioManager({
+      createElement: () => element,
+      download: vi.fn(async () => new Uint8Array([1, 2, 3, 4])),
+      createObjectUrl: () => 'blob:bgm/autoplay',
+      revokeObjectUrl: vi.fn(),
+    });
+    await manager.prepare(
+      1,
+      { tinId: TIN_A, mimeType: 'audio/ogg', name: 'blocked.ogg' },
+      ROOM_KEY,
+    );
+    expect(manager.getState(1).status).toBe('paused');
+
+    // A refusal is silent: no throw, no error, still prepared and paused.
+    await expect(manager.play(1)).resolves.toBe('paused');
+    const refused = manager.getState(1);
+    expect(refused.status).toBe('paused');
+    expect(refused.error).toBeNull();
+    expect(refused.tinId).toBe(TIN_A);
+    expect(element.paused).toBe(true);
+
+    // The gesture that follows replays the very same prepared element.
+    await expect(manager.play(1)).resolves.toBe('playing');
+    expect(manager.getState(1).status).toBe('playing');
+    expect(manager.getState(1).error).toBeNull();
+    expect(element.play).toHaveBeenCalledTimes(2);
+  });
+
+  // spec: Issue #248 音源の取得失敗は従来どおり error にする
+  it('still records an error when the track cannot be downloaded', async () => {
+    const audio = createAudioHarness({ failDownload: true });
+
+    await expect(
+      audio.manager.prepare(
+        1,
+        { tinId: TIN_A, mimeType: 'audio/ogg', name: 'broken.ogg' },
+        ROOM_KEY,
+      ),
+    ).rejects.toThrow();
+
+    const state = audio.manager.getState(1);
+    expect(state.status).toBe('error');
+    expect(state.error).toBe(BGM_AUDIO_LOAD_ERROR);
+    // The failed slot never gets an element, so it cannot be "played" silently.
+    expect(audio.elements).toHaveLength(0);
+    await expect(audio.manager.play(1)).rejects.toThrow();
   });
 
   // spec: argenterie/bgm-audio 音源取得/復号失敗はエラー表示しplayingを確定しない (Issue #164)

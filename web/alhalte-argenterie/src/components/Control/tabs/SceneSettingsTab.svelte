@@ -519,7 +519,7 @@
     }
   }
 
-  /** Starts the prepared element; autoplay rejection is surfaced as `blocked`. */
+  /** Starts the prepared element; a browser autoplay refusal is not an error. */
   async function playBgmAudio(slotNum: number): Promise<void> {
     if (!canUseBgmAudio()) return;
     try {
@@ -826,21 +826,6 @@
       return;
     }
     void commitBgmPlay(slotNum, track, slotTrack === null);
-  }
-
-  /** Retries playback after the click that satisfies the autoplay policy. */
-  async function handleEnableBgmAudio(slotNum: number) {
-    setBgmError(slotNum, null);
-    try {
-      await bgmAudio.retry(slotNum);
-      return;
-    } catch (error) {
-      console.warn(`[SceneSettingsTab] Autoplay retry failed for slot ${slotNum}:`, error);
-    }
-    const track = getSlotTrack(findBgmSlot(slotNum));
-    if (track && (await prepareBgmAudio(slotNum, track))) {
-      await playBgmAudio(slotNum);
-    }
   }
 
   function handleBgmSelect(slotOrKey: number | 'bgm1' | 'bgm2' | 'bgm3') {
@@ -1422,16 +1407,6 @@
               {bgmErrors[slot.slot] ?? bgmAudioStates[slot.slot]?.error}
             </p>
           {/if}
-          {#if bgmAudioStates[slot.slot]?.blocked}
-            <button
-              type="button"
-              class="bgm-enable-audio-btn"
-              data-testid="bgm-enable-audio-{slot.slot}"
-              onclick={() => handleEnableBgmAudio(slot.slot)}
-            >
-              クリックして有効化
-            </button>
-          {/if}
         </div>
       {/each}
     </div>
@@ -1824,18 +1799,6 @@
     font-size: 0.8rem;
     line-height: 1.3;
     color: var(--np-color-error);
-  }
-  .bgm-enable-audio-btn {
-    align-self: flex-start;
-    margin-left: 2.5rem;
-    padding: 0.35rem 0.75rem;
-    border: 1px solid var(--np-color-outline, #79747e);
-    border-radius: 999px;
-    background: var(--np-color-secondary-container, #e8def8);
-    color: var(--np-color-on-secondary-container, #1d192b);
-    font: inherit;
-    font-size: 0.8rem;
-    cursor: pointer;
   }
   .scene-state-error {
     margin: 0.25rem 0 0;
