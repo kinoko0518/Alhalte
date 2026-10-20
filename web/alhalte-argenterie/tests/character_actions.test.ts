@@ -82,9 +82,9 @@ describe('characterActions (Issue #228)', () => {
 
     it('has a label for every view', () => {
       expect(CHARACTER_VIEW_LABELS).toEqual({
-        scene: 'シーン内のキャラクター',
-        mine: '自分のキャラクター',
-        all: 'すべてのキャラクター',
+        scene: 'シーン内',
+        mine: '保有中',
+        all: 'すべて',
       });
     });
   });
