@@ -231,7 +231,7 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     unmount(instance);
   });
 
-  // spec: alhalte-argenterie/control-panel Issue #63: 縦画面時のBottom sheet (width: 100%) と3状態（閉・半・全開）
+  // spec: alhalte-argenterie/control-panel Issue #63 / Issue #242: 縦画面時のBottom sheet (width: 100%) と3状態（閉・半・全開）
   it('mounts Bottom sheet in portrait mode occupying 100% width and supports 3 states (half, full, collapsed)', async () => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
     Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
@@ -249,54 +249,51 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     expect(bottomSheet).toBeTruthy();
     expect(bottomSheet?.classList.contains('np-sheet-bottom')).toBe(true);
 
-    // Verify drag handle is present
+    // The noph-ui drag handle is kept (Issue #242 does not remove it; drag and
+    // snap-down still work).
     const handle = bottomSheet?.querySelector<HTMLButtonElement>('.np-sheet-handle');
     expect(handle).toBeTruthy();
 
     // Verify 100% width constraint (class & style)
     expect(bottomSheet?.classList.contains('portrait-bottom-sheet')).toBe(true);
 
-    // State 1: Half (default open state: 50vh, not expanded)
+    // State 1: Half (default open state: 50dvh, not expanded)
     expect(bottomSheet?.hasAttribute('open')).toBe(true);
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(false);
     // Issue #223: the state is explicit, not inferred from the content height.
     expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
 
-    // Mock getBoundingClientRect for sheet element & content so naturalHeight calculation works
-    if (bottomSheet) {
-      bottomSheet.getBoundingClientRect = () => ({
-        top: 400,
-        bottom: 800,
-        left: 0,
-        right: 400,
-        width: 400,
-        height: 400,
-        x: 0,
-        y: 400,
-        toJSON: () => {},
-      });
-      const content = bottomSheet.querySelector<HTMLElement>('.np-sheet-content');
-      if (content) {
-        Object.defineProperty(content, 'clientHeight', { configurable: true, value: 350 });
-        Object.defineProperty(content, 'scrollHeight', { configurable: true, value: 800 });
-      }
-    }
+    // State 2: Full (Issue #242: one activation of the header toggle, with no
+    // `clientHeight` / `scrollHeight` mock of the sheet content).
+    let expandBtn = target.querySelector<HTMLButtonElement>('[data-testid="expand-sheet-button"]');
+    expect(expandBtn).toBeTruthy();
+    expect(expandBtn?.getAttribute('data-panel-placement')).toBe('bottom');
+    expect(expandBtn?.getAttribute('aria-expanded')).toBe('false');
+    expect(expandBtn?.getAttribute('aria-label')).toBe('ボトムシートを全開にする');
+    expect(expandBtn?.textContent).toContain('open_in_full');
 
-    // State 2: Full (expanded to full window height less top margin)
-    // Clicking handle steps to full (expanded)
-    handle?.click();
+    expandBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(true);
     expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('full');
 
-    // Clicking handle again steps back to half
-    handle?.click();
+    expandBtn = target.querySelector<HTMLButtonElement>('[data-testid="expand-sheet-button"]');
+    expect(expandBtn?.getAttribute('aria-expanded')).toBe('true');
+    expect(expandBtn?.getAttribute('aria-label')).toBe('ボトムシートを半開に戻す');
+    expect(expandBtn?.textContent).toContain('close_fullscreen');
+
+    // One activation back to half.
+    expandBtn?.click();
     await new Promise((r) => setTimeout(r, 20));
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(false);
     expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
+    expect(
+      target
+        .querySelector('[data-testid="expand-sheet-button"]')
+        ?.getAttribute('aria-expanded'),
+    ).toBe('false');
 
-    // State 3: Collapsed (closed)
-    // Collapsing via panel collapse button
+    // State 3: Collapsed (closed), still via the header collapse button.
     const collapseBtn = target.querySelector<HTMLButtonElement>('[data-testid="collapse-button"]');
     expect(collapseBtn).toBeTruthy();
     collapseBtn?.click();
@@ -304,7 +301,7 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     expect(bottomSheet?.hasAttribute('open')).toBe(false);
     expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('closed');
 
-    // Reopen using floating reopen button returns to half height
+    // Reopen using floating reopen button returns to half height.
     const reopenBtn = target.querySelector<HTMLButtonElement>('[data-testid="reopen-sheet-button"]');
     expect(reopenBtn).toBeTruthy();
     reopenBtn?.click();
@@ -313,11 +310,117 @@ describe('Responsive Control Panel (Side Sheet & Bottom Sheet)', () => {
     expect(bottomSheet?.hasAttribute('open')).toBe(true);
     expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(false);
     expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
+    expect(
+      target
+        .querySelector('[data-testid="expand-sheet-button"]')
+        ?.getAttribute('aria-expanded'),
+    ).toBe('false');
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/control-panel Issue #242: 縦画面のボトムシートは内容高さに依存せず全開/半開を切り替えられる
+  it('reaches the full portrait sheet without content-height mocks (Issue #242)', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const instance = mount(App, {
+      target,
+      props: { initialRoom: dummyRoom },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const bottomSheet = target.querySelector<HTMLDialogElement>('[data-testid="portrait-sheet-dialog"]');
+    expect(bottomSheet).toBeTruthy();
+
+    // No mock: jsdom reports zero content height, so noph-ui's
+    // `scrollHeight - clientHeight` based `step()` cannot grow the sheet.
+    const content = bottomSheet?.querySelector<HTMLElement>('.np-sheet-content');
+    expect(content?.clientHeight).toBe(0);
+    expect(content?.scrollHeight).toBe(0);
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
+
+    // One activation: half -> full.
+    const expandBtn = target.querySelector<HTMLButtonElement>('[data-testid="expand-sheet-button"]');
+    expect(expandBtn).toBeTruthy();
+    expect(expandBtn?.getAttribute('aria-expanded')).toBe('false');
+    expandBtn?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(true);
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('full');
+    expect(
+      target.querySelector('[data-testid="expand-sheet-button"]')?.getAttribute('aria-expanded'),
+    ).toBe('true');
+
+    // One activation: full -> half.
+    target.querySelector<HTMLButtonElement>('[data-testid="expand-sheet-button"]')?.click();
+    await new Promise((r) => setTimeout(r, 20));
+    expect(bottomSheet?.classList.contains('np-sheet-expanded')).toBe(false);
+    expect(bottomSheet?.getAttribute('data-sheet-state')).toBe('half');
+    expect(
+      target.querySelector('[data-testid="expand-sheet-button"]')?.getAttribute('aria-expanded'),
+    ).toBe('false');
+
+    // CSS contract: the height comes from the viewport and the sheet state,
+    // never from the content height.
+    const portraitRule = ruleDeclarations(
+      APP_SOURCE,
+      '.bottom-sheet-container :global(.portrait-bottom-sheet)',
+    );
+    expect(portraitRule).toContain('--np-sheet-top-margin: 4.5rem');
+    expect(portraitRule).toContain(
+      '--np-sheet-full-height: calc(100dvh - var(--np-sheet-top-margin))',
+    );
+    expect(portraitRule).toContain('height: var(--np-sheet-half-height)');
+    expect(portraitRule).toContain('max-height: var(--np-sheet-half-height)');
+    // `dvh` only: no `vh` fallback that would ignore the dynamic viewport.
+    expect(portraitRule).not.toMatch(/(?<![a-z])vh\b/);
+    expect(portraitRule).not.toMatch(/height:\s*auto/);
+
+    const expandedRule = ruleDeclarations(
+      APP_SOURCE,
+      '.bottom-sheet-container :global(.portrait-bottom-sheet.np-sheet-expanded)',
+    );
+    expect(expandedRule).toContain('height: var(--np-sheet-full-height)');
+    expect(expandedRule).toContain('max-height: var(--np-sheet-full-height)');
+    expect(expandedRule).not.toMatch(/height:\s*auto/);
+
+    // Full covers ~90% of a typical portrait viewport: the only subtraction is
+    // noph-ui's 4.5rem top margin (72px at the default 16px root font size).
+    for (const viewportHeight of [800, 844]) {
+      const covered = (viewportHeight - 4.5 * 16) / viewportHeight;
+      expect(covered).toBeGreaterThanOrEqual(0.89);
+      expect(covered).toBeLessThanOrEqual(0.92);
+    }
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/control-panel Issue #242: 横画面のサイドシートには全開トグルを出さない
+  it('does not render the expand control on the landscape side sheet (Issue #242)', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1200 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const instance = mount(App, {
+      target,
+      props: { initialRoom: dummyRoom },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const sideSheet = target.querySelector<HTMLDialogElement>('[data-testid="landscape-side-sheet"]');
+    expect(sideSheet?.hasAttribute('open')).toBe(true);
+    // The header is shared, but the toggle is portrait-only.
+    expect(target.querySelector('[data-testid="expand-sheet-button"]')).toBeNull();
+    expect(target.querySelector('[data-testid="collapse-button"]')).toBeTruthy();
+    expect(sideSheet?.classList.contains('np-sheet-expanded')).toBe(false);
 
     unmount(instance);
   });
 
   // spec: alhalte-argenterie/control-panel Issue #63: ドラッグ終了時のMotion physics (Spring) とスナップ機構
+  // (Issue #242 keeps the noph-ui handle and its drag/snap behaviour; this test
+  // still mocks noph-ui internals because `step()` itself still depends on
+  // `naturalHeight`, which the state-sized portrait sheet never exceeds.)
   it('snaps Bottom sheet to nearest state with Motion physics (Spring) on drag release', async () => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
     Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
