@@ -40,6 +40,7 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`
    * - GitHub Issue #54: 共通フッターに関する提言
    * - GitHub Issue #109 / sub-issue #139: 送信中インジケーター・オフラインキュー通知
+   * - GitHub Issue #246: ダイスピッカーの表示設定をリロード後も保持する
    */
   import {
     Button,
@@ -62,6 +63,10 @@
     createTextGenerastAST,
     type GenerastAST,
   } from '../../utils/generast.js';
+  import {
+    getDicePickerVisible,
+    setDicePickerVisible,
+  } from '../../utils/dicePickerPreference.js';
   import {
     applyMenuPosition,
     getMenuPositionStyle,
@@ -86,7 +91,13 @@
     extensions = [],
     extensionPipeline = new ExtensionPipeline(),
     selectedCharacterId,
-    showDicePicker = $bindable(true),
+    /**
+     * Whether the dice picker is shown. An explicit prop wins (tests /
+     * preview overrides); otherwise the persisted preference is read on
+     * mount, so the hidden state survives reloads and footer remounts
+     * (Issue #246).
+     */
+    showDicePicker = $bindable(getDicePickerVisible()),
     role = 'participant',
     sending = false,
     onTabChange,
@@ -517,6 +528,8 @@
             <MenuItem
               onclick={() => {
                 showDicePicker = !showDicePicker;
+                // Issue #246: persist the choice so a reload / remount keeps it.
+                setDicePickerVisible(showDicePicker);
                 onToggleDicePicker?.(showDicePicker);
                 isMoreMenuOpen = false;
               }}
