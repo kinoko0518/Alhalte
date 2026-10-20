@@ -1104,8 +1104,12 @@
   }
 
   async function handleMoveMemberApply(charId: string) {
+    // A whitespace-only field is treated like an empty one (Issue #225): letting
+    // it through would create a scene whose display name is blank while the
+    // server falls back to the internal id.
+    const typedTarget = memberTargetSceneNames[charId]?.trim() ?? '';
     const targetName =
-      memberTargetSceneNames[charId] ||
+      typedTarget ||
       allScenes.find((s) => s.members.includes(charId))?.name ||
       currentScene.name;
     if (!targetName || isAnySceneActionPending()) return;

@@ -648,6 +648,65 @@ describe('Scene Settings & Juices', () => {
     target.remove();
   });
 
+  // spec: alhalte-argenterie/scene-settings 空白のみの移動先は空欄と同じ扱いにする (Issue #225)
+  it('treats a whitespace-only move target like an empty field instead of creating a blank-named scene', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const character: Character = {
+      id: 'char-alice',
+      name: 'アリス',
+      initiative: 10,
+      description: '',
+      reference: '',
+      statuses: [],
+      parameters: [],
+      chatPalette: '',
+      hideStatus: false,
+      placedAsPiece: false,
+    };
+    const currentScene: Scene = {
+      id: 'scene-a',
+      name: '町',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: ['char-alice'],
+    };
+
+    let movedTargetScene: string | undefined;
+    const instance = mount(SceneSettingsTab, {
+      target,
+      props: {
+        currentScene,
+        allScenes: [currentScene],
+        characters: [character],
+        role: 'admin',
+        onMoveMember: (_charId, targetScene) => {
+          movedTargetScene = targetScene;
+        },
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const targetInput = target.querySelector<HTMLInputElement>(
+      '[data-testid="member-target-input-char-alice"]',
+    )!;
+    targetInput.value = '   ';
+    targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    target.querySelector<HTMLButtonElement>('[data-testid="apply-move-btn-char-alice"]')!.click();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // The empty field falls back to the member's current scene, never to a
+    // blank name that would leave the server to name the scene after its id.
+    expect(movedTargetScene).toBe('町');
+
+    unmount(instance);
+    target.remove();
+  });
+
   // spec: alhalte-argenterie/scene-settings シーン名入力欄を最上部固定からスクロール内「管理」セクション・「シーンを新規作成」直上へ移動 (Issue #123)
   it('places scene name input inside management section above create scene button instead of fixed top header', () => {
     const target = document.createElement('div');
