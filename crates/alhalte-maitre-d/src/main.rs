@@ -92,6 +92,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("CORS allowed origins: {}", args.cors_origins.join(", "));
         state = state.with_allowed_origins(args.cors_origins);
     }
+    // Issue #229: development-only, opt-in private-network origins. Bistrot
+    // emits the port only for the bundled local-development configuration.
+    if !args.allow_lan_origin_ports.is_empty() {
+        tracing::warn!(
+            "Development-only LAN origins enabled for http://<private IPv4>:{:?}; never use this on a public network",
+            args.allow_lan_origin_ports
+        );
+        state = state.with_lan_origin_ports(args.allow_lan_origin_ports);
+    }
     let app = create_router(state);
 
     // If an optional UNIX domain socket is specified, also serve on it

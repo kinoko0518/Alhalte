@@ -36,6 +36,19 @@ chunk-size-exponent = 8
 
 [argenterie]
 port = 5173
+# 開発専用（Issue #229）: 同一イーサネット / LAN 内の端末（スマホ等）から
+# Bistrot を開いて状態同期を試せるようにする。
+#
+# true にすると次の 2 点だけが変わる:
+#   - Vite が 0.0.0.0 で待ち受ける（ローカルの http://127.0.0.1:5173/ も従来どおり）
+#   - maitre-d に --allow-lan-origin-port 5173 が渡され、
+#     http://<プライベート IPv4>:5173 の origin だけが CORS / OAuth の
+#     return_to に追加で許可される（ワイルドカードではない）
+#
+# UI は TLS なしの HTTP で配信され、認証は maitre-d のログインだけに依存する。
+# インターネットに露出する環境では絶対に true にしないこと。
+# 本番用の Bistrot.local.toml ではこの行を書かない（Rust 側の既定は false）。
+lan = true
 
 [[extensions]]
 id = "alhalte-dsl"

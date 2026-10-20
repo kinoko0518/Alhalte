@@ -189,6 +189,12 @@ WantedBy=alhalte-bistrot.target
 
 /// Generates the content of `alhalte-argenterie.service`.
 ///
+/// The bind host comes from [`BistrotConfig::argenterie_bind_host`], so the
+/// development-only `[argenterie] lan` switch exposes Vite on `0.0.0.0` while
+/// default configurations keep binding loopback (Issue #229). `package.json`
+/// does not hard-code the host; it only runs `vite`, and these arguments are
+/// the single source of truth.
+///
 /// Deterministic and pure function.
 pub fn generate_argenterie_service(config: &BistrotConfig, options: &SystemdOptions) -> String {
     let working_dir = options.web_dir.clone().or_else(|| {
@@ -206,10 +212,13 @@ pub fn generate_argenterie_service(config: &BistrotConfig, options: &SystemdOpti
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "pnpm".to_string());
-        format!(
-            "{pnpm} run dev --host {} --port {}",
-            config.restaurant.host, config.argenterie.port
-        )
+        let args = crate::args::generate_argenterie_args(config);
+        let escaped = args
+            .iter()
+            .map(|arg| systemd_escape_arg(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{pnpm} run dev {escaped}")
     };
 
     let mut service_lines = Vec::new();

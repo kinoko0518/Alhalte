@@ -87,7 +87,7 @@ pub use server::{
     RoomSessionQuery, SESSION_COOKIE_MAX_AGE_SECS, SearchAccountsQuery, ServerInfoResponse,
     SessionResponse, SetRoomPermissionRequest, VerifySessionQuery, VerifySessionResponse,
     create_router, extract_session_id_from_cookie, is_allowed_return_to,
-    parse_session_id_from_cookie_str, session_cookie_header,
+    is_allowed_return_to_with_lan, parse_session_id_from_cookie_str, session_cookie_header,
 };
 pub use session::{
     cleanup_sessions_at, cleanup_sessions_with_cutoff, duration_until_next_4am, previous_4am_local,

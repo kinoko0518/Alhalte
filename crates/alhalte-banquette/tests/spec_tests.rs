@@ -27,7 +27,9 @@ use alhalte_banquette::labels::{
     LABEL_ALHALTE_BANQUETTE_SCENE, LABEL_ALHALTE_MAITRE_D_ACCOUNT_ID,
     LABEL_ALHALTE_MAITRE_D_SESSION_ID,
 };
-use alhalte_banquette::log::{CharacterCameEvent, CharacterGoneEvent, SceneLog};
+use alhalte_banquette::log::{
+    CharacterCameEvent, CharacterGoneEvent, SceneLog, unix_timestamp_now,
+};
 use alhalte_banquette::protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
     WebRtcSignalPayload,
@@ -393,17 +395,39 @@ async fn test_log_chunk_sealing_to_cellar() {
     );
 }
 
+/// Encodes a `u64` using postcard's varint format.
+///
+/// Used to hand-build the legacy scene-event payload (a single
+/// `character_id` varint) that was persisted before Issue #227.
+fn postcard_varint(value: u64) -> Vec<u8> {
+    let mut remaining = value;
+    let mut bytes = Vec::new();
+    loop {
+        let byte = (remaining & 0x7f) as u8;
+        remaining >>= 7;
+        if remaining == 0 {
+            bytes.push(byte);
+            break;
+        }
+        bytes.push(byte | 0x80);
+    }
+    bytes
+}
+
 #[test]
 // spec: alhalte-banquette/log 0003 event serialization and duck-typing
 fn test_log_event_serialization_and_duck_typing() {
     // 1. CharacterCameEvent
     let came = CharacterCameEvent {
         character_id: 12345,
+        timestamp: 1_700_000_000,
     };
     let tin = came.to_tin().unwrap();
     assert_eq!(tin.label, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME);
     let decoded = CharacterCameEvent::from_tin(&tin).unwrap();
     assert_eq!(decoded, came);
+    assert_eq!(decoded.character_id, 12345);
+    assert_eq!(decoded.timestamp, 1_700_000_000);
 
     let duck = came.to_duck_typed_map();
     let from_duck = CharacterCameEvent::from_duck_typed_map(&duck).unwrap();
@@ -412,15 +436,72 @@ fn test_log_event_serialization_and_duck_typing() {
     // 2. CharacterGoneEvent
     let gone = CharacterGoneEvent {
         character_id: 12345,
+        timestamp: 1_700_000_001,
     };
     let tin = gone.to_tin().unwrap();
     assert_eq!(tin.label, LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE);
     let decoded = CharacterGoneEvent::from_tin(&tin).unwrap();
     assert_eq!(decoded, gone);
+    assert_eq!(decoded.character_id, 12345);
+    assert_eq!(decoded.timestamp, 1_700_000_001);
 
     let duck = gone.to_duck_typed_map();
+    assert_eq!(duck["timestamp"].as_u64().unwrap(), 1_700_000_001);
     let from_duck = CharacterGoneEvent::from_duck_typed_map(&duck).unwrap();
     assert_eq!(from_duck, gone);
+}
+
+#[test]
+// spec: alhalte-banquette/log 0003 legacy came/gone payload compatibility (#227)
+fn test_log_event_legacy_payload_decodes_with_zero_timestamp() {
+    // The old payload is a single postcard `u64` (the character id).
+    let legacy_came = Tin::new(
+        LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_CAME,
+        postcard_varint(12345),
+    );
+    let decoded = CharacterCameEvent::from_tin(&legacy_came).unwrap();
+    assert_eq!(decoded.character_id, 12345);
+    assert_eq!(decoded.timestamp, 0);
+
+    let legacy_gone = Tin::new(
+        LABEL_ALHALTE_BANQUETTE_LOG_CHARACTER_GONE,
+        postcard_varint(6789),
+    );
+    let decoded = CharacterGoneEvent::from_tin(&legacy_gone).unwrap();
+    assert_eq!(decoded.character_id, 6789);
+    assert_eq!(decoded.timestamp, 0);
+
+    // A duck-typed map written before #227 has no `timestamp` key.
+    let mut legacy_duck = HashMap::new();
+    legacy_duck.insert("character_id".to_string(), Tin::from_u64(12345));
+    let decoded = CharacterCameEvent::from_duck_typed_map(&legacy_duck).unwrap();
+    assert_eq!(decoded.character_id, 12345);
+    assert_eq!(decoded.timestamp, 0);
+    let decoded = CharacterGoneEvent::from_duck_typed_map(&legacy_duck).unwrap();
+    assert_eq!(decoded.character_id, 12345);
+    assert_eq!(decoded.timestamp, 0);
+}
+
+#[test]
+// spec: alhalte-banquette/character MoveCharacter appends timestamped came/gone (#227)
+fn test_log_event_now_sets_non_zero_timestamp() {
+    let before = unix_timestamp_now();
+    let came = CharacterCameEvent::now(7);
+    let gone = CharacterGoneEvent::now(7);
+    let after = unix_timestamp_now();
+
+    for timestamp in [came.timestamp, gone.timestamp] {
+        assert!(timestamp > 0, "the append time must be a real UNIX time");
+        assert!(
+            timestamp >= before && timestamp <= after,
+            "the append time must be read from the system clock"
+        );
+    }
+    assert_eq!(came.character_id, 7);
+    assert_eq!(gone.character_id, 7);
+    // The timestamp survives a Tin round trip on the MoveCharacter path.
+    let decoded = CharacterGoneEvent::from_tin(&gone.to_tin().unwrap()).unwrap();
+    assert_eq!(decoded, gone);
 }
 
 #[test]

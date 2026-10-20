@@ -62,14 +62,15 @@ pub mod args;
 pub mod config;
 pub mod error;
 pub mod ffi;
+pub mod lan;
 pub mod rops;
 pub mod secrets;
 pub mod systemd;
 
 // Re-exports for convenience
 pub use args::{
-    ModuleArgs, generate_all_args, generate_cellar_args, generate_maitre_d_args,
-    generate_module_args,
+    ModuleArgs, generate_all_args, generate_argenterie_args, generate_cellar_args,
+    generate_maitre_d_args, generate_module_args,
 };
 pub use config::{
     ArgenterieConfig, BanquetteConfig, BistrotConfig, CellarConfig, DEFAULT_ARGENTERIE_PORT,
@@ -77,6 +78,7 @@ pub use config::{
     DEFAULT_SOCKET_DIR, ExtensionConfig, ExtensionManifestEntry, MaitreDConfig, RestaurantConfig,
 };
 pub use error::{BistrotError, Result};
+pub use lan::{detect_lan_ipv4_addresses, detect_lan_urls, lan_url};
 pub use rops::{
     ParseOptions, decrypt_rops_toml, decrypt_rops_toml_with_key, encrypt_age_armored_value,
     encrypt_bistrot_toml, is_rops_encrypted, load_from_path, load_from_path_with_key,

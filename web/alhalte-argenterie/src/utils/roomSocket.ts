@@ -385,41 +385,82 @@ function readPostcardVarint(cursor: PostcardCursor): bigint | null {
   return null;
 }
 
+/** A decoded system event plus the append timestamp carried by the payload. */
+interface DecodedLogSystemEvent {
+  event: LogSystemEvent;
+  /** UNIX seconds; 0 for legacy id-only payloads or a missing timestamp. */
+  timestamp: number;
+}
+
 /**
- * Decodes a banquette system-event Tin into a {@link LogSystemEvent}.
+ * Decodes a banquette system-event Tin into its event plus the wire timestamp.
  *
- * Field order follows the serde definitions in `alhalte-banquette/src/log.rs`:
- * - `character-came` / `character-gone`: `u64`
+ * Field order follows the serde definitions in `alhalte-banquette/src/log.rs`
+ * (Issue #227):
+ * - `character-came` / `character-gone`: `character_id` then an optional
+ *   `timestamp`, both postcard `u64` varints with `character_id` first.
  *
- * Returns `null` for unknown labels or malformed payloads; callers then fall
- * back to the text path without ever decoding the bytes as UTF-8 chat content.
+ * The timestamp is optional for backward compatibility: events persisted before
+ * Issue #227 carry only `character_id`. The trailing varint is read only when
+ * bytes remain, so a legacy or truncated payload yields `timestamp: 0` instead
+ * of throwing.
+ *
+ * Returns `null` for unknown labels or a payload whose character id cannot be
+ * decoded.
  */
-export function decodeLogSystemEvent(entry: unknown): LogSystemEvent | null {
+function decodeLogSystemEventWithTimestamp(
+  entry: unknown,
+): DecodedLogSystemEvent | null {
   if (!isTinJson(entry)) return null;
   const label = Number(entry.label);
   const cursor: PostcardCursor = { bytes: toByteArray(entry.payload), offset: 0 };
 
+  let type: LogSystemEvent['type'] | null;
   if (label === LABEL_BANQUETTE_LOG_CHARACTER_CAME) {
-    const characterId = readPostcardVarint(cursor);
-    if (characterId === null) return null;
-    return { type: 'character-came', characterId: characterId.toString() };
-  }
-  if (label === LABEL_BANQUETTE_LOG_CHARACTER_GONE) {
-    const characterId = readPostcardVarint(cursor);
-    if (characterId === null) return null;
-    return { type: 'character-gone', characterId: characterId.toString() };
+    type = 'character-came';
+  } else if (label === LABEL_BANQUETTE_LOG_CHARACTER_GONE) {
+    type = 'character-gone';
+  } else {
+    return null;
   }
 
-  return null;
+  const characterId = readPostcardVarint(cursor);
+  if (characterId === null) return null;
+
+  // Legacy payloads end here (id only). Never throw on a truncated timestamp.
+  let timestamp = 0;
+  if (cursor.offset < cursor.bytes.length) {
+    const decodedTimestamp = readPostcardVarint(cursor);
+    if (decodedTimestamp !== null) timestamp = Number(decodedTimestamp);
+  }
+
+  return {
+    event: { type, characterId: characterId.toString() },
+    timestamp,
+  };
+}
+
+/**
+ * Decodes a banquette system-event Tin into a {@link LogSystemEvent}.
+ *
+ * Returns `null` for unknown labels or malformed payloads; callers then fall
+ * back to the text path without ever decoding the bytes as UTF-8 chat content.
+ * The event shape is unchanged by Issue #227; the append timestamp is exposed
+ * through the log record instead (see {@link systemEventToLogRecord}).
+ */
+export function decodeLogSystemEvent(entry: unknown): LogSystemEvent | null {
+  return decodeLogSystemEventWithTimestamp(entry)?.event ?? null;
 }
 
 /**
  * Builds a `system` log record from a decoded banquette event Tin.
  *
  * The postcard payload is never decoded as UTF-8, so no byte garbage can leak
- * into the chat text. A known event label with a malformed payload still yields
- * a `system` record (without an `event`), which renders as a generic status row
- * instead of binary text. Returns `null` for unknown labels.
+ * into the chat text. The record timestamp comes from the append time carried
+ * by the event payload (Issue #227); legacy id-only events keep timestamp 0. A
+ * known event label with a malformed payload still yields a `system` record
+ * (without an `event`), which renders as a generic status row instead of binary
+ * text. Returns `null` for unknown labels.
  */
 function systemEventToLogRecord(
   entry: unknown,
@@ -429,18 +470,18 @@ function systemEventToLogRecord(
 ): LogRecord | null {
   if (!isTinJson(entry)) return null;
   const label = Number(entry.label);
-  const event = decodeLogSystemEvent(entry);
-  if (!event && !isBanquetteSystemEventLabel(label)) return null;
+  const decoded = decodeLogSystemEventWithTimestamp(entry);
+  if (!decoded && !isBanquetteSystemEventLabel(label)) return null;
   return parseLogRecord(
     {
       sceneId,
       content: '',
       speaker: 'System',
-      timestamp: 0,
+      timestamp: decoded?.timestamp ?? 0,
       chunkIndex,
       position,
       kind: 'system',
-      ...(event ? { event } : {}),
+      ...(decoded ? { event: decoded.event } : {}),
     },
     `log-${chunkIndex}-${position}`,
   );

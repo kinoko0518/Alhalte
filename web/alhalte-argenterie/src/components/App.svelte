@@ -5,10 +5,14 @@
    * Layout adheres to Material 3 Expressive:
    * - Landscape: Left side field panel, Right side Side Sheet control panel (`Sheet` with `placement="end"`).
    * - Portrait: Full-screen field panel with Bottom Sheet control panel (`Sheet` with `placement="bottom"`).
+   *   The portrait sheet height is a function of its state only (closed, half 50dvh,
+   *   full viewport minus noph-ui's top margin) so the log list inside it scrolls
+   *   (Issue #223).
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie`
    * - GitHub Issue #32: Side sheets (landscape) & Bottom sheets (portrait)
+   * - GitHub Issue #223: portrait bottom sheet sizing, scrolling and close icon
    */
   import 'noph-ui/defaultTheme';
   import { Button, IconButton, Sheet } from 'noph-ui';
@@ -383,6 +387,14 @@
   );
   let isControlSheetOpen = $state(true);
   let isControlSheetExpanded = $state(false);
+  /**
+   * The three portrait bottom-sheet states (Issue #223): closed, half (exactly
+   * 50dvh) and fully open. Exposed as `data-sheet-state` so the state-sized
+   * sheet is assertable without measuring jsdom layout.
+   */
+  let controlSheetState = $derived(
+    !isControlSheetOpen ? 'closed' : isControlSheetExpanded ? 'full' : 'half',
+  );
   let sideSheetWidth = $state(440);
   let isResizing = $state(false);
 
@@ -3082,6 +3094,7 @@
                   {selectedCharacterId}
                   role={effectiveRole}
                   {defaultPermission}
+                  placement="side"
                   sending={isSending}
                   {queuedMessages}
                   {sceneActionPending}
@@ -3165,6 +3178,7 @@
             handleLabel="シートの開閉"
             class="portrait-bottom-sheet"
             data-testid="portrait-sheet-dialog"
+            data-sheet-state={controlSheetState}
           >
             <div class="bottom-sheet-content-wrapper">
               <ControlPanel
@@ -3178,6 +3192,7 @@
                 {selectedCharacterId}
                 role={effectiveRole}
                 {defaultPermission}
+                placement="bottom"
                 sending={isSending}
                 {queuedMessages}
                 {sceneActionPending}
@@ -3658,9 +3673,31 @@
     right: 0;
     z-index: 500;
   }
+  /*
+   * Portrait bottom sheet sizing (Issue #223).
+   *
+   * noph-ui sizes a bottom sheet from its content, capped by `--np-sheet-size`,
+   * so a short log made the half state short and a long one made it tall. The
+   * portrait sheet is sized by its state alone:
+   *
+   * - closed: the Sheet's own closed state (`display: none` / off screen).
+   * - half:   exactly 50dvh.
+   * - full:   the viewport less the same top margin noph-ui keeps free in
+   *           `np-sheet-bottom` (`--_top-margin`: 4.5rem, 3.5rem above 640px).
+   *
+   * A definite height is also what makes the inner scroll chain work: the flex
+   * children (`.np-sheet-content` → `.bottom-sheet-content-wrapper` →
+   * `.control-panel-container` → `.tab-content-area` → `.messages-list`) can
+   * only bound the log list when the sheet itself has a used height.
+   */
   .bottom-sheet-container :global(.portrait-bottom-sheet) {
-    --np-sheet-size: 50vh;
+    --np-sheet-size: 50dvh;
     --np-sheet-max-width: 100%;
+    --np-sheet-top-margin: 4.5rem;
+    --np-sheet-half-height: 50dvh;
+    --np-sheet-full-height: calc(100dvh - var(--np-sheet-top-margin));
+    height: var(--np-sheet-half-height);
+    max-height: var(--np-sheet-half-height);
     width: 100% !important;
     max-width: 100% !important;
     inset-inline: 0 !important;
@@ -3668,12 +3705,20 @@
     box-shadow: var(--np-elevation-3);
     transition:
       translate var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
+      height var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
       max-height var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
       display var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete,
       overlay var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete;
   }
   .bottom-sheet-container :global(.portrait-bottom-sheet.np-sheet-expanded) {
-    max-height: calc(100dvh - 3.5rem);
+    height: var(--np-sheet-full-height);
+    max-height: var(--np-sheet-full-height);
+  }
+  /* noph-ui raises its top margin from 4.5rem to 3.5rem above 640dp. */
+  @media (width > 640px) {
+    .bottom-sheet-container :global(.portrait-bottom-sheet) {
+      --np-sheet-top-margin: 3.5rem;
+    }
   }
   .bottom-sheet-container :global(.portrait-bottom-sheet .np-sheet-content) {
     padding: 0;
@@ -3691,6 +3736,16 @@
     flex-direction: column;
     flex: 1;
     overflow: hidden;
+  }
+  /*
+   * The control panel fills the sheet content wrapper instead of relying on a
+   * percentage of an auto-height parent (Issue #223). From here the definite
+   * height continues through `ControlPanel`'s `.tab-content-area` and
+   * `LogTab`'s `.messages-area` / `.messages-list`.
+   */
+  .bottom-sheet-container :global(.bottom-sheet-content-wrapper .control-panel-container) {
+    flex: 1;
+    min-height: 0;
   }
   .reopen-sheet-floating.portrait-reopen {
     position: fixed;
