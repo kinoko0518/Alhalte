@@ -1,32 +1,18 @@
 import { defineConfig } from 'vite';
 import { svelte } from '@sveltejs/vite-plugin-svelte';
 import path from 'path';
+import { viteProxy } from './vite.proxy.js';
 
 export default defineConfig({
   plugins: [svelte()],
+  // Serve the SPA shell for unknown paths (e.g. the direct room URL
+  // `/rooms/<roomId>#<roomKey>`) instead of answering 404. This is Vite's
+  // default; set explicitly to document why `/rooms/...` must not be proxied.
+  appType: 'spa',
   server: {
-    proxy: {
-      '/api': {
-        target: 'http://127.0.0.1:8080',
-        changeOrigin: true,
-      },
-      // Google OAuth entry / callback (`/auth/login`, `/auth/google/callback`).
-      // maitre-d's --public-url points at this dev origin so the session cookie
-      // is set on the same origin the UI and /api/session use.
-      '/auth': {
-        target: 'http://127.0.0.1:8080',
-        changeOrigin: true,
-      },
-      '/room': {
-        target: 'http://127.0.0.1:8080',
-        changeOrigin: true,
-        ws: true,
-      },
-      '/ws': {
-        target: 'ws://127.0.0.1:8080',
-        ws: true,
-      },
-    },
+    // `/rooms/<roomId>` is a client-side route and must fall through to the SPA
+    // fallback above; only maitre-d's `/room/...` endpoints are proxied (#224).
+    proxy: viteProxy,
   },
   resolve: {
     conditions: ['svelte', 'browser'],

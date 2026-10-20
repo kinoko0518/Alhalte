@@ -143,6 +143,25 @@ describe('Home Screen & Room URL', () => {
     expect(resolvedAdmin?.isAdmin).toBe(true);
   });
 
+  // spec: alhalte-argenterie/home 直接アクセスの部屋 URL 解決 (#224)
+  it('resolves a directly-opened /rooms/<id>#<64hex> URL and keeps the key in the fragment', () => {
+    const key = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+    const href = `http://127.0.0.1:5173/rooms/f39403e73f32ec91#${key}`;
+
+    // The SPA route is parsed client-side; the key never leaves the fragment.
+    const parsed = parseRoomUrl(href);
+    expect(parsed).toEqual({
+      roomId: 'f39403e73f32ec91',
+      roomKeyHex: key,
+      roomUrl: href,
+    });
+
+    const resolved = resolveRoomFromLocation({ href });
+    expect(resolved?.id).toBe('f39403e73f32ec91');
+    expect(resolved?.url).toBe(href);
+    expect(parseRoomUrl(resolved!.url)?.roomKeyHex).toBe(key);
+  });
+
   // spec: alhalte-argenterie/home localStorage保存・取得・管理者除外
   it('saves visited rooms and excludes rooms where user is admin from display', () => {
     const room1: VisitedRoom = {
