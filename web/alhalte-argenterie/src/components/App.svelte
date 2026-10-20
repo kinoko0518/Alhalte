@@ -745,6 +745,19 @@
     }
   });
 
+  // The first user gesture unlocks BGM autoplay; the user never has to manage
+  // it (Issue #248). A dedicated mount effect (no reactive reads) keeps the
+  // listener armed exactly once for the component lifetime.
+  $effect(() => {
+    if (typeof window === 'undefined') return;
+    bgmAutoplayUnlockEnabled = true;
+    armBgmAutoplayUnlockListener();
+    return () => {
+      bgmAutoplayUnlockEnabled = false;
+      disarmBgmAutoplayUnlockListener();
+    };
+  });
+
   $effect(() => {
     if (currentRoom?.id) {
       restoreRoomLogs(currentRoom.id);
@@ -1486,11 +1499,118 @@
     return [...slots, { slot: slotNum, tinId: null, volume: 0.8, isPlaying: false }];
   }
 
+  // ---------------------------------------------------------------------------
+  // BGM autoplay unlock (Issue #248)
+  // ---------------------------------------------------------------------------
+  /**
+   * Whether the window-level autoplay unlock listener may be armed.
+   *
+   * Set by the mount effect and cleared by its cleanup so a late re-arm from an
+   * async continuation can never leak a listener past unmount.
+   */
+  let bgmAutoplayUnlockEnabled = false;
+  /** Whether the one-shot `pointerdown` unlock listener is registered. */
+  let bgmAutoplayUnlockArmed = false;
+
+  /**
+   * Removes the one-shot autoplay unlock listener.
+   *
+   * The listener unregisters itself after a gesture (`once: true`); this covers
+   * the cases where playback is established or the component unmounts first.
+   */
+  function disarmBgmAutoplayUnlockListener(): void {
+    if (!bgmAutoplayUnlockArmed) return;
+    bgmAutoplayUnlockArmed = false;
+    if (typeof window === 'undefined') return;
+    window.removeEventListener('pointerdown', handleBgmAutoplayUnlock, {
+      capture: true,
+    });
+  }
+
+  /**
+   * Registers the one-shot `pointerdown` listener that unlocks BGM autoplay.
+   *
+   * Idempotent, so a state update that still needs a gesture can re-arm it after
+   * a gesture that could not start every intended slot (Issue #248). The user
+   * never sees a "click to enable" affordance; any interaction is enough.
+   */
+  function armBgmAutoplayUnlockListener(): void {
+    if (!bgmAutoplayUnlockEnabled || bgmAutoplayUnlockArmed) return;
+    if (typeof window === 'undefined') return;
+    bgmAutoplayUnlockArmed = true;
+    window.addEventListener('pointerdown', handleBgmAutoplayUnlock, {
+      capture: true,
+      once: true,
+    });
+  }
+
+  /** Slots the authoritative current-scene state wants playing. */
+  function intendedBgmSlots(): Array<{ slot: number; tinId: string }> {
+    const scene = currentScene;
+    if (!scene) return [];
+    const intended: Array<{ slot: number; tinId: string }> = [];
+    for (const slot of getNormalizedBgmSlots(scene.juices)) {
+      if (slot.isPlaying && slot.tinId) {
+        intended.push({ slot: slot.slot, tinId: slot.tinId });
+      }
+    }
+    return intended;
+  }
+
+  /**
+   * Starts every intended, already-prepared slot from inside the user gesture.
+   *
+   * `AudioManager.play()` reaches `HTMLAudioElement.play()` synchronously when
+   * the slot is prepared (no pending download), which is what Safari's
+   * same-task requirement needs. Slots still downloading are skipped; the
+   * listener stays armed so the next interaction retries them.
+   */
+  function handleBgmAutoplayUnlock(): void {
+    // `once: true` removed the listener before this callback ran.
+    bgmAutoplayUnlockArmed = false;
+    const attempts: Promise<unknown>[] = [];
+    for (const { slot, tinId } of intendedBgmSlots()) {
+      const state = audioManager.getState(slot);
+      // Only a prepared, silent slot can be resumed here. A slot whose source
+      // is still downloading (or already playing) waits for the next gesture.
+      if (state.tinId !== tinId || state.status !== 'paused') continue;
+      attempts.push(audioManager.play(slot).catch(() => undefined));
+    }
+    void settleBgmAutoplayUnlock(attempts);
+  }
+
+  /**
+   * Keeps the unlock listener armed until every intended slot actually plays.
+   *
+   * The issue literally asks for `{ once: true }`, but consuming the only
+   * unlock on a gesture that arrives before the track is prepared (or that the
+   * browser still refuses) would strand playback; re-arming is the deliberate
+   * deviation documented in the PR body.
+   */
+  async function settleBgmAutoplayUnlock(
+    attempts: Promise<unknown>[],
+  ): Promise<void> {
+    await Promise.all(attempts);
+    const intended = intendedBgmSlots();
+    const allPlaying =
+      intended.length > 0 &&
+      intended.every(({ slot, tinId }) => {
+        const state = audioManager.getState(slot);
+        return state.tinId === tinId && state.status === 'playing';
+      });
+    if (allPlaying) {
+      disarmBgmAutoplayUnlockListener();
+      return;
+    }
+    armBgmAutoplayUnlockListener();
+  }
+
   /**
    * Reconciles one slot's audio element with the authoritative scene state.
    *
-   * Only the current scene makes sound. A `blocked` slot waits for the user
-   * gesture affordance instead of retrying `play()` on every state change.
+   * Only the current scene makes sound. An autoplay rejection leaves the slot
+   * prepared and `paused` (not an error); the window-level pointerdown unlock
+   * above replays it on the next interaction (Issue #248).
    */
   async function syncBgmSlotAudio(
     sceneId: string,
@@ -1519,8 +1639,15 @@
     }
 
     const current = audioManager.getState(slot.slot);
-    // Autoplay policy: keep the prepared source but wait for the click.
-    if (current.status === 'blocked' && current.tinId === track.tinId) return;
+    // Already prepared, or prepared-and-waiting for the user gesture: do not
+    // re-download nor hammer `play()` on every state update. The pointerdown
+    // unlock below replays a paused slot (Issue #248).
+    if (
+      current.tinId === track.tinId &&
+      (current.status === 'playing' || current.status === 'paused')
+    ) {
+      return;
+    }
 
     try {
       await audioManager.prepare(slot.slot, track, roomKey);
@@ -1540,7 +1667,10 @@
       // scene switch): a cleared slot is not a playback error.
       const prepared = audioManager.getState(slot.slot);
       if (prepared.tinId !== track.tinId || prepared.status === 'idle') return;
-      await audioManager.play(slot.slot);
+      const result = await audioManager.play(slot.slot);
+      // The browser refused autoplay: keep the source and let the next user
+      // gesture retry it (Issue #248). This is not an error.
+      if (result === 'paused') armBgmAutoplayUnlockListener();
     } catch (error) {
       console.warn(`[App] Failed to play BGM slot ${slot.slot}:`, error);
       // The manager exposes the user-facing error to the settings tab.
