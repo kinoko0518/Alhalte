@@ -45,7 +45,7 @@
   - 応答が無い場合は `DEFAULT_OPERATION_TIMEOUT_MS = 8000` で `OperationTimeoutError`（`code: 'timeout'`）にし、pending を必ず破棄する。サーバー由来の失敗は `ServerOperationError`（`code` 付き）で返す。
 - 未処理だった `StateSnapshot` / `LogBiblioSnapshot` / `LogChunkSnapshot` / `CharacterInfo` / `LogEventRewound` / `SceneCreated` / `SceneDeleted` / `CharacterMoved` も dispatch し、`onServerFrame` と個別 callback の両方へ流す。
 - **SceneList / SceneInfo**: `SceneList.scenes` は `SceneSummary`（`id`、`name`、`present_character_count`、`present_characters`、`active_client_count`、`is_loaded`）の列で、旧サーバーの bare id 列も受理する。`present_characters` は scene 在籍 character id の昇順リストで、`App` はこれで `scene.members` を再構築する（reload / reconnect 後も復元）。`RoomSocket` は id 列を `getScenes()`、summary を `getSceneSummaries()` に保持し、`onSceneInfo` で create / rename / membership の broadcast を通知する。
-- **StateSnapshot hydration**: `EnterScene` の成功応答として banquette が `StateSnapshot` を返す（access 可能な場合）。`App` は `onStateSnapshot`（real socket）と subscribe（custom / test socket）の両経路で受け、`std::name` / `std::bgm<N>` / `bgm::<slot>::volume` / `std::b-img*` / `view::transform` / `piece::<id>::*` を冪等に適用する。再接続・scene 切替でも同じ snapshot が再適用される。
+- **StateSnapshot hydration**: `EnterScene` の成功応答として banquette が `StateSnapshot` を返す（access 可能な場合）。`App` は `onStateSnapshot`（real socket）と subscribe（custom / test socket）の両経路で受け、`std::name` / `std::bgm<N>` / `bgm::<slot>::playing` / `bgm::<slot>::volume` / `bgm::<slot>::started_at` / `bgm::<slot>::paused_at` / `bgm::<slot>::removed` / `std::b-img*` / `view::transform` / `piece::<id>::*` を冪等に適用する。BGM は removed → track → timestamps → playing / volume の順に適用する。再接続・scene 切替でも同じ snapshot が再適用される。
 
 ### WASM
 
@@ -81,7 +81,7 @@
 
 ### ローカル保存
 
-- `localStorage`: account ID、session ID、訪問済み部屋、最近の部屋、アセット（`alhalte_pantry_assets`）、部屋ログのキャッシュ（`alhalte:room-logs:<roomId>`）。部屋ログは `kind` / `event` / `contentTin` を含めて保存し、復元時は cache-origin として扱う。オフライン表示専用で、サーバーの biblio / chunk snapshot が届いた scene はキャッシュではなくサーバーを正とする。
+- `localStorage`: account ID、session ID、訪問済み部屋、最近の部屋、アセット（`alhalte_pantry_assets`）、部屋ログのキャッシュ（`alhalte:room-logs:<roomId>`）、テーマ（`alhalte:theme`）、共通フッターのダイスピッカー表示設定（`alhalte:dice-picker-visible`、`'true'` / `'false'`、既定は表示。読み書きの失敗・不正値は表示として扱う）。部屋ログは `kind` / `event` / `contentTin` を含めて保存し、復元時は cache-origin として扱う。オフライン表示専用で、サーバーの biblio / chunk snapshot が届いた scene はキャッシュではなくサーバーを正とする。
 - IndexedDB `alhalte-argenterie-outbox`（store `outbox`）: 送信できなかった message / character（拡張用に state / asset も型として許容）を `{ id, roomId, kind, createdAt, payload }` で保存する。`createdAt` から `OUTBOX_TTL_MS = 30 日` を超えたエントリは読み出し時に prune する。IndexedDB が無い環境ではメモリ実装へフォールバックする。
 - Cookie: `session_id`（`SameSite=Lax`）。
 - `sessionStorage`: サインイン前の完全な戻り先 URL（クエリと部屋鍵フラグメントを含む）。サインイン中だけ保持し、`/api/session` 完了時に削除する。OAuth の `state` と `redirect_uri` は maitre-d が保持するためアプリは持たない。
@@ -131,7 +131,7 @@
 
 1. `AccountMenu` は account ID と session ID の両方が保存されている場合だけサインイン済みとみなす。
 2. サインイン済みなら `GET /api/account/{account_id}` で表示名とアイコン Tin ID を取得し、32 byte の Tin ID から `/api/cellar/tin/<hex>` を組み立ててアバターにする。取得中・取得失敗時はイニシャルまたは `account_circle` を表示する。
-3. アバター押下で M3 Menu を開き、「別のアカウントでログイン」「サインアウト」を出す。サインアウトは localStorage / Cookie / OAuth 用 sessionStorage を消す。部屋鍵フラグメントは保持する。
+3. アバター押下で M3 Menu を開き、「別のアカウントでログイン」「サインアウト」を出す。サインアウトは account / session（`alhalte:account-id` / `alhalte:session-id` と `session_id` Cookie）と OAuth 用 sessionStorage を消す。端末嗜好（`alhalte:theme` / `alhalte:dice-picker-visible`）は残す。部屋鍵フラグメントは保持する。
 4. 未サインインなら Filled tonal の「サインイン」を出す。
 5. サインインは現在の完全な URL（クエリ・部屋鍵フラグメントを含む）を sessionStorage に保存し、fragment を除いた絶対 URL を `return_to` にして `GET /auth/login` へ遷移する。`prompt=select_account` はアカウント切り替え時に付ける。`return_to` の origin 検証・state 発行・Google への `redirect_uri` はすべて maitre-d の責務で、Google に argenterie の origin / port は渡らない。
 6. callback は maitre-d が処理し、`session_id` Cookie を設定して同じ `return_to` へ 302 する。アプリ起動時（`main.ts`）に sessionStorage の戻り先 URL があれば `GET /api/session` を Cookie 付きで呼び、account / session を保存して `history.replaceState` で元の URL（fragment 含む）を復元する。401 なら未サインインのまま戻り先の保存を消す。
@@ -161,18 +161,32 @@
 - `LogBiblioSnapshot` / `LogChunkSnapshot` はサーバー正。biblio が head を持つ scene では cache-origin record を破棄し、chunk snapshot は該当 chunk の entries を置換する（append しない）。head が無い biblio は cache とサーバー由来 chunk を空にし、サーバーで削除されたログをキャッシュから復活させない。live echo だけは空 biblio 応答との race を避けるため保持する。
 - `SceneGraphTab` の `movements` は、ライブの `CharacterMoved` と `character-came` / `character-gone` system record から再構築した履歴を `reconcileMovements` で統合する。came の scene を到着先、直前の gone の scene を出発元として `fromSceneId` を復元し、timestamp が無い system event は `(chunkIndex, position)` の順で並べる。同じ character / route の live move は log record が読み込まれた時点で二重計上しない。再入室・再接続後も、読み込み済み（キャッシュ含む）の came/gone から graph が復元される。
 
+### メニュー配置
+
+noph-ui の `Menu` は `popover` であり、HTML の UA stylesheet が `position: fixed; inset: 0` を与える。`utils/menuPosition.ts` はアンカーの viewport rect から位置を計算し、`position: fixed !important` / `margin: 0 !important` / `position-area: none !important` / `position-try-fallbacks: none !important` / `align-self: unset !important` / `justify-self: unset !important` で UA の自動配置を打ち消す。
+
+- `inset` は shorthand であり、使わない辺を `removeProperty()` で消すと author 宣言が失われ、UA の `0` がその辺に適用される。`position: fixed` + `fit-content` の過剰拘束は LTR で `left` / `top` を優先するため、メニューが x=0 / y=0 に潰れる（Issue #241）。
+- そのため **毎回 4 辺すべてを longhand で設定する**: 使う側は `<px> !important`、使わない側は `auto !important`。文字列パス（`getMenuPositionStyle` が返す `style` 属性）と DOM パス（`applyMenuPosition` の `$effect`）は同じ宣言リストを使う。
+- resize / scroll で再適用しても 4 辺の pin を維持し、`max-height` は利用可能領域から計算する。
+
 ### BGM / 背景画像
 
 BGM と背景画像は Argenterie の都合であり、banquette はこれらのキー・ラベル・イベントを知らない（Issue #186）。予約は Argenterie 側で行う。
 
-- BGM は state のみに書く。専用の log イベントは持たない。track は `std::bgm`（slot 1、旧来の互換）/ `std::bgm<N>`（任意の slot N >= 2）に `{ tinId, mimeType, name }` の JSON Tin で保存する。旧形式の裸の 64 hex 文字列も受理し、MIME 不明時は `audio/mpeg` を使う。再生状態は `bgm::<slot>::playing`（boolean）、音量は `bgm::<slot>::volume`。
-- 停止は `bgm::<slot>::playing=false` だけを書き、選択中の track は残す（再開できる）。track の削除は「NONE」を選んだときだけで、`std::bgm<N>` を削除する。
-- slot は 1〜3 固定ではなく任意番号を扱う。`StateSnapshot` / `StateUpdated` に未知の slot 番号が現れたら `bgmSlots` に追加して表示する。`SceneSettingsTab` の「スロット追加」も最大 slot + 1 を使う。
-- `SceneSettingsTab` は再生/停止・選択・音量変更を async 化し、再生/停止は `bgm::<slot>::playing`、選択は `std::bgm<N>` への `UpdateState` / `DeleteState` の ack が揃ったときだけローカルの `bgmSlots` / `scene.juices` を確定する。送信中は対象 slot の「BGM選択」アイコンを波線 `CircularProgress` にし、二重実行を防ぐ。
-- 再生は `utils/audio.ts` の `AudioManager` が担う。slot ごとに `HTMLAudioElement` を 1 つだけ保持し、`downloadTin(tinId, roomKey)` で復号した payload から object URL を作る。`StateSnapshot` / `SceneInfo` / `bgm::<slot>::playing` 更新 / scene 入場で再生を調整し、停止・track 変更・scene 切替・unmount では pause して object URL を revoke する。同じ snapshot の再適用は冪等で、再生や download を重複させない。
-- 音源取得 / 復号に失敗した slot は row 付近にエラーを表示し、`playing` を確定しない（state を書かない）。`play()` が autoplay policy で拒否された場合は「クリックして有効化」を出し、クリックで同じ要素を再生し直す。
+- BGM は state のみに書く。専用の log イベントは持たない。track は `std::bgm`（slot 1、旧来の互換）/ `std::bgm<N>`（任意の slot N >= 2）に `{ tinId, mimeType, name }` の JSON Tin で保存する。旧形式の裸の 64 hex 文字列も受理し、MIME 不明時は `audio/mpeg` を使う。
+- **行 = track のある slot**（Issue #249）。`createDefaultJuices` は `bgmSlots: []` を作り、`getNormalizedBgmSlots` は track を持つ slot だけを返す（`bgmSlots` が無い legacy scene は `bgm1..3` の set 済み slot のみ、`bgm::<slot>::removed` の tombstone は常に除外）。「スロット追加」は `max(既存行 ∪ tombstone) + 1` の slot で AssetPicker を開き、選択の ack 後にだけ行を作る。同じ slot 番号は再利用しない。
+- 再生状態は `bgm::<slot>::playing`（boolean）、音量は `bgm::<slot>::volume`、再生位置は `bgm::<slot>::started_at` / `bgm::<slot>::paused_at`（整数 UNIX ms、Issue #250）。duration は state に持たない。
+  - 再生中: `offset = ((now - started_at) mod D + D) mod D`
+  - 一時停止中: `offset = ((min(now, paused_at) - started_at) mod D + D) mod D`
+  - 再開: `started_at = now - (paused_at - started_at)`、`paused_at` を削除、`playing=true`。新規 track / ⏪ は `started_at = now`、`paused_at` を削除する。
+  - `D` は各クライアントの `HTMLAudioElement.duration`。不明な間は生の非負 offset を `currentTime` に入れ、ブラウザの clamp / loop に任せる。時刻は state を書いたクライアントの壁時計であり、クライアント間の NTP 同期を前提とする。
+- 一時停止は `bgm::<slot>::playing=false` と `paused_at` を書き、選択中の track と復号済みの object URL を保持する（再開で `downloadTin` をやり直さない）。track の削除は NONE と 🗑️ の両方で、`std::bgm<N>` / `volume` / `playing` / `started_at` / `paused_at` を削除し、`bgm::<slot>::removed=true` の tombstone を残す（後から届く stale な track broadcast / snapshot で行が復活しないようにする）。track 変更・削除・scene 切替・unmount では object URL を revoke する。
+- `SceneSettingsTab` は再生 / 一時停止 / 再開 / ⏪ / 選択 / 音量 / 削除を async 化し、track `std::bgm<N>` → `started_at` → `paused_at` 削除 → `playing` の順（一時停止は `paused_at` → `playing=false`）に ack を待って書く。ack が揃ったときだけローカルの `bgmSlots` / `scene.juices` を確定する。送信中は対象 slot の各コントロールを波線 `CircularProgress` にし、二重実行を防ぐ。
+- UI は slot ごとの Connected button group（⏪ `replay` / ▶️・⏸️ `play_arrow`・`pause` / 🎵 `music_note`）と音量 Slider、🗑️ の削除ボタン。viewer / denied は全コントロールを disabled にし、最終認可はサーバー。
+- 再生は `utils/audio.ts` の `AudioManager` が担う。slot ごとに `HTMLAudioElement` を 1 つだけ保持し、`loop=true`、`downloadTin(tinId, roomKey)` で復号した payload から object URL を作る。`StateSnapshot` / `StateUpdated` / scene 入場で `started_at` / `paused_at` / `playing` を反映し、再生中は transport identity（`tinId` / `started_at` / `paused_at`）の変化または 1 秒超のドリフトでだけシークする。同じ snapshot の再適用は冪等で、再生や download を重複させない。
+- autoplay 制限はユーザーに通知しない（Issue #248）。最初の `pointerdown`（capture, once）で、`playing` 意図があり準備済みの slot を導出済み offset から再開する。準備前の操作で消費した場合は次の操作で再試行する。音源取得 / 復号に失敗した slot は row 付近にエラーを表示し、`playing` を確定しない（state を書かない）。
 - 失敗時は変更前へ戻し、slot 付近にエラーを出す。キューには積まない（最終状態のみが意味を持つため、再接続時の自動再送をしない）。
-- `App` は `StateUpdated` / `StateDeleted` の BGM キー（track / playing / volume）を `bgmSlots` と旧 `bgm1..3` へ反映し、現在 scene の音声だけを再生する。state 更新の可否はサーバーの権限判定に従い、`PermissionDenied` はそのまま表示する。viewer も他クライアントが開始した BGM は再生する（viewer の操作制限は #158 / #159 のまま）。
+- `App` は `StateUpdated` / `StateDeleted` の BGM キー（track / playing / volume / started_at / paused_at / removed）を `bgmSlots` と旧 `bgm1..3` へ反映し、現在 scene の音声だけを再生する。`StateSnapshot` は removed → track → timestamps → playing / volume の順に適用する（辞書順に依存しない）。state 更新の可否はサーバーの権限判定に従い、`PermissionDenied` はそのまま表示する。viewer も他クライアントが開始した BGM は再生する（viewer の操作制限は #158 / #159 のまま）。
 
 ### scene の管理操作
 
@@ -206,7 +220,7 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 - **wasm 欠落**: `loadDefaultExtensions` は manifest にある wasm の取得・instantiate に失敗した拡張を `wasmMissing: true` で返す。`applyRemoteExtensions` は `tinId` の download に失敗した拡張も `wasmMissing: true` にする。タブは該当行に「wasm がありません」を出し、有効化 Switch を無効にする（並べ替え・削除は可能）。`ExtensionPipeline.executePipeline` は wasm の無い有効拡張を黙って skip せず、`getLastWarnings()` / `onWarning` に警告を残す。送信時 pipeline の警告はフッター上部の `pipeline-warning` に表示し、原文（ext-io Tin）はそのまま送信する。
 - タブ表示時に `queryState('/')` を発行し、contained `LoadingIndicator` を出す。
 - toggle / delete / reorder / upload は楽観更新せず、`requestUpdateState` / `requestDeleteState` の成功後にだけローカルへ反映する。送信中は該当行のアイコンを波線 `CircularProgress` にする。
-- タイムアウト / エラー時はタブ上部に「サーバーと通信できませんでした」を出し、一覧はスクロール・閲覧できる状態を保つ。暗転・`pointer-events: none` をタブ全体に掛けず、toggle / delete / reorder / upload などの mutation 操作だけを `disabled` / `aria-disabled` にする（Issue #149）。再接続で `queryState('/')` を再試行する。
+- タイムアウト / エラー時はタブ上部に「サーバーと通信できませんでした」を出し、一覧はスクロール・閲覧できる状態を保つ。暗転・`pointer-events: none` をタブ全体に掛けず、toggle / delete / reorder / upload などの mutation 操作だけを `disabled` / `aria-disabled` にする（Issue #149）。非管理者（participant / viewer / denied）には、行の非操作コンテンツ（名前・説明・アイコン・優先度バッジ）だけを少し暗くして操作不能を視覚的に示す（Issue #244）。シェル・一覧・スクロール領域・オフライン通知・ロック表示・「wasm がありません」は full contrast を保つ。再接続で `queryState('/')` を再試行する。
 - `.wasm` は検証後に `encodeRoomTin` + `uploadTin` で cellar へ保存し、進捗を表示して完了後に state を更新する。
 
 ### アセット
