@@ -1,7 +1,24 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
 import CommonHeader from '../src/components/Control/CommonHeader.svelte';
 import type { Scene } from '../src/types/index.js';
+
+// Issue #241: jsdom has no UA popover stylesheet. Emulate `[popover] { inset: 0 }`
+// with longhands (jsdom/cssstyle does not expand the `inset` shorthand) so the
+// cascade is exercised like a real browser.
+const UA_POPOVER_CSS = '[popover] { top: 0; right: 0; bottom: 0; left: 0; }';
+let uaPopoverSheet: HTMLStyleElement | null = null;
+
+beforeEach(() => {
+  uaPopoverSheet = document.createElement('style');
+  uaPopoverSheet.textContent = UA_POPOVER_CSS;
+  document.head.appendChild(uaPopoverSheet);
+});
+
+afterEach(() => {
+  uaPopoverSheet?.remove();
+  uaPopoverSheet = null;
+});
 
 describe('CommonHeader Component & Gear Menu Positioning (Issue #124)', () => {
   const sampleScene: Scene = {
@@ -101,6 +118,15 @@ describe('CommonHeader Component & Gear Menu Positioning (Issue #124)', () => {
     expect(gearBtn?.style.getPropertyValue('anchor-name')).toBe('--gear-menu-anchor');
     expect(menu?.style.getPropertyValue('position-anchor')).toBe('--gear-menu-anchor');
     expect(menu?.style.getPropertyValue('--np-menu-position-area')).toBe('bottom span-right');
+    // 8. Issue #241: the unused sides are pinned to auto, so the UA popover
+    //    `inset: 0` cannot collapse the menu to x=0.
+    expect(menu?.getAttribute('style')).toContain('left: auto !important');
+    expect(menu?.getAttribute('style')).toContain('bottom: auto !important');
+    expect(menu?.style.getPropertyPriority('left')).toBe('important');
+    expect(menu?.style.getPropertyPriority('top')).toBe('important');
+    expect(menu?.style.getPropertyPriority('right')).toBe('important');
+    expect(window.getComputedStyle(menu!).left).toBe('auto');
+    expect(window.getComputedStyle(menu!).left).not.toBe('0px');
 
     // Clicking an item triggers callback and closes menu
     const zipItem = target.querySelector<HTMLElement>('[data-testid="zip-export-item"]');
