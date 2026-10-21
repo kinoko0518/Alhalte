@@ -408,6 +408,10 @@
     }
   }
 
+  function amIowner(char: Character) {
+    return char.ownerAccountId === currentAccountId;
+  }
+
   function openDeleteConfirm(char: Character) {
     closeMenu();
     if (!capabilities.canManageCharacters) return;
@@ -507,7 +511,9 @@
         {@const actions = rowActions(char)}
         <ListItem
           type="text"
-          onclick={() => openEdit(char)}
+          onclick={() => {
+            if (amIowner(char)) openEdit(char);
+          }}
           class="character-card-wrapper character-segmented-item"
           data-testid="character-card-{char.id}"
         >
@@ -516,8 +522,10 @@
               type="button"
               class="char-avatar-btn"
               onclick={(e) => {
-                e.stopPropagation();
-                openEdit(char);
+                if (amIowner(char)) {
+                  e.stopPropagation();
+                  openEdit(char);
+                }
               }}
               disabled={!capabilities.canManageCharacters}
               title="キャラクター編集"
