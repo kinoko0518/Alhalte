@@ -75,7 +75,6 @@
   import FieldPanel from './Field/FieldPanel.svelte';
   import GateScreen from './Gate/GateScreen.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
-  import OfflineIndicator from './OfflineIndicator.svelte';
   import RoomPermissionModal from './Control/RoomPermissionModal.svelte';
   import {
     connectionManager as defaultConnectionManager,
@@ -120,8 +119,6 @@
     connectionManager: customConnectionManager,
     connectionState,
     onReconnect,
-    debugMode,
-    debugAlwaysShow = false,
     roomSocket: customRoomSocket,
     roomKey,
     audioManager: audioManagerOverride,
@@ -147,8 +144,6 @@
     connectionManager?: ConnectionManager;
     connectionState?: ConnectionState;
     onReconnect?: () => Promise<void> | void;
-    debugMode?: boolean;
-    debugAlwaysShow?: boolean;
     roomSocket?: RoomSocket;
     /**
      * 32-byte room key used to encrypt / decrypt extension wasm in the cellar
@@ -195,15 +190,6 @@
     });
     return unsubscribe;
   });
-
-  async function handleReconnectFromIndicator() {
-    // A failed join preflight blocks the socket; retry the HTTP check first.
-    if (initialRoom === undefined && activeRoomId && preflightStatus !== 'ok') {
-      handleRetryPreflight();
-      return;
-    }
-    await activeConnectionManager.reconnect();
-  }
 
   let currentRoom = $state<VisitedRoom | null>(
     initialRoom !== undefined ? initialRoom : resolveRoomFromLocation(),
@@ -3453,14 +3439,6 @@
 </script>
 
 <div class="alhalte-app-root" data-testid="alhalte-app">
-  <!-- Server connection / offline detection indicator placed in flow above panels on y-axis (Issue #111) -->
-  <OfflineIndicator
-    connectionState={currentConnectionState}
-    {debugMode}
-    {debugAlwaysShow}
-    onReconnect={handleReconnectFromIndicator}
-  />
-
   {#if pieceActionError}
     <div
       class="piece-action-error"

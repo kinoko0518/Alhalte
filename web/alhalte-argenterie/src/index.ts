@@ -29,7 +29,6 @@ export * from './wasm/runner.js';
 
 // Components
 export { default as App } from './components/App.svelte';
-export { default as OfflineIndicator } from './components/OfflineIndicator.svelte';
 export { default as HomeScreen } from './components/Home/HomeScreen.svelte';
 export { default as GateScreen } from './components/Gate/GateScreen.svelte';
 export { default as AccountMenu } from './components/Control/AccountMenu.svelte';

@@ -6,7 +6,7 @@
 
 ## 責務
 
-公式 cutlery。Svelte 5 と Noph UI で部屋 UI を提供する。部屋への入室、scene / character / log の表示と操作、拡張機能の管理と実行、Saignant WASM によるログ描画、接続状態とオフライン通知を担う。画面は Material 3 Expressive に準拠する。
+公式 cutlery。Svelte 5 と Noph UI で部屋 UI を提供する。部屋への入室、scene / character / log の表示と操作、拡張機能の管理と実行、Saignant WASM によるログ描画、オフライン時の操作キュー通知を担う。画面は Material 3 Expressive に準拠する。グローバルな接続状態バナーは持たず、通信失敗は操作したタブ / エディタ内で告知する（Issue #261）。
 
 ## 公開 API / 外部接続点
 
@@ -65,7 +65,7 @@
 | モーダル | `AssetPickerModal`、`CharacterEditModal`、`RoomPermissionModal`、`GenericImagePicker`、`IconImagePicker` |
 | アカウント | `Control/AccountMenu.svelte`、`utils/account.ts` |
 | 門前払い | `Gate/GateScreen.svelte` |
-| 接続表示 | `OfflineIndicator.svelte`、`utils/connection.ts` |
+| 接続状態 | `utils/connection.ts`（グローバルバナーは持たない） |
 
 横長画面ではフィールド左・コントロール右、縦長画面ではフィールド全体＋ボトムシート。コントロールパネルはサイドシート / ボトムシートの 2 形態と開閉状態を持つ。
 
@@ -260,7 +260,7 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 - タイムアウトは 8 秒で、権限問い合わせのようにサーバーが黙って破棄する操作では唯一の失敗シグナルになる。`PermissionDenied` が返らない経路はタイムアウトとして扱う。
 - Saignant WASM は v2 で character 名を受け取る。v2 をエクスポートしない古い wasm を読み込んだ場合だけ mention が `Anonymous` になる。committed artifact は `scripts/build-saignant-wasm.sh` で更新する。
 - 開発エントリ（`main.ts`）は `isAdmin` も `userRole` も渡さない。管理者は `GET /api/rooms/{id}` の `role === "admin"` から決まる。`isAdmin` prop はテスト / プレビュー用の明示 override で、既定は false。`initialRoom` prop も同じくテスト / プレビュー用で preflight をスキップし、そのとき role 未指定なら participant 相当（送信可・管理不可）として扱う。
-- 入室 preflight のネットワーク / 5xx 失敗は 2 秒間隔・最大 5 回で打ち切り、`OfflineIndicator` の再試行導線に合流する。403 / 401 / 404 は再試行しない。401 は `GateScreen`（サインイン導線）として扱う。
+- 入室 preflight のネットワーク / 5xx 失敗は 2 秒間隔・最大 5 回で打ち切り、preflight エラー画面の「再試行」ボタンだけを導線にする。403 / 401 / 404 は再試行しない。401 は `GateScreen`（サインイン導線）として扱う。グローバルな接続バナーは無く、失敗は操作したタブ / エディタ内で告知する（Issue #261）。
 - 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。`App` は `roomKey` prop → `currentRoom.url` のフラグメント → `window.location.hash` の順に解決し、64 hex を検証する。鍵が無い場合、アセット・拡張 wasm の cellar upload は試行せずエラーを表示する。
 - ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
 - Google OAuth の `redirect_uri` は maitre-d の固定 URL（`{public_url}/auth/google/callback`）だけを Google Cloud Console に登録する。argenterie の origin / port は登録しない。`return_to` は maitre-d が CORS allow-list と照合する。`/api/session` を Cookie 付きで呼ぶため、開発では `public_url` を argenterie の dev origin（Vite の `/auth` proxy）に合わせる必要がある。
