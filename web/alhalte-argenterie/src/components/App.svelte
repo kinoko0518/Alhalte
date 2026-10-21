@@ -5,14 +5,15 @@
    * Layout adheres to Material 3 Expressive:
    * - Landscape: Left side field panel, Right side Side Sheet control panel (`Sheet` with `placement="end"`).
    * - Portrait: Full-screen field panel with Bottom Sheet control panel (`Sheet` with `placement="bottom"`).
-   *   The portrait sheet height is a function of its state only (closed, half 50dvh,
-   *   full viewport minus noph-ui's top margin) so the log list inside it scrolls
-   *   (Issue #223).
+   *   The portrait sheet is either closed or fully open; its height is the
+   *   viewport minus noph-ui's top margin, so the log list inside it scrolls
+   *   (Issue #223 / #262).
    *
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie`
    * - GitHub Issue #32: Side sheets (landscape) & Bottom sheets (portrait)
    * - GitHub Issue #223: portrait bottom sheet sizing, scrolling and close icon
+   * - GitHub Issue #262: remove the portrait half-open state and drag handle
    */
   import 'noph-ui/defaultTheme';
   import { Button, IconButton, Sheet } from 'noph-ui';
@@ -376,21 +377,14 @@
     typeof window !== 'undefined' ? window.innerWidth >= window.innerHeight : true,
   );
   let isControlSheetOpen = $state(true);
-  let isControlSheetExpanded = $state(false);
   /**
-   * The three portrait bottom-sheet states (Issue #223): closed, half (exactly
-   * 50dvh) and fully open. Exposed as `data-sheet-state` so the state-sized
-   * sheet is assertable without measuring jsdom layout.
-   *
-   * `isControlSheetExpanded` is driven from the portrait header toggle
-   * (Issue #242) as well as noph-ui's handle drag/step. The sheet is sized by
-   * this state, so its content never grows taller than half and noph-ui's
-   * `step()` (which compares `scrollHeight` with `clientHeight`) cannot reach
-   * the full state on its own.
+   * The two portrait bottom-sheet states (Issue #262): closed and fully open.
+   * The half-open state and the drag handle were removed because the handle
+   * could not reach the full height and the half height was too small to use.
+   * Exposed as `data-sheet-state` so the state-sized sheet is assertable
+   * without measuring jsdom layout.
    */
-  let controlSheetState = $derived(
-    !isControlSheetOpen ? 'closed' : isControlSheetExpanded ? 'full' : 'half',
-  );
+  let controlSheetState = $derived(isControlSheetOpen ? 'full' : 'closed');
   let sideSheetWidth = $state(440);
   let isResizing = $state(false);
 
@@ -3630,11 +3624,9 @@
         >
           <Sheet
             bind:open={isControlSheetOpen}
-            bind:expanded={isControlSheetExpanded}
             placement="bottom"
             modal={false}
-            handle={true}
-            handleLabel="シートの開閉"
+            handle={false}
             class="portrait-bottom-sheet"
             data-testid="portrait-sheet-dialog"
             data-sheet-state={controlSheetState}
@@ -3652,8 +3644,6 @@
                 role={effectiveRole}
                 {defaultPermission}
                 placement="bottom"
-                sheetExpanded={isControlSheetExpanded}
-                onToggleSheetExpanded={() => (isControlSheetExpanded = !isControlSheetExpanded)}
                 sending={isSending}
                 {queuedMessages}
                 {sceneActionPending}
@@ -3699,7 +3689,6 @@
                 variant="tonal"
                 onclick={() => {
                   isControlSheetOpen = true;
-                  isControlSheetExpanded = false;
                 }}
                 data-testid="reopen-sheet-button"
                 aria-label="コントロールパネルを開く"
@@ -4135,16 +4124,19 @@
     z-index: 500;
   }
   /*
-   * Portrait bottom sheet sizing (Issue #223).
+   * Portrait bottom sheet sizing (Issue #223 / #262).
    *
    * noph-ui sizes a bottom sheet from its content, capped by `--np-sheet-size`,
-   * so a short log made the half state short and a long one made it tall. The
-   * portrait sheet is sized by its state alone:
+   * so a short log made the sheet short and a long one made it tall. The
+   * portrait sheet is instead sized by its state alone:
    *
    * - closed: the Sheet's own closed state (`display: none` / off screen).
-   * - half:   exactly 50dvh.
    * - full:   the viewport less the same top margin noph-ui keeps free in
    *           `np-sheet-bottom` (`--_top-margin`: 4.5rem, 3.5rem above 640px).
+   *
+   * The half state and the drag handle were removed in Issue #262: the handle
+   * could not reach the full height and the half height was too small to use.
+   * Opening the sheet always opens it fully.
    *
    * A definite height is also what makes the inner scroll chain work: the flex
    * children (`.np-sheet-content` → `.bottom-sheet-content-wrapper` →
@@ -4152,13 +4144,12 @@
    * only bound the log list when the sheet itself has a used height.
    */
   .bottom-sheet-container :global(.portrait-bottom-sheet) {
-    --np-sheet-size: 50dvh;
+    --np-sheet-size: var(--np-sheet-full-height);
     --np-sheet-max-width: 100%;
     --np-sheet-top-margin: 4.5rem;
-    --np-sheet-half-height: 50dvh;
     --np-sheet-full-height: calc(100dvh - var(--np-sheet-top-margin));
-    height: var(--np-sheet-half-height);
-    max-height: var(--np-sheet-half-height);
+    height: var(--np-sheet-full-height);
+    max-height: var(--np-sheet-full-height);
     width: 100% !important;
     max-width: 100% !important;
     inset-inline: 0 !important;
@@ -4170,10 +4161,6 @@
       max-height var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)),
       display var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete,
       overlay var(--np-motion-expressive-default-spatial, 500ms cubic-bezier(0.38, 1.21, 0.22, 1)) allow-discrete;
-  }
-  .bottom-sheet-container :global(.portrait-bottom-sheet.np-sheet-expanded) {
-    height: var(--np-sheet-full-height);
-    max-height: var(--np-sheet-full-height);
   }
   /* noph-ui raises its top margin from 4.5rem to 3.5rem above 640dp. */
   @media (width > 640px) {

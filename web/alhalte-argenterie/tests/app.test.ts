@@ -87,10 +87,10 @@ describe('App Layout (Material 3 Expressive)', () => {
     expect(portraitField).toBeTruthy();
     expect(bottomSheet).toBeTruthy();
 
-    // Verify noph-ui Bottom Sheet (.np-sheet-bottom) with drag handle is used
+    // Verify noph-ui Bottom Sheet (.np-sheet-bottom) without a drag handle (Issue #262)
     const sheetDialog = bottomSheet?.querySelector('.np-sheet.np-sheet-bottom');
     expect(sheetDialog).toBeTruthy();
-    expect(sheetDialog?.querySelector('.np-sheet-handle')).toBeTruthy();
+    expect(sheetDialog?.querySelector('.np-sheet-handle')).toBeNull();
 
     unmount(instance);
     target.remove();

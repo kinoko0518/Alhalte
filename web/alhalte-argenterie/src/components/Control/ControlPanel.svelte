@@ -82,8 +82,6 @@
     sceneActionPending = null,
     sceneActionError = null,
     placement = 'side',
-    sheetExpanded = false,
-    onToggleSheetExpanded,
   }: {
     currentScene: Scene;
     allScenes?: Scene[];
@@ -188,17 +186,6 @@
      * `CommonHeader` so the close icon points at the closing edge.
      */
     placement?: PanelPlacement;
-    /**
-     * Forwarded to `CommonHeader`: whether the portrait bottom sheet is fully
-     * open (Issue #242).
-     */
-    sheetExpanded?: boolean;
-    /**
-     * Forwarded to `CommonHeader`: toggles the portrait bottom sheet between
-     * half and full (Issue #242). `CommonHeader` itself gates the toggle on
-     * `placement === 'bottom'`, so the landscape side sheet is unchanged.
-     */
-    onToggleSheetExpanded?: () => void;
   } = $props();
 
   let activeTab = $state<ActiveTab>('log');
@@ -236,8 +223,6 @@
     {role}
     {defaultPermission}
     {placement}
-    {sheetExpanded}
-    {onToggleSheetExpanded}
     {onCollapse}
     {onSelectScene}
     {onExportZip}
