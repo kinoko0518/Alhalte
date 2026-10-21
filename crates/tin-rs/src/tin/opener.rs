@@ -1,5 +1,8 @@
 //! Opener definition and related enums for encryption and compression metadata.
 
+mod compression;
+mod encryption;
+
 use crate::error::TinError;
 use serde::{Deserialize, Serialize};
 

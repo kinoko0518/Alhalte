@@ -1,12 +1,6 @@
 //! Wire format encoding and decoding for raw bytes and `Tin` containers.
 
-use crate::compression::{compress, decompress};
-use crate::encryption::{
-    TinId, ZERO_NONCE, decrypt_aes_256_gcm_siv, derive_convergent_id_and_key,
-    encrypt_aes_256_gcm_siv,
-};
 use crate::error::TinError;
-use crate::opener::{Compression, Encryption, Opener};
 use crate::tin::Tin;
 
 /// Parameter specifying encryption configuration for encoding.

@@ -56,7 +56,7 @@ pub enum TinError {
 
     /// Payload is not valid UTF-8.
     #[error("invalid utf-8 string: {0}")]
-    InvalidUtf8(#[from] std::str::Utf8Error),
+    InvalidUtf8(#[from] std::string::FromUtf8Error),
 
     /// Payload length does not match the expected length for this type.
     #[error("invalid payload length: expected {expected} bytes, got {actual}")]

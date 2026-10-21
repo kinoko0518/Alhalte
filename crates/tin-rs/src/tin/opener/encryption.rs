@@ -7,9 +7,6 @@ use aes_gcm_siv::{
 
 use crate::error::TinError;
 
-/// 256-bit identifier uniquely identifying a tin.
-pub type TinId = [u8; 32];
-
 /// Zero nonce (`[0u8; 12]`) used for convergent encryption (`0001`).
 pub const ZERO_NONCE: [u8; 12] = [0u8; 12];
 

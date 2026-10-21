@@ -29,36 +29,18 @@
 //! ```
 
 #![forbid(unsafe_code)]
-#![warn(missing_docs)]
 
 pub mod codec;
-pub mod compression;
-pub mod encryption;
 pub mod error;
-pub mod label;
-pub mod opener;
 pub mod tin;
 
 pub use codec::{
     EncodedRaw, EncryptionParam, decode, decode_raw_plaintext_bytes, encode_raw_convergent,
     encode_raw_plaintext, encode_raw_plaintext_bytes, encode_raw_room_key,
 };
-pub use compression::{compress, decompress};
-pub use encryption::{
-    TinId, ZERO_NONCE, decrypt_aes_256_gcm_siv, derive_convergent_id_and_key,
-    encrypt_aes_256_gcm_siv, verify_convergent,
-};
 pub use error::TinError;
-pub use label::{
-    IDENT_ALHALTE_TIN_ID, IDENT_ALHALTE_UNIX_TIME, IDENT_PRIMITIVE_BOOL, IDENT_PRIMITIVE_F16,
-    IDENT_PRIMITIVE_F32, IDENT_PRIMITIVE_F64, IDENT_PRIMITIVE_I8, IDENT_PRIMITIVE_I16,
-    IDENT_PRIMITIVE_I32, IDENT_PRIMITIVE_I64, IDENT_PRIMITIVE_I128, IDENT_PRIMITIVE_STRING,
-    IDENT_PRIMITIVE_U8, IDENT_PRIMITIVE_U16, IDENT_PRIMITIVE_U32, IDENT_PRIMITIVE_U64,
-    IDENT_PRIMITIVE_U128, LABEL_ALHALTE_TIN_ID, LABEL_ALHALTE_UNIX_TIME, LABEL_NEED_NOT_KNOW,
-    LABEL_PRIMITIVE_BOOL, LABEL_PRIMITIVE_F16, LABEL_PRIMITIVE_F32, LABEL_PRIMITIVE_F64,
-    LABEL_PRIMITIVE_I8, LABEL_PRIMITIVE_I16, LABEL_PRIMITIVE_I32, LABEL_PRIMITIVE_I64,
-    LABEL_PRIMITIVE_I128, LABEL_PRIMITIVE_STRING, LABEL_PRIMITIVE_U8, LABEL_PRIMITIVE_U16,
-    LABEL_PRIMITIVE_U32, LABEL_PRIMITIVE_U64, LABEL_PRIMITIVE_U128, Label, label_hash,
-};
-pub use opener::{Compression, Encryption, Opener};
 pub use tin::Tin;
+pub use tin::label::*;
+
+/// 256-bit identifier uniquely identifying a tin.
+pub type TinId = [u8; 32];
