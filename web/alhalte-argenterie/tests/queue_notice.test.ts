@@ -152,8 +152,8 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     expect(noticeDescription()).toBe('メッセージは次回の接続時に送信されます');
     expect(noticeCount()).toBe('1 件を蓄積中');
     expect(notice?.querySelectorAll('.wavy-divider').length).toBe(2);
-    // The duplicated footer notice was removed (#148): connection state stays in
-    // `OfflineIndicator`, the queue count now lives in the log.
+    // The duplicated footer notice was removed (#148), and the global
+    // connection bar was removed (#261): the queue count lives in the log.
     expect(footer().querySelector('[data-testid="offline-queue-notice"]')).toBeNull();
     expect(target.querySelector('[data-testid="footer-queue-notice"]')).toBeNull();
 

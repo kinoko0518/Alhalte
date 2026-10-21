@@ -1,6 +1,6 @@
 <script lang="ts">
   /**
-   * OfflineQueueNotice — queue-side companion to `OfflineIndicator`.
+   * OfflineQueueNotice — notice for work queued while the server is unreachable.
    *
    * Displays a Material 3 Expressive notice framed by CSS wavy dividers (no
    * images) that explains what happens to work created while the server is
@@ -14,9 +14,9 @@
    * region (`role="status"`, `aria-live="polite"`) so screen readers announce
    * queue changes without stealing focus.
    *
-   * Division of responsibility: `OfflineIndicator.svelte` is the top connection
-   * bar (connection state); this component reports queue state and never
-   * replaces the indicator.
+   * The notice reports queue state only. It does not render a global connection
+   * bar; connection failures surface inside the tab or editor that performed the
+   * operation (Issue #261).
    *
    * Styling uses only `--np-color-*` / `--np-shape-*` semantic tokens.
    *

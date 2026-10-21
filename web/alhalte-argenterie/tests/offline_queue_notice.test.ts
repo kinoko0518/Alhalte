@@ -136,7 +136,8 @@ describe('OfflineQueueNotice (Issue #137)', () => {
     expect(element.getAttribute('role')).toBe('status');
     expect(element.getAttribute('aria-live')).toBe('polite');
     expect(element.getAttribute('aria-atomic')).toBe('true');
-    // The top connection bar stays the OfflineIndicator's job.
+    // The global connection bar was removed in Issue #261; the queue notice
+    // must stay local to the log instead of recreating it.
     expect(element.getAttribute('data-testid')).not.toBe('offline-indicator');
     expect(element.textContent).not.toContain('サーバーとの接続が切断されました');
     expect(element.textContent).not.toContain('再接続');
