@@ -5,6 +5,7 @@
    * References:
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーングラフタブ`
    * - Issue #30: シーン管理タブをシーングラフタブに統合（シーンタブへ改名、左クリック・長押しで削除ボタン表示＋全画面警告ダイアログ）
+   * - Issue #263: 保有キャラクターの到達状況でグラフを絞り、未知のシーンは独立した「？」ノードにする
    */
   import { Button } from 'noph-ui';
   import type { SceneGraphNode, SceneGraphResult } from '../../../types/index.js';
@@ -78,7 +79,7 @@
 
   function handleNodeClick(node: SceneGraphNode) {
     clearLongPressTimer();
-    if (node.isUnknown) return; // Cannot navigate to or manage inaccessible scenes
+    if (node.isUnknown) return; // Cannot navigate to or manage a frontier scene
     activeActionNodeId = node.id;
     onNavigateToScene?.(node.sceneId);
   }
@@ -206,7 +207,7 @@
                 onpointercancel={clearLongPressTimer}
                 oncontextmenu={(e) => handleNodeContextMenu(e, node)}
                 data-testid="node-dot-{node.id}"
-                title={node.isUnknown ? 'アクセス権のないシーン' : `${node.sceneName} へ移動`}
+                title={node.isUnknown ? 'まだ到達していないシーン' : `${node.sceneName} へ移動`}
               >
                 {#if node.isUnknown}
                   ?

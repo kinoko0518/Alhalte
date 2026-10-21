@@ -155,11 +155,12 @@
 - 過去 chunk の挿入時はサーバーの `(chunkIndex, position)` 順で並べ、読み手のスクロール位置を維持する（最下部へジャンプしない）。
 - タイムアウト / 通信エラー時は `OfflineQueueNotice kind="generic"`（「接続が回復したらログを再読み込みします」）を出し、再接続時に再試行する。Saignant 描画は維持する。
 
-### ログキャッシュと scene graph 復元
+### ログキャッシュと scene graph 復元・絞り込み
 
 - `ChunkLogManager` の cache-origin record は `cached: true` を持ち、`alhalte:room-logs:<roomId>` から復元したものだけが該当する。オフラインで cache-origin record を表示している間は LogTab に「キャッシュ表示中」を出す。
 - `LogBiblioSnapshot` / `LogChunkSnapshot` はサーバー正。biblio が head を持つ scene では cache-origin record を破棄し、chunk snapshot は該当 chunk の entries を置換する（append しない）。head が無い biblio は cache とサーバー由来 chunk を空にし、サーバーで削除されたログをキャッシュから復活させない。live echo だけは空 biblio 応答との race を避けるため保持する。
 - `SceneGraphTab` の `movements` は、ライブの `CharacterMoved` と `character-came` / `character-gone` system record から再構築した履歴を `reconcileMovements` で統合する。came の scene を到着先、直前の gone の scene を出発元として `fromSceneId` を復元し、timestamp が無い system event は `(chunkIndex, position)` の順で並べる。同じ character / route の live move は log record が読み込まれた時点で二重計上しない。再入室・再接続後も、読み込み済み（キャッシュ含む）の came/gone から graph が復元される。
+- **scene graph のアカウント絞り込み（Issue #263）**: participant の graph は、保存済み account ID と `std::owner_account` から保有 character を引き、その移動だけを `V_known` の算出に使う（`filterOwnedMovements` → `collectKnownSceneIds`）。`V_known` は保有 character が参加した scene に、`/`・現在の scene・保有 character が現在在籍する scene を加えた集合で、毎回計算する（キャッシュしない）。graph 自体には全 character の移動を渡すため、既知 scene 間の遷移や他 character が見つけた frontier は失わない。`V_known` 外への移動は、scene ID / 名前を捨てた独立した「？」ノードへの点線 edge にし、同じ実 scene への複数 edge も共有しない。admin / viewer は `can_access_scene` が全 scene を許可するため、従来どおり全 graph を表示する。この絞り込みは UI の可視性だけを変えるもので、認可は banquette の `can_access_scene` / `can_send_to_scene` が最終判断する。
 
 ### メニュー配置
 
@@ -247,7 +248,7 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 | `viewer` | 不可（入力欄・送信・ダイスを無効化） | 不可 | 不可 | 不可 | 不可 |
 | `denied` | 不可（`GateScreen` を表示） | 不可 | 不可 | 不可 | 不可 |
 
-`PermissionsSnapshot` は `accessible_scenes` を持たないため、participant の「アクセス可能 scene」は UI では現在の scene（と banquette が writer に常時許可する `/`）だけを送信可能として扱う。`accessibleSceneIds`（シーングラフの可視判定）は全 scene のままで、書込の可否とは独立している。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
+`PermissionsSnapshot` は `accessible_scenes` を持たないため、participant の「アクセス可能 scene」は UI では現在の scene（と banquette が writer に常時許可する `/`）だけを送信可能として扱う。`accessibleSceneIds`（全 scene）は admin / viewer の graph と書込の可否に使い、participant の graph は `sceneGraphSceneIds`（`V_known`）で絞る（Issue #263）。書込の可否とは独立している。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
 
 ## 既知の差分・制約
 

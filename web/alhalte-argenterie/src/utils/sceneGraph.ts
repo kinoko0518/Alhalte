@@ -32,12 +32,56 @@ export interface SceneMovementEvent {
 }
 
 /**
+ * Keeps only the movements performed by the given characters (Issue #263).
+ *
+ * The scene graph is scoped to the caller's own characters: a participant
+ * should not learn the route of characters they do not own.
+ */
+export function filterOwnedMovements(
+  movements: SceneMovementEvent[],
+  ownedCharacterIds: ReadonlySet<string>,
+): SceneMovementEvent[] {
+  if (ownedCharacterIds.size === 0) return [];
+  return movements.filter((movement) => ownedCharacterIds.has(movement.characterId));
+}
+
+/**
+ * Computes `V_known` for the scene graph (Issue #263): the scenes the caller's
+ * own characters have participated in, plus the seed scenes (the room root, the
+ * scene currently being viewed and the scenes where an owned character is
+ * currently present).
+ *
+ * Only ids present in `sceneIds` are returned. A movement to a scene that no
+ * longer exists therefore becomes a frontier edge to an anonymous "?" node,
+ * not a named node. The result is recomputed on every call; it is never cached.
+ */
+export function collectKnownSceneIds(
+  movements: SceneMovementEvent[],
+  sceneIds: ReadonlySet<string>,
+  seedSceneIds: Iterable<string> = [],
+): Set<string> {
+  const known = new Set<string>();
+  for (const sceneId of seedSceneIds) {
+    if (sceneIds.has(sceneId)) known.add(sceneId);
+  }
+  for (const movement of movements) {
+    if (sceneIds.has(movement.toSceneId)) known.add(movement.toSceneId);
+    if (movement.fromSceneId !== undefined && sceneIds.has(movement.fromSceneId)) {
+      known.add(movement.fromSceneId);
+    }
+  }
+  return known;
+}
+
+/**
  * Builds a Git Graph representation from character movement events.
  *
  * Requirements:
  * 1. Earlier events at top, later events at bottom (chronological ascending order).
  * 2. Uncorrelated scenes are assigned to separate branch lanes.
- * 3. Movements to inaccessible/unknown scenes are drawn to a "?" node via a dotted edge (one "?" node per unknown scene).
+ * 3. A movement from a known scene to a scene outside `accessibleSceneIds` is
+ *    drawn as a dotted edge to an independent "?" node. The unknown scene id and
+ *    name are not exposed, and two frontier edges never share a node (Issue #263).
  * 4. Re-visiting the same scene duplicates the node.
  * 5. Branch continuations remain strictly vertical (parallel to Y axis, branchIndex === parent.branchIndex).
  * 6. Branch merges converge back into the minimum branch lane.
@@ -83,9 +127,6 @@ export function buildSceneGraph(
 
   // Track currently active branch lanes: Set<number>
   const activeLanes = new Set<number>();
-
-  // Cache for unknown scene "?" nodes: unknownSceneId -> nodeId
-  const unknownSceneNodes = new Map<string, string>();
 
   let nodeCounter = 0;
 
@@ -167,18 +208,21 @@ export function buildSceneGraph(
       characterVisitedNodes.set(characterId, charNodes);
     }
 
-    // Resolve parent node
+    // Resolve parent node. An unknown node is never a parent/route: once a
+    // character walks out of a frontier scene, only the fact that some unknown
+    // scene was involved is known, not where the character came from.
     let prevNodeId: string | undefined;
     const charLastId = characterLastNodeId.get(characterId);
     const charLastNode = charLastId ? nodeById.get(charLastId) : undefined;
+    const knownCharLastNode = charLastNode && !charLastNode.isUnknown ? charLastNode : undefined;
 
     if (fromSceneId) {
-      if (charLastNode && charLastNode.sceneId === fromSceneId) {
-        prevNodeId = charLastNode.id;
-      } else if (sceneLatestNodeId.has(fromSceneId)) {
+      if (knownCharLastNode && knownCharLastNode.sceneId === fromSceneId) {
+        prevNodeId = knownCharLastNode.id;
+      } else if (accessibleSceneIds.has(fromSceneId) && sceneLatestNodeId.has(fromSceneId)) {
         prevNodeId = sceneLatestNodeId.get(fromSceneId);
-      } else if (accessibleSceneIds.has(fromSceneId) || sceneNames.has(fromSceneId)) {
-        // Initial node for fromSceneId needs to be created on lane 0
+      } else if (accessibleSceneIds.has(fromSceneId)) {
+        // Initial node for a known fromSceneId needs to be created on lane 0
         const fromNodeId = `node-${fromSceneId}-init`;
         const fromNode: SceneGraphNode = {
           id: fromNodeId,
@@ -198,11 +242,9 @@ export function buildSceneGraph(
         charScenes.add(fromSceneId);
         charNodes.add(fromNodeId);
         prevNodeId = fromNodeId;
-      } else {
-        prevNodeId = charLastId ?? sceneLatestNodeId.get('/');
       }
     } else {
-      prevNodeId = charLastId;
+      prevNodeId = knownCharLastNode?.id;
     }
 
     const prevNode = prevNodeId ? nodeById.get(prevNodeId) : undefined;
@@ -214,43 +256,40 @@ export function buildSceneGraph(
     const isKnown = accessibleSceneIds.has(toSceneId);
 
     if (!isKnown) {
-      // Inaccessible scene: single "?" node per unknown scene
-      let targetNodeId: string;
-      if (unknownSceneNodes.has(toSceneId)) {
-        targetNodeId = unknownSceneNodes.get(toSceneId)!;
-        const targetNode = nodeById.get(targetNodeId)!;
-        targetNode.timestamp = Math.max(targetNode.timestamp, timestamp);
-      } else {
-        targetNodeId = `node-unknown-${++nodeCounter}`;
-        unknownSceneNodes.set(toSceneId, targetNodeId);
-
-        const branch = allocateLane(prevNode);
-        const unknownNode: SceneGraphNode = {
-          id: targetNodeId,
-          sceneId: toSceneId,
-          sceneName: '？',
-          timestamp,
-          characterId,
-          characterName,
-          branchIndex: branch,
-          isUnknown: true,
-        };
-        nodes.push(unknownNode);
-        nodeById.set(targetNodeId, unknownNode);
-        nodeChildCount.set(targetNodeId, 0);
+      if (!prevNodeId) {
+        // The character came from a scene outside V_known: there is no known
+        // source to draw a frontier edge from, so draw nothing rather than an
+        // orphan "?" node.
+        characterLastNodeId.delete(characterId);
+        continue;
       }
 
-      if (prevNodeId) {
-        if (prevNode) {
-          nodeChildCount.set(prevNode.id, (nodeChildCount.get(prevNode.id) ?? 0) + 1);
-        }
-        edges.push({
-          fromNodeId: prevNodeId,
-          toNodeId: targetNodeId,
-          characterId,
-          isDotted: true,
-        });
-      }
+      // Frontier edge: create an independent "?" node per transition. Neither
+      // the unknown scene id nor its name is retained, and two edges never
+      // merge into one node (Issue #263).
+      const targetNodeId = `node-unknown-${++nodeCounter}`;
+      const branch = allocateLane(prevNode);
+      const unknownNode: SceneGraphNode = {
+        id: targetNodeId,
+        sceneId: '',
+        sceneName: '？',
+        timestamp,
+        characterId,
+        characterName,
+        branchIndex: branch,
+        isUnknown: true,
+      };
+      nodes.push(unknownNode);
+      nodeById.set(targetNodeId, unknownNode);
+      nodeChildCount.set(targetNodeId, 0);
+      charactersAtNode.set(targetNodeId, new Set());
+
+      edges.push({
+        fromNodeId: prevNodeId,
+        toNodeId: targetNodeId,
+        characterId,
+        isDotted: true,
+      });
 
       characterLastNodeId.set(characterId, targetNodeId);
       continue;

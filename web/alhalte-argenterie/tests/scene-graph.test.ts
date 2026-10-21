@@ -1,7 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { mount, unmount } from 'svelte';
-import { buildSceneGraph, type SceneMovementEvent } from '../src/utils/sceneGraph.js';
+import {
+  buildSceneGraph,
+  collectKnownSceneIds,
+  filterOwnedMovements,
+  type SceneMovementEvent,
+} from '../src/utils/sceneGraph.js';
 import SceneGraphTab from '../src/components/Control/tabs/SceneGraphTab.svelte';
+import App from '../src/components/App.svelte';
+import { createDefaultJuices } from '../src/utils/sceneSettings.js';
+import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
 
 describe('Scene Graph Algorithm & View', () => {
   const sceneNames = new Map<string, string>([
@@ -187,15 +195,15 @@ describe('Scene Graph Algorithm & View', () => {
     expect(nodeD?.branchIndex).not.toBe(nodeA?.branchIndex);
   });
 
-  // spec: alhalte-argenterie/scene-graph 未知シーン「？」点線
-  it('draws dotted edge to a single "?" node per inaccessible unknown scene', () => {
+  // spec: alhalte-argenterie/scene-graph Issue #263: 未知シーンは独立した「？」ノードと点線
+  it('draws one independent "?" node per frontier edge without leaking the unknown scene', () => {
     const movements: SceneMovementEvent[] = [
       { characterId: 'c1', characterName: '潜入者', toSceneId: 'scene-a', timestamp: 100 },
       {
         characterId: 'c1',
         characterName: '潜入者',
         fromSceneId: 'scene-a',
-        toSceneId: 'scene-secret-1', // Inaccessible
+        toSceneId: 'scene-secret-1', // Not in V_known
         timestamp: 150,
       },
       {
@@ -208,24 +216,205 @@ describe('Scene Graph Algorithm & View', () => {
         characterId: 'c2',
         characterName: '別の潜入者',
         fromSceneId: 'scene-a',
-        toSceneId: 'scene-secret-1', // Same inaccessible scene
+        toSceneId: 'scene-secret-1', // Same actual scene, but still anonymous
         timestamp: 160,
       },
     ];
 
     const result = buildSceneGraph(movements, sceneNames, accessibleScenes);
 
-    // Only one "?" node for scene-secret-1
-    const unknownNodes = result.nodes.filter((n) => n.sceneId === 'scene-secret-1');
-    expect(unknownNodes).toHaveLength(1);
-    expect(unknownNodes[0].sceneName).toBe('？');
-    expect(unknownNodes[0].isUnknown).toBe(true);
+    // One independent "?" node per frontier edge: merging them would reveal
+    // that both transitions lead to the same hidden scene.
+    const unknownNodes = result.nodes.filter((n) => n.isUnknown);
+    expect(unknownNodes).toHaveLength(2);
+    expect(unknownNodes[0].id).not.toBe(unknownNodes[1].id);
+    for (const node of unknownNodes) {
+      expect(node.sceneName).toBe('？');
+      expect(node.sceneId).toBe('');
+      expect(result.nodes.some((n) => n !== node && n.sceneId === 'scene-secret-1')).toBe(false);
+    }
 
-    // Both transitions should be dotted edges
+    // Both transitions are dotted edges into distinct unknown nodes.
     const dottedEdges = result.edges.filter((e) => e.isDotted);
     expect(dottedEdges).toHaveLength(2);
-    expect(dottedEdges[0].toNodeId).toBe(unknownNodes[0].id);
-    expect(dottedEdges[1].toNodeId).toBe(unknownNodes[0].id);
+    expect(new Set(dottedEdges.map((edge) => edge.toNodeId))).toEqual(
+      new Set(unknownNodes.map((node) => node.id)),
+    );
+  });
+
+  // spec: alhalte-argenterie/scene-graph Issue #263: 未知 scene からの退出は edge にしない
+  it('does not invent a frontier edge when a movement leaves an unknown scene', () => {
+    const movements: SceneMovementEvent[] = [
+      {
+        characterId: 'mine',
+        characterName: '自キャラ',
+        fromSceneId: 'scene-secret',
+        toSceneId: 'scene-a',
+        timestamp: 100,
+      },
+    ];
+
+    const result = buildSceneGraph(movements, sceneNames, accessibleScenes);
+
+    // Only the known destination is drawn; there is no known source to attach
+    // a dotted edge to, so no orphan "?" node is created.
+    expect(result.nodes.map((node) => node.sceneId)).toEqual(['scene-a']);
+    expect(result.nodes.some((node) => node.isUnknown)).toBe(false);
+    expect(result.edges).toHaveLength(0);
+  });
+
+  // spec: alhalte-argenterie/scene-graph Issue #263: 保有キャラクターの移動だけを残す
+  it('filters movements to the characters owned by the caller', () => {
+    const movements: SceneMovementEvent[] = [
+      { characterId: 'mine', characterName: '自キャラ', toSceneId: 'scene-a', timestamp: 100 },
+      { characterId: 'other', characterName: '他人', toSceneId: 'scene-b', timestamp: 110 },
+    ];
+
+    expect(filterOwnedMovements(movements, new Set(['mine']))).toEqual([movements[0]]);
+    expect(filterOwnedMovements(movements, new Set())).toEqual([]);
+  });
+
+  // spec: alhalte-argenterie/scene-graph Issue #263: V_known は保有キャラクターの到達 scene + seed
+  it('computes V_known from owned movements, current scene and present characters only', () => {
+    const movements: SceneMovementEvent[] = [
+      {
+        characterId: 'mine',
+        characterName: '自キャラ',
+        fromSceneId: 'scene-a',
+        toSceneId: 'scene-b',
+        timestamp: 100,
+      },
+      {
+        characterId: 'mine',
+        characterName: '自キャラ',
+        fromSceneId: 'scene-b',
+        toSceneId: 'deleted-scene',
+        timestamp: 120,
+      },
+    ];
+    const sceneIds = new Set(['/', 'scene-a', 'scene-b', 'scene-c']);
+
+    const known = collectKnownSceneIds(movements, sceneIds, ['/', 'scene-c']);
+
+    // scene-c is the seed (current scene / owned character present), while the
+    // deleted destination is not a known scene and must stay a frontier node.
+    expect([...known].sort()).toEqual(['/', 'scene-a', 'scene-b', 'scene-c']);
+  });
+
+  // spec: alhalte-argenterie/scene-graph Issue #263: App は保有キャラクターのグラフに絞る
+  it('scopes the App scene graph to the owned characters and keeps frontier nodes anonymous', async () => {
+    localStorage.clear();
+    localStorage.setItem('alhalte:account-id', '1001');
+
+    const makeScene = (id: string, name: string, members: string[]): Scene => ({
+      id,
+      name,
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members,
+    });
+    const scenes = [
+      makeScene('/', 'メインシーン', ['mine']),
+      makeScene('scene-a', '街頭', ['mine']),
+      makeScene('scene-b', '地下迷宮', ['other']),
+    ];
+    const characters: Character[] = [
+      {
+        id: 'mine',
+        name: '自キャラ',
+        initiative: 10,
+        description: '',
+        statuses: [],
+        parameters: [],
+        chatPalette: '',
+        hideStatus: false,
+        ownerAccountId: '1001',
+      },
+      {
+        id: 'other',
+        name: '他人のキャラ',
+        initiative: 10,
+        description: '',
+        statuses: [],
+        parameters: [],
+        chatPalette: '',
+        hideStatus: false,
+        ownerAccountId: '2002',
+      },
+    ];
+    const movements: SceneMovementEvent[] = [
+      {
+        characterId: 'mine',
+        characterName: '自キャラ',
+        fromSceneId: '/',
+        toSceneId: 'scene-a',
+        timestamp: 100,
+      },
+      {
+        characterId: 'other',
+        characterName: '他人のキャラ',
+        fromSceneId: '/',
+        toSceneId: 'scene-b',
+        timestamp: 110,
+      },
+      {
+        characterId: 'mine',
+        characterName: '自キャラ',
+        fromSceneId: 'scene-a',
+        toSceneId: 'scene-secret',
+        timestamp: 120,
+      },
+    ];
+    const room: VisitedRoom = {
+      id: '0000000000000263',
+      name: 'シーングラフ絞り込みテスト',
+      url: 'https://alhalte.example/rooms/0000000000000263#key',
+      lastVisited: Date.now(),
+    };
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: room,
+        initialScenes: scenes,
+        initialCharacters: characters,
+        initialMovements: movements,
+        userRole: 'participant',
+      },
+    });
+    await new Promise((r) => setTimeout(r, 30));
+
+    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-graph"]')?.click();
+    await new Promise((r) => setTimeout(r, 40));
+
+    const labels = Array.from(target.querySelectorAll('[data-testid^="node-label-"]'))
+      .map((element) => element.textContent ?? '')
+      .join(' ');
+    // The owned character reached scene-a; the other character's scene-b route
+    // must not leak the scene name. It is shown only as a frontier "?" node
+    // because scene-b is outside this participant's V_known.
+    expect(labels).toContain('街頭');
+    expect(labels).not.toContain('地下迷宮');
+
+    // Two unreached destinations (scene-b and scene-secret) are anonymous,
+    // independent frontier nodes drawn with dotted edges.
+    const frontierDots = target.querySelectorAll('[data-testid^="node-dot-node-unknown-"]');
+    expect(frontierDots.length).toBe(2);
+    for (const dot of Array.from(frontierDots)) {
+      expect(dot.textContent?.trim()).toBe('?');
+    }
+    const dottedEdge = Array.from(target.querySelectorAll('[data-testid^="edge-"]')).find(
+      (element) => element.getAttribute('stroke-dasharray') === '4,4',
+    );
+    expect(dottedEdge).toBeTruthy();
+    expect(labels).not.toContain('scene-secret');
+
+    unmount(instance);
+    target.remove();
+    document.body.innerHTML = '';
+    localStorage.clear();
   });
 
   // spec: alhalte-argenterie/scene-graph 再訪時の点複製

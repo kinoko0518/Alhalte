@@ -40,6 +40,8 @@
   import {
     buildMovementsFromLogRecords,
     collapseLiveMovements,
+    collectKnownSceneIds,
+    filterOwnedMovements,
     reconcileMovements,
     type SceneMovementEvent,
   } from '../utils/sceneGraph.js';
@@ -93,7 +95,7 @@
     type SceneSummary,
   } from '../utils/roomSocket.js';
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
-  import { normalizeAccountId } from '../utils/characterActions.js';
+  import { isCharacterOwnedBy, normalizeAccountId } from '../utils/characterActions.js';
   import { resolveRoomKey } from '../utils/cellarTransfer.js';
   import {
     getSavedAccountId,
@@ -462,13 +464,47 @@
   let extensionStateApplied = false;
 
   /**
-   * Scenes whose content this client already holds (graph / read view).
+   * Scenes whose content this client already holds (read view).
    *
    * `SceneList` is not permission-filtered, so every known scene id is listed;
-   * the server still refuses reads the role may not perform.
+   * the server still refuses reads the role may not perform. The scene graph
+   * applies its own reachability filter below (Issue #263).
    */
   let accessibleSceneIds = $derived.by(() => {
     return new Set(scenes.map((s) => s.id));
+  });
+
+  /** Characters owned by the signed-in account (`std::owner_account`). */
+  let ownedCharacterIds = $derived.by(() => {
+    return new Set(
+      characters
+        .filter((character) => isCharacterOwnedBy(character, currentAccountId))
+        .map((character) => character.id),
+    );
+  });
+
+  /**
+   * `V_known` for the scene graph (Issue #263): the scenes the caller's own
+   * characters have participated in, plus `/`, the currently viewed scene and
+   * the scenes where one of those characters is present now. Edges leaving this
+   * set become dotted frontier edges to independent "?" nodes. Computed on
+   * every render, never cached.
+   *
+   * The graph still receives every movement so transitions between known scenes
+   * (and frontier exits discovered by other characters) are not lost; only the
+   * set of named nodes is narrowed to `V_known`.
+   */
+  let sceneGraphSceneIds = $derived.by(() => {
+    if (effectiveRole !== 'participant') return accessibleSceneIds;
+    const sceneIds = new Set(scenes.map((scene) => scene.id));
+    const seedSceneIds = ['/', currentScene.id];
+    for (const scene of scenes) {
+      if (scene.members.some((characterId) => ownedCharacterIds.has(characterId))) {
+        seedSceneIds.push(scene.id);
+      }
+    }
+    const ownedMovements = filterOwnedMovements(movements, ownedCharacterIds);
+    return collectKnownSceneIds(ownedMovements, sceneIds, seedSceneIds);
   });
 
   /**
@@ -3543,7 +3579,7 @@
                   {extensions}
                   {extensionPipeline}
                   {movements}
-                  {accessibleSceneIds}
+                  accessibleSceneIds={sceneGraphSceneIds}
                   {selectedCharacterId}
                   role={effectiveRole}
                   {defaultPermission}
@@ -3639,7 +3675,7 @@
                 {extensions}
                 {extensionPipeline}
                 {movements}
-                {accessibleSceneIds}
+                accessibleSceneIds={sceneGraphSceneIds}
                 {selectedCharacterId}
                 role={effectiveRole}
                 {defaultPermission}
