@@ -11,7 +11,7 @@ use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::codec::Framed;
 
 use crate::cellar_sink::CellarSink;
-use crate::error::Result;
+use crate::error::{BanquetteError, Result};
 use crate::labels::KEY_STD_NAME;
 use crate::log::{CharacterCameEvent, CharacterGoneEvent, LogOperationEvent};
 use crate::protocol::{
@@ -703,11 +703,19 @@ impl BanquetteServer {
                     }
                     Ok(_) => {}
                     Err(e) => {
+                        // Issue #271: a rejected speaker is reported with its own
+                        // code so the client can stop retrying instead of
+                        // queueing the frame forever.
+                        let code = if matches!(e, BanquetteError::SpeakerNotOwned { .. }) {
+                            "SpeakerNotOwned"
+                        } else {
+                            "AppendLogFailed"
+                        };
                         send_to_client(
                             out_tx,
                             client_id,
                             ServerFrame::Error {
-                                code: "AppendLogFailed".to_string(),
+                                code: code.to_string(),
                                 message: e.to_string(),
                             },
                         )
@@ -748,11 +756,16 @@ impl BanquetteServer {
                             .await;
                     }
                     Err(e) => {
+                        let code = if matches!(e, BanquetteError::SpeakerNotOwned { .. }) {
+                            "SpeakerNotOwned"
+                        } else {
+                            "EditLogFailed"
+                        };
                         let _ = out_tx
                             .send(BanquetteToMaitreD::SendToClient {
                                 client_id,
                                 frame: ServerFrame::Error {
-                                    code: "EditLogFailed".to_string(),
+                                    code: code.to_string(),
                                     message: e.to_string(),
                                 },
                             })

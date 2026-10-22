@@ -50,6 +50,7 @@ pub mod error;
 pub mod export;
 pub mod labels;
 pub mod log;
+pub mod log_record;
 pub mod protocol;
 pub mod room;
 pub mod scene;
@@ -78,6 +79,7 @@ pub use labels::{
 pub use log::{
     CharacterCameEvent, CharacterGoneEvent, LogBiblio, LogChunk, LogOperationEvent, SceneLog,
 };
+pub use log_record::entry_speaker_id;
 pub use protocol::{
     BanquetteToMaitreD, ClientFrame, MaitreDToBanquette, ProtocolCodec, ServerFrame,
     WebRtcSignalPayload,

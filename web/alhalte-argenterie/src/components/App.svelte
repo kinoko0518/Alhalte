@@ -95,7 +95,11 @@
     type SceneSummary,
   } from '../utils/roomSocket.js';
   import { getOutbox, type OutboxEntry } from '../utils/outbox.js';
-  import { isCharacterOwnedBy, normalizeAccountId } from '../utils/characterActions.js';
+  import {
+    isCharacterOwnedBy,
+    normalizeAccountId,
+    speakableCharacters,
+  } from '../utils/characterActions.js';
   import { resolveRoomKey } from '../utils/cellarTransfer.js';
   import {
     getSavedAccountId,
@@ -442,7 +446,42 @@
   // history reconstructed from the came/gone log records (Issue #162). The
   // reconciliation drops a live movement once its log record has loaded.
   let movements = $derived(reconcileMovements(liveMovements, logMovements));
-  let selectedCharacterId = $state<string | undefined>(characters[0]?.id);
+  let selectedCharacterId = $state<string | undefined>(undefined);
+
+  /**
+   * Characters the caller may speak as (Issue #271).
+   *
+   * Only these reach the footer's speaker picker; the character management tab
+   * keeps the full `characters` list. `selectedCharacterId` is kept inside this
+   * list so the default speaker can never be another account's character.
+   */
+  let speakable = $derived(
+    speakableCharacters(characters, effectiveRole, currentAccountId),
+  );
+
+  // Keep the selected speaker speakable (or `undefined` = narration) whenever
+  // the character list, the role or the account changes.
+  $effect(() => {
+    const available = speakable;
+    if (available.length === 0) {
+      if (selectedCharacterId !== undefined) selectedCharacterId = undefined;
+      return;
+    }
+    if (!selectedCharacterId || !available.some((c) => c.id === selectedCharacterId)) {
+      selectedCharacterId = available[0]?.id;
+    }
+  });
+
+  /**
+   * Selects the speaker from the footer picker (Issue #271).
+   *
+   * Only a speakable character may become the speaker; anything else is ignored
+   * so a stale click cannot select another account's character.
+   */
+  function handleSelectSpeaker(characterId: string): void {
+    if (!speakable.some((character) => character.id === characterId)) return;
+    selectedCharacterId = characterId;
+  }
 
   /**
    * Room key used for cellar transfers (Issue #109 / #145 / #156).
@@ -866,6 +905,14 @@
    */
   let pipelineWarning = $state<string | null>(null);
   /**
+   * Visible reason for a message the server refused because the speaker belongs
+   * to another account (Issue #271). Cleared on the next send attempt.
+   */
+  let sendWarning = $state<string | null>(null);
+  /** Copy shown when banquette answers `SpeakerNotOwned`. */
+  const SPEAKER_NOT_OWNED_WARNING =
+    '他のアカウントのキャラクターを話者にしていたため、この発言は送信できませんでした。話者を選び直してください。';
+  /**
    * `kind: 'message'` entries of the active room's durable outbox, projected for
    * inline rendering in `LogTab` (Issue #148).
    *
@@ -993,7 +1040,36 @@
         if (!roomSocket || !roomSocket.isConnected) {
           throw new Error('room socket is not connected');
         }
-        await roomSocket.requestAppendLog(sceneId, record);
+        // Issue #271: a queued message may name a speaker the caller can no
+        // longer voice (character deleted, ownership changed, role downgraded).
+        // Convert it to narration once instead of replaying an impersonation.
+        const speakerId = record.speakerId;
+        const canSpeakAsSelected =
+          speakerId === undefined || speakable.some((c) => c.id === speakerId);
+        if (!canSpeakAsSelected) {
+          console.warn(
+            'Sending a queued message as narration; its speaker is not speakable (Issue #271):',
+            entry.id,
+          );
+        }
+        const deliverable: LogRecord = canSpeakAsSelected
+          ? record
+          : { ...record, speaker: 'Anonymous', speakerId: undefined };
+        try {
+          await roomSocket.requestAppendLog(sceneId, deliverable);
+        } catch (err) {
+          // Non-retryable: replaying cannot fix an ownership mismatch, so the
+          // entry is dropped instead of staying queued for up to 30 days.
+          if (err instanceof ServerOperationError && err.code === 'SpeakerNotOwned') {
+            console.warn(
+              'Dropping a queued message refused as SpeakerNotOwned (Issue #271):',
+              entry.id,
+            );
+            sendWarning = SPEAKER_NOT_OWNED_WARNING;
+            return true;
+          }
+          throw err;
+        }
         return true;
       });
     } catch (err) {
@@ -1120,9 +1196,10 @@
     // Replace even when the list is empty: the server list is authoritative and
     // a room may legitimately end up with zero characters.
     characters = list;
-    // Keep the selected character valid (or fall back to the first one).
-    if (!selectedCharacterId || !characters.some((c) => c.id === selectedCharacterId)) {
-      selectedCharacterId = characters[0]?.id;
+    // Keep the selected speaker inside the speakable list; the effect above also
+    // repairs it, but doing it here keeps the footer correct for the same tick.
+    if (!selectedCharacterId || !speakable.some((c) => c.id === selectedCharacterId)) {
+      selectedCharacterId = speakable[0]?.id;
     }
   }
 
@@ -1174,7 +1251,7 @@
       sc.members = sc.members.filter((id) => id !== characterId);
     }
     if (selectedCharacterId === characterId) {
-      selectedCharacterId = characters[0]?.id;
+      selectedCharacterId = speakable[0]?.id;
     }
     // Drop any pending piece state so a re-created id cannot inherit a ghost.
     for (const states of pieceStatesByScene.values()) {
@@ -1197,7 +1274,9 @@
     } else {
       characters = [...characters, decoded];
     }
-    if (!selectedCharacterId) selectedCharacterId = decoded.id;
+    if (!selectedCharacterId && speakable.some((character) => character.id === decoded.id)) {
+      selectedCharacterId = decoded.id;
+    }
     // The per-scene piece state (`piece::<id>::placed` / `pos`) stays
     // authoritative for placement; re-apply it after the character attributes.
     applyPieceStatesToCharacters(currentSceneId);
@@ -3385,10 +3464,16 @@
     if (!canSendToScene(currentScene.id)) return;
     if (isSending) return; // prevent double sends while an echo is pending
 
-    const char = characters.find((c) => c.id === characterId);
+    // Issue #271: never send a speaker the caller may not voice. A stale picker
+    // selection (role change, character deleted, another account's character
+    // still selected) degrades to narration instead of being forwarded; the
+    // server rejects it anyway.
+    const char = speakable.find((candidate) => candidate.id === characterId);
     const speaker = char?.name || 'Anonymous';
+    const speakerId = char?.id;
     const sceneId = currentScene.id;
     pipelineWarning = null;
+    sendWarning = null;
     isSending = true;
 
     try {
@@ -3401,7 +3486,7 @@
           text,
           extensions,
           extensionPipeline,
-          characterId,
+          speakerId,
         );
         // Issue #165: an enabled extension without a wasm body is skipped with a
         // warning instead of disappearing silently. The message is still sent.
@@ -3449,6 +3534,16 @@
       } catch (err) {
         const isPermissionDenied =
           err instanceof ServerOperationError && err.code === 'PermissionDenied';
+        // Issue #271: the server refused the speaker. Retrying cannot succeed, so
+        // the message is neither queued nor rendered; the reason is shown instead
+        // of leaving a 30-day outbox entry that would be replayed forever.
+        const isSpeakerNotOwned =
+          err instanceof ServerOperationError && err.code === 'SpeakerNotOwned';
+        if (isSpeakerNotOwned) {
+          console.warn('Dropping a message refused as SpeakerNotOwned (Issue #271):', record.id);
+          sendWarning = SPEAKER_NOT_OWNED_WARNING;
+          return;
+        }
         const isRetryable =
           err instanceof OperationTimeoutError ||
           (err instanceof ServerOperationError && !isPermissionDenied);
@@ -3486,6 +3581,16 @@
       data-testid="pipeline-warning"
     >
       {pipelineWarning}
+    </div>
+  {/if}
+
+  {#if sendWarning}
+    <div
+      class="pipeline-warning"
+      role="alert"
+      data-testid="speaker-warning"
+    >
+      {sendWarning}
     </div>
   {/if}
 
@@ -3576,6 +3681,7 @@
                   {currentScene}
                   allScenes={scenes}
                   {characters}
+                  speakableCharacters={speakable}
                   {extensions}
                   {extensionPipeline}
                   {movements}
@@ -3594,7 +3700,7 @@
                   connectionState={currentConnectionState}
                   onCollapse={() => (isControlSheetOpen = false)}
                   onSelectScene={handleSelectScene}
-                  onSelectCharacter={(id) => (selectedCharacterId = id)}
+                  onSelectCharacter={handleSelectSpeaker}
                   onUpdateScene={handleUpdateScene}
                   onCreateScene={handleCreateScene}
                   onDeleteScene={handleDeleteScene}
@@ -3672,6 +3778,7 @@
                 {currentScene}
                 allScenes={scenes}
                 {characters}
+                speakableCharacters={speakable}
                 {extensions}
                 {extensionPipeline}
                 {movements}
@@ -3690,7 +3797,7 @@
                 connectionState={currentConnectionState}
                 onCollapse={() => (isControlSheetOpen = false)}
                 onSelectScene={handleSelectScene}
-                onSelectCharacter={(id) => (selectedCharacterId = id)}
+                onSelectCharacter={handleSelectSpeaker}
                 onUpdateScene={handleUpdateScene}
                 onCreateScene={handleCreateScene}
                 onDeleteScene={handleDeleteScene}

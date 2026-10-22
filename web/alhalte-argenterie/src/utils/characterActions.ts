@@ -76,6 +76,30 @@ export function isCharacterOwnedBy(
 }
 
 /**
+ * Characters the caller may speak as in the log footer (Issue #271).
+ *
+ * - `admin`: every character (the GM voices NPCs and the players' PCs, the same
+ *   exception banquette applies).
+ * - `participant`: only the characters it owns (`std::owner_account`), reusing
+ *   {@link isCharacterOwnedBy} so the comparison matches character CRUD.
+ * - `viewer` / `denied`: none; they cannot write logs at all.
+ *
+ * An empty result means the footer falls back to narration (no `speakerId`).
+ * This is a UI convenience only: banquette re-authorizes the speaker on append
+ * and edit, and an unknown owner never becomes speakable by accident.
+ */
+export function speakableCharacters<T extends Pick<Character, 'ownerAccountId'>>(
+  characters: readonly T[] | null | undefined,
+  role: RoomRole,
+  currentAccountId: unknown,
+): T[] {
+  const list = characters ?? [];
+  if (role === 'admin') return [...list];
+  if (role !== 'participant') return [];
+  return list.filter((character) => isCharacterOwnedBy(character, currentAccountId));
+}
+
+/**
  * Views available to a role.
  *
  * - viewer: only the current scene (no segmented button at all),

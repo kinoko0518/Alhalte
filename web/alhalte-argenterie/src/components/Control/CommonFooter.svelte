@@ -88,6 +88,12 @@
   let {
     activeTab = 'log',
     characters = [],
+    /**
+     * Footer-only speaker candidates (Issue #271). `App` derives them from the
+     * role and `std::owner_account`; the picker never offers anything else.
+     * Defaults to `characters` so standalone mounts (tests / preview) still work.
+     */
+    speakableCharacters,
     extensions = [],
     extensionPipeline = new ExtensionPipeline(),
     selectedCharacterId,
@@ -108,6 +114,11 @@
   }: {
     activeTab?: ActiveTab;
     characters?: Character[];
+    /**
+     * Characters the caller may speak as (Issue #271). Only these appear in the
+     * speaker picker; an empty list means narration only.
+     */
+    speakableCharacters?: Character[];
     extensions?: ExtensionItem[];
     extensionPipeline?: ExtensionPipeline;
     selectedCharacterId?: string;
@@ -189,8 +200,11 @@
 
   const diceList = ['1D2', '1D4', '1D6', '1D8', '1D10', '1D12', '1D20', '1D100'] as const;
 
+  /** Characters offered by the speaker picker (Issue #271). */
+  let speakerOptions = $derived(speakableCharacters ?? characters);
+
   let selectedCharacter = $derived.by(() => {
-    return characters.find((c) => c.id === selectedCharacterId) || characters[0];
+    return speakerOptions.find((c) => c.id === selectedCharacterId) || speakerOptions[0];
   });
 
   // Chat palette suggestions
@@ -442,7 +456,7 @@
           class="char-picker-menu"
           data-testid="character-picker-dropdown"
         >
-          {#each characters as char (char.id)}
+          {#each speakerOptions as char (char.id)}
             <MenuItem
               selected={char.id === selectedCharacter?.id}
               onclick={() => {

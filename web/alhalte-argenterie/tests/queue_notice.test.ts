@@ -13,8 +13,8 @@ import App from '../src/components/App.svelte';
 import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
 import { createConnectionManager } from '../src/utils/connection.js';
 import { getOutbox, resetOutbox } from '../src/utils/outbox.js';
-import { OperationTimeoutError } from '../src/utils/roomSocket.js';
-import type { LogRecord, VisitedRoom } from '../src/types/index.js';
+import { OperationTimeoutError, ServerOperationError } from '../src/utils/roomSocket.js';
+import type { Character, LogRecord, VisitedRoom } from '../src/types/index.js';
 
 const ROOM: VisitedRoom = {
   id: 'room-queue-notice-test',
@@ -53,7 +53,11 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     resetOutbox();
   });
 
-  function mountApp(socket: FakeRoomSocket, initialState: 'connected' | 'disconnected' = 'connected') {
+  function mountApp(
+    socket: FakeRoomSocket,
+    initialState: 'connected' | 'disconnected' = 'connected',
+    extraProps: Record<string, unknown> = {},
+  ) {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
     Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
 
@@ -65,6 +69,7 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
         isAdmin: true,
         connectionManager,
         roomSocket: asRoomSocket(socket),
+        ...extraProps,
       },
     });
     return { instance, connectionManager };
@@ -373,6 +378,184 @@ describe('Send path, offline outbox and queue notice (Issue #139)', () => {
     // The entry stayed queued, so its inline preview stays visible.
     expect(messagesText()).toContain('再送されるメッセージ');
     expect(target.querySelectorAll('[data-queued="true"]')).toHaveLength(1);
+
+    unmount(instance);
+  });
+});
+
+/**
+ * A rejected speaker is never retried (Issue #271).
+ *
+ * References:
+ * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 発言とログ表示`
+ * - GitHub Issue #271
+ */
+describe('SpeakerNotOwned is not retried (Issue #271)', () => {
+  let target: HTMLDivElement;
+  const ACCOUNT = '1001';
+  const ownedCharacter: Character = {
+    id: 'own-1',
+    name: 'アリス',
+    initiative: 10,
+    description: '',
+    statuses: [],
+    parameters: [],
+    chatPalette: '',
+    hideStatus: false,
+    ownerAccountId: ACCOUNT,
+  };
+
+  function mountApp(
+    socket: FakeRoomSocket,
+    initialState: 'connected' | 'disconnected' = 'connected',
+    extraProps: Record<string, unknown> = {},
+  ) {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+    const connectionManager = createConnectionManager({ initialState });
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: ROOM,
+        isAdmin: true,
+        connectionManager,
+        roomSocket: asRoomSocket(socket),
+        ...extraProps,
+      },
+    });
+    return { instance, connectionManager };
+  }
+
+  beforeEach(() => {
+    document.body.innerHTML = '';
+    localStorage.clear();
+    localStorage.setItem('alhalte:account-id', ACCOUNT);
+    resetOutbox();
+    target = document.createElement('div');
+    document.body.appendChild(target);
+  });
+
+  afterEach(() => {
+    document.body.innerHTML = '';
+    resetOutbox();
+  });
+
+  function typeAndSend(text: string): void {
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    expect(textarea).toBeTruthy();
+    textarea!.value = text;
+    textarea!.dispatchEvent(new Event('input', { bubbles: true }));
+    target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]')?.click();
+  }
+
+  // spec: alhalte-argenterie/発言とログ表示 SpeakerNotOwned は再送しない (Issue #271)
+  it('does not queue a message the server refuses as SpeakerNotOwned', async () => {
+    const socket = new FakeRoomSocket();
+    const { instance } = mountApp(socket);
+    await tick(30);
+
+    typeAndSend('なりすまし');
+    await tick(20);
+    expect(socket.requestAppendLogCalls).toHaveLength(1);
+
+    socket.rejectPending(new ServerOperationError('SpeakerNotOwned', 'not owned'));
+    await tick(80);
+
+    // Nothing entered the durable outbox and nothing was retried.
+    expect(await getOutbox().list(ROOM.id!, 'message')).toHaveLength(0);
+    expect(socket.requestAppendLogCalls).toHaveLength(1);
+    expect(socket.appendLogCalls).toHaveLength(0);
+    const warning = target.querySelector('[data-testid="speaker-warning"]');
+    expect(warning?.textContent).toContain('他のアカウントのキャラクター');
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/発言とログ表示 SpeakerNotOwned は再送しない (Issue #271)
+  it('drops a queued message the server refuses as SpeakerNotOwned', async () => {
+    await getOutbox().enqueue({
+      roomId: ROOM.id!,
+      kind: 'message',
+      createdAt: Date.now() - 1000,
+      payload: {
+        sceneId: '/',
+        record: {
+          id: 'msg-queued-impersonation',
+          sceneId: '/',
+          content: 'なりすましキュー',
+          speaker: 'ボブ',
+          speakerId: 'foreign-1',
+          timestamp: 1000,
+        } satisfies LogRecord,
+      },
+    });
+
+    const socket = new FakeRoomSocket();
+    // Admin: every character is speakable, so the entry is replayed as-is and the
+    // server decides (the character exists here, the fake server refuses it).
+    const foreignCharacter: Character = {
+      id: 'foreign-1',
+      name: 'ボブ',
+      initiative: 5,
+      description: '',
+      statuses: [],
+      parameters: [],
+      chatPalette: '',
+      hideStatus: false,
+      ownerAccountId: '2002',
+    };
+    const { instance } = mountApp(socket, 'connected', {
+      initialCharacters: [foreignCharacter],
+    });
+    await waitFor(() => socket.requestAppendLogCalls.length > 0);
+    expect(socket.requestAppendLogCalls[0].record.speakerId).toBe('foreign-1');
+
+    socket.rejectPending(new ServerOperationError('SpeakerNotOwned', 'not owned'));
+    await tick(80);
+
+    // Dropped instead of staying queued for the 30-day TTL, and never retried.
+    expect(await getOutbox().list(ROOM.id!, 'message')).toHaveLength(0);
+    expect(socket.requestAppendLogCalls).toHaveLength(1);
+    expect(target.querySelector('[data-testid="speaker-warning"]')).toBeTruthy();
+
+    unmount(instance);
+  });
+
+  // spec: alhalte-argenterie/発言とログ表示 送信できない話者のキューはナレーションへ変換する (Issue #271)
+  it('replays a queued foreign speaker as narration for a participant', async () => {
+    await getOutbox().enqueue({
+      roomId: ROOM.id!,
+      kind: 'message',
+      createdAt: Date.now() - 1000,
+      payload: {
+        sceneId: '/',
+        record: {
+          id: 'msg-queued-narration',
+          sceneId: '/',
+          content: 'キューからナレーション',
+          speaker: 'ボブ',
+          speakerId: 'foreign-1',
+          timestamp: 1000,
+        } satisfies LogRecord,
+      },
+    });
+
+    const socket = new FakeRoomSocket();
+    const { instance } = mountApp(socket, 'connected', {
+      isAdmin: false,
+      userRole: 'participant',
+      initialCharacters: [ownedCharacter],
+    });
+    await waitFor(() => socket.requestAppendLogCalls.length > 0);
+
+    // The non-owned speaker is stripped once instead of being replayed forever.
+    const sent = socket.requestAppendLogCalls[0].record;
+    expect(sent.speakerId).toBeUndefined();
+    expect(sent.speaker).toBe('Anonymous');
+
+    socket.deliverEcho();
+    await tick(60);
+    expect(await getOutbox().list(ROOM.id!, 'message')).toHaveLength(0);
 
     unmount(instance);
   });

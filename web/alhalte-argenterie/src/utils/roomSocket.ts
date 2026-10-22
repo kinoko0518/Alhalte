@@ -79,8 +79,8 @@ export class OperationTimeoutError extends Error {
  * Error used when the server rejects a Promise-based operation.
  *
  * `code` is the `ServerFrame::Error` code (e.g. `'AppendLogFailed'`,
- * `'PermissionDenied'`, or `'disconnected'` when the socket closed before the
- * acknowledgement arrived).
+ * `'SpeakerNotOwned'`, `'PermissionDenied'`, or `'disconnected'` when the socket
+ * closed before the acknowledgement arrived).
  */
 export class ServerOperationError extends Error {
   /** Machine-readable error code reported by the server. */
@@ -1893,7 +1893,9 @@ export class RoomSocket {
     const entry = logRecordToTin(record, clientOpId);
     const promise = this.registerOperation<LogAppendedAck>(
       'appendLog',
-      ['AppendLogFailed'],
+      // Issue #271: `SpeakerNotOwned` is the room's answer when the record names
+      // a character the caller does not own (and is not an admin).
+      ['AppendLogFailed', 'SpeakerNotOwned'],
       (frame) => {
         if (typeof frame !== 'object' || frame === null || !('LogEventAppended' in frame)) {
           return { matched: false };

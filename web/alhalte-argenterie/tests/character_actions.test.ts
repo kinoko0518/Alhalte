@@ -12,6 +12,7 @@ import {
   CHARACTER_VIEW_LABELS,
   isCharacterOwnedBy,
   normalizeAccountId,
+  speakableCharacters,
   visibleRowActions,
   type CharacterRowAction,
   type CharacterView,
@@ -167,5 +168,66 @@ describe('characterActions (Issue #228)', () => {
       expect(actions('admin', 'scene', owned, false)).toEqual(['move', 'piece', 'more']);
       expect(actions('admin', 'all', owned, false)).toEqual(['focus', 'more']);
     });
+  });
+});
+
+/**
+ * Speaker ownership matrix for the log footer (Issue #271).
+ *
+ * References:
+ * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 権限 UI`
+ * - GitHub Issue #271
+ */
+describe('characterActions speakableCharacters (Issue #271)', () => {
+  const ACCOUNT = '1001';
+  const owned = { id: '42', ownerAccountId: ACCOUNT };
+  const other = { id: '43', ownerAccountId: '2002' };
+  const unowned = { id: '44' };
+  const characters = [owned, other, unowned];
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('lets an admin speak as every character', () => {
+    expect(speakableCharacters(characters, 'admin', ACCOUNT)).toEqual(characters);
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('lets a participant speak only as its own characters', () => {
+    expect(speakableCharacters(characters, 'participant', ACCOUNT)).toEqual([owned]);
+    // A character without an owner is never speakable by a participant.
+    expect(speakableCharacters([unowned], 'participant', ACCOUNT)).toEqual([]);
+    // A missing / malformed account never matches an owner.
+    expect(speakableCharacters(characters, 'participant', null)).toEqual([]);
+    expect(speakableCharacters(characters, 'participant', 'abc')).toEqual([]);
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('gives a viewer or a denied account no speaker at all', () => {
+    expect(speakableCharacters(characters, 'viewer', ACCOUNT)).toEqual([]);
+    expect(speakableCharacters(characters, 'denied', ACCOUNT)).toEqual([]);
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('does not mutate the input list and tolerates a missing list', () => {
+    const input = [...characters];
+    const result = speakableCharacters(input, 'admin', ACCOUNT);
+    expect(input).toEqual(characters);
+    expect(result).not.toBe(input);
+    expect(speakableCharacters(undefined, 'admin', ACCOUNT)).toEqual([]);
+    expect(speakableCharacters(null, 'participant', ACCOUNT)).toEqual([]);
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('keeps IDs above 2^53 exact when matching the owner', () => {
+    const bigId = '9007199254740993';
+    expect(
+      speakableCharacters([{ id: '1', ownerAccountId: bigId }], 'participant', bigId),
+    ).toHaveLength(1);
+    expect(
+      speakableCharacters(
+        [{ id: '1', ownerAccountId: bigId }],
+        'participant',
+        9007199254740993 as never,
+      ),
+    ).toEqual([]);
   });
 });

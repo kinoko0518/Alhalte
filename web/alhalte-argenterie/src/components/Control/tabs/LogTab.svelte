@@ -528,15 +528,39 @@
     return isNaN(d.getTime()) ? '1970/1/1 00:00:00' : d.toLocaleString();
   }
 
+  /**
+   * Neutral speaker label for a record naming a character that does not exist.
+   *
+   * The client-supplied `speaker` string is never shown for such a record: a
+   * `speakerId` is the authoritative identity, and an id that resolves to
+   * nothing must not let a client choose the displayed name (Issue #271).
+   */
+  const UNKNOWN_SPEAKER_LABEL = '不明なキャラクター';
+
   function findCharacter(speakerId?: string, speakerName?: string): Character | undefined {
+    // With a `speakerId` the id is authoritative and there is no name fallback:
+    // matching by name would let another record borrow a character's identity.
     if (speakerId) {
-      const found = characters.find((c) => c.id === speakerId);
-      if (found) return found;
+      return characters.find((c) => c.id === speakerId);
     }
     if (speakerName) {
       return characters.find((c) => c.name === speakerName);
     }
     return undefined;
+  }
+
+  /**
+   * Displayed speaker name of a chat record (Issue #271).
+   *
+   * - `speakerId` resolving to a character → the character's **current** name,
+   *   not the client-supplied `speaker` string.
+   * - `speakerId` that resolves to nothing → {@link UNKNOWN_SPEAKER_LABEL}.
+   * - narration (no `speakerId`) → the stored `speaker` (unchanged behavior).
+   */
+  function displaySpeakerName(record: LogRecord, character?: Character): string {
+    if (character) return character.name;
+    if (record.speakerId) return UNKNOWN_SPEAKER_LABEL;
+    return record.speaker || 'Anonymous';
   }
 
   /**
@@ -605,6 +629,7 @@
   {:else}
     {@const char = findCharacter(record.speakerId, record.speaker)}
     {@const charColor = char?.color}
+    {@const speakerName = displaySpeakerName(record, char)}
     <div
       class="message-entry"
       class:message-entry-new={isNew}
@@ -619,7 +644,7 @@
         {#if char?.iconUrl}
           <IconImagePicker
             src={char.iconUrl}
-            alt={record.speaker}
+            alt={speakerName}
             size={36}
             shape="circle"
             dataTestId="msg-avatar-{record.id}"
@@ -633,7 +658,7 @@
               ? `background-color: color-mix(in srgb, ${charColor} 18%, transparent); color: ${charColor}; border-color: ${charColor};`
               : ''}
           >
-            {record.speaker ? record.speaker.slice(0, 2) : '👤'}
+            {speakerName.slice(0, 2)}
           </div>
         {/if}
       </div>
@@ -646,7 +671,7 @@
             style={charColor ? `--char-color: ${charColor};` : ''}
             data-testid="msg-speaker-{record.id}"
           >
-            {record.speaker}
+            {speakerName}
           </span>
           <span class="msg-timestamp" data-testid="msg-timestamp-{record.id}">
             {formatTime(record.timestamp)}

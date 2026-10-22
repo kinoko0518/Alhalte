@@ -40,6 +40,13 @@
     movements = [],
     accessibleSceneIds = new Set<string>(),
     selectedCharacterId,
+    /**
+     * Characters the caller may speak as (Issue #271). Footer-only: the
+     * character management tab keeps the full `characters` list, because
+     * admins manage characters they cannot voice and participants can own
+     * several.
+     */
+    speakableCharacters = [],
     role = 'participant',
     defaultPermission = null,
     chunkManager = new ChunkLogManager(),
@@ -91,6 +98,11 @@
     movements?: SceneMovementEvent[];
     accessibleSceneIds?: Set<string>;
     selectedCharacterId?: string;
+    /**
+     * Footer-only speaker candidates (Issue #271). `App` derives them with
+     * `speakableCharacters()`; the picker never offers anything else.
+     */
+    speakableCharacters?: Character[];
     /**
      * Role of the caller (Issue #201). Every child derives its own
      * capabilities from it; `isAdmin` / `isViewer` are no longer passed around.
@@ -328,6 +340,7 @@
   <CommonFooter
     {activeTab}
     {characters}
+    {speakableCharacters}
     {extensions}
     {extensionPipeline}
     {selectedCharacterId}

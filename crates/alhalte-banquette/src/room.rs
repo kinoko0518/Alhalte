@@ -11,6 +11,7 @@ use crate::character::{Character, CharacterBiblio, get_character_owner};
 use crate::error::{BanquetteError, Result};
 use crate::labels::{KEY_STD_NAME, LABEL_ALHALTE_BANQUETTE};
 use crate::log::{LogBiblio, LogChunk, LogOperationEvent, SceneLog};
+use crate::log_record::entry_speaker_id;
 use crate::scene::{Scene, SceneData};
 use crate::state::SceneState;
 
@@ -508,6 +509,39 @@ impl Room {
         Ok(())
     }
 
+    /// Authorizes the speaker claimed by a client-supplied log entry (Issue #271).
+    ///
+    /// The rules, applied identically by [`Room::append_log`] and
+    /// [`Room::edit_log`]:
+    ///
+    /// 1. No `speakerId` → narration; the scene write check is the only gate.
+    /// 2. `speakerId` present → the character must exist and the caller must be
+    ///    its owner (`std::owner_account`).
+    /// 3. An [`RoomPermissionLevel::Admin`] caller may voice any existing
+    ///    character (the GM speaking as an NPC / another player's PC).
+    /// 4. An unknown / deleted character id (including `0`: ids start at `1`) is
+    ///    rejected with [`BanquetteError::SpeakerNotOwned`].
+    ///
+    /// Non-JSON entries and JSON objects without a `speakerId` key stay opaque
+    /// (see [`crate::log_record::entry_speaker_id`]). A malformed `speakerId` is
+    /// rejected instead of being treated as narration.
+    fn authorize_speaker(&self, caller_account: u64, entry: &Tin) -> Result<()> {
+        let Some(character_id) = entry_speaker_id(entry)? else {
+            return Ok(());
+        };
+        let character = self
+            .character_biblio
+            .get(character_id)
+            .ok_or(BanquetteError::SpeakerNotOwned { character_id })?;
+        if self.is_admin(caller_account) {
+            return Ok(());
+        }
+        match get_character_owner(character) {
+            Some(owner) if owner == caller_account => Ok(()),
+            _ => Err(BanquetteError::SpeakerNotOwned { character_id }),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Scene queries
     // -----------------------------------------------------------------------
@@ -740,7 +774,9 @@ impl Room {
 
     /// Appends a log entry to a scene.
     ///
-    /// Requires [`Room::can_send_to_scene`] on the target scene.
+    /// Requires [`Room::can_send_to_scene`] on the target scene. When the entry
+    /// names a speaker, the caller must own that character unless it is a room
+    /// administrator (Issue #271; see [`Room::authorize_speaker`]).
     pub async fn append_log(
         &mut self,
         caller_account: u64,
@@ -750,6 +786,9 @@ impl Room {
         cellar: &dyn CellarSink,
     ) -> Result<LogOperationEvent> {
         self.authorize_send(caller_account, scene_id)?;
+        if let Some(entry) = entry.as_ref() {
+            self.authorize_speaker(caller_account, entry)?;
+        }
 
         let scene = self
             .scene_biblio
@@ -764,7 +803,9 @@ impl Room {
 
     /// Edits an existing log entry before the head.
     ///
-    /// Requires [`Room::can_send_to_scene`] on the target scene.
+    /// Requires [`Room::can_send_to_scene`] on the target scene. The replacement
+    /// entry is authorized like an append, so an edit cannot change the speaker
+    /// to another account's character (Issue #271).
     ///
     /// The parameter list mirrors the wire frame and the append/delete paths;
     /// grouping it into a struct would obscure the one-to-one mapping.
@@ -780,6 +821,7 @@ impl Room {
         cellar: &dyn CellarSink,
     ) -> Result<LogOperationEvent> {
         self.authorize_send(caller_account, scene_id)?;
+        self.authorize_speaker(caller_account, &entry)?;
 
         let scene = self
             .scene_biblio
