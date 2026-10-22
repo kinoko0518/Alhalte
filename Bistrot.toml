@@ -10,7 +10,7 @@
 #   printf '%s' 'SECRET' | alhalte-bistrot encrypt-value --recipient age1...
 
 [restaurant]
-domain = "localhost"
+domain = "100.117.28.78"
 host = "127.0.0.1"
 data-dir = ".alhalte/data"
 socket-dir = ".alhalte/sockets"
@@ -24,6 +24,7 @@ client-id = "debug-client-id"
 client-secret = "debug-client-secret"
 salt = "alhalte-local-instance-salt-0001"
 debug-login = true
+public-url = "http://100.117.28.78:5173"
 
 [cellar]
 port = 8081

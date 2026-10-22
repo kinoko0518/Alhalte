@@ -5,17 +5,23 @@ use aes_gcm_siv::{
     aead::{Aead, KeyInit},
 };
 
-use crate::error::TinError;
+use crate::{TinId, error::TinError};
 
 /// Zero nonce (`[0u8; 12]`) used for convergent encryption (`0001`).
 pub const ZERO_NONCE: [u8; 12] = [0u8; 12];
+
+#[derive(PartialEq)]
+pub struct ConvergentKey([u8; 32]);
+
+#[derive(PartialEq)]
+pub struct RoomKey([u8; 32]);
 
 /// Derives the 256-bit `TinId` and 256-bit AES-256-GCM-SIV convergent encryption key
 /// from the BLAKE3 XOF 512-bit hash of `plaintext`.
 ///
 /// The first 256 bits (32 bytes) form the `TinId`, and the remaining 256 bits (32 bytes)
 /// form the AES-256-GCM-SIV encryption key.
-pub fn derive_convergent_id_and_key(plaintext: &[u8]) -> (TinId, [u8; 32]) {
+pub fn derive_convergent_id_and_key(plaintext: &[u8]) -> (TinId, ConvergentKey) {
     let mut hasher = blake3::Hasher::new();
     hasher.update(plaintext);
     let mut xof = hasher.finalize_xof();
@@ -27,14 +33,14 @@ pub fn derive_convergent_id_and_key(plaintext: &[u8]) -> (TinId, [u8; 32]) {
     tin_id.copy_from_slice(&xof_out[0..32]);
     key.copy_from_slice(&xof_out[32..64]);
 
-    (tin_id, key)
+    (tin_id, ConvergentKey(key))
 }
 
 /// Verifies whether the convergent key (and optionally `TinId`) derived from `plaintext`
 /// matches the provided `key` (and `tin_id`).
 pub fn verify_convergent(
     plaintext: &[u8],
-    key: &[u8; 32],
+    key: &ConvergentKey,
     tin_id: Option<&TinId>,
 ) -> Result<(), TinError> {
     let (derived_tin_id, derived_key) = derive_convergent_id_and_key(plaintext);
@@ -64,7 +70,7 @@ pub fn encrypt_aes_256_gcm_siv(
 
 /// Decrypts `ciphertext` using AES-256-GCM-SIV with the given 256-bit key and 96-bit nonce.
 pub fn decrypt_aes_256_gcm_siv(
-    key: &[u8; 32],
+    key: &RoomKey,
     nonce: &[u8; 12],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, TinError> {

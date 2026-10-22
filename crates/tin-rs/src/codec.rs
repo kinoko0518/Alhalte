@@ -1,7 +1,6 @@
 //! Wire format encoding and decoding for raw bytes and `Tin` containers.
 
 use crate::error::TinError;
-use crate::tin::Tin;
 
 /// Parameter specifying encryption configuration for encoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11,12 +10,7 @@ pub enum EncryptionParam<'a> {
     /// Convergent encryption (key and TinId derived from plaintext BLAKE3 XOF 512, zero nonce).
     Convergent,
     /// Room key encryption with external 256-bit key and 96-bit nonce.
-    RoomKey {
-        /// 256-bit room key.
-        room_key: &'a [u8; 32],
-        /// 96-bit nonce.
-        nonce: &'a [u8; 12],
-    },
+    RoomKey {},
 }
 
 /// Result of encoding raw plaintext bytes into the wire format.
@@ -176,9 +170,4 @@ pub fn decode_raw_plaintext_bytes(
             Ok((decompressed, opener, tin_id))
         }
     }
-}
-
-/// Decodes a `Tin` container from wire format.
-pub fn decode(wire_bytes: &[u8], key: Option<&[u8; 32]>) -> Result<(Tin, Opener, TinId), TinError> {
-    Tin::decode(wire_bytes, key)
 }

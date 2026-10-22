@@ -6,6 +6,12 @@ mod encryption;
 use crate::error::TinError;
 use serde::{Deserialize, Serialize};
 
+pub use compression::compress;
+pub use encryption::{
+    ConvergentKey, RoomKey, decrypt_aes_256_gcm_siv, derive_convergent_id_and_key,
+    encrypt_aes_256_gcm_siv,
+};
+
 /// Encryption modes supported by the `tin` format (upper 4 bits of the Opener).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[repr(u8)]
@@ -15,30 +21,17 @@ pub enum Encryption {
     /// `0001`: Convergent encryption with Zero Nonce (`[0u8; 12]`) and AES-256-GCM-SIV.
     Convergent = 0x1,
     /// `0010`: Room key encryption with random 96-bit Nonce and AES-256-GCM-SIV.
-    RoomKey = 0x2,
+    RoomKey([u8; 12]) = 0x2,
 }
 
 impl Encryption {
-    /// Attempts to parse an encryption mode from a 4-bit nibble.
-    pub fn try_from_u4(nibble: u8) -> Result<Self, TinError> {
-        match nibble {
-            0x0 => Ok(Self::Plaintext),
-            0x1 => Ok(Self::Convergent),
-            0x2 => Ok(Self::RoomKey),
-            other => Err(TinError::UnsupportedEncryption(other)),
-        }
-    }
-
     /// Returns the 4-bit representation of the encryption mode.
     pub const fn to_u4(self) -> u8 {
-        self as u8
-    }
-
-    /// Returns whether this encryption mode includes a 12-byte Nonce in the wire format.
-    ///
-    /// Only `RoomKey` (`0010`) includes a nonce directly in the wire format.
-    pub const fn has_wire_nonce(self) -> bool {
-        matches!(self, Self::RoomKey)
+        match self {
+            Self::Plaintext => 0,
+            Self::Convergent => 1,
+            Self::RoomKey(_) => 2,
+        }
     }
 }
 
@@ -94,37 +87,10 @@ impl Opener {
             compression,
         }
     }
-
-    /// Parses an `Opener` from a single byte.
-    pub fn from_byte(b: u8) -> Result<Self, TinError> {
-        let enc_nibble = (b >> 4) & 0x0F;
-        let comp_nibble = b & 0x0F;
-
-        let encryption = Encryption::try_from_u4(enc_nibble)?;
-        let compression = Compression::try_from_u4(comp_nibble)?;
-
-        Ok(Self {
-            encryption,
-            compression,
-        })
-    }
-
-    /// Serializes this `Opener` into a single byte.
-    pub const fn to_byte(self) -> u8 {
-        (self.encryption.to_u4() << 4) | self.compression.to_u4()
-    }
-}
-
-impl TryFrom<u8> for Opener {
-    type Error = TinError;
-
-    fn try_from(b: u8) -> Result<Self, Self::Error> {
-        Self::from_byte(b)
-    }
 }
 
 impl From<Opener> for u8 {
     fn from(opener: Opener) -> Self {
-        opener.to_byte()
+        (opener.encryption.to_u4() << 4) | opener.compression.to_u4()
     }
 }

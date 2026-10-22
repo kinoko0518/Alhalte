@@ -35,7 +35,7 @@ pub mod error;
 pub mod tin;
 
 pub use codec::{
-    EncodedRaw, EncryptionParam, decode, decode_raw_plaintext_bytes, encode_raw_convergent,
+    EncodedRaw, EncryptionParam, decode_raw_plaintext_bytes, encode_raw_convergent,
     encode_raw_plaintext, encode_raw_plaintext_bytes, encode_raw_room_key,
 };
 pub use error::TinError;
@@ -43,4 +43,4 @@ pub use tin::Tin;
 pub use tin::label::*;
 
 /// 256-bit identifier uniquely identifying a tin.
-pub type TinId = [u8; 32];
+pub struct TinId([u8; 32]);
