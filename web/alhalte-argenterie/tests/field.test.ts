@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { mount, unmount } from 'svelte';
 import {
   applyPan,
@@ -170,5 +170,152 @@ describe('Field Panel & Initiatives', () => {
 
     unmount(instance);
     target.remove();
+  });
+});
+
+/**
+ * Issue #268: the field container captured the pointer on every primary
+ * pointerdown bubbling through it, including presses on the account avatar in
+ * `.field-top-right-layer`. The retargeted `pointerup` made the browser deliver
+ * the `click` to `.field-container`, so `AccountMenu`'s `onclick` never ran and
+ * the menu never opened. Pressing the avatar also panned the board.
+ *
+ * References:
+ * - ARCHITECTURE.md: `## alhalte-argenterie -> ### アカウントUI / Googleサインイン` (7. 配置)
+ * - GitHub Issue #268: フィールドパネルのアカウントアイコンからMenuが開かない
+ */
+describe('Field overlay controls (Issue #268)', () => {
+  let target: HTMLDivElement;
+
+  function makeScene(): Scene {
+    return {
+      id: 'scene-268',
+      name: 'アカウント操作テスト',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+  }
+
+  function pointerDown(pointerId: number, clientX = 10, clientY = 10): PointerEvent {
+    return new PointerEvent('pointerdown', {
+      bubbles: true,
+      cancelable: true,
+      button: 0,
+      pointerId,
+      clientX,
+      clientY,
+    });
+  }
+
+  function pointerMove(pointerId: number, clientX: number, clientY: number): PointerEvent {
+    return new PointerEvent('pointermove', {
+      bubbles: true,
+      pointerId,
+      clientX,
+      clientY,
+    });
+  }
+
+  function signIn(): void {
+    localStorage.setItem('alhalte:account-id', '42');
+    localStorage.setItem('alhalte:session-id', '99');
+  }
+
+  async function flush(): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+
+  beforeEach(() => {
+    localStorage.clear();
+    sessionStorage.clear();
+    document.cookie = 'session_id=; path=/; max-age=0; SameSite=Lax';
+    // `AccountMenu` reads `/api/account/{id}` on mount; tests never use the network.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        json: async () => ({ account_id: 42, handle_name: 'Alice', icon_tin_id: null }),
+      })),
+    );
+    target = document.createElement('div');
+    document.body.appendChild(target);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    target.remove();
+  });
+
+  // spec: Issue #268 フィールドのアバターからアカウントメニューを開ける
+  it('opens the account menu when the field avatar is pressed', async () => {
+    signIn();
+    const instance = mount(FieldPanel, { target, props: { scene: makeScene() } });
+    await flush();
+
+    const layer = target.querySelector<HTMLElement>('[data-testid="field-account-layer"]');
+    expect(layer).toBeTruthy();
+    const avatar = layer?.querySelector<HTMLButtonElement>('[data-testid="account-menu-button"]');
+    expect(avatar).toBeTruthy();
+    expect(avatar?.getAttribute('aria-expanded')).toBe('false');
+
+    // Reproduce the browser sequence: pointerdown on the avatar, then its click.
+    avatar?.dispatchEvent(pointerDown(7));
+    avatar?.click();
+    await flush();
+
+    expect(avatar?.getAttribute('aria-expanded')).toBe('true');
+    const menu = target.querySelector('[data-testid="account-menu"]');
+    expect(menu).toBeTruthy();
+    expect(
+      menu?.querySelector('[data-testid="account-switch-item"]')?.textContent,
+    ).toContain('別のアカウントでログイン');
+    expect(menu?.querySelector('[data-testid="account-signout-item"]')?.textContent).toContain(
+      'サインアウト',
+    );
+
+    unmount(instance);
+  });
+
+  // spec: Issue #268 フィールドのオーバーレイ上の pointerdown は盤面の pan に使わない
+  it('does not capture the pointer or pan the board from overlay controls', async () => {
+    signIn();
+    const capture = vi.spyOn(Element.prototype, 'setPointerCapture');
+    const scene = makeScene();
+    const instance = mount(FieldPanel, { target, props: { scene } });
+    await flush();
+
+    const container = target.querySelector<HTMLElement>('[data-testid="field-panel"]');
+    const accountLayer = target.querySelector<HTMLElement>('[data-testid="field-account-layer"]');
+    const avatar = target.querySelector<HTMLElement>('[data-testid="account-menu-button"]');
+    const overlayLayer = target.querySelector<HTMLElement>('[data-testid="field-overlay-layer"]');
+    const badge = target.querySelector<HTMLElement>('[data-testid="room-name-badge"]');
+    const canvas = target.querySelector<HTMLElement>('[data-testid="field-canvas"]');
+    expect(container && accountLayer && avatar && overlayLayer && badge && canvas).toBeTruthy();
+
+    // The account overlay (root and avatar) and the top-left overlay are not
+    // board drags: no capture, and the following pointermove must not pan.
+    accountLayer!.dispatchEvent(pointerDown(11));
+    avatar!.dispatchEvent(pointerDown(12));
+    badge!.dispatchEvent(pointerDown(13));
+    expect(capture).not.toHaveBeenCalled();
+
+    container!.dispatchEvent(pointerMove(11, 40, 40));
+    container!.dispatchEvent(pointerMove(13, 40, 40));
+    expect(scene.viewTransform).toEqual({ x: 0, y: 0, scale: 1 });
+
+    // The board background keeps capturing the pointer and panning.
+    canvas!.dispatchEvent(pointerDown(14));
+    expect(capture).toHaveBeenCalledTimes(1);
+    expect(capture).toHaveBeenCalledWith(14);
+    expect(capture.mock.contexts[0]).toBe(container);
+
+    container!.dispatchEvent(pointerMove(14, 45, 35));
+    expect(scene.viewTransform).toEqual({ x: 35, y: 25, scale: 1 });
+
+    unmount(instance);
   });
 });

@@ -118,8 +118,35 @@
     onTransformChange?.(scene.id, updated);
   }
 
+  /**
+   * Controls that live inside `.field-container` but are not part of the board.
+   *
+   * Pressing any of them must not start a board pan: capturing the pointer on
+   * the container retargets `pointerup` (and therefore the `click`) away from
+   * the pressed control, which is why the account menu never opened
+   * (Issue #268). Pieces are handled separately by their own
+   * `stopPropagation`.
+   */
+  const FIELD_INTERACTIVE_SELECTOR = [
+    'button',
+    'a',
+    'input',
+    'textarea',
+    'select',
+    '[role="button"]',
+    '[data-testid="field-account-layer"]',
+    '[data-testid="field-overlay-layer"]',
+  ].join(', ');
+
+  function isInteractiveFieldTarget(target: EventTarget | null): boolean {
+    return target instanceof Element && target.closest(FIELD_INTERACTIVE_SELECTOR) !== null;
+  }
+
   function handlePointerDown(e: PointerEvent) {
     if (e.button !== 0) return; // Primary left button or touch
+    // spec: Issue #268 フィールドのオーバーレイ上の pointerdown は盤面の pan に使わない
+    if (isInteractiveFieldTarget(e.target)) return;
+
     isDragging = true;
     dragStart = { x: e.clientX, y: e.clientY };
     (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
