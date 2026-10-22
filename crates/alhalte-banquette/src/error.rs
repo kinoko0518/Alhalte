@@ -35,6 +35,18 @@ pub enum BanquetteError {
     #[error("Permission denied: a room must keep at least one administrator")]
     LastAdminDemotion,
 
+    /// The caller tried to speak as a character it may not voice (Issue #271).
+    ///
+    /// Raised by [`crate::room::Room::append_log`] / [`crate::room::Room::edit_log`]
+    /// when the entry names a character that does not exist (ids start at `1`) or
+    /// that is owned by another account. A room [`crate::RoomPermissionLevel::Admin`]
+    /// is exempt: administering the room includes voicing any existing character.
+    #[error("Permission denied: character {character_id} is not owned by the caller")]
+    SpeakerNotOwned {
+        /// Character id claimed by the rejected log entry.
+        character_id: u64,
+    },
+
     /// Persisted (or about to be persisted) room data violates a room invariant.
     ///
     /// This is also how a `RoomData` written by an incompatible schema is

@@ -220,6 +220,20 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       target,
       props: {
         scene: testScene,
+        // Issue #271: with a `speakerId` the pill shows the character's current
+        // name, so the record's character must exist in the list.
+        characters: [
+          {
+            id: 'char-1',
+            name: '探索者A',
+            initiative: 10,
+            description: '',
+            statuses: [],
+            parameters: [],
+            chatPalette: '',
+            hideStatus: false,
+          },
+        ],
         chunkManager,
       },
     });
@@ -1175,6 +1189,101 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     expect(content1?.textContent?.trim()).toBe('過去ログ1');
     expect(content2?.innerHTML).toContain('saignant-italic');
     expect(content2?.textContent?.trim()).toBe('キューログ2');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab speakerId はキャラクター名を優先する (Issue #271)
+  it("prefers the character name over the client speaker string", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+
+    const scene: Scene = {
+      id: "/",
+      name: "メインシーン",
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: ["char-1"],
+    };
+    const characters: Character[] = [
+      {
+        id: "char-1",
+        name: "現在の名前",
+        initiative: 10,
+        description: "",
+        statuses: [],
+        parameters: [],
+        chatPalette: "",
+        hideStatus: false,
+      },
+    ];
+    const chunkManager = new ChunkLogManager();
+    const instance = mount(LogTab, {
+      target,
+      props: { scene, characters, chunkManager },
+    });
+
+    chunkManager.appendRecord({
+      id: "msg-speaker-1",
+      sceneId: "/",
+      content: "本文",
+      speaker: "なりすまし名",
+      speakerId: "char-1",
+      timestamp: 1700000000,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const pill = target.querySelector('[data-testid="msg-speaker-msg-speaker-1"]');
+    expect(pill?.textContent?.trim()).toBe("現在の名前");
+    expect(pill?.textContent).not.toContain("なりすまし名");
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/log-tab 不明な speakerId ではクライアント名を出さない (Issue #271)
+  it("falls back to a neutral label for an unknown speakerId", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+
+    const scene: Scene = {
+      id: "/",
+      name: "メインシーン",
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+    const chunkManager = new ChunkLogManager();
+    const instance = mount(LogTab, {
+      target,
+      props: { scene, characters: [], chunkManager },
+    });
+
+    chunkManager.appendRecord({
+      id: "msg-speaker-2",
+      sceneId: "/",
+      content: "本文",
+      speaker: "なりすまし名",
+      speakerId: "char-deleted",
+      timestamp: 1700000000,
+    });
+    // Narration (no speakerId) keeps the stored speaker string.
+    chunkManager.appendRecord({
+      id: "msg-speaker-3",
+      sceneId: "/",
+      content: "ナレーション",
+      speaker: "GM",
+      timestamp: 1700000001,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const unknown = target.querySelector('[data-testid="msg-speaker-msg-speaker-2"]');
+    expect(unknown?.textContent?.trim()).toBe("不明なキャラクター");
+    expect(unknown?.textContent).not.toContain("なりすまし名");
+
+    const narration = target.querySelector('[data-testid="msg-speaker-msg-speaker-3"]');
+    expect(narration?.textContent?.trim()).toBe("GM");
 
     unmount(instance);
     target.remove();

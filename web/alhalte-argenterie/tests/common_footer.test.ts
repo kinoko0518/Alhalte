@@ -3,9 +3,12 @@ import { mount, unmount } from 'svelte';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import CommonFooter from '../src/components/Control/CommonFooter.svelte';
-import type { Character, ExtensionItem } from '../src/types/index.js';
+import App from '../src/components/App.svelte';
+import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
+import type { Character, ExtensionItem, VisitedRoom } from '../src/types/index.js';
 import type { GenerastAST } from '../src/utils/generast.js';
 import { decodeExtIoTin } from '../src/utils/generast.js';
+import { speakableCharacters } from '../src/utils/characterActions.js';
 import { ExtensionPipeline } from '../src/wasm/runner.js';
 
 const FOOTER_SOURCE = readFileSync(
@@ -827,6 +830,239 @@ describe('CommonFooter Component Rebuild (Issue #54)', () => {
     expect(FOOTER_SOURCE).not.toContain('OfflineQueueNotice');
     expect(FOOTER_SOURCE).not.toContain('footer-queue-notice');
     expect(FOOTER_SOURCE).not.toContain('pendingMessageCount');
+
+    unmount(instance);
+    target.remove();
+  });
+});
+
+/**
+ * Speaker picker ownership (Issue #271).
+ *
+ * References:
+ * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 権限 UI`
+ * - GitHub Issue #271
+ */
+describe('CommonFooter speaker picker ownership (Issue #271)', () => {
+  const ACCOUNT = '1001';
+  const ownedCharacter: Character = {
+    id: 'own-1',
+    name: 'アリス',
+    initiative: 10,
+    description: '',
+    statuses: [],
+    parameters: [],
+    chatPalette: '',
+    hideStatus: false,
+    ownerAccountId: ACCOUNT,
+  };
+  const foreignCharacter: Character = {
+    id: 'other-1',
+    name: 'ボブ',
+    initiative: 5,
+    description: '',
+    statuses: [],
+    parameters: [],
+    chatPalette: '',
+    hideStatus: false,
+    ownerAccountId: '2002',
+  };
+  const allCharacters = [ownedCharacter, foreignCharacter];
+
+  function mountFooter(props: Record<string, unknown>) {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(CommonFooter, {
+      target,
+      props: {
+        activeTab: 'log',
+        characters: allCharacters,
+        ...props,
+      },
+    });
+    return { target, instance };
+  }
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('offers a participant only the speakable list in the picker', async () => {
+    const { target, instance } = mountFooter({
+      role: 'participant',
+      speakableCharacters: speakableCharacters(allCharacters, 'participant', ACCOUNT),
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="character-select-button"]')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(target.querySelector('[data-testid="char-picker-item-own-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="char-picker-item-other-1"]')).toBeNull();
+    // The default speaker is the owned character, never the foreign one.
+    expect(target.querySelector('.picker-name')?.textContent?.trim()).toBe('アリス');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('offers an admin every character', async () => {
+    const { target, instance } = mountFooter({
+      role: 'admin',
+      speakableCharacters: speakableCharacters(allCharacters, 'admin', ACCOUNT),
+    });
+
+    target.querySelector<HTMLButtonElement>('[data-testid="character-select-button"]')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(target.querySelector('[data-testid="char-picker-item-own-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="char-picker-item-other-1"]')).toBeTruthy();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('disables sending for a viewer with no speakable characters', () => {
+    const onSendMessage = vi.fn();
+    const { target, instance } = mountFooter({
+      role: 'viewer',
+      speakableCharacters: speakableCharacters(allCharacters, 'viewer', ACCOUNT),
+      onSendMessage,
+    });
+
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    expect(textarea?.disabled).toBe(true);
+    target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]')?.click();
+    expect(onSendMessage).not.toHaveBeenCalled();
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('sends narration (no speakerId) when the speakable list is empty', async () => {
+    const onSendMessage = vi.fn();
+    const { target, instance } = mountFooter({
+      role: 'participant',
+      speakableCharacters: [],
+      onSendMessage,
+    });
+
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    textarea!.value = 'ナレーション';
+    textarea!.dispatchEvent(new Event('input', { bubbles: true }));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]')?.click();
+
+    expect(onSendMessage).toHaveBeenCalledTimes(1);
+    expect(onSendMessage.mock.calls[0][0]).toBe('ナレーション');
+    expect(onSendMessage.mock.calls[0][1]).toBeUndefined();
+
+    unmount(instance);
+    target.remove();
+  });
+});
+
+/**
+ * End-to-end speaker picker for `App` (Issue #271).
+ *
+ * References:
+ * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 権限 UI`
+ * - GitHub Issue #271
+ */
+describe('App speaker picker derives the speakable list (Issue #271)', () => {
+  const ACCOUNT = '1001';
+  const ROOM: VisitedRoom = {
+    id: 'room-271-speaker',
+    name: '話者テスト部屋',
+    url: 'https://alhalte.example/rooms/room-271-speaker#key',
+    lastVisited: Date.now(),
+    isAdmin: false,
+  };
+  const ownedCharacter: Character = {
+    id: 'own-1',
+    name: 'アリス',
+    initiative: 10,
+    description: '',
+    statuses: [],
+    parameters: [],
+    chatPalette: '',
+    hideStatus: false,
+    ownerAccountId: ACCOUNT,
+  };
+  const foreignCharacter: Character = {
+    id: 'other-1',
+    name: 'ボブ',
+    initiative: 5,
+    description: '',
+    statuses: [],
+    parameters: [],
+    chatPalette: '',
+    hideStatus: false,
+    ownerAccountId: '2002',
+  };
+
+  beforeEach(() => {
+    document.body.innerHTML = '';
+    localStorage.clear();
+    localStorage.setItem('alhalte:account-id', ACCOUNT);
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+  });
+
+  async function mountForRole(role: 'admin' | 'participant', socket: FakeRoomSocket) {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: ROOM,
+        userRole: role,
+        initialCharacters: [ownedCharacter, foreignCharacter],
+        roomSocket: asRoomSocket(socket),
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    return { target, instance };
+  }
+
+  function openPicker(target: HTMLElement): void {
+    target.querySelector<HTMLButtonElement>('[data-testid="character-select-button"]')?.click();
+  }
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('gives a participant only owned characters and a safe default speaker', async () => {
+    const socket = new FakeRoomSocket();
+    const { target, instance } = await mountForRole('participant', socket);
+
+    // Default speaker: the owned character, never the foreign one.
+    expect(target.querySelector('.picker-name')?.textContent?.trim()).toBe('アリス');
+
+    openPicker(target);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(target.querySelector('[data-testid="char-picker-item-own-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="char-picker-item-other-1"]')).toBeNull();
+
+    // A sent message carries the owned speakerId.
+    const textarea = target.querySelector<HTMLTextAreaElement>('[data-testid="chat-input-field"]');
+    textarea!.value = '参加者の発言';
+    textarea!.dispatchEvent(new Event('input', { bubbles: true }));
+    target.querySelector<HTMLButtonElement>('[data-testid="send-message-button"]')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(socket.requestAppendLogCalls).toHaveLength(1);
+    expect(socket.requestAppendLogCalls[0].record.speakerId).toBe('own-1');
+
+    unmount(instance);
+    target.remove();
+  });
+
+  // spec: alhalte-argenterie/permissions log speaker ownership (Issue #271)
+  it('gives an admin every character', async () => {
+    const socket = new FakeRoomSocket();
+    const { target, instance } = await mountForRole('admin', socket);
+
+    openPicker(target);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(target.querySelector('[data-testid="char-picker-item-own-1"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="char-picker-item-other-1"]')).toBeTruthy();
 
     unmount(instance);
     target.remove();

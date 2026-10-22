@@ -1578,3 +1578,179 @@ async fn test_scene_name_is_summarized_and_broadcast() {
 
     server_task.abort();
 }
+
+/// Builds a duck-typed log record entry claiming `speaker_id` as its speaker.
+fn speaker_log_entry(speaker_id: u64, content: &str) -> Tin {
+    Tin::need_not_know(
+        format!(r#"{{"content":"{content}","speakerId":{speaker_id},"clientOpId":"op-271"}}"#)
+            .into_bytes(),
+    )
+}
+
+/// Waits for the `CharacterCreated` ack of `client_id` and returns the new id.
+async fn expect_character_created(stream: &mut ServerStream, client_id: u64) -> u64 {
+    let (responder, frame) = expect_send_to_client(
+        wait_for_frame(stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    client_id: id,
+                    frame: ServerFrame::CharacterCreated { .. },
+                } if *id == client_id
+            )
+        })
+        .await,
+    );
+    assert_eq!(responder, client_id);
+    match frame {
+        ServerFrame::CharacterCreated { character_id } => character_id,
+        other => panic!("expected CharacterCreated, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_speaker_not_owned_is_reported_to_the_requester() {
+    let (_dir, mut sink, mut stream, server_task) = start_test_server().await;
+
+    // Admin 10 (client 100) creates character 1.
+    let mut data: Character = HashMap::new();
+    set_character_name(&mut data, "GM NPC");
+    send_frame(&mut sink, 100, ClientFrame::CreateCharacter { data }).await;
+    let admin_character = expect_character_created(&mut stream, 100).await;
+
+    // Admit account 20 as a participant and connect it as client 200.
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::SetMemberPermission {
+            account_id: 20,
+            permission: RoomPermissionLevel::Participant,
+        },
+    )
+    .await;
+    wait_for_frame(&mut stream, |f| {
+        matches!(
+            f,
+            BanquetteToMaitreD::SendToClient {
+                frame: ServerFrame::PermissionsUpdated { .. },
+                ..
+            }
+        )
+    })
+    .await;
+    sink.send(MaitreDToBanquette::ClientConnected {
+        client_id: 200,
+        account_id: 20,
+        session_id: 2,
+    })
+    .await
+    .unwrap();
+
+    // The participant cannot append as the admin's character: the requester gets
+    // the dedicated `SpeakerNotOwned` code (not `AppendLogFailed`).
+    send_frame(
+        &mut sink,
+        200,
+        ClientFrame::AppendLog {
+            scene_id: "/".to_string(),
+            entry: Some(speaker_log_entry(admin_character, "impersonation")),
+        },
+    )
+    .await;
+    let (responder, frame) = expect_send_to_client(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::SendToClient {
+                    frame: ServerFrame::Error { code, .. },
+                    ..
+                } if code == "SpeakerNotOwned"
+            )
+        })
+        .await,
+    );
+    assert_eq!(responder, 200, "the rejection goes to the requester only");
+    match frame {
+        ServerFrame::Error { code, message } => {
+            assert_eq!(code, "SpeakerNotOwned");
+            assert!(
+                message.contains(&admin_character.to_string()),
+                "the message names the rejected character: {message}"
+            );
+        }
+        other => panic!("expected Error, got {other:?}"),
+    }
+
+    // The participant may still speak as its own character.
+    let mut data: Character = HashMap::new();
+    set_character_name(&mut data, "Participant PC");
+    send_frame(&mut sink, 200, ClientFrame::CreateCharacter { data }).await;
+    let participant_character = expect_character_created(&mut stream, 200).await;
+    send_frame(
+        &mut sink,
+        200,
+        ClientFrame::AppendLog {
+            scene_id: "/".to_string(),
+            entry: Some(speaker_log_entry(participant_character, "own voice")),
+        },
+    )
+    .await;
+    match expect_broadcast_to_scene(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToScene {
+                    frame: ServerFrame::LogEventAppended { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    )
+    .1
+    {
+        ServerFrame::LogEventAppended { entry, .. } => {
+            assert_eq!(
+                entry,
+                Some(speaker_log_entry(participant_character, "own voice"))
+            );
+        }
+        other => panic!("expected LogEventAppended, got {other:?}"),
+    }
+
+    // Admin 10 may voice the participant's character (documented exception).
+    send_frame(
+        &mut sink,
+        100,
+        ClientFrame::AppendLog {
+            scene_id: "/".to_string(),
+            entry: Some(speaker_log_entry(participant_character, "GM voicing")),
+        },
+    )
+    .await;
+    match expect_broadcast_to_scene(
+        wait_for_frame(&mut stream, |f| {
+            matches!(
+                f,
+                BanquetteToMaitreD::BroadcastToScene {
+                    frame: ServerFrame::LogEventAppended { .. },
+                    ..
+                }
+            )
+        })
+        .await,
+    )
+    .1
+    {
+        ServerFrame::LogEventAppended { entry, .. } => {
+            assert_eq!(
+                entry,
+                Some(speaker_log_entry(participant_character, "GM voicing"))
+            );
+        }
+        other => panic!("expected LogEventAppended, got {other:?}"),
+    }
+
+    server_task.abort();
+}

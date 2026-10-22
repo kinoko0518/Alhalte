@@ -17,6 +17,7 @@ use alhalte_banquette::cellar_sink::{CellarSink, InMemoryCellarSink};
 use alhalte_banquette::character::CharacterBiblio;
 use alhalte_banquette::error::BanquetteError;
 use alhalte_banquette::labels::LABEL_ALHALTE_BANQUETTE;
+use alhalte_banquette::log::LogOperationEvent;
 use alhalte_banquette::room::{Room, RoomData, RoomPermissionLevel};
 use alhalte_banquette::scene::SceneData;
 use serde::Serialize;
@@ -490,4 +491,271 @@ fn test_removed_done_symbols_are_absent() {
         scanned += 1;
     }
     assert!(scanned > 0, "the scan must actually read source files");
+}
+
+// ---------------------------------------------------------------------------
+// Log speaker ownership (Issue #271)
+// ---------------------------------------------------------------------------
+
+/// Builds a duck-typed log record entry claiming `speaker_id` as its speaker.
+fn speaker_entry(speaker_id: u64) -> Tin {
+    Tin::new(
+        tin::label_hash("alhalte/argenterie/log-record"),
+        format!(r#"{{"content":"hi","speaker":"x","speakerId":{speaker_id},"clientOpId":"op"}}"#)
+            .into_bytes(),
+    )
+}
+
+/// Builds a duck-typed log record entry that carries no `speakerId` key.
+fn narration_entry() -> Tin {
+    Tin::new(
+        tin::label_hash("alhalte/argenterie/log-record"),
+        br#"{"content":"narrated","speaker":"GM","clientOpId":"op"}"#.to_vec(),
+    )
+}
+
+/// Creates a character owned by `owner_account` named `name`.
+fn owned_character(room: &mut Room, owner_account: u64, name: &str) -> u64 {
+    let mut data = Character::new();
+    alhalte_banquette::set_character_name(&mut data, name);
+    room.create_character(owner_account, data)
+        .expect("character creation requires write access")
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_participant_cannot_speak_as_another_accounts_character() {
+    let cellar = InMemoryCellarSink::new();
+    let (mut room, own_character) = permission_fixture();
+    let foreign_character = owned_character(&mut room, 1, "GM NPC");
+    assert_ne!(own_character, foreign_character);
+
+    let error = room
+        .append_log(
+            3,
+            1,
+            "alpha",
+            Some(speaker_entry(foreign_character)),
+            &cellar,
+        )
+        .await
+        .expect_err("a participant must not speak as another account's character");
+    assert!(
+        matches!(
+            error,
+            BanquetteError::SpeakerNotOwned { character_id } if character_id == foreign_character
+        ),
+        "expected SpeakerNotOwned, got {error:?}"
+    );
+
+    // Nothing was appended: the log head did not move.
+    assert_eq!(
+        room.query_log_biblio(3, "alpha").map(|b| b.head),
+        Some((0, 0))
+    );
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_owner_can_speak_as_own_character() {
+    let cellar = InMemoryCellarSink::new();
+    let (mut room, own_character) = permission_fixture();
+
+    let event = room
+        .append_log(3, 1, "alpha", Some(speaker_entry(own_character)), &cellar)
+        .await
+        .expect("an owner may speak as its own character");
+    assert!(matches!(event, LogOperationEvent::Appended { position, .. } if position == (0, 0)));
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_admin_may_speak_as_any_character() {
+    let cellar = InMemoryCellarSink::new();
+    let (mut room, participant_character) = permission_fixture();
+    let admin_character = owned_character(&mut room, 1, "GM NPC");
+
+    // Admin 1 and admin 4 voice the participant's character and their own.
+    for (admin, character_id) in [
+        (1, participant_character),
+        (1, admin_character),
+        (4, participant_character),
+    ] {
+        room.append_log(
+            admin,
+            1,
+            "alpha",
+            Some(speaker_entry(character_id)),
+            &cellar,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            panic!("admin {admin} must be able to voice character {character_id}: {error:?}")
+        });
+    }
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_append_without_speaker_id_is_narration() {
+    let cellar = InMemoryCellarSink::new();
+    let (mut room, _) = permission_fixture();
+
+    // A JSON record without the key and a non-JSON / opaque payload both stay
+    // allowed for any writer.
+    room.append_log(3, 1, "alpha", Some(narration_entry()), &cellar)
+        .await
+        .expect("a record without speakerId is narration");
+    room.append_log(3, 1, "alpha", Some(Tin::from_string("narration")), &cellar)
+        .await
+        .expect("an opaque non-JSON entry is narration");
+    room.append_log(3, 1, "alpha", None, &cellar)
+        .await
+        .expect("a tombstone append carries no speaker");
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_unknown_speaker_id_is_rejected() {
+    let cellar = InMemoryCellarSink::new();
+    let (mut room, _) = permission_fixture();
+
+    for unknown in [0, 999] {
+        let error = room
+            .append_log(3, 1, "alpha", Some(speaker_entry(unknown)), &cellar)
+            .await
+            .expect_err("unknown character ids must be rejected");
+        assert!(
+            matches!(
+                error,
+                BanquetteError::SpeakerNotOwned { character_id } if character_id == unknown
+            ),
+            "unexpected error for {unknown}: {error:?}"
+        );
+    }
+
+    // The admin exception is about *existing* characters only.
+    let error = room
+        .append_log(1, 1, "alpha", Some(speaker_entry(999)), &cellar)
+        .await
+        .expect_err("an admin cannot voice a character that does not exist");
+    assert!(
+        matches!(error, BanquetteError::SpeakerNotOwned { character_id } if character_id == 999)
+    );
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_opaque_non_json_entry_is_allowed() {
+    let cellar = InMemoryCellarSink::new();
+    let (mut room, _) = permission_fixture();
+
+    // banquette's own came / gone events are postcard payloads, not JSON.
+    let came = alhalte_banquette::CharacterCameEvent::now(1)
+        .to_tin()
+        .unwrap();
+    room.append_log(3, 1, "alpha", Some(came), &cellar)
+        .await
+        .expect("non-JSON entries must not be interpreted as speakers");
+}
+
+#[tokio::test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+async fn test_edit_log_cannot_change_the_speaker() {
+    let cellar = InMemoryCellarSink::new();
+    let (mut room, own_character) = permission_fixture();
+    let foreign_character = owned_character(&mut room, 1, "GM NPC");
+
+    room.append_log(3, 1, "alpha", Some(speaker_entry(own_character)), &cellar)
+        .await
+        .expect("seed the entry to edit");
+
+    let error = room
+        .edit_log(
+            3,
+            1,
+            "alpha",
+            0,
+            0,
+            speaker_entry(foreign_character),
+            &cellar,
+        )
+        .await
+        .expect_err("an edit must not move the speaker to another account's character");
+    assert!(
+        matches!(
+            error,
+            BanquetteError::SpeakerNotOwned { character_id } if character_id == foreign_character
+        ),
+        "expected SpeakerNotOwned, got {error:?}"
+    );
+
+    // Editing while keeping the owned speaker still works, and so does narration.
+    room.edit_log(3, 1, "alpha", 0, 0, speaker_entry(own_character), &cellar)
+        .await
+        .expect("the owner may keep its own speaker");
+    room.edit_log(3, 1, "alpha", 0, 0, narration_entry(), &cellar)
+        .await
+        .expect("an edit to a narration record is allowed");
+
+    // The admin exception applies to edits as well.
+    room.edit_log(1, 1, "alpha", 0, 0, speaker_entry(own_character), &cellar)
+        .await
+        .expect("an admin may voice any character on edit");
+}
+
+#[test]
+// spec: alhalte-banquette/permissions log speaker ownership (Issue #271)
+fn test_entry_speaker_id_parses_numbers_and_strings() {
+    let numeric = Tin::need_not_know(br#"{"speakerId":42}"#.to_vec());
+    assert_eq!(
+        alhalte_banquette::entry_speaker_id(&numeric).unwrap(),
+        Some(42)
+    );
+
+    let stringly = Tin::need_not_know(br#"{"speakerId":"42"}"#.to_vec());
+    assert_eq!(
+        alhalte_banquette::entry_speaker_id(&stringly).unwrap(),
+        Some(42)
+    );
+
+    let absent = Tin::need_not_know(br#"{"content":"hi"}"#.to_vec());
+    assert_eq!(alhalte_banquette::entry_speaker_id(&absent).unwrap(), None);
+
+    let null = Tin::need_not_know(br#"{"speakerId":null}"#.to_vec());
+    assert_eq!(alhalte_banquette::entry_speaker_id(&null).unwrap(), None);
+
+    // JSON that is not an object is not a log record.
+    for payload in [&b"42"[..], b"\"text\"", b"[1,2]"] {
+        let not_object = Tin::need_not_know(payload.to_vec());
+        assert_eq!(
+            alhalte_banquette::entry_speaker_id(&not_object).unwrap(),
+            None
+        );
+    }
+
+    // Non-JSON payloads stay opaque.
+    let opaque = Tin::from_string("hello");
+    assert_eq!(alhalte_banquette::entry_speaker_id(&opaque).unwrap(), None);
+
+    // A malformed speakerId is an error, not narration.
+    for payload in [
+        &br#"{"speakerId":1.5}"#[..],
+        br#"{"speakerId":-1}"#,
+        br#"{"speakerId":true}"#,
+        br#"{"speakerId":{}}"#,
+        br#"{"speakerId":"abc"}"#,
+        br#"{"speakerId":"-1"}"#,
+        br#"{"speakerId":18446744073709551616}"#,
+    ] {
+        let malformed = Tin::need_not_know(payload.to_vec());
+        assert!(
+            matches!(
+                alhalte_banquette::entry_speaker_id(&malformed),
+                Err(BanquetteError::Serialization(_))
+            ),
+            "expected a serialization error for {}",
+            String::from_utf8_lossy(payload)
+        );
+    }
 }
