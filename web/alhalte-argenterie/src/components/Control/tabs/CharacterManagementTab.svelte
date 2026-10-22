@@ -408,8 +408,16 @@
     }
   }
 
-  function amIowner(char: Character) {
-    return char.ownerAccountId === currentAccountId;
+  /**
+   * Whether the caller may open the character editor (Issue #267).
+   *
+   * The server's character CRUD allows the owner **or** an admin
+   * (`crates/alhalte-banquette/src/character.rs`), so an admin may edit any
+   * character; a participant only its own. Unknown/legacy owners therefore do
+   * not lock an admin out of the editor.
+   */
+  function canEditCharacter(char: Character) {
+    return capabilities.isAdmin || isCharacterOwnedBy(char, currentAccountId);
   }
 
   function openDeleteConfirm(char: Character) {
@@ -512,7 +520,7 @@
         <ListItem
           type="text"
           onclick={() => {
-            if (amIowner(char)) openEdit(char);
+            if (canEditCharacter(char)) openEdit(char);
           }}
           class="character-card-wrapper character-segmented-item"
           data-testid="character-card-{char.id}"
@@ -522,7 +530,7 @@
               type="button"
               class="char-avatar-btn"
               onclick={(e) => {
-                if (amIowner(char)) {
+                if (canEditCharacter(char)) {
                   e.stopPropagation();
                   openEdit(char);
                 }

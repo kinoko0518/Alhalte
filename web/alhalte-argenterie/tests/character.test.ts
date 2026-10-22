@@ -238,6 +238,7 @@ describe('Character Management & Edit Panel', () => {
       parameters: [],
       chatPalette: '',
       hideStatus: false,
+      ownerAccountId: '1001',
     };
 
     let savedChar: Character | null = null;
@@ -247,6 +248,7 @@ describe('Character Management & Edit Panel', () => {
       props: {
         characters: [testChar],
         role: 'participant',
+        currentAccountId: '1001',
         onUpdateCharacter: (c) => {
           savedChar = c;
         },

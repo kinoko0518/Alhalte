@@ -158,6 +158,7 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
       parameters: [{ label: 'CON', value: 14 }],
       chatPalette: '1D100<=70 【聞き耳】',
       hideStatus: false,
+      ownerAccountId: '1001',
     };
 
     let updatedChar: Character | null = null;
@@ -165,6 +166,7 @@ describe('Material 3 Expressive Outlined TextField Migration (Issue #62)', () =>
       target,
       props: {
         characters: [testChar],
+        currentAccountId: '1001',
         onUpdateCharacter: (c) => {
           updatedChar = c;
         },
