@@ -132,6 +132,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 - `delete`: head より前の位置を `None`（tombstone）で上書きする。
 - `rewind`: head を過去へ戻し、以降を切り捨てる。
 - `read_chunk`: active chunk、メモリ上の sealed cache、cellar の順に読む。
+- `append` / `edit` は entry の `speakerId` を認可する（Issue #271）。entry の payload が JSON object で `speakerId` を持つ場合、その character が実在し、`std::owner_account` が呼び出し元と一致するか、呼び出し元が `Admin` であることを要求する。`speakerId` が無い / `null` / entry が非 JSON ならナレーションとして許可する。違反は `BanquetteError::SpeakerNotOwned` になり、要求元へ `Error { code: "SpeakerNotOwned" }` を返す。came/gone は `speakerId` を持たないため従来どおり通る。
 
 各操作は `LogOperationEvent` になり、同一 scene のクライアントへ `LogEventAppended` / `Edited` / `Deleted` / `Rewound` として配信される。
 
@@ -162,8 +163,8 @@ ZIP の構成は `room.tin`（`RoomData` Tin）と `chunks/<tin-id>.tin`（`LogC
 
 - `Denied`: 読み書き不可。読み取り query には**無言**で応答しない（接続時の入場可否は現状 `maitre-d` のゲートが担う）。
 - `Viewer`: 全 scene の log / state を受信できる。全 mutate を拒否される。
-- `Participant`: 管理者に移動させられた scene と root `/` の log / state を送受信できる。`CreateScene` / `DeleteScene` / `MoveCharacter` は不可。
-- `Admin`: 全 scene の送受信と権限変更。
+- `Participant`: 管理者に移動させられた scene と root `/` の log / state を送受信できる。`CreateScene` / `DeleteScene` / `MoveCharacter` は不可。log の `speakerId` には自分の保有 character だけを使える。
+- `Admin`: 全 scene の送受信と権限変更。すべての実在 character を話者にできる（GM 代演、Issue #271）。
 
 ### `Room::new`
 
@@ -197,7 +198,7 @@ load 後と権限変更後に呼び、次を検証する。違反は `InvalidRoo
 - `alhalte-kitchen` は main から削除し、`kitchen-freeze` ブランチに保存した（#184）。banquette の export は `RoomData` をそのまま ZIP に格納し、`export.rs` の `RoomArchive` で権限表ごと読み戻す。`done` 射影は持たない（#193）。
 - `SetMemberPermission` / `SetDefaultPermission` の ack は要求元にだけ返し、部屋全体へは broadcast しない。降格された account は次回 `QueryPermissions` まで自分の権限変化を知らない（UI 追従は #201）。
 - `EnterScene` は権限が無い場合に無言で何もしない。`maitre-d` は自前の `client_scenes` で broadcast 先を決めるため、接続時の入場可否は当面 `maitre-d` のゲートが正で、banquette 側の判定は defense in depth。#200 で一本化する。
-- log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。
+- log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。ただし `speakerId` だけは認可のため banquette が解釈する（Issue #271）。entry が JSON object のときだけ読み、非 JSON / キー無しはナレーションとして扱う。
 - WebRTC の DataChannel は signaling の中継までを実装し、state の DataChannel 経路そのものは未実装。
 - `RoomData` は `HashMap` を含むため、内容が同じでも postcard の map 順序が変わり tin id が変わることがある。heartbeat ごとに head が作り直されるが、旧 head の unregister と GC で回収される。
 - `persist` の失敗はログのみで、次周期までの再試行はない。メトリクスや専用の再試行キューは持たない。

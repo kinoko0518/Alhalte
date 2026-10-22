@@ -81,12 +81,11 @@ port = 5173
 
 [[extensions]]
 id = "alhalte-dsl"
-name = "Alhalte DSL"
 path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
 enabled = true
 ```
 
-`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。`cellar.service-token` は設定する場合のみ非空でなければならない。`maitre-d.debug-login` は既定 `false` で、真偽値のみ。true はローカル開発専用で、起動する maitre-d は account 名だけでサインインできる状態になる（検証では禁止しないが、ドキュメントで明示する）。
+`maitre-d` の `client-id` / `client-secret` / `salt` は必須。`chunk-size-exponent` は 1〜30。`argenterie.port` は 0 不可。`extensions[].id` は空不可。`cellar.service-token` は設定する場合のみ非空でなければならない。`maitre-d.debug-login` は既定 `false` で、真偽値のみ。true はローカル開発専用で、起動する maitre-d は account 名だけでサインインできる状態になる（検証では禁止しないが、ドキュメントで明示する）。`extensions[].name` は Issue #274 で廃止した。表示名・アイコン・説明は wasm の `self_introduction`（ABI 2 の `(id, name, icon_svg, description)`）が正で、`Bistrot.toml` は `id` / wasm path / `enabled` だけを持つ。旧 TOML に `name` が残っていても unknown field として無視される。
 
 ### 秘密値の扱い（Issue #194）
 
@@ -155,7 +154,7 @@ enabled = true
 
 ### 拡張機能 staging
 
-`stage_extensions_with_base` は設定順を 0-based の `priority` とし、`<output_dir>/<id>.wasm` へコピーする。`ext.path` が存在しない場合は `Bistrot.toml` の親ディレクトリからの相対パスも試す。宣言された wasm がどちらにも無い場合は `BistrotError::ExtensionWasmMissing { id, path }` で失敗し、コピーも `manifest.json` の書き込みも行わない（Issue #165）。`Bistrot.toml` のパス間違いや wasm のビルド忘れを起動時に検出するため、`manifest.json` には存在しない wasm を指す entry を作らない。全 wasm を解決してからコピーするため、失敗時に中途半端な staging 出力は残らない。`manifest.json` は `id`、`name`、`url`、`enabled`、`priority` を持つ。
+`stage_extensions_with_base` は設定順を 0-based の `priority` とし、`<output_dir>/<id>.wasm` へコピーする。`ext.path` が存在しない場合は `Bistrot.toml` の親ディレクトリからの相対パスも試す。宣言された wasm がどちらにも無い場合は `BistrotError::ExtensionWasmMissing { id, path }` で失敗し、コピーも `manifest.json` の書き込みも行わない（Issue #165）。`Bistrot.toml` のパス間違いや wasm のビルド忘れを起動時に検出するため、`manifest.json` には存在しない wasm を指す entry を作らない。全 wasm を解決してからコピーするため、失敗時に中途半端な staging 出力は残らない。`manifest.json` は `id`、`url`、`enabled`、`priority` を持ち、`name` は持たない（Issue #274。表示メタデータは wasm の自己紹介が正）。
 
 ### rops
 

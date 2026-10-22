@@ -14,7 +14,7 @@ Alhalte 内で動く DSL を `Generast` に変換する。BCDice 系より表現
 - `parse_dice_command(&mut &str) -> ModalResult<DiceExpr>`
 - `derive_seed(speaker_id, text) -> [u8; 32]`
 - `process_ast(ast, speaker_id) -> Generast`
-- `self_introduction_info() -> (name, icon_svg, description)`
+- `self_introduction_info() -> (id, name, icon_svg, description)`（ABI 2）
 - ABI: `alhalte_abi_version`、`alloc`、`dealloc`、`process_generast`、`self_introduction`
 
 ## 文法と変換

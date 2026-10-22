@@ -208,7 +208,7 @@ client 総体 = cutlery
 | 権限 | 部屋の `done` フラグと `std::admins` | `banquette` の `RoomData.permissions` / `default_permission` が正（4 段階）。`maitre-d` は権限テーブルを持たず、WS / `GET /api/rooms/{id}` / export / HTTP 権限 API で banquette に問い合わせる。旧 `gm/pl/viewer` / `rooms.done` は起動時に拒否する。 |
 | 部屋状態 | 部屋プロセスは揮発 | cellar の `alhalte/banquette` Tin と head alias `room/<room_id>/head` で永続化し、banquette が起動時に自分で復元する（#192）。復元失敗は空部屋にフォールバックしない。 |
 | 内部書き込み | ユーザー session で認可 | `cellar.service-token` による内部認証。合成 session（旧 `system_session_id = 1`）は廃止。 |
-| 拡張 ABI | `process-generast(Generast) -> Generast` | `process_generast(ptr, len) -> i64`。`(Generast, speaker_id)` の Tin を入出力し、`alhalte_abi_version` / `alloc` / `dealloc` / `self_introduction` を持つ。 |
+| 拡張 ABI | `process-generast(Generast) -> Generast` | `process_generast(ptr, len) -> i64`。`(Generast, speaker_id)` の Tin を入出力し、`alhalte_abi_version` / `alloc` / `dealloc` / `self_introduction` を持つ。ABI 2 の `self_introduction` は `(id, name, icon_svg, description)` を postcard で返し、ホストは ABI 1 も受け入れる。 |
 | canner | クライアント側 wasm の `encode-*` / `encrypt-*` | Rust ライブラリとして実装済み。WASM ABI は未エクスポート。ブラウザでは `pantry` の TS 実装が暗号・展開を担う。 |
 | アセット | `pantry` が cellar から取得・復号・キャッシュ | `argenterie` は `pantry` の `encodeTin` で RoomKey 暗号化した Tin を maitre-d の `/api/cellar/*` proxy 経由で cellar へ保存し、進捗・失敗・再試行をカードに出す。room アセットのメタデータは `/` の state、personal は localStorage のみ。拡張 wasm も同じ経路で `tinId` だけを state に持つ。 |
 | kitchen の room key | ランダム 96bit nonce | `export_room_to_zip` / `export_room_to_tar_gz` は Zero Nonce で room-key 暗号化する。 |
