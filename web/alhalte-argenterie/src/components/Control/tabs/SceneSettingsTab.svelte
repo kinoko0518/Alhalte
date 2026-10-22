@@ -10,6 +10,7 @@
    * - GitHub Issue #109 / sub-issue #142: BGM状態変更のサーバー送信と送信中インジケーター
    * - GitHub Issue #226: BGMスロット削除 (track / playing / volume をサーバーから消す)
    * - GitHub Issue #250: BGM の再生位置同期 (started_at / paused_at) とトランスポート UI
+   * - GitHub Issue #275: スロット追加フローの失敗を、行が無くても BGM 節に表示する
    */
   import {
     ButtonGroup,
@@ -45,6 +46,7 @@
     type BgmTrackState,
   } from '../../../utils/sceneSettings.js';
   import {
+    BGM_AUDIO_LOAD_ERROR,
     computeBgmOffsetMs,
     createAudioManager,
     type AudioManager,
@@ -325,7 +327,15 @@
   let activeBgmSlotPicking = $state<number | null>(null);
   /** Slots with an in-flight server operation; reassigned so Svelte sees the change. */
   let pendingBgmSlots = $state<Set<number>>(new Set());
-  /** Per-slot error message rendered under the row with `role="status"`. */
+  /**
+   * Per-slot error message (Issue #275).
+   *
+   * A slot that has a row renders its message under the row
+   * (`bgm-error-<slot>`); a slot without a row — every failure of the
+   * "スロット追加" flow, because a row only exists after the track write
+   * succeeded (Issue #249) — is rendered once under the section header
+   * (`bgm-add-error`) by {@link bgmAddError}.
+   */
   let bgmErrors = $state<Record<number, string>>({});
   /** Slider drafts: the committed volume lives in `bgmSlots` only after the ack. */
   let draftBgmVolumes = $state<Record<number, number>>({});
@@ -347,6 +357,33 @@
     pendingBgmSlots = new Set();
     bgmErrors = {};
     draftBgmVolumes = {};
+  });
+
+  /**
+   * Section-level error of the BGM block (Issue #275).
+   *
+   * The per-slot errors are rendered inside the row of the slot, but a row only
+   * exists once its track write succeeded (Issue #249). Every failure of the
+   * add flow (prepare / tinId-less asset / denied / rejected write) therefore
+   * belongs to a slot that has **no** row, which is exactly the slot this
+   * derives: the first error message of a slot that is not in `bgmSlots`,
+   * including the user-facing error the audio manager recorded (missing room
+   * key / download failure). One paragraph is enough: the add flow only ever
+   * targets one slot at a time, and a second message would just repeat the same
+   * cause.
+   */
+  let bgmAddError = $derived.by((): string | null => {
+    const rowSlots = new Set(bgmSlots.map((slot) => slot.slot));
+    const slotNumbers = [
+      ...Object.keys(bgmErrors).map((key) => Number(key)),
+      ...Object.keys(bgmAudioStates).map((key) => Number(key)),
+    ].sort((a, b) => a - b);
+    for (const slotNum of slotNumbers) {
+      if (rowSlots.has(slotNum)) continue;
+      const message = bgmErrors[slotNum] ?? bgmAudioStates[slotNum]?.error;
+      if (message) return message;
+    }
+    return null;
   });
 
   function syncSlotToLegacy(slot: BgmSlot) {
@@ -562,7 +599,11 @@
    *
    * A missing / undecryptable tin must never leave the server thinking the slot
    * is playing: the manager records the user-facing error and this returns
-   * `false` so the caller skips the acknowledgement path.
+   * `false` so the caller skips the acknowledgement path. The message is also
+   * copied into {@link bgmErrors} (Issue #275): the failure of a new slot has no
+   * row to be rendered under, so the section-level error area has to learn about
+   * it explicitly. The manager's own message (missing room key / load failure)
+   * is preferred so the user sees the actual cause.
    */
   async function prepareBgmAudio(
     slotNum: number,
@@ -578,6 +619,7 @@
       return true;
     } catch (error) {
       console.warn(`[SceneSettingsTab] Failed to prepare BGM slot ${slotNum}:`, error);
+      setBgmError(slotNum, bgmAudio.getState(slotNum).error ?? BGM_AUDIO_LOAD_ERROR);
       return false;
     }
   }
@@ -980,7 +1022,13 @@
     void commitBgmRestart(slotNum);
   }
 
+  /**
+   * Opens the AssetPicker for a slot (Issue #275: read-only roles never start
+   * the flow — the server would reject the writes with `PermissionDenied` and a
+   * new slot has no row to show that error under).
+   */
   function handleBgmSelect(slotOrKey: number | 'bgm1' | 'bgm2' | 'bgm3') {
+    if (!capabilities.canSend) return;
     const slotNum =
       typeof slotOrKey === 'number'
         ? slotOrKey
@@ -1110,8 +1158,11 @@
    * `bgm::<slot>::removed` tombstone never hides the new selection. No empty
    * row is created here: the row appears only after the selection is
    * acknowledged, through the track StateUpdated / the ack of `commitBgmPlay`.
+   * A viewer / denied role cannot use it at all (Issue #275): the button is
+   * disabled with the same capability predicate as the row controls.
    */
   function handleAddBgmSlot() {
+    if (!capabilities.canSend) return;
     const maxRow = bgmSlots.reduce((max, slot) => Math.max(max, slot.slot), 0);
     const maxRemoved = getBgmRemovedSlots(currentScene.juices).reduce(
       (max, slot) => Math.max(max, slot),
@@ -1452,10 +1503,13 @@
     <div class="bgm-controls" data-testid="bgm-controls">
       <div class="bgm-section-header">
         <span class="bgm-header-label">BGMスロット設定</span>
+        <!-- Issue #275: a viewer / denied role is read-only, so it cannot start
+             the add flow (the row controls use the same predicate). -->
         <button
           type="button"
           class="add-slot-text-btn"
           onclick={handleAddBgmSlot}
+          disabled={!capabilities.canSend}
           data-testid="add-bgm-slot-btn"
           aria-label="スロットを追加"
         >
@@ -1463,6 +1517,14 @@
           <span>スロット追加</span>
         </button>
       </div>
+
+      <!-- Issue #275: 追加フローの失敗は行が存在しないスロットで起きるため、
+           行の中 (`bgm-error-<slot>`) ではなく節の直下に 1 つだけ表示する。 -->
+      {#if bgmAddError}
+        <p class="bgm-add-error-text" role="status" data-testid="bgm-add-error">
+          {bgmAddError}
+        </p>
+      {/if}
 
       {#each bgmSlots as slot (slot.slot)}
         <div class="bgm-slot-block" data-testid="bgm-slot-block-{slot.slot}">
@@ -1993,6 +2055,23 @@
   }
   .add-slot-text-btn:hover {
     background: var(--np-color-surface-container-highest);
+  }
+  /* Issue #275: 読み取り専用ロール (viewer / denied) ではスロット追加を押せない。 */
+  .add-slot-text-btn:disabled {
+    color: var(--np-color-on-surface-variant);
+    opacity: 0.5;
+    cursor: default;
+  }
+  .add-slot-text-btn:disabled:hover {
+    background: none;
+  }
+  /* Issue #275: 行を持たないスロット (= 追加フロー) のエラー。
+     行のエラーと違い行頭のインデントは不要なので、節の左端に揃える。 */
+  .bgm-add-error-text {
+    margin: 0;
+    font-size: 0.8rem;
+    line-height: 1.3;
+    color: var(--np-color-error);
   }
   .bgm-row {
     display: flex;
