@@ -231,6 +231,7 @@ describe('Image Picker Separation (Issue #52)', () => {
       parameters: [],
       chatPalette: '',
       hideStatus: false,
+      ownerAccountId: '1001',
     };
 
     const target = document.createElement('div');
@@ -241,6 +242,7 @@ describe('Image Picker Separation (Issue #52)', () => {
       props: {
         characters: [testChar],
         role: 'participant',
+        currentAccountId: '1001',
       },
     });
 
