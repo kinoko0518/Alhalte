@@ -344,6 +344,68 @@ describe('Fullscreen Warnings & Overlays Viewport Hoisting (Issue #60)', () => {
     target.remove();
   });
 
+  // spec: alhalte-argenterie/fullscreen-overlay 縦長画面（portrait）Bottom Sheetでのシーングラフリスト削除ダイアログのビューポート最前面化 (Issue #273)
+  it('renders the scene graph list-view delete confirmation at root viewport level in the portrait bottom sheet layout', async () => {
+    Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 400 });
+    Object.defineProperty(window, 'innerHeight', { writable: true, configurable: true, value: 800 });
+
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+
+    const instance = mount(App, {
+      target,
+      props: {
+        initialRoom: dummyRoom,
+        initialScenes: [scene1, scene2],
+        initialMovements: [
+          { characterId: 'char-1', characterName: '調査員アルト', toSceneId: 'scene-alpha', timestamp: 100 },
+          { characterId: 'char-1', characterName: '調査員アルト', fromSceneId: 'scene-alpha', toSceneId: 'scene-beta', timestamp: 200 },
+        ],
+        isAdmin: true,
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+
+    const bottomSheet = target.querySelector('[data-testid="portrait-bottom-sheet"]');
+    expect(bottomSheet).toBeTruthy();
+
+    // Open the graph tab and switch to the list view inside the bottom sheet.
+    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-graph"]')?.click();
+    await new Promise((r) => setTimeout(r, 30));
+    target
+      .querySelector<HTMLInputElement>('[data-testid="scene-graph-view-segmented"] input[value="list"]')
+      ?.click();
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="scene-graph-list"]')).toBeTruthy();
+
+    // The trash button is inside the sheet, the confirmation it opens is not.
+    const trash = target.querySelector<HTMLButtonElement>(
+      '[data-testid="scene-list-delete-scene-beta"]',
+    );
+    expect(trash).toBeTruthy();
+    trash?.click();
+    await new Promise((r) => setTimeout(r, 30));
+
+    const controlPanel = target.querySelector('[data-testid="control-panel"]');
+    const rootOverlay = target.querySelector('[data-testid="root-delete-scene-dialog"]');
+    expect(rootOverlay).toBeTruthy();
+    expect(rootOverlay?.classList.contains('fullscreen-dialog-overlay')).toBe(true);
+    expect(bottomSheet?.contains(rootOverlay)).toBe(false);
+    expect(controlPanel?.contains(rootOverlay)).toBe(false);
+    expect(rootOverlay?.querySelector('[data-testid="graph-delete-dialog-title"]')?.textContent).toContain(
+      'シーン「深緑の森」を削除しますか？',
+    );
+
+    // Click scrim to close.
+    rootOverlay?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 30));
+    expect(target.querySelector('[data-testid="root-delete-scene-dialog"]')).toBeNull();
+
+    unmount(instance);
+    target.remove();
+  });
+
   // spec: alhalte-argenterie/fullscreen-overlay キャラクター編集モーダルのビューポート最前面化と全画面スクリム (Issue #60)
   it('renders CharacterEditModal at root viewport level outside control panel with dark scrim, closing on outside click and cancel', async () => {
     Object.defineProperty(window, 'innerWidth', { writable: true, configurable: true, value: 1280 });

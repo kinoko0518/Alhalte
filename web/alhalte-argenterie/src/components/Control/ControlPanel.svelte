@@ -287,6 +287,8 @@
         {movements}
         sceneNames={sceneNamesMap}
         {accessibleSceneIds}
+        scenes={allScenes}
+        currentSceneId={currentScene.id}
         {role}
         onNavigateToScene={handleNavigateFromGraph}
         onOpenSceneLog={handleOpenSceneLog}
