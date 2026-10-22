@@ -329,7 +329,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     expect(toggle('markdown')?.checked).toBe(false);
     // Official defaults listed by the server are rendered from its metadata.
     expect(extName('alhalte-dsl')).toBe('Alhalte DSL');
-    expect(extName('aozora')).toBe('青空文庫ルビ・傍点');
+    expect(extName('aozora')).toBe('青空文庫書式');
     // The marker is present, so the server is authoritative: an official id it
     // does not list (coc-6) was deleted and must not be re-added (Issue #165).
     expect(extName('coc-6')).toBeUndefined();
@@ -522,7 +522,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     expect(extensionTabRoot()?.getAttribute('aria-disabled')).toBeNull();
     expect(toggle('markdown')?.disabled).toBe(true);
     expect(toggle('markdown')?.getAttribute('aria-disabled')).toBe('true');
-    expect(extName('markdown')).toBe('Markdown スタイル');
+    expect(extName('markdown')).toBe('Markdown');
     expect(offlineNotice()?.textContent).toContain('サーバーと通信できませんでした');
     // The local model was not updated.
     expect(toggle('markdown')?.getAttribute('aria-checked')).toBe('true');
@@ -557,7 +557,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     const list = target.querySelector('[data-testid="extension-list"]');
     expect(list).toBeTruthy();
     expect(extName('alhalte-dsl')).toBe('Alhalte DSL');
-    expect(extName('markdown')).toBe('Markdown スタイル');
+    expect(extName('markdown')).toBe('Markdown');
     const scrollContainer = root.querySelector('.extension-tab-container');
     expect(scrollContainer).toBeTruthy();
     expect(scrollContainer?.contains(list)).toBe(true);
@@ -776,7 +776,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     expect(value.id).toBe(write.key.slice(EXTENSION_STATE_KEY_PREFIX.length));
     expect(value.tinId).toBe(WASM_TIN_ID);
     // Metadata comes from `self_introduction()` of the validated wasm.
-    expect(value.name).toBe('Markdown スタイル');
+    expect(value.name).toBe('Markdown');
     expect(typeof value.iconSvg).toBe('string');
     expect(typeof value.description).toBe('string');
     // 4 KiB limit: the metadata never carries the wasm bytes.
@@ -795,7 +795,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     await tick(40);
 
     expect(target.querySelector(`[data-testid="extension-item-${extensionId}"]`)).toBeTruthy();
-    expect(extName(extensionId)).toBe('Markdown スタイル');
+    expect(extName(extensionId)).toBe('Markdown');
     expect(target.querySelector('[data-testid="extension-upload-progress"]')).toBeNull();
     expect(extensionTabRoot()?.classList.contains('extensions-offline')).toBe(false);
   });
@@ -857,7 +857,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     });
     expect(socket.stateSnapshot[EXTENSION_SEEDED_STATE_KEY]).toBe(true);
     expect(extName('alhalte-dsl')).toBe('Alhalte DSL');
-    expect(extName('markdown')).toBe('Markdown スタイル');
+    expect(extName('markdown')).toBe('Markdown');
     // Seed values are metadata only: the wasm body never enters the state.
     for (const call of socket.requestUpdateStateCalls) {
       if (call.key === EXTENSION_SEEDED_STATE_KEY) continue;
@@ -882,7 +882,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
     await mountAndOpen(socket, { seeded: false });
     await waitFor(() => socket.stateSnapshot[EXTENSION_SEEDED_STATE_KEY] === true);
     await tick(20);
-    expect(extName('markdown')).toBe('Markdown スタイル');
+    expect(extName('markdown')).toBe('Markdown');
 
     await deleteViaMenu('markdown');
     await waitFor(
@@ -1004,7 +1004,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
   it('shows a pipeline warning instead of silently skipping an enabled extension without wasm', async () => {
     const socket = new FakeRoomSocket();
     mountApp(socket, 'connected', [
-      { id: 'markdown', name: 'Markdown スタイル', enabled: true, priority: 0 },
+      { id: 'markdown', name: 'Markdown', enabled: true, priority: 0 },
     ]);
     await tick(30);
 
@@ -1018,7 +1018,7 @@ describe('Extension tab server synchronization (Issue #109 / #145)', () => {
 
     const warning = target.querySelector<HTMLElement>('[data-testid="pipeline-warning"]');
     expect(warning).toBeTruthy();
-    expect(warning?.textContent).toContain('Markdown スタイル');
+    expect(warning?.textContent).toContain('Markdown');
     expect(warning?.textContent).toContain('wasm がありません');
     // The message is still sent with the raw/ext-io Tin (warning, not a block).
     expect(socket.requestAppendLogCalls).toHaveLength(1);
@@ -1040,7 +1040,7 @@ describe('utils/extensions merge & cellar helpers (Issue #109 / #145)', () => {
     },
     {
       id: 'markdown',
-      name: 'Markdown スタイル',
+      name: 'Markdown',
       iconSvg: '<svg/>',
       description: 'Markdown',
       enabled: true,

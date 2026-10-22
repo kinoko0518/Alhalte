@@ -8,7 +8,38 @@
 
 import type { ExtensionItem } from '../types/index.js';
 
-export const CURRENT_ALHALTE_ABI_VERSION = 1;
+/**
+ * ABI version implemented by the official extensions (`(id, name, icon_svg, description)`).
+ *
+ * ABI 1 is still accepted for reading room state / older wasm bodies; see
+ * {@link MIN_SUPPORTED_ALHALTE_ABI_VERSION}.
+ */
+export const CURRENT_ALHALTE_ABI_VERSION = 2;
+
+/**
+ * Oldest extension ABI the host still runs.
+ *
+ * ABI 1 `self_introduction` returns `(name, icon_svg, description)`; the host
+ * uses the manifest id for those extensions (Issue #274).
+ */
+export const MIN_SUPPORTED_ALHALTE_ABI_VERSION = 1;
+
+/**
+ * Decoded `self_introduction` metadata.
+ *
+ * `id` is only present for ABI 2+ wasm. ABI 1 has no id, so the manifest id is
+ * authoritative there.
+ */
+export interface SelfIntroduction {
+  /** Extension id declared by the wasm (ABI 2+ only). */
+  id?: string;
+  /** Display name. */
+  name: string;
+  /** Inline SVG icon markup. */
+  iconSvg: string;
+  /** Human readable description. */
+  description: string;
+}
 
 export interface WasmExtensionExports {
   memory: WebAssembly.Memory;
@@ -50,15 +81,11 @@ function decodeVarint(bytes: Uint8Array, offset: number): { value: number; nextO
 }
 
 /**
- * Encodes `(String, String, String)` in Postcard binary format.
+ * Encodes a tuple of strings in Postcard binary format.
  */
-export function encodePostcardStringTuple3(
-  name: string,
-  iconSvg: string,
-  description: string,
-): Uint8Array {
+function encodePostcardStringTuple(values: readonly string[]): Uint8Array {
   const encoder = new TextEncoder();
-  const parts = [name, iconSvg, description].map((s) => encoder.encode(s));
+  const parts = values.map((s) => encoder.encode(s));
   const out: number[] = [];
   for (const part of parts) {
     out.push(...encodeVarint(part.length));
@@ -70,17 +97,38 @@ export function encodePostcardStringTuple3(
 }
 
 /**
- * Decodes `(String, String, String)` from Postcard binary format.
+ * Encodes `(String, String, String)` in Postcard binary format.
  */
-export function decodePostcardStringTuple3(bytes: Uint8Array): {
-  name: string;
-  iconSvg: string;
-  description: string;
-} {
+export function encodePostcardStringTuple3(
+  name: string,
+  iconSvg: string,
+  description: string,
+): Uint8Array {
+  return encodePostcardStringTuple([name, iconSvg, description]);
+}
+
+/**
+ * Encodes `(String, String, String, String)` in Postcard binary format.
+ *
+ * Used by tests (and hosts) to build ABI 2 `self_introduction` payloads.
+ */
+export function encodePostcardStringTuple4(
+  id: string,
+  name: string,
+  iconSvg: string,
+  description: string,
+): Uint8Array {
+  return encodePostcardStringTuple([id, name, iconSvg, description]);
+}
+
+/**
+ * Decodes `count` consecutive Postcard strings from binary format.
+ */
+function decodePostcardStrings(bytes: Uint8Array, count: number): string[] {
   const decoder = new TextDecoder();
   let offset = 0;
   const values: string[] = [];
-  for (let i = 0; i < 3; i++) {
+  for (let i = 0; i < count; i++) {
     const { value: len, nextOffset } = decodeVarint(bytes, offset);
     const end = nextOffset + len;
     if (end > bytes.length) {
@@ -89,10 +137,40 @@ export function decodePostcardStringTuple3(bytes: Uint8Array): {
     values.push(decoder.decode(bytes.subarray(nextOffset, end)));
     offset = end;
   }
+  return values;
+}
+
+/**
+ * Decodes `(String, String, String)` from Postcard binary format (ABI 1).
+ */
+export function decodePostcardStringTuple3(bytes: Uint8Array): {
+  name: string;
+  iconSvg: string;
+  description: string;
+} {
+  const values = decodePostcardStrings(bytes, 3);
   return {
     name: values[0],
     iconSvg: values[1],
     description: values[2],
+  };
+}
+
+/**
+ * Decodes `(String, String, String, String)` from Postcard binary format (ABI 2).
+ */
+export function decodePostcardStringTuple4(bytes: Uint8Array): {
+  id: string;
+  name: string;
+  iconSvg: string;
+  description: string;
+} {
+  const values = decodePostcardStrings(bytes, 4);
+  return {
+    id: values[0],
+    name: values[1],
+    iconSvg: values[2],
+    description: values[3],
   };
 }
 
@@ -102,6 +180,7 @@ export function decodePostcardStringTuple3(bytes: Uint8Array): {
 export class WasmExtensionInstance {
   private instance: WebAssembly.Instance;
   private exports: WasmExtensionExports;
+  private abiVersion: number;
 
   private constructor(instance: WebAssembly.Instance) {
     this.instance = instance;
@@ -111,9 +190,13 @@ export class WasmExtensionInstance {
       throw new Error('Extension does not export alhalte_abi_version');
     }
     const version = exp.alhalte_abi_version();
-    if (version !== CURRENT_ALHALTE_ABI_VERSION) {
+    if (
+      !Number.isInteger(version) ||
+      version < MIN_SUPPORTED_ALHALTE_ABI_VERSION ||
+      version > CURRENT_ALHALTE_ABI_VERSION
+    ) {
       throw new Error(
-        `Unsupported extension ABI version: ${version} (expected ${CURRENT_ALHALTE_ABI_VERSION})`,
+        `Unsupported extension ABI version: ${version} (supported ${MIN_SUPPORTED_ALHALTE_ABI_VERSION}..${CURRENT_ALHALTE_ABI_VERSION})`,
       );
     }
 
@@ -129,6 +212,14 @@ export class WasmExtensionInstance {
     }
 
     this.exports = exp;
+    this.abiVersion = version;
+  }
+
+  /**
+   * ABI version reported by the wasm (`alhalte_abi_version`).
+   */
+  public getAbiVersion(): number {
+    return this.abiVersion;
   }
 
   /**
@@ -141,9 +232,13 @@ export class WasmExtensionInstance {
   }
 
   /**
-   * Calls `self_introduction()` if exported by the extension module and decodes `(name, icon_svg, description)`.
+   * Calls `self_introduction()` if exported by the extension module and decodes it.
+   *
+   * ABI 1 returns `(name, icon_svg, description)` and the result has no `id`.
+   * ABI 2 returns `(id, name, icon_svg, description)`. The optional export means
+   * a v2 wasm may return `null`; the caller then falls back to the manifest id.
    */
-  public selfIntroduction(): { name: string; iconSvg: string; description: string } | null {
+  public selfIntroduction(): SelfIntroduction | null {
     if (typeof this.exports.self_introduction !== 'function') {
       return null;
     }
@@ -164,6 +259,9 @@ export class WasmExtensionInstance {
     const output = new Uint8Array(outMemBuffer.subarray(outPtr, outPtr + outLen));
     this.exports.dealloc(outPtr, outLen);
 
+    if (this.abiVersion >= 2) {
+      return decodePostcardStringTuple4(output);
+    }
     return decodePostcardStringTuple3(output);
   }
 
@@ -435,7 +533,10 @@ export function deleteExtension(
 /**
  * Default official extensions configured in Bistrot.toml.
  *
- * Includes metadata matching `self_introduction_info()` in each official extension crate.
+ * Offline / test fallback only: the display metadata of the real rows comes
+ * from each staged wasm (`self_introduction`, ABI 2). The values here must stay
+ * in sync with the official wasm; `extensions-abi.test.ts` compares them with
+ * the staged `public/extensions/*.wasm` (Issue #274).
  */
 export const DEFAULT_OFFICIAL_EXTENSIONS: ExtensionItem[] = [
   {
@@ -444,27 +545,25 @@ export const DEFAULT_OFFICIAL_EXTENSIONS: ExtensionItem[] = [
     iconSvg:
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zM7.5 18c-.83 0-1.5-.67-1.5-1.5S6.67 15 7.5 15s1.5.67 1.5 1.5S8.33 18 7.5 18zm0-9C6.67 9 6 8.33 6 7.5S6.67 6 7.5 6 9 6.67 9 7.5 8.33 9 7.5 9zm4.5 4.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm4.5 4.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zm0-9c-.83 0-1.5-.67-1.5-1.5S15.67 6 16.5 6s1.5.67 1.5 1.5-.67 1.5-1.5 1.5z"/></svg>',
     description:
-      'ダイスロール（xDy）・四則演算・比較判定・シークレットダイス・変数展開を処理する公式DSL拡張機能',
+      'ダイスの記法などを処理します。ほとんどのルール拡張の動作のために必要です。',
     enabled: true,
     priority: 0,
   },
   {
     id: 'markdown',
-    name: 'Markdown スタイル',
+    name: 'Markdown',
     iconSvg:
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M2.5 4v16h19V4H2.5zm2 2h15v12h-15V6zm2 2v8h2.5V11l2 2.5 2-2.5V16h2.5V8h-2.5l-2 2.5-2-2.5H6.5zm11 0l-2.5 3h1.5v5h2v-5h1.5l-2.5-3z"/></svg>',
-    description:
-      '太字（**）・斜体（*）・打ち消し線（~~）などのMarkdown記法を装飾ノードに変換する公式拡張機能',
+    description: '太字（**）・斜体（*）・打ち消し線（~~）などのMarkdown記法を処理します。',
     enabled: true,
     priority: 1,
   },
   {
     id: 'aozora',
-    name: '青空文庫ルビ・傍点',
+    name: '青空文庫書式',
     iconSvg:
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M18 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zM6 4h5v8l-2.5-1.5L6 12V4z"/></svg>',
-    description:
-      '青空文庫形式のルビ（｜親文字《ルビ》）と傍点（［＃「…」に傍点］）を変換する公式拡張機能',
+    description: '青空文庫書式を変換する公式拡張機能',
     enabled: true,
     priority: 2,
   },
@@ -473,8 +572,7 @@ export const DEFAULT_OFFICIAL_EXTENSIONS: ExtensionItem[] = [
     name: 'クトゥルフ神話TRPG (第6版)',
     iconSvg:
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 2L4.5 6.5v11L12 22l7.5-4.5v-11L12 2zm0 2.3l5.5 3.3v8.8L12 19.7l-5.5-3.3V7.6L12 4.3zm0 3.7a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4z"/></svg>',
-    description:
-      'CoC第6版のCCB/CC判定・クリティカル/ファンブル・組み合わせロール・RESB対抗ロールを提供する公式拡張機能',
+    description: 'クトゥルフ神話TRPG第6版の記法や処理のための公式拡張機能です。',
     enabled: false,
     priority: 3,
   },
@@ -483,8 +581,7 @@ export const DEFAULT_OFFICIAL_EXTENSIONS: ExtensionItem[] = [
     name: '新クトゥルフ神話TRPG (第7版)',
     iconSvg:
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 2L4.5 6.5v11L12 22l7.5-4.5v-11L12 2zm0 2.3l5.5 3.3v8.8L12 19.7l-5.5-3.3V7.6L12 4.3zM9 9v2h3.5L9 16h2.2l3.5-5V9H9z"/></svg>',
-    description:
-      'CoC第7版のCC判定（レギュラー/ハード/イクストリーム）・ボーナス/ペナルティダイスを提供する公式拡張機能',
+    description: '新クトゥルフ神話TRPG第7版の記法や処理のための公式拡張機能です。',
     enabled: false,
     priority: 4,
   },
@@ -493,8 +590,7 @@ export const DEFAULT_OFFICIAL_EXTENSIONS: ExtensionItem[] = [
     name: 'エモクロアTRPG',
     iconSvg:
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>',
-    description:
-      'エモクロアTRPGのxDM<=y判定（共鳴判定・成功数カウント・ダブル/トリプル等）を提供する公式拡張機能',
+    description: 'エモクロアTRPGの記法や処理のための公式拡張機能です。',
     enabled: false,
     priority: 5,
   },
@@ -518,6 +614,11 @@ export interface ExtensionManifestItem {
  * listing a metadata-only extension as runnable. When the manifest itself is
  * unreachable the static defaults are returned unchanged: availability is
  * unknown there, so no row is marked.
+ *
+ * ABI 2 extensions declare their own id in `self_introduction`. When it differs
+ * from the manifest id the wasm is not trusted (fail-closed, Issue #274): the
+ * row keeps the manifest metadata, is marked `wasmMissing` and never runs.
+ * ABI 1 wasm has no declared id, so the manifest id is used.
  */
 export async function loadDefaultExtensions(
   fetchFn: typeof fetch | undefined = typeof globalThis.fetch === 'function'
@@ -545,7 +646,7 @@ export async function loadDefaultExtensions(
       const fallback = DEFAULT_OFFICIAL_EXTENSIONS.find((d) => d.id === entry.id);
 
       let wasmBytes: Uint8Array | undefined;
-      let intro: { name: string; iconSvg: string; description: string } | null = null;
+      let intro: SelfIntroduction | null = null;
 
       if (entry.url) {
         try {
@@ -560,7 +661,19 @@ export async function loadDefaultExtensions(
           // Missing / unreadable / ABI-incompatible wasm: keep the metadata but
           // surface the row as unavailable (Issue #165).
           wasmBytes = undefined;
+          intro = null;
         }
+      }
+
+      // Issue #274: a wasm that introduces itself under a different id is not
+      // the extension the manifest asked for. Fail closed instead of running
+      // foreign code under the manifest id.
+      if (wasmBytes && intro?.id && intro.id !== entry.id) {
+        console.warn(
+          `[extensions] self_introduction id mismatch: manifest id "${entry.id}" but wasm declares "${intro.id}"; the extension is disabled`,
+        );
+        wasmBytes = undefined;
+        intro = null;
       }
 
       const item: ExtensionItem = {
