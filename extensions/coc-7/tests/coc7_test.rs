@@ -137,7 +137,7 @@ fn test_coc7_combine_diceroll_and_suffix() {
 // spec: extensions/coc-7 ABI roundtrip
 #[test]
 fn test_coc7_abi_exports() {
-    assert_eq!(alhalte_abi_version(), 1);
+    assert_eq!(alhalte_abi_version(), 2);
 
     let speaker_id = 888u64;
     let input_ast = Generast::string("CC<=65【心理学】");
@@ -172,19 +172,23 @@ fn test_coc7_abi_exports() {
 // spec: extensions/coc-7 self-introduction metadata
 #[test]
 fn test_self_introduction() {
-    let (name, icon_svg, description) = coc_7::self_introduction_info();
+    let (id, name, icon_svg, description) = coc_7::self_introduction_info();
+    assert_eq!(id, "coc-7");
     assert_eq!(name, "新クトゥルフ神話TRPG (第7版)");
     assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
     assert_eq!(
         description,
-        "CoC第7版のCC判定（レギュラー/ハード/イクストリーム）・ボーナス/ペナルティダイスを提供する公式拡張機能"
+        "新クトゥルフ神話TRPG第7版の記法や処理のための公式拡張機能です。"
     );
 
+    assert_eq!(coc_7::abi::alhalte_abi_version(), 2);
+
     let bytes = coc_7::abi::encode_self_introduction();
-    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.0, name);
-    assert_eq!(decoded.1, icon_svg);
-    assert_eq!(decoded.2, description);
+    let decoded: (String, String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, id);
+    assert_eq!(decoded.1, name);
+    assert_eq!(decoded.2, icon_svg);
+    assert_eq!(decoded.3, description);
 
     let packed = coc_7::abi::self_introduction();
     assert_ne!(packed, 0);

@@ -151,7 +151,7 @@ fn test_nested_and_recursive_processing() {
 // spec: extensions/markdown ABI roundtrip
 #[test]
 fn test_markdown_abi() {
-    assert_eq!(alhalte_abi_version(), 1);
+    assert_eq!(alhalte_abi_version(), 2);
 
     let speaker_id = 123u64;
     let input_ast = Generast::string("# Header\n**bold**");
@@ -189,19 +189,23 @@ fn test_markdown_abi() {
 // spec: extensions/markdown self-introduction metadata
 #[test]
 fn test_self_introduction() {
-    let (name, icon_svg, description) = markdown::self_introduction_info();
-    assert_eq!(name, "Markdown スタイル");
+    let (id, name, icon_svg, description) = markdown::self_introduction_info();
+    assert_eq!(id, "markdown");
+    assert_eq!(name, "Markdown");
     assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
     assert_eq!(
         description,
-        "太字（**）・斜体（*）・打ち消し線（~~）などのMarkdown記法を装飾ノードに変換する公式拡張機能"
+        "太字（**）・斜体（*）・打ち消し線（~~）などのMarkdown記法を処理します。"
     );
 
+    assert_eq!(markdown::abi::alhalte_abi_version(), 2);
+
     let bytes = markdown::abi::encode_self_introduction();
-    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.0, name);
-    assert_eq!(decoded.1, icon_svg);
-    assert_eq!(decoded.2, description);
+    let decoded: (String, String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, id);
+    assert_eq!(decoded.1, name);
+    assert_eq!(decoded.2, icon_svg);
+    assert_eq!(decoded.3, description);
 
     let packed = markdown::abi::self_introduction();
     assert_ne!(packed, 0);
