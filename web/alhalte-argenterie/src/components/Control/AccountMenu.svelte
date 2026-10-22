@@ -134,6 +134,19 @@
     }
   }
 
+  /**
+   * Keeps presses inside the account control from reaching a pan/capture
+   * ancestor (the field container captures the pointer for board panning, which
+   * retargets `pointerup`/`click` away from the avatar). Mirrors
+   * `FieldPiece.svelte`; harmless on the home app bar and the gate screen.
+   *
+   * References:
+   * - GitHub Issue #268: フィールドパネルのアカウントアイコンからMenuが開かない
+   */
+  function handlePointerDown(e: PointerEvent) {
+    e.stopPropagation();
+  }
+
   function handleSignOut() {
     isMenuOpen = false;
     clearSession();
@@ -150,7 +163,12 @@
   }
 </script>
 
-<div class="account-menu-root" data-testid="account-controls">
+<div
+  class="account-menu-root"
+  data-testid="account-controls"
+  role="presentation"
+  onpointerdown={handlePointerDown}
+>
   {#if signedIn}
     <IconButton
       variant="text"

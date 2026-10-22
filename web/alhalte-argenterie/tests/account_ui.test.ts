@@ -1,9 +1,12 @@
 /**
- * Tests for account UI, Google sign-in flow, and sign-out (Issue #116).
+ * Tests for account UI, Google sign-in flow, and sign-out (Issue #116), plus the
+ * account control placements in the home app bar, the field screen, and the gate
+ * screen (Issue #268).
  *
  * References:
  * - ARCHITECTURE.md: `## alhalte-argenterie -> ### アカウントUI / Googleサインイン`
  * - GitHub Issue #116: アカウントに関するUIを追加
+ * - GitHub Issue #268: フィールドパネルのアカウントアイコンからMenuが開かない
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mount, unmount } from 'svelte';
@@ -31,6 +34,11 @@ function jsonResponse(payload: unknown, status = 200): Response {
   } as Response;
 }
 
+/** Waits for Svelte to flush the state changes triggered by a DOM event. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 20));
+}
+
 describe('Account UI & Google sign-in (Issue #116)', () => {
   let target: HTMLDivElement;
 
@@ -45,6 +53,7 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
 
   afterEach(() => {
     target.remove();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -278,8 +287,17 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
     unmount(instance);
   });
 
-  // spec: alhalte-argenterie/account 0034 フィールド画面右上にアカウントUI
-  it('places the account control in the top-right layer of the field panel', async () => {
+  // spec: Issue #268 フィールドの右上アカウントUIからメニューを開いて項目を操作できる
+  it('opens the account menu from the field top-right layer and signs out from a menu item', async () => {
+    localStorage.setItem('alhalte:account-id', '42');
+    localStorage.setItem('alhalte:session-id', '99');
+    // `AccountMenu` reads `/api/account/{id}` on mount; tests never use the network.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () =>
+        jsonResponse({ account_id: 42, handle_name: 'Alice', icon_tin_id: null }),
+      ),
+    );
     const scene: Scene = {
       id: '/',
       name: 'メインシーン',
@@ -292,11 +310,39 @@ describe('Account UI & Google sign-in (Issue #116)', () => {
       target,
       props: { scene },
     });
-    await new Promise((r) => setTimeout(r, 20));
+    await flush();
 
     const layer = target.querySelector('[data-testid="field-account-layer"]');
     expect(layer).toBeTruthy();
     expect(layer?.querySelector('[data-testid="account-controls"]')).toBeTruthy();
+
+    const avatar = layer?.querySelector<HTMLButtonElement>('[data-testid="account-menu-button"]');
+    expect(avatar).toBeTruthy();
+    expect(avatar?.getAttribute('aria-expanded')).toBe('false');
+
+    // Issue #268: a press on the avatar must reach the button instead of being
+    // captured by the field container for board panning.
+    avatar?.dispatchEvent(
+      new PointerEvent('pointerdown', { bubbles: true, button: 0, pointerId: 1 }),
+    );
+    avatar?.click();
+    await flush();
+
+    expect(avatar?.getAttribute('aria-expanded')).toBe('true');
+    const menu = target.querySelector('[data-testid="account-menu"]');
+    expect(menu).toBeTruthy();
+    const switchItem = menu?.querySelector<HTMLElement>('[data-testid="account-switch-item"]');
+    const signOutItem = menu?.querySelector<HTMLElement>('[data-testid="account-signout-item"]');
+    expect(switchItem?.textContent).toContain('別のアカウントでログイン');
+    expect(signOutItem?.textContent).toContain('サインアウト');
+
+    // The menu items are reachable: sign-out clears the local session.
+    signOutItem?.click();
+    await flush();
+
+    expect(localStorage.getItem('alhalte:account-id')).toBeNull();
+    expect(localStorage.getItem('alhalte:session-id')).toBeNull();
+    expect(layer?.querySelector('[data-testid="account-signin-button"]')).toBeTruthy();
 
     unmount(instance);
   });
