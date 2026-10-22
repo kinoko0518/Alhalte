@@ -413,7 +413,6 @@ impl BistrotConfig {
 
             let entry = ExtensionManifestEntry {
                 id: ext.id.clone(),
-                name: ext.name.clone().unwrap_or_else(|| ext.id.clone()),
                 url: format!("/extensions/{dest_wasm_name}"),
                 enabled: ext.enabled,
                 priority,
@@ -622,15 +621,16 @@ impl Default for ArgenterieConfig {
 }
 
 /// Default extension entry configured in `Bistrot.toml`.
+///
+/// The display name / icon / description are **not** configured here: they come
+/// from the extension wasm's `self_introduction` export (Issue #274), so the
+/// manifest and the UI have a single source of truth. `id` must stay in sync
+/// with the id the wasm itself reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ExtensionConfig {
     /// Unique identifier for the extension (e.g. `"alhalte-dsl"`).
     pub id: String,
-
-    /// Display name fallback if WASM self_introduction is not yet loaded.
-    #[serde(default)]
-    pub name: Option<String>,
 
     /// Path to the compiled `.wasm` binary (relative to working directory or absolute).
     pub path: PathBuf,
@@ -641,14 +641,15 @@ pub struct ExtensionConfig {
 }
 
 /// Extension manifest entry written into `manifest.json`.
+///
+/// Display metadata is intentionally absent: `alhalte-argenterie` reads it from
+/// the staged wasm (`self_introduction`, ABI 2) and keeps `name` optional for
+/// manifests generated before Issue #274.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct ExtensionManifestEntry {
     /// Unique identifier for the extension (e.g. `"alhalte-dsl"`).
     pub id: String,
-
-    /// Display name of the extension.
-    pub name: String,
 
     /// URL to download the extension `.wasm` file (e.g. `"/extensions/alhalte-dsl.wasm"`).
     pub url: String,

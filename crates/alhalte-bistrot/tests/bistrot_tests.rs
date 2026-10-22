@@ -1259,7 +1259,6 @@ salt = "salt"
 
 [[extensions]]
 id = "alhalte-dsl"
-name = "Alhalte DSL"
 path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
 enabled = true
 
@@ -1271,7 +1270,6 @@ path = "custom.wasm"
     let config = dev_parse(toml_str).unwrap();
     assert_eq!(config.extensions.len(), 2);
     assert_eq!(config.extensions[0].id, "alhalte-dsl");
-    assert_eq!(config.extensions[0].name.as_deref(), Some("Alhalte DSL"));
     assert_eq!(
         config.extensions[0].path,
         PathBuf::from("target/wasm32-unknown-unknown/release/alhalte_dsl.wasm")
@@ -1279,9 +1277,49 @@ path = "custom.wasm"
     assert!(config.extensions[0].enabled);
 
     assert_eq!(config.extensions[1].id, "custom-ext");
-    assert_eq!(config.extensions[1].name, None);
     assert_eq!(config.extensions[1].path, PathBuf::from("custom.wasm"));
     assert!(config.extensions[1].enabled); // defaults to true
+}
+
+// spec: Issue #274 old Bistrot.toml entries carrying an unknown `name` still parse
+#[test]
+fn test_extensions_legacy_name_field_still_parses() {
+    let toml_str = r#"
+[maitre-d]
+client-id = "id"
+client-secret = "sec"
+salt = "salt"
+
+[cellar]
+
+[[extensions]]
+id = "alhalte-dsl"
+name = "Alhalte DSL"
+path = "alhalte_dsl.wasm"
+enabled = true
+"#;
+
+    // `ExtensionConfig` must not use `deny_unknown_fields`: the removed `name`
+    // key is simply ignored, so old configurations keep working.
+    let config = dev_parse(toml_str).unwrap();
+    assert_eq!(config.extensions.len(), 1);
+    assert_eq!(config.extensions[0].id, "alhalte-dsl");
+    assert_eq!(config.extensions[0].path, PathBuf::from("alhalte_dsl.wasm"));
+    assert!(config.extensions[0].enabled);
+
+    // The same holds for the shipped template / root config, which no longer
+    // contain `name` at all.
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let repo_root = manifest_dir.parent().unwrap().parent().unwrap();
+    for file in ["Bistrot.toml", "Bistrot.example.toml"] {
+        let content = std::fs::read_to_string(repo_root.join(file)).unwrap();
+        assert!(
+            !content.contains("name ="),
+            "{file} still configures a display name"
+        );
+    }
+    // The local development config (plaintext secrets) must still parse.
+    dev_parse(&std::fs::read_to_string(repo_root.join("Bistrot.toml")).unwrap()).unwrap();
 }
 
 // spec: alhalte-bistrot/extensions
@@ -1327,7 +1365,6 @@ salt = "salt"
 
 [[extensions]]
 id = "first-ext"
-name = "First Extension"
 path = "{}"
 enabled = true
 
@@ -1347,14 +1384,12 @@ enabled = false
 
     // Check entry 0
     assert_eq!(manifest_entries[0].id, "first-ext");
-    assert_eq!(manifest_entries[0].name, "First Extension");
     assert_eq!(manifest_entries[0].url, "/extensions/first-ext.wasm");
     assert!(manifest_entries[0].enabled);
     assert_eq!(manifest_entries[0].priority, 0);
 
     // Check entry 1
     assert_eq!(manifest_entries[1].id, "second-ext");
-    assert_eq!(manifest_entries[1].name, "second-ext"); // Fallback to id
     assert_eq!(manifest_entries[1].url, "/extensions/second-ext.wasm");
     assert!(!manifest_entries[1].enabled);
     assert_eq!(manifest_entries[1].priority, 1);
@@ -1374,6 +1409,21 @@ enabled = false
     let parsed_manifest: Vec<ExtensionManifestEntry> =
         serde_json::from_str(&manifest_content).unwrap();
     assert_eq!(parsed_manifest, manifest_entries);
+
+    // Issue #274: the manifest only carries configuration fields. Display
+    // metadata is read from the wasm, so no `name` key is written.
+    let json: serde_json::Value = serde_json::from_str(&manifest_content).unwrap();
+    for entry in json.as_array().unwrap() {
+        let object = entry.as_object().unwrap();
+        assert!(
+            !object.contains_key("name"),
+            "manifest entry still has name"
+        );
+        assert!(object.contains_key("id"));
+        assert!(object.contains_key("url"));
+        assert!(object.contains_key("enabled"));
+        assert!(object.contains_key("priority"));
+    }
 }
 
 // spec: alhalte-bistrot/stage-extensions 0002 a missing wasm fails staging without partial output
@@ -1404,7 +1454,6 @@ enabled = true
 
 [[extensions]]
 id = "missing-ext"
-name = "Missing Ext"
 path = "{}"
 enabled = true
 "#,
@@ -1506,47 +1555,38 @@ fn test_root_bistrot_toml_extensions_configuration() {
     let expected = [
         (
             "alhalte-dsl",
-            Some("Alhalte DSL"),
             "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm",
             true,
         ),
         (
             "markdown",
-            Some("Markdown スタイル"),
             "target/wasm32-unknown-unknown/release/markdown.wasm",
             true,
         ),
         (
             "aozora",
-            Some("青空文庫ルビ・傍点"),
             "target/wasm32-unknown-unknown/release/aozora.wasm",
             true,
         ),
         (
             "coc-6",
-            Some("クトゥルフ神話TRPG (第6版)"),
             "target/wasm32-unknown-unknown/release/coc_6.wasm",
             false,
         ),
         (
             "coc-7",
-            Some("新クトゥルフ神話TRPG (第7版)"),
             "target/wasm32-unknown-unknown/release/coc_7.wasm",
             false,
         ),
         (
             "emoklore",
-            Some("エモクロアTRPG"),
             "target/wasm32-unknown-unknown/release/emoklore.wasm",
             false,
         ),
     ];
 
-    for (i, (expected_id, expected_name, expected_path, expected_enabled)) in
-        expected.iter().enumerate()
-    {
+    for (i, (expected_id, expected_path, expected_enabled)) in expected.iter().enumerate() {
         assert_eq!(&config.extensions[i].id, expected_id);
-        assert_eq!(config.extensions[i].name.as_deref(), *expected_name);
         assert_eq!(config.extensions[i].path, PathBuf::from(*expected_path));
         assert_eq!(config.extensions[i].enabled, *expected_enabled);
     }

@@ -52,36 +52,30 @@ lan = true
 
 [[extensions]]
 id = "alhalte-dsl"
-name = "Alhalte DSL"
 path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
 enabled = true
 
 [[extensions]]
 id = "markdown"
-name = "Markdown スタイル"
 path = "target/wasm32-unknown-unknown/release/markdown.wasm"
 enabled = true
 
 [[extensions]]
 id = "aozora"
-name = "青空文庫ルビ・傍点"
 path = "target/wasm32-unknown-unknown/release/aozora.wasm"
 enabled = true
 
 [[extensions]]
 id = "coc-6"
-name = "クトゥルフ神話TRPG (第6版)"
 path = "target/wasm32-unknown-unknown/release/coc_6.wasm"
 enabled = false
 
 [[extensions]]
 id = "coc-7"
-name = "新クトゥルフ神話TRPG (第7版)"
 path = "target/wasm32-unknown-unknown/release/coc_7.wasm"
 enabled = false
 
 [[extensions]]
 id = "emoklore"
-name = "エモクロアTRPG"
 path = "target/wasm32-unknown-unknown/release/emoklore.wasm"
 enabled = false
