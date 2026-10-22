@@ -456,7 +456,7 @@ describe('Room-wide character synchronization (Issue #160)', () => {
     expect(reverted?.style.top).toBe('100px');
   });
 
-  // spec: argenterie/offline offline member move fails without mutating members (Issue #160, #228)
+  // spec: argenterie/offline offline member move fails without mutating members (Issue #160, #228, #269)
   it('does not apply an offline member move from the character list', async () => {
     const socket = new FakeRoomSocket();
     socket.isConnected = false;
@@ -471,19 +471,25 @@ describe('Room-wide character synchronization (Issue #160)', () => {
     openCharacters(target);
     await settle(30);
 
-    // 別シーンに配置 → the existing scene, then the failure is reported.
+    // 「キャラクターを移動」 → root modal → the existing scene, then the failure
+    // is reported by the modal's switcher (Issue #269).
     target.querySelector<HTMLButtonElement>('[data-testid="move-char-btn-42"]')?.click();
     await settle(20);
-    target
-      .querySelector<HTMLElement>('[data-testid="move-char-scene-42-scene-b"]')
-      ?.click();
+    const input = target.querySelector<HTMLInputElement>(
+      '[data-testid="move-scene-search-input"]',
+    );
+    expect(input).toBeTruthy();
+    input!.value = '森';
+    input!.dispatchEvent(new Event('input', { bubbles: true }));
+    input!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     await settle(40);
 
     expect(
-      target.querySelector('[data-testid="character-action-error"]')?.textContent?.trim(),
+      target.querySelector('[data-testid="move-scene-search-error"]')?.textContent?.trim(),
     ).toBe(ERROR_MESSAGE);
     expect(socket.requestMoveCharacterCalls).toHaveLength(0);
-    // The member was not moved: the row still belongs to the current scene.
+    // The modal stays open so the admin can retry, and the row is unchanged.
+    expect(target.querySelector('[data-testid="move-character-modal"]')).toBeTruthy();
     expect(card(target, '42')).toBeTruthy();
     vi.restoreAllMocks();
   });

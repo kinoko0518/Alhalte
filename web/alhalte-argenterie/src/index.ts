@@ -46,4 +46,6 @@ export { default as ExtensionManagementTab } from './components/Control/tabs/Ext
 export { default as GenericImagePicker } from './components/Control/GenericImagePicker.svelte';
 export { default as IconImagePicker } from './components/Control/IconImagePicker.svelte';
 export { default as AssetPickerModal } from './components/Control/AssetPickerModal.svelte';
+export { default as SceneSwitcher } from './components/Control/SceneSwitcher.svelte';
+export { default as SceneMoveModal } from './components/Control/SceneMoveModal.svelte';
 

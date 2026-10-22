@@ -49,6 +49,7 @@
     buildBgmTrackState,
     createDefaultJuices,
     downloadSceneBackground,
+    generateSceneId,
     getBgmRemovedSlots,
     getNormalizedBgmSlots,
     hasBgmTrack,
@@ -75,6 +76,7 @@
   import AssetPickerModal from './Control/AssetPickerModal.svelte';
   import CharacterEditModal from './Control/CharacterEditModal.svelte';
   import ControlPanel from './Control/ControlPanel.svelte';
+  import SceneMoveModal from './Control/SceneMoveModal.svelte';
   import FieldPanel from './Field/FieldPanel.svelte';
   import GateScreen from './Gate/GateScreen.svelte';
   import HomeScreen from './Home/HomeScreen.svelte';
@@ -665,6 +667,83 @@
   function handleCloseCharacterEdit() {
     if (characterSaving) return;
     closeCharacterEditPanel();
+  }
+
+  // ---------------------------------------------------------------------------
+  // 「キャラクターを移動」 modal (Issue #269)
+  // ---------------------------------------------------------------------------
+  /**
+   * Character whose root-hoisted move modal is open (`null` = closed).
+   *
+   * Like `activeCharacterEdit`, this is a second slot next to `activeOverlay`:
+   * the character tab requests it, and the modal is rendered at the root so the
+   * scene switcher is not clipped by the control panel / sheet.
+   */
+  let activeMoveCharacter = $state<Character | null>(null);
+
+  /** Scene currently holding the modal's character (`null` = 未所属). */
+  let activeMoveCharacterSceneId = $derived.by(() => {
+    const character = activeMoveCharacter;
+    if (!character) return null;
+    return scenes.find((scene) => scene.members.includes(character.id))?.id ?? null;
+  });
+
+  /**
+   * Opens the move modal for a row (admin-only: moving is a scene management
+   * action). Participants and viewers have no move button at all.
+   */
+  function handleRequestMoveCharacter(character: Character) {
+    if (!canManageScenes) return;
+    activeMoveCharacter = character;
+  }
+
+  /** Closes the modal unless a move is still waiting for its acknowledgement. */
+  function handleCloseMoveCharacter() {
+    if (sceneActionPending !== null) return;
+    activeMoveCharacter = null;
+  }
+
+  /**
+   * Modal switcher → existing scene: move only (no `CreateScene`).
+   *
+   * Selecting the scene that already holds the character is a no-op: it must not
+   * emit a `MoveCharacter` that would write a self-loop into the scene graph.
+   * `currentSceneId` is never changed (Issue #228): moving a character is a
+   * curation action, not a view switch.
+   */
+  async function handleMoveCharacterToScene(
+    character: Character,
+    sceneId: string,
+  ): Promise<boolean> {
+    const target = scenes.find((scene) => scene.id === sceneId);
+    if (!target) return false;
+    if (target.members.includes(character.id)) {
+      activeMoveCharacter = null;
+      return true;
+    }
+    const result = await handleMoveMember(character.id, target.name, sceneId);
+    if (result !== true) return false;
+    activeMoveCharacter = null;
+    return true;
+  }
+
+  /**
+   * Modal switcher → unknown name: create the scene at the switcher-generated id
+   * and then move (both acknowledgements, in that order).
+   *
+   * If the `CreateScene` ack succeeds but the move fails, the (empty) scene stays
+   * on the server; the local list reflects it through the server's `SceneList`
+   * broadcast and the failure is reported without moving anything.
+   */
+  async function handleMoveCharacterToNewScene(
+    character: Character,
+    name: string,
+    sceneId: string,
+  ): Promise<boolean> {
+    const result = await handleMoveMember(character.id, name, undefined, sceneId);
+    if (result !== true) return false;
+    activeMoveCharacter = null;
+    return true;
   }
 
   const chunkManager = new ChunkLogManager();
@@ -2922,8 +3001,7 @@
     if (!beginSceneAction('create')) return;
 
     try {
-      const newId = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
-      const juices = inheritJuice ? inheritJuices(currentScene.juices) : createDefaultJuices();
+      const newId = generateSceneId();
       const socket = roomSocket;
 
       if (!socket || !socket.isConnected) {
@@ -2931,21 +3009,74 @@
       }
 
       await socket.requestCreateScene(newId, inheritJuice, name);
-
-      pendingSceneListIds.add(newId);
-      const alreadyListed = scenes.find((scene) => scene.id === newId);
-      if (alreadyListed) {
-        // A `SceneList` broadcast created the placeholder while we were waiting.
-        alreadyListed.name = name;
-        alreadyListed.juices = juices;
-      } else {
-        scenes = [
-          ...scenes,
-          { id: newId, name, juices, viewTransform: { x: 0, y: 0, scale: 1 }, members: [] },
-        ];
-      }
+      createSceneAcked(newId, name, inheritJuice);
       currentSceneId = newId;
       applyPieceStatesToCharacters(newId);
+      return true;
+    } catch (error) {
+      return failSceneAction(error, 'create');
+    } finally {
+      sceneActionPending = null;
+    }
+  }
+
+  /**
+   * Commits a scene the server acknowledged with `SceneCreated`.
+   *
+   * Shared by every creation path (scene settings tab, header scene switcher,
+   * move modal) so the local placeholder, the `SceneList`-race protection and
+   * the inherited / default Juices cannot drift. A scene the `SceneList`
+   * broadcast already added is renamed / re-juiced in place instead of being
+   * duplicated.
+   */
+  function createSceneAcked(sceneId: string, name: string, inheritJuice: boolean): Scene {
+    const juices = inheritJuice ? inheritJuices(currentScene.juices) : createDefaultJuices();
+    // The server's `SceneList` broadcast may still be in flight; keep the freshly
+    // acknowledged scene until a list actually contains it.
+    pendingSceneListIds.add(sceneId);
+    const alreadyListed = scenes.find((scene) => scene.id === sceneId);
+    if (alreadyListed) {
+      alreadyListed.name = name;
+      alreadyListed.juices = juices;
+      return alreadyListed;
+    }
+    const created: Scene = {
+      id: sceneId,
+      name,
+      juices,
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: [],
+    };
+    scenes = [...scenes, created];
+    return created;
+  }
+
+  /**
+   * Creates a scene at a caller-chosen id and switches to it (Issue #269).
+   *
+   * Used by the header's scene switcher (Enter on an unknown name, admin only)
+   * and by the move modal: the switcher generates the id so it can refer to the
+   * scene it just created. The switch happens with {@link handleSelectScene}
+   * after the `SceneCreated` ack, so the field enters the new scene exactly like
+   * a normal scene selection (the scene settings tab's own create path only
+   * sets `currentSceneId`).
+   */
+  async function handleCreateSceneAt(name: string, sceneId: string): Promise<boolean | void> {
+    // The switcher reports `false` as a failure, so a no-op for a non-admin or a
+    // concurrent action must not look like a successful creation.
+    if (!canManageScenes) return false;
+    if (!beginSceneAction('create')) return false;
+
+    try {
+      const socket = roomSocket;
+      if (!socket || !socket.isConnected) {
+        throw new Error('ルームに接続していないため、シーンを作成できません');
+      }
+      // Inherit the current scene's Juices: a scene created from the scene
+      // search is a sibling view of the current one (Issue #269).
+      await socket.requestCreateScene(sceneId, true, name);
+      createSceneAcked(sceneId, name, true);
+      handleSelectScene(sceneId);
       return true;
     } catch (error) {
       return failSceneAction(error, 'create');
@@ -3039,25 +3170,29 @@
 
   /**
    * Moves a character to another scene (Issue #109 / sub-issue #143, #159, #225,
-   * #228).
+   * #228, #269).
    *
-   * The target is resolved **id-first**: when `targetSceneId` is given (the
-   * character list's 「別シーンに配置」 menu), only an existing scene with that
-   * id is accepted and no scene is created. Without it the previous name-based
-   * path applies and an unknown name creates the scene first: `MoveCharacter`
-   * alone would let banquette name the implicit scene after its internal id
-   * (Issue #225).
+   * The target is resolved **id-first**: when `targetSceneId` is given (the move
+   * modal's existing-scene rows), only an existing scene with that id is
+   * accepted and no scene is created. Without it the name-based path applies and
+   * an unknown name creates the scene first: `MoveCharacter` alone would let
+   * banquette name the implicit scene after its internal id (Issue #225).
+   * `createSceneId` pins the id of that new scene (Issue #269), so the
+   * switcher-generated id is used for both `CreateScene` and `MoveCharacter`.
    *
    * The local model is only replaced after every request succeeded (the create
-   * when needed, then the move). Without a connected socket the move fails
-   * instead of mutating the local model. Scene membership is authoritative on
-   * the server (`SceneInfo`) since Issue #160, so no `character::<id>::scene`
-   * state mirror is written.
+   * when needed, then the move). If the create is acknowledged but the move
+   * fails, the (empty) destination scene stays on the server and reaches this
+   * client through `SceneList`; the character is not moved. Without a connected
+   * socket the move fails instead of mutating the local model. Scene membership
+   * is authoritative on the server (`SceneInfo`) since Issue #160, so no
+   * `character::<id>::scene` state mirror is written.
    */
   async function handleMoveMember(
     characterId: string,
     targetSceneName: string,
     targetSceneId?: string,
+    createSceneId?: string,
   ): Promise<boolean | void> {
     if (!canManageScenes) return;
     if (!beginSceneAction(`move:${characterId}`)) return;
@@ -3067,7 +3202,7 @@
         (scenes.find((scene) => scene.members.includes(characterId)) || currentScene).id;
       const result = targetSceneId
         ? moveMemberToSceneById(characterId, targetSceneId, scenes)
-        : moveMemberToScene(characterId, targetSceneName, currentScene, scenes);
+        : moveMemberToScene(characterId, targetSceneName, currentScene, scenes, createSceneId);
       if (!result) {
         // The id-first path operates on existing scenes only (Issue #228).
         return failSceneAction(
@@ -3109,8 +3244,8 @@
   /**
    * Resolves a member move against an **existing** target scene id.
    *
-   * Used by the character list's 「別シーンに配置」 menu so two scenes with the
-   * same display name can never be confused and no scene is created implicitly.
+   * Used by the move modal's existing-scene rows so two scenes with the same
+   * display name can never be confused and no scene is created implicitly.
    * Returns `null` when the id is not in the local authoritative list.
    */
   function moveMemberToSceneById(
@@ -3129,21 +3264,6 @@
       targetScene.members.push(characterId);
     }
     return { updatedScenes, targetScene, isNewSceneCreated: false };
-  }
-
-  /**
-   * Entry point for the character tab's 「別シーンに配置」 (Issue #228).
-   *
-   * Resolves the display name of the target scene so the App move path still
-   * carries a human-readable name, but keeps the id authoritative.
-   */
-  function handleCharacterMoveById(
-    characterId: string,
-    targetSceneId: string,
-  ): Promise<boolean | void> {
-    const target = scenes.find((scene) => scene.id === targetSceneId);
-    if (!target) return Promise.resolve(false);
-    return handleMoveMember(characterId, target.name, targetSceneId);
   }
 
   /**
@@ -3703,8 +3823,10 @@
                   onSelectCharacter={handleSelectSpeaker}
                   onUpdateScene={handleUpdateScene}
                   onCreateScene={handleCreateScene}
+                  canCreateScene={canManageScenes}
+                  onCreateSceneAt={handleCreateSceneAt}
                   onDeleteScene={handleDeleteScene}
-                  onMoveCharacter={handleCharacterMoveById}
+                  onRequestMoveCharacter={handleRequestMoveCharacter}
                   onFocusCharacterScene={handleSelectScene}
                   {currentAccountId}
                   onDeleteCharacter={handleDeleteCharacter}
@@ -3800,8 +3922,10 @@
                 onSelectCharacter={handleSelectSpeaker}
                 onUpdateScene={handleUpdateScene}
                 onCreateScene={handleCreateScene}
+                canCreateScene={canManageScenes}
+                onCreateSceneAt={handleCreateSceneAt}
                 onDeleteScene={handleDeleteScene}
-                onMoveCharacter={handleCharacterMoveById}
+                onRequestMoveCharacter={handleRequestMoveCharacter}
                 onFocusCharacterScene={handleSelectScene}
                 {currentAccountId}
                 onDeleteCharacter={handleDeleteCharacter}
@@ -4019,6 +4143,28 @@
         onRequestAssetPicker={handleRequestAssetPicker}
         onSave={handleSaveCharacter}
         onClose={handleCloseCharacterEdit}
+      />
+    </div>
+  {/if}
+
+  <!-- 「キャラクターを移動」 modal at Root Viewport Level (Issue #269).
+       The scene search inside it is the shared `SceneSwitcher`, so a new scene
+       can be created from the same input that moves the character. -->
+  {#if activeMoveCharacter}
+    {@const movingCharacter = activeMoveCharacter}
+    <div
+      class="root-scene-move-wrapper"
+      data-testid="root-scene-move-wrapper"
+    >
+      <SceneMoveModal
+        character={movingCharacter}
+        scenes={scenes}
+        characterSceneId={activeMoveCharacterSceneId}
+        canCreate={canManageScenes}
+        onSelectScene={(sceneId) => handleMoveCharacterToScene(movingCharacter, sceneId)}
+        onCreateScene={(name, sceneId) =>
+          handleMoveCharacterToNewScene(movingCharacter, name, sceneId)}
+        onClose={handleCloseMoveCharacter}
       />
     </div>
   {/if}

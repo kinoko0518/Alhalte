@@ -7,7 +7,10 @@
    *   The icon follows the hosting surface (`placement`, Issue #223):
    *   `right_panel_close` on the landscape side sheet and `bottom_panel_close`
    *   on the portrait bottom sheet.
-   * - Center: Search in Docked layout, contained style, displaying scene candidates (existing scenes only)
+   * - Center: Search in Docked layout, contained style, displaying scene candidates (existing scenes only).
+   *   The search itself is the shared `SceneSwitcher` (Issue #269): Enter selects
+   *   the exact / first candidate scene, and an admin can create a scene for an
+   *   unknown name (which is then selected and entered like a normal switch).
    * - Right: Gear IconButton opening menu (room ZIP export, log ZIP export, admin actions, horizontal theme color circles)
    *
    * References:
@@ -15,8 +18,9 @@
    * - GitHub Issue #89: コントロールパネルに関する複数の提言
    * - GitHub Issue #223: 縦画面のボトムシートは下向きの閉じるアイコンを使う
    * - GitHub Issue #262: 縦画面のコントロールパネルから半開状態を削除する
+   * - GitHub Issue #269: シーンの移動からシーンを新規作成する導線を作る
    */
-  import { Button, Divider, IconButton, Item, Menu, MenuItem, Search } from 'noph-ui';
+  import { Button, Divider, IconButton, Menu, MenuItem } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
   import type { Character, PanelPlacement, Scene } from '../../types/index.js';
   import {
@@ -35,6 +39,7 @@
     applyMenuPosition,
     getMenuPositionStyle,
   } from '../../utils/menuPosition.js';
+  import SceneSwitcher from './SceneSwitcher.svelte';
 
   let {
     scene,
@@ -46,6 +51,8 @@
     placement = 'side',
     onCollapse,
     onSelectScene,
+    canCreate = false,
+    onCreateScene,
     onExportZip,
     onRenameScene,
     onDeleteScene,
@@ -72,6 +79,18 @@
     placement?: PanelPlacement;
     onCollapse?: () => void;
     onSelectScene?: (sceneId: string) => void;
+    /**
+     * Whether an unknown name typed into the scene search may create a scene
+     * (Issue #269). Admin-only: scene creation is rejected server-side for
+     * every other role, so a non-admin keeps the plain empty-result notice.
+     */
+    canCreate?: boolean;
+    /**
+     * Creates the scene `sceneId` for `name` and selects it after the
+     * `SceneCreated` ack (Issue #269). `App` owns the acknowledgement and the
+     * `enterScene` call.
+     */
+    onCreateScene?: (name: string, sceneId: string) => void | Promise<unknown>;
     onExportZip?: (type: 'full' | 'logs') => void;
     onRenameScene?: () => void;
     onDeleteScene?: () => void;
@@ -94,10 +113,6 @@
    * landscape side sheet keeps the right-facing `right_panel_close`.
    */
   let closeIcon = $derived(placement === 'bottom' ? 'bottom_panel_close' : 'right_panel_close');
-
-  // Search state
-  let sceneSearchQuery = $state('');
-  let isSceneSearchExpanded = $state(false);
 
   // Gear menu state
   let isGearMenuOpen = $state(false);
@@ -144,18 +159,6 @@
   }
 
   let availableScenes = $derived(allScenes.length > 0 ? allScenes : [scene]);
-
-  let filteredScenes = $derived.by(() => {
-    const q = sceneSearchQuery.trim().toLowerCase();
-    if (!q) return availableScenes;
-    return availableScenes.filter((s) => s.name.toLowerCase().includes(q));
-  });
-
-  function handleSelectScene(sceneId: string) {
-    isSceneSearchExpanded = false;
-    sceneSearchQuery = '';
-    onSelectScene?.(sceneId);
-  }
 
   function handleSelectTheme(palId: ThemePaletteId) {
     currentPaletteId = palId;
@@ -228,45 +231,21 @@
     </IconButton>
   </div>
 
-  <!-- Center: Search in Docked layout, contained style -->
+  <!-- Center: Search in Docked layout, contained style (shared SceneSwitcher) -->
   <div class="header-center" data-testid="scene-search-anchor">
     <span class="visually-hidden-label" data-testid="scene-name-header">{scene.name}</span>
-    <Search
-      variant="contained"
-      view="docked"
+    <SceneSwitcher
+      scenes={availableScenes}
+      currentSceneId={scene.id}
+      {canCreate}
+      {onSelectScene}
+      {onCreateScene}
       placeholder={scene.name || 'シーンを検索'}
-      bind:value={sceneSearchQuery}
-      bind:expanded={isSceneSearchExpanded}
-      class="common-scene-search"
-      inputAttributes={{
-        'data-testid': 'scene-search-input',
-        'aria-label': 'シーンを検索・切り替え',
-      }}
-      resultsAttributes={{
-        'data-testid': 'scene-search-menu',
-        class: 'scene-search-docked-results',
-      }}
-    >
-      {#each filteredScenes as s (s.id)}
-        <Item
-          type="button"
-          role="option"
-          selected={s.id === scene.id}
-          onclick={() => handleSelectScene(s.id)}
-          data-testid="scene-search-item-{s.id}"
-        >
-          {#snippet start()}
-            <Icon>{s.id === scene.id ? 'check' : 'account_tree'}</Icon>
-          {/snippet}
-          {s.name}
-        </Item>
-      {/each}
-      {#if filteredScenes.length === 0}
-        <div class="menu-empty-notice" data-testid="empty-search-notice">
-          該当するシーンがありません
-        </div>
-      {/if}
-    </Search>
+      ariaLabel="シーンを検索・切り替え"
+      testIdPrefix="scene-search"
+      emptyNoticeTestId="empty-search-notice"
+      searchClass="common-scene-search"
+    />
   </div>
 
   <!-- Right: Gear Icon & Dropdown Menu -->
@@ -470,12 +449,6 @@
     max-height: 240px;
     box-shadow: var(--np-elevation-2);
     border: 1px solid var(--np-color-outline-variant);
-  }
-  .menu-empty-notice {
-    padding: 12px 16px;
-    font-size: 0.85rem;
-    color: var(--np-color-on-surface-variant);
-    text-align: center;
   }
   .admin-badge {
     font-size: 0.72rem;

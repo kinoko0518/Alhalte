@@ -172,7 +172,14 @@ export function getNormalizedBgmSlots(juices: Juices): BgmSlot[] {
 /**
  * Inherits Juices from a parent / source scene.
  *
- * ARCHITECTURE.md: "トグル”Juicesを継承”" / "存在しないシーン名が割り振られていた場合、Juicesを継承して新規作成する。"
+ * Used by the new-scene paths that copy the current scene's background / BGM
+ * (`SceneSettingsTab`'s 「Juicesを継承」 toggle and the implicit creation of a
+ * move destination in {@link moveMemberToScene}). The background dimensions and
+ * the BGM transport follow `createDefaultJuices` when absent; `bgmRemovedSlots`
+ * is deliberately not inherited.
+ *
+ * References:
+ * - ARCHITECTURE.md: `## alhalte-argenterie -> ### scene の管理操作`
  */
 export function inheritJuices(source: Juices): Juices {
   const result: Juices = {
@@ -208,14 +215,35 @@ export {
 
 
 /**
+ * Generates a client-side scene id for a `CreateScene` request (Issue #269).
+ *
+ * The server never allocates scene ids (`CreateScene` carries one), so the
+ * caller has to pick it. The shape is the historical
+ * `scene-<unix ms>-<4 base36 chars>`, which is unique enough per room and
+ * readable in logs; every creation path (header switcher, move modal, scene
+ * creation from the settings tab, implicit move destination) shares this
+ * helper so the format cannot drift.
+ */
+export function generateSceneId(): string {
+  return `scene-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+}
+
+/**
  * Moves a member to target scene. If the target scene name does not exist,
  * automatically creates the scene inheriting Juices from the current scene.
+ *
+ * `targetSceneId` lets the caller pin the id of the scene it creates (Issue
+ * #269): the move modal generates the id up front so the `CreateScene` ack and
+ * the following `MoveCharacter` request address the same scene. Without it a
+ * fresh id is generated with {@link generateSceneId}. The id is ignored when
+ * the name already matches an existing scene (no scene is created).
  */
 export function moveMemberToScene(
   characterId: string,
   targetSceneName: string,
   currentScene: Scene,
   existingScenes: Scene[],
+  targetSceneId?: string,
 ): {
   updatedScenes: Scene[];
   targetScene: Scene;
@@ -233,7 +261,7 @@ export function moveMemberToScene(
   if (!targetScene) {
     // Scene does not exist: create new scene inheriting Juices
     isNewSceneCreated = true;
-    const newId = `scene-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+    const newId = targetSceneId?.trim() || generateSceneId();
     targetScene = {
       id: newId,
       name: trimmedName,

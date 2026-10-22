@@ -3,6 +3,7 @@ import { mount, unmount } from 'svelte';
 import {
   calculateDimensionsAndCrop,
   createDefaultJuices,
+  generateSceneId,
   getNormalizedBgmSlots,
   inheritJuices,
   moveMemberToScene,
@@ -138,6 +139,48 @@ describe('Scene Settings & Juices', () => {
     // Old scene should no longer have char-hero
     const updatedOld = result.updatedScenes.find((s) => s.id === 'scene-1');
     expect(updatedOld?.members).not.toContain('char-hero');
+  });
+
+  // spec: alhalte-argenterie/scene-settings 新規シーン id は呼び出し側が固定できる (Issue #269)
+  it('creates the implicit scene at the caller-provided id', () => {
+    const currentScene: Scene = {
+      id: 'scene-1',
+      name: '本陣',
+      juices: createDefaultJuices(),
+      viewTransform: { x: 0, y: 0, scale: 1 },
+      members: ['char-hero'],
+    };
+
+    const result = moveMemberToScene(
+      'char-hero',
+      '前線基地',
+      currentScene,
+      [currentScene],
+      'scene-generated-269',
+    );
+
+    expect(result.isNewSceneCreated).toBe(true);
+    expect(result.targetScene.id).toBe('scene-generated-269');
+    expect(result.targetScene.members).toContain('char-hero');
+    // The pinned id is ignored when the name already exists.
+    const existing = moveMemberToScene(
+      'char-hero',
+      '本陣',
+      currentScene,
+      [currentScene],
+      'scene-generated-270',
+    );
+    expect(existing.isNewSceneCreated).toBe(false);
+    expect(existing.targetScene.id).toBe('scene-1');
+  });
+
+  // spec: alhalte-argenterie/scene-switcher 新規シーン id の形式 (Issue #269)
+  it('generates unique scene ids in the historical format', () => {
+    const ids = new Set(Array.from({ length: 20 }, () => generateSceneId()));
+    expect(ids.size).toBeGreaterThan(1);
+    for (const id of ids) {
+      expect(id).toMatch(/^scene-\d+-[a-z0-9]+$/);
+    }
   });
 
   // spec: alhalte-argenterie/scene-settings SceneSettingsTab コンポーネント描画 & M3 Expressive UI (Issue #32)
