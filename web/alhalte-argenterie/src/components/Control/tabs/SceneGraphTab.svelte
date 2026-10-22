@@ -6,9 +6,11 @@
    * - ARCHITECTURE.md: `## alhalte-argenterie -> ### 部屋内 -> シーングラフタブ`
    * - Issue #30: シーン管理タブをシーングラフタブに統合（シーンタブへ改名、左クリック・長押しで削除ボタン表示＋全画面警告ダイアログ）
    * - Issue #263: 保有キャラクターの到達状況でグラフを絞り、未知のシーンは独立した「？」ノードにする
+   * - Issue #273: グラフ / リストの表示切替と、リスト行からの視点移動・削除
    */
-  import { Button } from 'noph-ui';
-  import type { SceneGraphNode, SceneGraphResult } from '../../../types/index.js';
+  import { Button, Divider, IconButton, SegmentedButton } from 'noph-ui';
+  import { Icon } from 'noph-ui/icons';
+  import type { Scene, SceneGraphNode, SceneGraphResult } from '../../../types/index.js';
   import { buildSceneGraph, type SceneMovementEvent } from '../../../utils/sceneGraph.js';
   import { roomRoleCapabilities, type RoomRole } from '../../../utils/session.js';
 
@@ -16,6 +18,8 @@
     movements = [],
     sceneNames = new Map<string, string>(),
     accessibleSceneIds = new Set<string>(),
+    scenes,
+    currentSceneId,
     role = 'participant',
     onNavigateToScene,
     onOpenSceneLog,
@@ -25,6 +29,15 @@
     movements?: SceneMovementEvent[];
     sceneNames?: Map<string, string>;
     accessibleSceneIds?: Set<string>;
+    /**
+     * Every scene of the room, in the scene-list order (Issue #273). `App`
+     * passes its authoritative `scenes` model through `ControlPanel`. When it
+     * is omitted (standalone tab / older call sites), the list is derived from
+     * the graph nodes so the tab still works.
+     */
+    scenes?: Scene[];
+    /** Id of the scene being viewed; marks the current row of the list (Issue #273). */
+    currentSceneId?: string;
     /** Role of the caller (Issue #201); only an admin may delete a scene. */
     role?: RoomRole;
     onNavigateToScene?: (sceneId: string) => void;
@@ -41,6 +54,40 @@
 
   let activeActionNodeId = $state<string | null>(null);
   let sceneToDelete = $state<{ sceneId: string; sceneName: string } | null>(null);
+
+  /** View of the tab (Issue #273). The graph stays the default. */
+  type SceneGraphView = 'graph' | 'list';
+  let view = $state<SceneGraphView>('graph');
+
+  let viewOptions = $derived([
+    { value: 'graph', label: 'グラフ', selected: view === 'graph' },
+    { value: 'list', label: 'リスト', selected: view === 'list' },
+  ]);
+
+  /** Minimal pair rendered by the list; `scenes` may be absent. */
+  interface SceneListEntry {
+    id: string;
+    name: string;
+  }
+
+  /**
+   * Scenes of the list, in `allScenes` order (Issue #273).
+   *
+   * Without the `scenes` prop (standalone tab / tests) the list falls back to
+   * the real scenes the graph nodes reference: frontier "?" nodes (`isUnknown`,
+   * empty `sceneId`) are dropped and repeated visits are deduped by scene id.
+   */
+  let listScenes = $derived.by<SceneListEntry[]>(() => {
+    if (scenes !== undefined) return scenes;
+    const seen = new Set<string>();
+    const entries: SceneListEntry[] = [];
+    for (const node of graphData.nodes) {
+      if (node.isUnknown || !node.sceneId || seen.has(node.sceneId)) continue;
+      seen.add(node.sceneId);
+      entries.push({ id: node.sceneId, name: node.sceneName });
+    }
+    return entries;
+  });
 
   const LONG_PRESS_DURATION_MS = 450;
   let longPressTimer: ReturnType<typeof setTimeout> | null = null;
@@ -107,20 +154,28 @@
     activeActionNodeId = node.id;
   }
 
-  function openDeleteConfirm(e: MouseEvent, node: SceneGraphNode) {
-    e.stopPropagation();
+  /**
+   * Requests the deletion confirmation for a scene (Issue #30, Issue #273).
+   *
+   * Graph nodes and list rows share this path: the root-hoisted confirmation
+   * (`onRequestDeleteScene`) is preferred so the dialog sits at the viewport
+   * level; the tab-local dialog is the standalone fallback.
+   */
+  function requestSceneDelete(sceneId: string, sceneName: string) {
     if (onRequestDeleteScene) {
       activeActionNodeId = null;
-      onRequestDeleteScene({
-        id: node.sceneId,
-        name: node.sceneName,
-      });
+      onRequestDeleteScene({ id: sceneId, name: sceneName });
     } else {
       sceneToDelete = {
-        sceneId: node.sceneId,
-        sceneName: node.sceneName,
+        sceneId,
+        sceneName,
       };
     }
+  }
+
+  function openDeleteConfirm(e: MouseEvent, node: SceneGraphNode) {
+    e.stopPropagation();
+    requestSceneDelete(node.sceneId, node.sceneName);
   }
 
   function handleConfirmDelete() {
@@ -137,93 +192,80 @@
 </script>
 
 <div class="scene-graph-container" data-testid="scene-graph-tab">
-  <div class="graph-scroll-area">
-    {#if graphData.nodes.length === 0}
-      <div class="empty-graph-notice" data-testid="empty-graph-notice">
-        シーン移動履歴がありません
-      </div>
-    {:else}
-      <div
-        class="graph-canvas-container"
-        style="min-height: {graphData.nodes.length * ROW_HEIGHT + 20}px;"
-        data-testid="graph-canvas-container"
-      >
-        <!-- SVG layer for Git Graph branch connection lines -->
-        <svg
-          class="graph-svg-layer"
-          style="width: {Math.max(120, graphData.branchCount * LANE_WIDTH + 20)}px; height: {graphData.nodes.length * ROW_HEIGHT + 20}px;"
-          data-testid="graph-svg-layer"
+  <!-- グラフ / リストの切り替え（Issue #273）。既定はグラフ。 -->
+  <div class="tab-header" data-testid="scene-graph-view-tabs">
+    <SegmentedButton
+      name="scene-graph-view"
+      options={viewOptions}
+      bind:group={view}
+      aria-label="シーングラフの表示"
+      data-testid="scene-graph-view-segmented"
+    />
+  </div>
+
+  {#if view === 'graph'}
+    <div class="graph-scroll-area">
+      {#if graphData.nodes.length === 0}
+        <div class="empty-graph-notice" data-testid="empty-graph-notice">
+          シーン移動履歴がありません
+        </div>
+      {:else}
+        <div
+          class="graph-canvas-container"
+          style="min-height: {graphData.nodes.length * ROW_HEIGHT + 20}px;"
+          data-testid="graph-canvas-container"
         >
-          {#each graphData.edges as edge (edge.fromNodeId + '-' + edge.toNodeId + '-' + edge.characterId)}
-            {@const fromIdx = graphData.nodes.findIndex((n) => n.id === edge.fromNodeId)}
-            {@const toIdx = graphData.nodes.findIndex((n) => n.id === edge.toNodeId)}
-            {#if fromIdx !== -1 && toIdx !== -1}
-              {@const fromNode = graphData.nodes[fromIdx]}
-              {@const toNode = graphData.nodes[toIdx]}
-              {@const x1 = fromNode.branchIndex * LANE_WIDTH + 20}
-              {@const y1 = fromIdx * ROW_HEIGHT + 22}
-              {@const x2 = toNode.branchIndex * LANE_WIDTH + 20}
-              {@const y2 = toIdx * ROW_HEIGHT + 22}
-              {@const edgeColor = edge.isDotted
-                ? 'var(--np-color-outline, #79747e)'
-                : getBranchColor(
-                    fromNode.branchIndex === toNode.branchIndex
-                      ? fromNode.branchIndex
-                      : Math.max(fromNode.branchIndex, toNode.branchIndex),
-                  )}
-              <path
-                d={getEdgePath(x1, y1, x2, y2)}
-                fill="none"
-                stroke={edgeColor}
-                stroke-width="2.5"
-                stroke-dasharray={edge.isDotted ? '4,4' : undefined}
-                data-testid="edge-{edge.fromNodeId}-{edge.toNodeId}"
-              />
-            {/if}
-          {/each}
-        </svg>
+          <!-- SVG layer for Git Graph branch connection lines -->
+          <svg
+            class="graph-svg-layer"
+            style="width: {Math.max(120, graphData.branchCount * LANE_WIDTH + 20)}px; height: {graphData.nodes.length * ROW_HEIGHT + 20}px;"
+            data-testid="graph-svg-layer"
+          >
+            {#each graphData.edges as edge (edge.fromNodeId + '-' + edge.toNodeId + '-' + edge.characterId)}
+              {@const fromIdx = graphData.nodes.findIndex((n) => n.id === edge.fromNodeId)}
+              {@const toIdx = graphData.nodes.findIndex((n) => n.id === edge.toNodeId)}
+              {#if fromIdx !== -1 && toIdx !== -1}
+                {@const fromNode = graphData.nodes[fromIdx]}
+                {@const toNode = graphData.nodes[toIdx]}
+                {@const x1 = fromNode.branchIndex * LANE_WIDTH + 20}
+                {@const y1 = fromIdx * ROW_HEIGHT + 22}
+                {@const x2 = toNode.branchIndex * LANE_WIDTH + 20}
+                {@const y2 = toIdx * ROW_HEIGHT + 22}
+                {@const edgeColor = edge.isDotted
+                  ? 'var(--np-color-outline, #79747e)'
+                  : getBranchColor(
+                      fromNode.branchIndex === toNode.branchIndex
+                        ? fromNode.branchIndex
+                        : Math.max(fromNode.branchIndex, toNode.branchIndex),
+                    )}
+                <path
+                  d={getEdgePath(x1, y1, x2, y2)}
+                  fill="none"
+                  stroke={edgeColor}
+                  stroke-width="2.5"
+                  stroke-dasharray={edge.isDotted ? '4,4' : undefined}
+                  data-testid="edge-{edge.fromNodeId}-{edge.toNodeId}"
+                />
+              {/if}
+            {/each}
+          </svg>
 
-        <!-- HTML Nodes List (Earliest on top, latest at bottom) -->
-        <div class="nodes-list">
-          {#each graphData.nodes as node, idx (node.id)}
-            {@const x = node.branchIndex * LANE_WIDTH + 20}
-            {@const y = idx * ROW_HEIGHT + 22}
-            <div
-              class="graph-node-row"
-              style="top: {y - 14}px;"
-              data-testid="graph-row-{node.id}"
-            >
-              <!-- Commit-like dot -->
-              <button
-                type="button"
-                class="graph-commit-dot"
-                class:unknown-dot={node.isUnknown}
-                style="left: {x - 8}px; border-color: {node.isUnknown ? 'var(--np-color-outline, #79747e)' : getBranchColor(node.branchIndex)};"
-                onclick={() => handleNodeClick(node)}
-                ondblclick={() => handleNodeDoubleClick(node)}
-                onpointerdown={() => handleNodePointerDown(node)}
-                onpointerup={clearLongPressTimer}
-                onpointerleave={clearLongPressTimer}
-                onpointercancel={clearLongPressTimer}
-                oncontextmenu={(e) => handleNodeContextMenu(e, node)}
-                data-testid="node-dot-{node.id}"
-                title={node.isUnknown ? 'まだ到達していないシーン' : `${node.sceneName} へ移動`}
-              >
-                {#if node.isUnknown}
-                  ?
-                {/if}
-              </button>
-
-              <!-- Scene name label and revealed node actions -->
+          <!-- HTML Nodes List (Earliest on top, latest at bottom) -->
+          <div class="nodes-list">
+            {#each graphData.nodes as node, idx (node.id)}
+              {@const x = node.branchIndex * LANE_WIDTH + 20}
+              {@const y = idx * ROW_HEIGHT + 22}
               <div
-                class="node-labels"
-                style="left: {graphData.branchCount * LANE_WIDTH + 24}px;"
+                class="graph-node-row"
+                style="top: {y - 14}px;"
+                data-testid="graph-row-{node.id}"
               >
+                <!-- Commit-like dot -->
                 <button
                   type="button"
-                  class="scene-name-button"
-                  class:disabled-label={node.isUnknown}
-                  class:active-node={activeActionNodeId === node.id}
+                  class="graph-commit-dot"
+                  class:unknown-dot={node.isUnknown}
+                  style="left: {x - 8}px; border-color: {node.isUnknown ? 'var(--np-color-outline, #79747e)' : getBranchColor(node.branchIndex)};"
                   onclick={() => handleNodeClick(node)}
                   ondblclick={() => handleNodeDoubleClick(node)}
                   onpointerdown={() => handleNodePointerDown(node)}
@@ -231,33 +273,109 @@
                   onpointerleave={clearLongPressTimer}
                   onpointercancel={clearLongPressTimer}
                   oncontextmenu={(e) => handleNodeContextMenu(e, node)}
-                  data-testid="node-label-{node.id}"
+                  data-testid="node-dot-{node.id}"
+                  title={node.isUnknown ? 'まだ到達していないシーン' : `${node.sceneName} へ移動`}
                 >
-                  <span class="scene-title">{node.sceneName}</span>
-                  <span class="node-time">{new Date(node.timestamp * 1000).toLocaleTimeString()}</span>
+                  {#if node.isUnknown}
+                    ?
+                  {/if}
                 </button>
 
-                {#if activeActionNodeId === node.id && !node.isUnknown && capabilities.isAdmin && node.sceneId !== '/'}
-                  <div class="node-actions" data-testid="node-actions-{node.id}">
-                    <div class="delete-btn-wrapper">
-                      <Button
-                        variant="tonal"
-                        size="xs"
-                        onclick={(e: MouseEvent) => openDeleteConfirm(e, node)}
-                        data-testid="node-delete-btn-{node.id}"
-                      >
-                        削除
-                      </Button>
+                <!-- Scene name label and revealed node actions -->
+                <div
+                  class="node-labels"
+                  style="left: {graphData.branchCount * LANE_WIDTH + 24}px;"
+                >
+                  <button
+                    type="button"
+                    class="scene-name-button"
+                    class:disabled-label={node.isUnknown}
+                    class:active-node={activeActionNodeId === node.id}
+                    onclick={() => handleNodeClick(node)}
+                    ondblclick={() => handleNodeDoubleClick(node)}
+                    onpointerdown={() => handleNodePointerDown(node)}
+                    onpointerup={clearLongPressTimer}
+                    onpointerleave={clearLongPressTimer}
+                    onpointercancel={clearLongPressTimer}
+                    oncontextmenu={(e) => handleNodeContextMenu(e, node)}
+                    data-testid="node-label-{node.id}"
+                  >
+                    <span class="scene-title">{node.sceneName}</span>
+                    <span class="node-time">{new Date(node.timestamp * 1000).toLocaleTimeString()}</span>
+                  </button>
+
+                  {#if activeActionNodeId === node.id && !node.isUnknown && capabilities.isAdmin && node.sceneId !== '/'}
+                    <div class="node-actions" data-testid="node-actions-{node.id}">
+                      <div class="delete-btn-wrapper">
+                        <Button
+                          variant="tonal"
+                          size="xs"
+                          onclick={(e: MouseEvent) => openDeleteConfirm(e, node)}
+                          data-testid="node-delete-btn-{node.id}"
+                        >
+                          削除
+                        </Button>
+                      </div>
                     </div>
-                  </div>
-                {/if}
+                  {/if}
+                </div>
               </div>
+            {/each}
+          </div>
+        </div>
+      {/if}
+    </div>
+  {:else}
+    <!-- シーンの一覧（Issue #273）。行クリックで視点を移動する。 -->
+    <div class="scene-list-scroll-area" data-testid="scene-graph-list">
+      {#if listScenes.length === 0}
+        <div class="empty-scene-list" data-testid="empty-scene-list">シーンがありません</div>
+      {:else}
+        <div class="scene-list">
+          {#each listScenes as scene, index (scene.id)}
+            {#if index > 0}
+              <Divider />
+            {/if}
+            <div class="scene-list-row" data-testid="scene-list-row-{scene.id}">
+              <button
+                type="button"
+                class="scene-list-item"
+                class:current-scene={scene.id === currentSceneId}
+                aria-current={scene.id === currentSceneId ? 'true' : undefined}
+                onclick={() => onNavigateToScene?.(scene.id)}
+                data-testid="scene-list-item-{scene.id}"
+              >
+                <span class="scene-list-name">{scene.name}</span>
+                {#if scene.id === currentSceneId}
+                  <span class="scene-current-icon" data-testid="scene-list-current-{scene.id}">
+                    <Icon>check</Icon>
+                  </span>
+                {/if}
+              </button>
+
+              {#if capabilities.isAdmin && scene.id !== '/'}
+                <div class="scene-list-delete">
+                  <IconButton
+                    variant="text"
+                    size="s"
+                    aria-label="{scene.name} を削除"
+                    title="シーンを削除"
+                    onclick={(e: MouseEvent) => {
+                      e.stopPropagation();
+                      requestSceneDelete(scene.id, scene.name);
+                    }}
+                    data-testid="scene-list-delete-{scene.id}"
+                  >
+                    <Icon>delete</Icon>
+                  </IconButton>
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
-      </div>
-    {/if}
-  </div>
+      {/if}
+    </div>
+  {/if}
 
   <!-- Full-Screen Confirmation Dialog for Scene Deletion -->
   {#if sceneToDelete}
@@ -307,6 +425,16 @@
     background: var(--np-color-surface, #fbf8fd);
     display: flex;
     flex-direction: column;
+  }
+  .tab-header {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--np-color-outline-variant, #cac4d0);
+  }
+  .tab-header :global(.np-segmented-buttons) {
+    width: 100%;
   }
   .graph-scroll-area {
     flex: 1;
@@ -417,6 +545,61 @@
   .delete-btn-wrapper {
     --np-button-container-color: var(--np-color-error-container, #f9dedc);
     --np-button-label-text-color: var(--np-color-on-error-container, #410e0b);
+  }
+  .scene-list-scroll-area {
+    flex: 1;
+    overflow: auto;
+    padding: 8px 0;
+    position: relative;
+  }
+  .scene-list {
+    display: flex;
+    flex-direction: column;
+  }
+  .scene-list-row {
+    display: flex;
+    align-items: center;
+    min-height: 48px;
+  }
+  .scene-list-item {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 16px;
+    background: none;
+    border: none;
+    cursor: pointer;
+    text-align: start;
+    font-size: 0.9rem;
+    color: var(--np-color-on-surface, #1d1b20);
+    transition: background-color 0.15s;
+  }
+  .scene-list-item:hover,
+  .scene-list-item.current-scene {
+    background: var(--np-color-surface-container-high, #e6e0e9);
+  }
+  .scene-list-name {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .scene-current-icon {
+    display: inline-flex;
+    color: var(--np-color-primary, #6750a4);
+  }
+  .scene-list-delete {
+    display: flex;
+    margin-inline-start: auto;
+    padding-inline-end: 8px;
+  }
+  .empty-scene-list {
+    padding: 48px;
+    text-align: center;
+    color: var(--np-color-on-surface-variant, #49454f);
+    font-size: 0.95rem;
   }
   .fullscreen-dialog-overlay {
     position: fixed;
