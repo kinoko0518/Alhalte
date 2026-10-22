@@ -19,10 +19,7 @@ import CharacterManagementTab from '../src/components/Control/tabs/CharacterMana
 import { clearAssets } from '../src/utils/assets.js';
 import { createDefaultJuices } from '../src/utils/sceneSettings.js';
 import { resetOutbox } from '../src/utils/outbox.js';
-import {
-  OperationTimeoutError,
-  type RoomSocket,
-} from '../src/utils/roomSocket.js';
+import type { RoomSocket } from '../src/utils/roomSocket.js';
 import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
 import type { Character, Scene, VisitedRoom } from '../src/types/index.js';
 import type { RoomRole } from '../src/utils/session.js';
@@ -361,116 +358,96 @@ describe('Character list views and row actions (Issue #228)', () => {
     expect(toggled).toBe('own-in-scene');
   });
 
-  // spec: Issue #228 別シーンに配置は既存シーンの Menu で、現在シーンは除外する
-  it('opens a move menu with every other existing scene, anchored to its own button', async () => {
-    mountTab({ role: 'admin' });
+  // spec: Issue #269 行の「キャラクターを移動」はルートの移動モーダルを要求する
+  it('asks for the root move modal from the row button instead of a per-row scene menu', async () => {
+    const requested: Character[] = [];
+    mountTab({
+      role: 'admin',
+      onRequestMoveCharacter: (character: Character) => {
+        requested.push(character);
+      },
+    });
 
     const moveBtn = target.querySelector<HTMLButtonElement>(
       '[data-testid="move-char-btn-own-in-scene"]',
     );
-    expect(moveBtn?.getAttribute('aria-haspopup')).toBe('menu');
-    expect(moveBtn?.getAttribute('aria-expanded')).toBe('false');
+    expect(moveBtn).toBeTruthy();
+    expect(moveBtn?.getAttribute('aria-label')).toBe('キャラクターを移動');
+    // The name comes from the tooltip / aria-label pair of `IconButton`.
+    expect(tooltipText(moveBtn)).toBe('キャラクターを移動');
+    // The per-row destination menu is gone (Issue #269): the button only opens
+    // the modal, which owns the destination choice.
+    expect(moveBtn?.getAttribute('aria-haspopup')).toBeNull();
+    expect(moveBtn?.getAttribute('aria-expanded')).toBeNull();
 
     moveBtn?.click();
     await tick();
 
-    expect(moveBtn?.getAttribute('aria-expanded')).toBe('true');
-    expect(target.querySelector('[data-testid="move-char-menu-own-in-scene"]')).toBeTruthy();
-    // Other scenes only: never the character's current scene.
-    expect(
-      target.querySelector('[data-testid="move-char-scene-own-in-scene-scene-b"]'),
-    ).toBeTruthy();
-    expect(
-      target.querySelector('[data-testid="move-char-scene-own-in-scene-scene-c"]'),
-    ).toBeTruthy();
-    expect(
-      target.querySelector('[data-testid="move-char-scene-own-in-scene-scene-a"]'),
-    ).toBeNull();
-    // The button itself carries the menu anchor.
-    expect(moveBtn?.style.getPropertyValue('anchor-name')).toBe(
-      '--character-menu-anchor-move-own-in-scene',
-    );
+    expect(requested.map((character) => character.id)).toEqual(['own-in-scene']);
+    expect(target.querySelector('[data-testid="move-char-menu-own-in-scene"]')).toBeNull();
   });
 
-  // spec: Issue #228 別シーンに配置: 行き先が無ければ空メニュー
-  it('shows an empty move menu when there is no other scene', async () => {
+  // spec: Issue #269 シーンが1つでも移動ボタンは出る（新規作成はモーダル側の導線）
+  it('keeps the move button when the room has a single scene', () => {
+    const only = makeScene({ id: 'only', name: '唯一のシーン', members: ['own-in-scene'] });
     mountTab({
       role: 'admin',
-      currentScene: makeScene({ id: 'only', name: '唯一のシーン', members: ['own-in-scene'] }),
-      allScenes: [makeScene({ id: 'only', name: '唯一のシーン', members: ['own-in-scene'] })],
+      currentScene: only,
+      allScenes: [only],
       characters: [makeCharacter({ id: 'own-in-scene', ownerAccountId: ACCOUNT })],
     });
 
-    target.querySelector<HTMLButtonElement>('[data-testid="move-char-btn-own-in-scene"]')?.click();
-    await tick();
-    expect(target.querySelector('[data-testid="move-char-menu-empty"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="move-char-scene-own-in-scene-only"]')).toBeNull();
+    expect(target.querySelector('[data-testid="move-char-btn-own-in-scene"]')).toBeTruthy();
+    expect(target.querySelector('[data-testid="move-char-menu-empty"]')).toBeNull();
   });
 
-  // spec: Issue #228 メニューは外側クリックで閉じ、同時に1つだけ開く
-  it('closes menus on an outside click and keeps only one menu open', async () => {
+  // spec: Issue #228 その他メニューは外側クリックで閉じ、同時に1つだけ開く
+  it('closes the その他 menu on an outside click and keeps only one menu open', async () => {
     mountTab({ role: 'admin' });
 
-    const moveBtn = target.querySelector<HTMLButtonElement>(
-      '[data-testid="move-char-btn-own-in-scene"]',
-    )!;
     const moreBtn = target.querySelector<HTMLButtonElement>(
       '[data-testid="more-char-btn-own-in-scene"]',
     )!;
+    const otherMoreBtn = target.querySelector<HTMLButtonElement>(
+      '[data-testid="more-char-btn-other-in-scene"]',
+    )!;
 
-    moveBtn.click();
+    moreBtn.click();
     await tick();
-    expect(moveBtn.getAttribute('aria-expanded')).toBe('true');
+    expect(moreBtn.getAttribute('aria-expanded')).toBe('true');
+    expect(target.querySelector('[data-testid="character-menu-own-in-scene"]')).toBeTruthy();
 
     // Outside click closes it.
     document.body.dispatchEvent(new MouseEvent('click', { bubbles: true }));
     await tick();
-    expect(moveBtn.getAttribute('aria-expanded')).toBe('false');
+    expect(moreBtn.getAttribute('aria-expanded')).toBe('false');
 
-    // Opening その他 closes the move menu.
-    moveBtn.click();
-    await tick();
+    // Opening another row's menu closes the previous one.
     moreBtn.click();
     await tick();
-    expect(moveBtn.getAttribute('aria-expanded')).toBe('false');
-    expect(moreBtn.getAttribute('aria-expanded')).toBe('true');
-    expect(target.querySelector('[data-testid="character-menu-own-in-scene"]')).toBeTruthy();
-    expect(target.querySelector('[data-testid="delete-char-btn-own-in-scene"]')).toBeTruthy();
-
-    // Opening another row's move menu closes the previous one.
-    const otherMove = target.querySelector<HTMLButtonElement>(
-      '[data-testid="move-char-btn-other-in-scene"]',
-    )!;
-    otherMove.click();
+    otherMoreBtn.click();
     await tick();
     expect(moreBtn.getAttribute('aria-expanded')).toBe('false');
-    expect(otherMove.getAttribute('aria-expanded')).toBe('true');
+    expect(otherMoreBtn.getAttribute('aria-expanded')).toBe('true');
+    expect(target.querySelector('[data-testid="delete-char-btn-other-in-scene"]')).toBeTruthy();
   });
 
-  // spec: Issue #228 別シーンに配置はシーンIDで App の移動経路を呼ぶ
-  it('calls the move callback with the target scene ID and reports a failed callback', async () => {
-    let moved: { characterId: string; sceneId: string } | null = null;
+  // spec: Issue #269 移動ボタンのコールバック失敗は行を残してエラーを出す
+  it('reports a thrown move request and keeps the row', async () => {
     mountTab({
       role: 'admin',
-      onMoveCharacter: (characterId: string, sceneId: string) => {
-        moved = { characterId, sceneId };
-        return false;
+      onRequestMoveCharacter: () => {
+        throw new Error('boom');
       },
     });
 
     target.querySelector<HTMLButtonElement>('[data-testid="move-char-btn-own-in-scene"]')?.click();
     await tick();
-    target
-      .querySelector<HTMLElement>('[data-testid="move-char-scene-own-in-scene-scene-b"]')
-      ?.click();
-    await tick();
 
-    expect(moved).toEqual({ characterId: 'own-in-scene', sceneId: 'scene-b' });
     const error = target.querySelector<HTMLElement>('[data-testid="character-action-error"]');
     expect(error).toBeTruthy();
     expect(error?.getAttribute('role')).toBe('status');
     expect(error?.textContent?.trim()).toBe('サーバーと通信できませんでした');
-    // The menu closed and the row stayed.
     expect(target.querySelector('[data-testid="move-char-btn-own-in-scene"]')).toBeTruthy();
   });
 
@@ -571,15 +548,6 @@ describe('Character list App integration (Issue #228)', () => {
     await tick(40);
   }
 
-  async function openSettings(): Promise<void> {
-    target.querySelector<HTMLButtonElement>('[data-testid="tab-btn-settings"]')?.click();
-    await tick(40);
-  }
-
-  function sceneName(): string {
-    return target.querySelector<HTMLInputElement>('[data-testid="scene-name-input"]')?.value ?? '';
-  }
-
   // spec: Issue #228 駒トグルは ack 後にだけ反転する
   it('flips the piece toggle only after the state ack', async () => {
     const socket = new FakeRoomSocket();
@@ -640,81 +608,6 @@ describe('Character list App integration (Issue #228)', () => {
     await tick();
     expect(card('43')).toBeTruthy();
     expect(card('42')).toBeNull();
-  });
-
-  // spec: Issue #228 別シーンに配置は ack 後にだけ行を消し、管理者の現在シーンは変えない
-  it('removes the row after the move ack and keeps the current scene', async () => {
-    const socket = new FakeRoomSocket();
-    socket.autoAnswerSceneActions = false;
-    socket.characterListSnapshot = [
-      makeCharacter({ id: '42', name: '勇者ロラン', ownerAccountId: ACCOUNT }),
-      makeCharacter({ id: '43', name: '魔法使いミナ', ownerAccountId: ACCOUNT }),
-    ];
-    mountApp(socket, {
-      initialScenes: [
-        makeScene({ id: '/', name: '広場', members: ['42', '43'] }),
-        makeScene({ id: 'scene-b', name: '森', members: [] }),
-      ],
-    });
-    await tick(30);
-    await openCharacters();
-
-    target.querySelector<HTMLButtonElement>('[data-testid="move-char-btn-42"]')?.click();
-    await tick();
-    target
-      .querySelector<HTMLElement>('[data-testid="move-char-scene-42-scene-b"]')
-      ?.click();
-    await tick();
-
-    expect(socket.requestMoveCharacterCalls).toEqual([{ characterId: 42, toSceneId: 'scene-b' }]);
-    // The character list never creates a scene implicitly.
-    expect(socket.requestCreateSceneCalls).toHaveLength(0);
-    expect(target.querySelector('[data-testid="move-char-pending-42"]')).toBeTruthy();
-    // No optimistic removal.
-    expect(card('42')).toBeTruthy();
-    expect(target.querySelector('[data-testid="character-action-error"]')).toBeNull();
-
-    socket.resolveSceneAction('move');
-    await tick(40);
-
-    expect(target.querySelector('[data-testid="move-char-pending-42"]')).toBeNull();
-    expect(card('42')).toBeNull();
-    expect(card('43')).toBeTruthy();
-    // The admin stays in the scene they were curating (Issue #228).
-    await openSettings();
-    expect(sceneName()).toBe('広場');
-    expect(socket.enterSceneCalls).not.toContain('scene-b');
-  });
-
-  // spec: Issue #228 別シーンに配置の失敗は行を残してエラーを出す
-  it('keeps the row and reports a move failure', async () => {
-    const socket = new FakeRoomSocket();
-    socket.autoAnswerSceneActions = false;
-    socket.characterListSnapshot = [
-      makeCharacter({ id: '42', name: '勇者ロラン', ownerAccountId: ACCOUNT }),
-    ];
-    mountApp(socket);
-    await tick(30);
-    await openCharacters();
-
-    target.querySelector<HTMLButtonElement>('[data-testid="move-char-btn-42"]')?.click();
-    await tick();
-    target
-      .querySelector<HTMLElement>('[data-testid="move-char-scene-42-scene-b"]')
-      ?.click();
-    await tick();
-
-    socket.rejectSceneAction(new OperationTimeoutError('moveCharacter', 8000), 'move');
-    await tick(40);
-
-    const error = target.querySelector<HTMLElement>('[data-testid="character-action-error"]');
-    expect(error).toBeTruthy();
-    expect(error?.getAttribute('role')).toBe('status');
-    expect(error?.textContent?.trim()).toBe('サーバーと通信できませんでした');
-    expect(card('42')).toBeTruthy();
-    expect(target.querySelector('[data-testid="move-char-pending-42"]')).toBeNull();
-    await openSettings();
-    expect(sceneName()).toBe('広場');
   });
 
   // spec: Issue #228 削除は その他 → 削除 → ルート確認ダイアログ → ack

@@ -68,10 +68,10 @@
     onRequestCreateCharacter,
     onRefreshCharacters,
     onFocusCharacterScene,
-    onMoveCharacter,
+    onRequestMoveCharacter,
   }: {
     characters?: Character[];
-    /** Every scene of the room: used for scene labels and the "別シーン" menu. */
+    /** Every scene of the room: used for the per-row scene labels. */
     allScenes?: Scene[];
     /**
      * Scene the caller is currently looking at. The default `scene` view lists
@@ -127,14 +127,11 @@
      */
     onFocusCharacterScene?: (sceneId: string) => void;
     /**
-     * Moves a character to an existing scene by ID (「別シーンに配置」). `App`
-     * resolves the display name and follows the `MoveCharacter` ack path; this
-     * tab never creates a scene.
+     * Requests the root-hoisted 「キャラクターを移動」 modal for a character
+     * (Issue #269). `App` owns the modal, the scene list and the acknowledgement
+     * path; the tab only forwards the row.
      */
-    onMoveCharacter?: (
-      characterId: string,
-      targetSceneId: string,
-    ) => Promise<boolean | void> | boolean | void;
+    onRequestMoveCharacter?: (character: Character) => void;
   } = $props();
 
   const CHARACTER_ACTION_ERROR_MESSAGE = 'サーバーと通信できませんでした';
@@ -284,23 +281,18 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Menus (move / more), one open at a time and closed on outside click
+  // Menus (その他), one open at a time and closed on outside click
   // ---------------------------------------------------------------------------
-  type CharacterMenuKind = 'move' | 'more';
-  let openMenu = $state<{ kind: CharacterMenuKind; characterId: string } | null>(null);
+  let openMenu = $state<string | null>(null);
   let menuAnchors = $state<Record<string, HTMLElement | undefined>>({});
   let menuElements = $state<Record<string, HTMLElement | undefined>>({});
 
-  function menuKey(kind: CharacterMenuKind, characterId: string): string {
-    return `${kind}-${characterId}`;
+  function isMenuOpen(characterId: string): boolean {
+    return openMenu === characterId;
   }
 
-  function isMenuOpen(kind: CharacterMenuKind, characterId: string): boolean {
-    return openMenu?.kind === kind && openMenu.characterId === characterId;
-  }
-
-  function toggleMenu(kind: CharacterMenuKind, characterId: string): void {
-    openMenu = isMenuOpen(kind, characterId) ? null : { kind, characterId };
+  function toggleMenu(characterId: string): void {
+    openMenu = isMenuOpen(characterId) ? null : characterId;
   }
 
   function closeMenu(): void {
@@ -312,8 +304,7 @@
     if (!active) return;
     const target = event.target;
     if (target instanceof Node) {
-      const key = menuKey(active.kind, active.characterId);
-      if (menuAnchors[key]?.contains(target) || menuElements[key]?.contains(target)) return;
+      if (menuAnchors[active]?.contains(target) || menuElements[active]?.contains(target)) return;
     }
     openMenu = null;
   }
@@ -321,67 +312,44 @@
   $effect(() => {
     const active = openMenu;
     if (!active) return;
-    const key = menuKey(active.kind, active.characterId);
-    if (menuElements[key] && menuAnchors[key]) {
-      return applyMenuPosition(menuElements[key], menuAnchors[key], {
+    if (menuElements[active] && menuAnchors[active]) {
+      return applyMenuPosition(menuElements[active], menuAnchors[active], {
         placement: 'bottom-end',
-        anchorName: `--character-menu-anchor-${key}`,
+        anchorName: `--character-menu-anchor-${active}`,
       });
     }
   });
 
-  /** Existing scenes a character can be moved to (never its current scene). */
-  function moveTargetScenes(characterId: string): Scene[] {
-    const currentSceneId = characterScene(characterId)?.id;
-    return allScenes.filter((scene) => scene.id !== currentSceneId);
-  }
-
   // ---------------------------------------------------------------------------
   // Row actions (Issue #228)
   // ---------------------------------------------------------------------------
-  /** This tab's own pending action, so standalone usage shows the spinner too. */
-  let localPendingAction = $state<string | null>(null);
-  /** Failure text owned by this tab (a callback returned `false` / threw). */
+  /** Failure text owned by this tab (a callback threw). */
   let localActionError = $state<string | null>(null);
 
   let effectiveActionError = $derived(sceneActionError || localActionError);
-  let isAnyActionPending = $derived(localPendingAction !== null);
 
+  /** `App` owns the in-flight scene action, so the move spinner is its state. */
   function isMovePending(characterId: string): boolean {
-    return (
-      localPendingAction === `move:${characterId}` ||
-      sceneActionPending === `move:${characterId}`
-    );
+    return sceneActionPending === `move:${characterId}`;
   }
 
-  async function runAction(
-    actionId: string,
-    action: (() => Promise<boolean | void> | boolean | void) | undefined,
-  ): Promise<boolean> {
-    if (isAnyActionPending || !action) return false;
+  /**
+   * Moves a character through the root-hoisted modal (Issue #269).
+   *
+   * The row does not choose a destination any more: the modal's shared
+   * `SceneSwitcher` does, so a scene can be created from the same input. The
+   * acknowledgement (and therefore the row removal / failure text) stays in
+   * `App`, which also drives the `move:<id>` spinner through `sceneActionPending`.
+   */
+  function handleRequestMoveCharacter(character: Character): void {
+    if (isMovePending(character.id)) return;
     localActionError = null;
-    localPendingAction = actionId;
     try {
-      const result = await action();
-      if (result === false) {
-        localActionError = CHARACTER_ACTION_ERROR_MESSAGE;
-        return false;
-      }
-      return true;
+      onRequestMoveCharacter?.(character);
     } catch (error) {
-      console.warn(`[CharacterManagementTab] Character action "${actionId}" failed:`, error);
+      console.warn('[CharacterManagementTab] Failed to open the move modal:', error);
       localActionError = CHARACTER_ACTION_ERROR_MESSAGE;
-      return false;
-    } finally {
-      localPendingAction = null;
     }
-  }
-
-  async function handleMoveCharacter(character: Character, targetSceneId: string): Promise<void> {
-    closeMenu();
-    await runAction(`move:${character.id}`, () =>
-      onMoveCharacter?.(character.id, targetSceneId),
-    );
   }
 
   function handleFocusCharacter(character: Character): void {
@@ -564,15 +532,15 @@
             <div class="char-actions" onclick={(e) => e.stopPropagation()}>
               {#each actions as action (action)}
                 {#if action === 'move'}
+                  <!-- Issue #269: the row only opens the root-hoisted
+                       「キャラクターを移動」 modal; the destination (and a new
+                       scene) is chosen there. -->
                   <IconButton
                     variant="tonal"
-                    onclick={() => toggleMenu('move', char.id)}
-                    bind:element={menuAnchors[menuKey('move', char.id)]}
+                    onclick={() => handleRequestMoveCharacter(char)}
                     disabled={isMovePending(char.id)}
-                    aria-label="別シーンに配置"
-                    title="別シーンに配置"
-                    aria-haspopup="menu"
-                    aria-expanded={isMenuOpen('move', char.id) ? 'true' : 'false'}
+                    aria-label="キャラクターを移動"
+                    title="キャラクターを移動"
                     data-testid="move-char-btn-{char.id}"
                   >
                     {#if isMovePending(char.id)}
@@ -588,36 +556,6 @@
                       <Icon>drive_file_move</Icon>
                     {/if}
                   </IconButton>
-                  <Menu
-                    bind:element={menuElements[menuKey('move', char.id)]}
-                    open={isMenuOpen('move', char.id)}
-                    anchor={menuAnchors[menuKey('move', char.id)]}
-                    style={getMenuPositionStyle(menuAnchors[menuKey('move', char.id)], {
-                      placement: 'bottom-end',
-                      anchorName: `--character-menu-anchor-${menuKey('move', char.id)}`,
-                    })}
-                    data-testid="move-char-menu-{char.id}"
-                    class="character-menu"
-                    ontoggle={(e) => {
-                      if (!e.newState || e.newState === 'closed') {
-                        if (isMenuOpen('move', char.id)) closeMenu();
-                      }
-                    }}
-                  >
-                    {#each moveTargetScenes(char.id) as targetScene (targetScene.id)}
-                      <MenuItem
-                        onclick={() => handleMoveCharacter(char, targetScene.id)}
-                        data-testid="move-char-scene-{char.id}-{targetScene.id}"
-                      >
-                        {targetScene.name}
-                      </MenuItem>
-                    {/each}
-                    {#if moveTargetScenes(char.id).length === 0}
-                      <div class="character-menu-empty" data-testid="move-char-menu-empty">
-                        移動できるシーンがありません
-                      </div>
-                    {/if}
-                  </Menu>
                 {:else if action === 'focus'}
                   <IconButton
                     variant="text"
@@ -637,29 +575,29 @@
                 {:else if action === 'more'}
                   <IconButton
                     variant="text"
-                    onclick={() => toggleMenu('more', char.id)}
-                    bind:element={menuAnchors[menuKey('more', char.id)]}
+                    onclick={() => toggleMenu(char.id)}
+                    bind:element={menuAnchors[char.id]}
                     aria-label="その他"
                     title="その他"
                     aria-haspopup="menu"
-                    aria-expanded={isMenuOpen('more', char.id) ? 'true' : 'false'}
+                    aria-expanded={isMenuOpen(char.id) ? 'true' : 'false'}
                     data-testid="more-char-btn-{char.id}"
                   >
                     <Icon>more_vert</Icon>
                   </IconButton>
                   <Menu
-                    bind:element={menuElements[menuKey('more', char.id)]}
-                    open={isMenuOpen('more', char.id)}
-                    anchor={menuAnchors[menuKey('more', char.id)]}
-                    style={getMenuPositionStyle(menuAnchors[menuKey('more', char.id)], {
+                    bind:element={menuElements[char.id]}
+                    open={isMenuOpen(char.id)}
+                    anchor={menuAnchors[char.id]}
+                    style={getMenuPositionStyle(menuAnchors[char.id], {
                       placement: 'bottom-end',
-                      anchorName: `--character-menu-anchor-${menuKey('more', char.id)}`,
+                      anchorName: `--character-menu-anchor-${char.id}`,
                     })}
                     data-testid="character-menu-{char.id}"
                     class="character-menu"
                     ontoggle={(e) => {
                       if (!e.newState || e.newState === 'closed') {
-                        if (isMenuOpen('more', char.id)) closeMenu();
+                        if (isMenuOpen(char.id)) closeMenu();
                       }
                     }}
                   >
@@ -940,11 +878,6 @@
   }
   :global(.character-action-progress) {
     --np-circular-progress-size: 1.25rem;
-  }
-  .character-menu-empty {
-    padding: 8px 16px;
-    font-size: 0.85rem;
-    color: var(--np-color-on-surface-variant);
   }
   .character-action-error {
     margin: 0;
