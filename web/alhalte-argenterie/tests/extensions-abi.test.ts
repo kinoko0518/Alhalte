@@ -12,8 +12,13 @@ import {
   deleteExtension,
   encodePostcardStringTuple3,
   decodePostcardStringTuple3,
+  encodePostcardStringTuple4,
+  decodePostcardStringTuple4,
   formatExtensionPipelineWarning,
   loadDefaultExtensions,
+  CURRENT_ALHALTE_ABI_VERSION,
+  MIN_SUPPORTED_ALHALTE_ABI_VERSION,
+  DEFAULT_OFFICIAL_EXTENSIONS,
 } from '../src/wasm/runner.js';
 import ExtensionManagementTab from '../src/components/Control/tabs/ExtensionManagementTab.svelte';
 import type { ExtensionItem } from '../src/types/index.js';
@@ -21,7 +26,7 @@ import { buildGenerastFromText } from '../src/utils/generast.js';
 import { renderGenerast } from '../src/utils/saignant.js';
 import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
 
-// Valid WebAssembly binary implementing:
+// Valid ABI 1 WebAssembly binary implementing:
 // - memory (1 page)
 // - alhalte_abi_version() -> 1
 // - alloc(len) -> 0
@@ -29,10 +34,6 @@ import { asRoomSocket, FakeRoomSocket } from './helpers/fakeRoomSocket.js';
 // - process_generast(ptr, len) -> copies input to 1024, appends '!' (0x21), returns (1024n << 32) | (len + 1)
 const VALID_WASM_HEX =
   '0061736d010000000115046000017f60017f017f60027f7f0060027f7f017e030504000102030503010001074505066d656d6f7279020013616c68616c74655f6162695f76657273696f6e000005616c6c6f630001076465616c6c6f6300021070726f636573735f67656e657261737400030a3404040041010b040041000b02000b250041800820002001fc0a000041800820016a41213a0000428008422086200141016aad840b';
-
-// Invalid version WebAssembly binary (alhalte_abi_version returns 2)
-const INVALID_VERSION_WASM_HEX =
-  '0061736d010000000115046000017f60017f017f60027f7f0060027f7f017e030504000102030503010001074505066d656d6f7279020013616c68616c74655f6162695f76657273696f6e000005616c6c6f630001076465616c6c6f6300021070726f636573735f67656e657261737400030a1304040041020b040041000b02000b0400422a0b';
 
 function uleb128(value: number): number[] {
   const out: number[] = [];
@@ -68,7 +69,18 @@ function exportEntry(name: string, kind: number, index: number): number[] {
   return [...uleb128(nameBytes.length), ...nameBytes, kind, ...uleb128(index)];
 }
 
-function buildWasmWithSelfIntro(introBytes: Uint8Array): Uint8Array {
+/**
+ * Builds a minimal extension wasm.
+ *
+ * `abiVersion` controls the `alhalte_abi_version` return value and
+ * `introBytes` (when given) becomes the Postcard payload of the optional
+ * `self_introduction` export. Without `introBytes` the export is absent, like
+ * an ABI 2 extension that does not self-introduce.
+ */
+function buildWasm(
+  { abiVersion = 1, introBytes }: { abiVersion?: number; introBytes?: Uint8Array } = {},
+): Uint8Array {
+  const withIntro = introBytes !== undefined;
   const typeSec = section(1, [
     5,
     0x60, 0x00, 0x01, 0x7f, // () -> i32
@@ -77,44 +89,51 @@ function buildWasmWithSelfIntro(introBytes: Uint8Array): Uint8Array {
     0x60, 0x02, 0x7f, 0x7f, 0x01, 0x7e, // (i32, i32) -> i64
     0x60, 0x00, 0x01, 0x7e, // () -> i64
   ]);
-  const funcSec = section(3, [5, 0, 1, 2, 3, 4]);
+  const funcTypes = withIntro ? [0, 1, 2, 3, 4] : [0, 1, 2, 3];
+  const funcSec = section(3, [funcTypes.length, ...funcTypes]);
   const memSec = section(5, [1, 0x00, 1]);
   const expPayload = [
-    6,
+    withIntro ? 6 : 5,
     ...exportEntry('memory', 2, 0),
     ...exportEntry('alhalte_abi_version', 0, 0),
     ...exportEntry('alloc', 0, 1),
     ...exportEntry('dealloc', 0, 2),
     ...exportEntry('process_generast', 0, 3),
-    ...exportEntry('self_introduction', 0, 4),
+    ...(withIntro ? exportEntry('self_introduction', 0, 4) : []),
   ];
   const expSec = section(7, expPayload);
 
-  const fn0 = [0x00, 0x41, 0x01, 0x0b];
+  const fn0 = [0x00, 0x41, ...sleb128(abiVersion), 0x0b];
   const fn1 = [0x00, 0x41, 0x00, 0x0b];
   const fn2 = [0x00, 0x0b];
   const fn3 = [0x00, 0x42, 0x00, 0x0b];
-  // (2048n << 32n) | BigInt(introBytes.length)
-  const fn4 = [
-    0x00,
-    0x42, ...sleb128(2048),
-    0x42, 0x20,
-    0x86, // i64.shl
-    0x41, ...sleb128(introBytes.length),
-    0xad, // i64.extend_i32_u
-    0x84, // i64.or
-    0x0b,
-  ];
-  const bodies = [fn0, fn1, fn2, fn3, fn4].flatMap((b) => [...uleb128(b.length), ...b]);
-  const codeSec = section(10, [5, ...bodies]);
+  const fns = [fn0, fn1, fn2, fn3];
+  if (withIntro) {
+    // (2048n << 32n) | BigInt(introBytes.length)
+    fns.push([
+      0x00,
+      0x42, ...sleb128(2048),
+      0x42, 0x20,
+      0x86, // i64.shl
+      0x41, ...sleb128(introBytes.length),
+      0xad, // i64.extend_i32_u
+      0x84, // i64.or
+      0x0b,
+    ]);
+  }
+  const bodies = fns.flatMap((b) => [...uleb128(b.length), ...b]);
+  const codeSec = section(10, [fns.length, ...bodies]);
 
-  const dataSeg = [
-    0x00,
-    0x41, ...sleb128(2048), 0x0b,
-    ...uleb128(introBytes.length),
-    ...Array.from(introBytes),
-  ];
-  const dataSec = section(11, [1, ...dataSeg]);
+  const dataSec =
+    introBytes === undefined
+      ? []
+      : section(11, [
+          1,
+          0x00,
+          0x41, ...sleb128(2048), 0x0b,
+          ...uleb128(introBytes.length),
+          ...Array.from(introBytes),
+        ]);
 
   return new Uint8Array([
     0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
@@ -125,6 +144,10 @@ function buildWasmWithSelfIntro(introBytes: Uint8Array): Uint8Array {
     ...codeSec,
     ...dataSec,
   ]);
+}
+
+function buildWasmWithSelfIntro(introBytes: Uint8Array, abiVersion = 1): Uint8Array {
+  return buildWasm({ abiVersion, introBytes });
 }
 
 describe('Extensions Tab & WASM ABI Host Runner', () => {
@@ -191,18 +214,25 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     target.remove();
   });
 
-  // spec: alhalte-argenterie/extensions-abi WASM ABI バージョン確認
-  it('validates alhalte_abi_version is 1 and rejects incompatible versions', async () => {
-    // Valid module
-    const validBytes = hexToBytes(VALID_WASM_HEX);
-    const instance = await WasmExtensionInstance.instantiate(validBytes);
-    expect(instance).toBeDefined();
+  // spec: alhalte-argenterie/extensions-abi WASM ABI バージョン確認（1 と 2 を受理、それ以外は拒否）
+  it('accepts ABI 1 and 2 and rejects incompatible versions', async () => {
+    expect(CURRENT_ALHALTE_ABI_VERSION).toBe(2);
+    expect(MIN_SUPPORTED_ALHALTE_ABI_VERSION).toBe(1);
 
-    // Invalid module with version 2
-    const invalidBytes = hexToBytes(INVALID_VERSION_WASM_HEX);
-    await expect(WasmExtensionInstance.instantiate(invalidBytes)).rejects.toThrow(
-      /Unsupported extension ABI version: 2/,
-    );
+    // ABI 1 module (no self_introduction, the pre-#274 ABI)
+    const v1 = await WasmExtensionInstance.instantiate(hexToBytes(VALID_WASM_HEX));
+    expect(v1.getAbiVersion()).toBe(1);
+    expect(v1.selfIntroduction()).toBeNull();
+
+    // ABI 2 module without self_introduction: the optional export is allowed
+    const v2 = await WasmExtensionInstance.instantiate(buildWasm({ abiVersion: 2 }));
+    expect(v2.getAbiVersion()).toBe(2);
+    expect(v2.selfIntroduction()).toBeNull();
+
+    // ABI 3 is newer than the host supports
+    await expect(
+      WasmExtensionInstance.instantiate(buildWasm({ abiVersion: 3 })),
+    ).rejects.toThrow(/Unsupported extension ABI version: 3/);
   });
 
   // spec: alhalte-argenterie/extensions-abi WASM process_generast 実行
@@ -261,7 +291,7 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     const iconSvg =
       '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24"><circle cx="12" cy="12" r="10"/></svg>';
     const description =
-      'CoC第6版のCCB/CC判定・クリティカル/ファンブル・組み合わせロール・RESB対抗ロールを提供する公式拡張機能';
+      'クトゥルフ神話TRPG第6版の記法や処理のための公式拡張機能です。';
 
     const encoded = encodePostcardStringTuple3(name, iconSvg, description);
     const decoded = decodePostcardStringTuple3(encoded);
@@ -271,11 +301,22 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     const legacyInstance = await WasmExtensionInstance.instantiate(hexToBytes(VALID_WASM_HEX));
     expect(legacyInstance.selfIntroduction()).toBeNull();
 
-    // Module with self_introduction returns decoded metadata
+    // ABI 1: legacy tuple3 (no id)
     const introWasmBytes = buildWasmWithSelfIntro(encoded);
     const introInstance = await WasmExtensionInstance.instantiate(introWasmBytes);
     const intro = introInstance.selfIntroduction();
     expect(intro).toEqual({ name, iconSvg, description });
+
+    // ABI 2: tuple4 with the declared id first
+    const encodedV2 = encodePostcardStringTuple4('coc-6', name, iconSvg, description);
+    expect(decodePostcardStringTuple4(encodedV2)).toEqual({
+      id: 'coc-6',
+      name,
+      iconSvg,
+      description,
+    });
+    const introV2 = await WasmExtensionInstance.instantiate(buildWasmWithSelfIntro(encodedV2, 2));
+    expect(introV2.selfIntroduction()).toEqual({ id: 'coc-6', name, iconSvg, description });
 
     // UI renders iconSvg, name, and description
     const target = document.createElement('div');
@@ -330,7 +371,7 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
       },
       {
         id: 'markdown',
-        name: 'Markdown スタイル',
+        name: 'Markdown',
         enabled: true,
         priority: 1,
         wasmBytes: markdownBytes,
@@ -466,6 +507,7 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
           JSON.stringify([
             {
               id: 'markdown',
+              // Legacy manifest generated before Issue #274 still carries `name`.
               name: 'Markdown スタイル',
               url: '/extensions/markdown.wasm',
               enabled: true,
@@ -494,10 +536,103 @@ describe('Extensions Tab & WASM ABI Host Runner', () => {
     const markdown = items.find((item) => item.id === 'markdown');
     expect(markdown?.wasmBytes).toEqual(validBytes);
     expect(markdown?.wasmMissing).toBeUndefined();
+    // Issue #274: a manifest generated before the name removal still contributes
+    // its optional `name` when the wasm is ABI 1 (no declared id/name).
+    expect(markdown?.name).toBe('Markdown スタイル');
     // Issue #165: a manifest entry without a fetchable wasm must be visible as
     // `wasm がありません`, not silently listed as if it were runnable.
     expect(items.find((item) => item.id === 'aozora')?.wasmMissing).toBe(true);
     expect(items.find((item) => item.id === 'no-url')?.wasmMissing).toBe(true);
+  });
+
+  // spec: Issue #274 ABI 2 wasm の自己紹介 id が manifest id と違う場合は fail-closed
+  it('marks an ABI 2 wasm whose declared id differs from the manifest id as wasmMissing', async () => {
+    const goodIntro = encodePostcardStringTuple4('markdown', 'Markdown', '<svg/>', 'md');
+    const wrongIntro = encodePostcardStringTuple4('impostor', 'Impostor', '<svg/>', 'other');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/extensions/manifest.json') {
+        return new Response(
+          JSON.stringify([
+            { id: 'markdown', url: '/extensions/markdown.wasm', enabled: true, priority: 0 },
+            { id: 'aozora', url: '/extensions/aozora.wasm', enabled: true, priority: 1 },
+          ]),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === '/extensions/markdown.wasm') {
+        return new Response(buildWasmWithSelfIntro(goodIntro, 2), { status: 200 });
+      }
+      if (url === '/extensions/aozora.wasm') {
+        return new Response(buildWasmWithSelfIntro(wrongIntro, 2), { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const items = await loadDefaultExtensions(fetchFn as unknown as typeof fetch);
+
+    // Matching id: the wasm metadata is trusted and the extension runs.
+    const markdown = items.find((item) => item.id === 'markdown');
+    expect(markdown?.wasmMissing).toBeUndefined();
+    expect(markdown?.wasmBytes).toBeDefined();
+    expect(markdown?.name).toBe('Markdown');
+
+    // Mismatched id: the wasm is not adopted under the manifest id.
+    const aozora = items.find((item) => item.id === 'aozora');
+    expect(aozora?.wasmMissing).toBe(true);
+    expect(aozora?.wasmBytes).toBeUndefined();
+    // The mismatched wasm's metadata is not trusted either.
+    expect(aozora?.name).not.toBe('Impostor');
+    expect(warn).toHaveBeenCalledTimes(1);
+    const warning = String(warn.mock.calls[0][0]);
+    expect(warning).toContain('"aozora"');
+    expect(warning).toContain('"impostor"');
+    warn.mockRestore();
+  });
+
+  // spec: Issue #274 ABI 2 でも self_introduction 未実装なら manifest id を使う
+  it('uses the manifest id for an ABI 2 wasm without self_introduction', async () => {
+    const fetchFn = vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url === '/extensions/manifest.json') {
+        return new Response(
+          JSON.stringify([
+            { id: 'coc-6', url: '/extensions/coc-6.wasm', enabled: false, priority: 3 },
+          ]),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        );
+      }
+      if (url === '/extensions/coc-6.wasm') {
+        return new Response(buildWasm({ abiVersion: 2 }), { status: 200 });
+      }
+      return new Response('not found', { status: 404 });
+    });
+
+    const items = await loadDefaultExtensions(fetchFn as unknown as typeof fetch);
+    expect(items).toHaveLength(1);
+    expect(items[0].id).toBe('coc-6');
+    expect(items[0].wasmMissing).toBeUndefined();
+    expect(items[0].wasmBytes).toBeDefined();
+  });
+
+  // spec: Issue #274 DEFAULT_OFFICIAL_EXTENSIONS は公式 wasm の自己紹介と一致する
+  it('keeps DEFAULT_OFFICIAL_EXTENSIONS in sync with the staged official wasm', async () => {
+    for (const fallback of DEFAULT_OFFICIAL_EXTENSIONS) {
+      const bytes = fs.readFileSync(
+        path.resolve(__dirname, `../public/extensions/${fallback.id}.wasm`),
+      );
+      const instance = await WasmExtensionInstance.instantiate(new Uint8Array(bytes));
+      expect(instance.getAbiVersion()).toBe(CURRENT_ALHALTE_ABI_VERSION);
+
+      const intro = instance.selfIntroduction();
+      expect(intro).not.toBeNull();
+      expect(intro?.id).toBe(fallback.id);
+      expect(intro?.name).toBe(fallback.name);
+      expect(intro?.iconSvg).toBe(fallback.iconSvg);
+      expect(intro?.description).toBe(fallback.description);
+    }
   });
 
   // spec: Issue #165 拡張機能タブは wasm 欠落行を可視化し有効化を無効にする

@@ -3,10 +3,10 @@
 use generast::{Generast, decode_ext_io, encode_ext_io};
 use tin::Tin;
 
-/// Returns current Alhalte extension ABI version (`1`).
+/// Returns current Alhalte extension ABI version (`2`).
 #[unsafe(no_mangle)]
 pub extern "C" fn alhalte_abi_version() -> i32 {
-    1
+    2
 }
 
 /// Allocates memory buffer of length `len` for host input.
@@ -124,10 +124,11 @@ pub extern "C" fn process_generast(ptr: i32, len: i32) -> i64 {
     ((out_ptr as i64) << 32) | (out_len as i64 & 0xffff_ffff)
 }
 
-/// Encodes the self-introduction metadata `(name, icon_svg, description)` using Postcard.
+/// Encodes the self-introduction metadata `(id, name, icon_svg, description)` using Postcard.
 pub fn encode_self_introduction() -> Vec<u8> {
-    let (name, icon_svg, description) = crate::self_introduction_info();
+    let (id, name, icon_svg, description) = crate::self_introduction_info();
     postcard::to_allocvec(&(
+        id.to_string(),
         name.to_string(),
         icon_svg.to_string(),
         description.to_string(),
@@ -135,7 +136,7 @@ pub fn encode_self_introduction() -> Vec<u8> {
     .unwrap_or_default()
 }
 
-/// WebAssembly entry point returning self-introduction metadata `(name, icon_svg, description)` as Postcard bytes.
+/// WebAssembly entry point returning self-introduction metadata `(id, name, icon_svg, description)` as Postcard bytes.
 ///
 /// Output memory format is packed `(ptr << 32) | len`.
 #[unsafe(no_mangle)]

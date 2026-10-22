@@ -355,10 +355,10 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       'Alhalte DSL',
     );
     expect(target.querySelector('[data-testid="ext-name-markdown"]')?.textContent?.trim()).toBe(
-      'Markdown スタイル',
+      'Markdown',
     );
     expect(target.querySelector('[data-testid="ext-name-aozora"]')?.textContent?.trim()).toBe(
-      '青空文庫ルビ・傍点',
+      '青空文庫書式',
     );
 
     unmount(instance);
@@ -875,7 +875,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     const extensions: ExtensionItem[] = [
       {
         id: 'markdown',
-        name: 'Markdown スタイル',
+        name: 'Markdown',
         enabled: true,
         priority: 0,
         wasmBytes: markdownWasm,
@@ -961,7 +961,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
       },
       {
         id: 'markdown',
-        name: 'Markdown スタイル',
+        name: 'Markdown',
         enabled: true,
         priority: 1,
         wasmBytes: markdownWasm,
@@ -1030,7 +1030,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     const initialExtensions: ExtensionItem[] = [
       {
         id: 'markdown',
-        name: 'Markdown スタイル',
+        name: 'Markdown',
         enabled: true,
         priority: 0,
         wasmBytes: markdownWasm,
@@ -1141,7 +1141,7 @@ describe('Log Tab & Chunk Lazy Loading', () => {
     const extensions: ExtensionItem[] = [
       {
         id: 'markdown',
-        name: 'Markdown スタイル',
+        name: 'Markdown',
         enabled: true,
         priority: 0,
         wasmBytes: markdownWasm,

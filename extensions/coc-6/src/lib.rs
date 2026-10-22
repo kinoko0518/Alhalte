@@ -52,11 +52,15 @@ pub fn process_ast(ast: Generast, speaker_id: u64) -> Generast {
     }
 }
 
-/// Returns self-introduction metadata `(name, icon_svg, description)` for CoC 6th edition.
-pub fn self_introduction_info() -> (&'static str, &'static str, &'static str) {
+/// Returns self-introduction metadata `(id, name, icon_svg, description)` for CoC 6th edition.
+///
+/// The id is the crate's package name, which must match the `Bistrot.toml`
+/// extension id (ABI 2, Issue #274).
+pub fn self_introduction_info() -> (&'static str, &'static str, &'static str, &'static str) {
     (
+        env!("CARGO_PKG_NAME"),
         "クトゥルフ神話TRPG (第6版)",
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="currentColor"><path d="M12 2L4.5 6.5v11L12 22l7.5-4.5v-11L12 2zm0 2.3l5.5 3.3v8.8L12 19.7l-5.5-3.3V7.6L12 4.3zm0 3.7a4 4 0 100 8 4 4 0 000-8zm0 2a2 2 0 110 4 2 2 0 010-4z"/></svg>"#,
-        "CoC第6版のCCB/CC判定・クリティカル/ファンブル・組み合わせロール・RESB対抗ロールを提供する公式拡張機能",
+        "クトゥルフ神話TRPG第6版の記法や処理のための公式拡張機能です。",
     )
 }

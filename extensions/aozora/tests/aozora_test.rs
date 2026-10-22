@@ -133,7 +133,7 @@ fn test_styles() {
 // spec: extensions/aozora ABI roundtrip
 #[test]
 fn test_aozora_abi() {
-    assert_eq!(alhalte_abi_version(), 1);
+    assert_eq!(alhalte_abi_version(), 2);
 
     let speaker_id = 999u64;
     let input_ast = Generast::string("［＃太字］重要［＃太字終わり］");
@@ -166,19 +166,20 @@ fn test_aozora_abi() {
 // spec: extensions/aozora self-introduction metadata
 #[test]
 fn test_self_introduction() {
-    let (name, icon_svg, description) = aozora::self_introduction_info();
-    assert_eq!(name, "青空文庫ルビ・傍点");
+    let (id, name, icon_svg, description) = aozora::self_introduction_info();
+    assert_eq!(id, "aozora");
+    assert_eq!(name, "青空文庫書式");
     assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
-    assert_eq!(
-        description,
-        "青空文庫形式のルビ（｜親文字《ルビ》）と傍点（［＃「…」に傍点］）を変換する公式拡張機能"
-    );
+    assert_eq!(description, "青空文庫書式を変換する公式拡張機能");
+
+    assert_eq!(aozora::abi::alhalte_abi_version(), 2);
 
     let bytes = aozora::abi::encode_self_introduction();
-    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.0, name);
-    assert_eq!(decoded.1, icon_svg);
-    assert_eq!(decoded.2, description);
+    let decoded: (String, String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, id);
+    assert_eq!(decoded.1, name);
+    assert_eq!(decoded.2, icon_svg);
+    assert_eq!(decoded.3, description);
 
     let packed = aozora::abi::self_introduction();
     assert_ne!(packed, 0);

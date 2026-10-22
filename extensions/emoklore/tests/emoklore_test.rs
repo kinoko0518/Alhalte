@@ -174,7 +174,7 @@ fn test_emoklore_combine_diceroll_and_suffix() {
 // spec: extensions/emoklore ABI roundtrip
 #[test]
 fn test_emoklore_abi_exports() {
-    assert_eq!(alhalte_abi_version(), 1);
+    assert_eq!(alhalte_abi_version(), 2);
 
     let speaker_id = 777u64;
     let input_ast = Generast::string("{1}DM<=7〈観察眼〉");
@@ -209,19 +209,23 @@ fn test_emoklore_abi_exports() {
 // spec: extensions/emoklore self-introduction metadata
 #[test]
 fn test_self_introduction() {
-    let (name, icon_svg, description) = emoklore::self_introduction_info();
+    let (id, name, icon_svg, description) = emoklore::self_introduction_info();
+    assert_eq!(id, "emoklore");
     assert_eq!(name, "エモクロアTRPG");
     assert!(icon_svg.starts_with("<svg") && icon_svg.ends_with("</svg>"));
     assert_eq!(
         description,
-        "エモクロアTRPGのxDM<=y判定（共鳴判定・成功数カウント・ダブル/トリプル等）を提供する公式拡張機能"
+        "エモクロアTRPGの記法や処理のための公式拡張機能です。"
     );
 
+    assert_eq!(emoklore::abi::alhalte_abi_version(), 2);
+
     let bytes = emoklore::abi::encode_self_introduction();
-    let decoded: (String, String, String) = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.0, name);
-    assert_eq!(decoded.1, icon_svg);
-    assert_eq!(decoded.2, description);
+    let decoded: (String, String, String, String) = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.0, id);
+    assert_eq!(decoded.1, name);
+    assert_eq!(decoded.2, icon_svg);
+    assert_eq!(decoded.3, description);
 
     let packed = emoklore::abi::self_introduction();
     assert_ne!(packed, 0);

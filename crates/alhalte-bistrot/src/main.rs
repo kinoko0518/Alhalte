@@ -254,10 +254,11 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             );
             println!("  Extensions:    {} configured", config.extensions.len());
             for ext in &config.extensions {
+                // Display metadata comes from the wasm (Issue #274); `validate`
+                // only reports the configuration fields it owns.
                 println!(
-                    "    - [{}] {} (path: {}, enabled: {})",
+                    "    - [{}] (path: {}, enabled: {})",
                     ext.id,
-                    ext.name.as_deref().unwrap_or(&ext.id),
                     ext.path.display(),
                     ext.enabled
                 );

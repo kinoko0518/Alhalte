@@ -72,7 +72,7 @@ function markdownExtension(): ExtensionItem[] {
   return [
     {
       id: 'markdown',
-      name: 'Markdown スタイル',
+      name: 'Markdown',
       enabled: true,
       priority: 0,
       wasmBytes: markdownWasm,
