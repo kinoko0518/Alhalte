@@ -67,7 +67,7 @@ pub struct CliArgs {
 
     /// File containing the internal service token (mode 0600).
     ///
-    /// Bistrot writes the decrypted secret to `<data-dir>/secrets/` and passes
+    /// alhalte-restaurant writes the decrypted secret to `<data-dir>/secrets/` and passes
     /// this path, so the token never appears in `ps` or in a systemd unit
     /// (Issue #194). Takes precedence over `--service-token`.
     #[arg(long, env = "ALHALTE_SERVICE_TOKEN_FILE")]

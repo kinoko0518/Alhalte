@@ -20,9 +20,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = parse_cli_args();
-    let debug_login = args.debug_login;
-    // `--debug-login` switches to the isolated debug SQLite file; the normal
-    // database is never opened while it is active (Issue #150).
+    let local_login = args.local_login;
+    // `--local-login` switches to the isolated local SQLite file; the normal
+    // Google database is never opened while it is active.
     let db_path = args.active_db_path();
     tracing::info!(
         "Starting alhalte-maitre-d on {}:{} (db: {:?})",
@@ -30,11 +30,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         args.port,
         db_path
     );
-    if debug_login {
+    if local_login {
         tracing::warn!(
-            "Debug login is ENABLED: accounts and sessions are stored in the isolated database \
-             {:?}, spawned banquettes run with --no-persist, and the normal database is not opened. \
-             Never enable this on a public instance",
+            "Local password login is ENABLED: accounts, sessions, and rooms use the isolated \
+             database {:?}; room state is still persisted to cellar. The login is HTTP-only, so \
+             use this only on a trusted LAN",
             db_path
         );
     }
@@ -57,7 +57,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &args.socket_dir,
         &args.cellar_url,
         args.chunk_size_exponent,
-    );
+    )
+    .with_heartbeat_interval_secs(args.banquette_heartbeat_interval_secs);
     match (service_token.as_deref(), args.service_token_file.as_deref()) {
         // Forward the injected file path so the child never holds the value in
         // its argument list.
@@ -72,11 +73,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              state unless cellar accepts the write through a user session"
         ),
     }
-    if debug_login {
-        // Debug rooms keep their state in process memory: no write reaches the
-        // shared cellar, and the room is discarded when the process exits.
-        spawner = spawner.with_no_persist();
-    }
     let spawner = Arc::new(spawner);
 
     let room_manager = RoomBridgeManager::new(spawner);
@@ -84,26 +80,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new(db, args.salt, oauth, room_manager)
         .with_public_url(&args.public_url)
         .with_cellar_proxy(CellarProxy::new(&args.cellar_url)?);
-    if debug_login {
-        state = state.with_debug_login();
+    if local_login {
+        state = state.with_local_login();
+    } else {
+        tracing::info!("Google OAuth redirect URI: {}", state.oauth_redirect_uri());
     }
-    tracing::info!("Google OAuth redirect URI: {}", state.oauth_redirect_uri());
+    if let Some(web_root) = &args.web_root {
+        tracing::info!("Serving SPA from {:?}", web_root);
+        state = state.with_web_root(web_root);
+    }
     if !args.cors_origins.is_empty() {
         tracing::info!("CORS allowed origins: {}", args.cors_origins.join(", "));
         state = state.with_allowed_origins(args.cors_origins);
     }
-    // Issue #229: development-only, opt-in private-network origins. Bistrot
+    // Issue #229: development-only, opt-in private-network origins. alhalte-restaurant
     // emits the port only for the bundled local-development configuration.
     if !args.allow_lan_origin_ports.is_empty() {
         tracing::warn!(
-            "Development-only LAN origins enabled for http://<private IPv4>:{:?}; never use this on a public network",
+            "Private-network LAN origins enabled for http://<private IPv4>:{:?}; never use this on a public network",
             args.allow_lan_origin_ports
         );
         state = state.with_lan_origin_ports(args.allow_lan_origin_ports);
     }
     let app = create_router(state);
 
-    // If an optional UNIX domain socket is specified, also serve on it
+    // If an optional UNIX domain socket is specified, also serve on it.
+    #[cfg(unix)]
     if let Some(unix_path) = &args.unix_socket {
         if unix_path.exists() {
             let _ = tokio::fs::remove_file(unix_path).await;
@@ -120,6 +122,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::error!("UNIX socket server error: {e:?}");
             }
         });
+    }
+    #[cfg(not(unix))]
+    if args.unix_socket.is_some() {
+        return Err(std::io::Error::other(
+            "--unix-socket is not supported on Windows; use the TCP listener",
+        )
+        .into());
     }
 
     let addr = format!("{}:{}", args.host, args.port);

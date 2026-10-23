@@ -48,9 +48,9 @@ Tin.payload = postcard((Generast, speaker_character_id: u64))
 
 ## 配布
 
-- `Bistrot.toml` の `[[extensions]]` に `id`、wasm の path、`enabled` を書く。表示名・アイコン・説明は wasm の `self_introduction` が正で、設定ファイルには `name` を書かない（Issue #274）。
+- `Restaurant.toml` の `[[extensions]]` に `id`、wasm の path、`enabled` を書く。表示名・アイコン・説明は wasm の `self_introduction` が正で、設定ファイルには `name` を書かない（Issue #274）。
 - `alhalte-bistrot stage-extensions --output-dir <dir>` が `<id>.wasm` をコピーし、`manifest.json` を生成する。
-- manifest は `id`、`url`、`enabled`、`priority` を持ち、`name` は持たない。`priority` は `Bistrot.toml` の定義順（0-based）。
+- manifest は `id`、`url`、`enabled`、`priority` を持ち、`name` は持たない。`priority` は `Restaurant.toml` の定義順（0-based）。
 - `alhalte-argenterie` は `.wasm` を読み、ABI バージョン（1 または 2）と必須エクスポートを検証してからパイプラインに登録する。
 - ABI 2 の `self_introduction` が返す `id` が manifest の `id` と一致しない wasm は実行せず、`wasmMissing: true` として扱う（fail-closed）。ABI 1 は id を持たないため manifest id を使う。
 

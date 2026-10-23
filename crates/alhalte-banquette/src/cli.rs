@@ -22,13 +22,20 @@ pub struct CliArgs {
     #[arg(long, alias = "owner", env = "ALHALTE_ADMIN_ACCOUNT")]
     pub admin: u64,
 
-    /// UNIX domain socket path for communication with `alhalte-maitre-d`.
+    /// UNIX domain socket path for communication with `alhalte-maitre-d` (Unix).
     #[arg(
         long,
         default_value = "/tmp/alhalte-banquette.sock",
         env = "ALHALTE_SOCKET_PATH"
     )]
     pub socket: PathBuf,
+
+    /// Windows named-pipe path for communication with `alhalte-maitre-d`.
+    ///
+    /// Required on Windows (for example `\\.\pipe\alhalte-banquette-...`);
+    /// ignored on Unix.
+    #[arg(long, env = "ALHALTE_PIPE_NAME")]
+    pub pipe_name: Option<String>,
 
     /// Base HTTP URL of the `alhalte-cellar` content storage service.
     ///
@@ -72,17 +79,6 @@ pub struct CliArgs {
     /// `--service-token`.
     #[arg(long, env = "ALHALTE_SERVICE_TOKEN_FILE")]
     pub service_token_file: Option<PathBuf>,
-
-    /// Keeps room state and log chunks in process memory instead of cellar.
-    ///
-    /// `alhalte-maitre-d --debug-login` passes this so a debug instance never
-    /// writes to the shared `alhalte-cellar`: nothing is persisted, superseded
-    /// heads are not released, and the room disappears when the process exits.
-    /// The head normally comes from the cellar alias, so `--no-persist` starts
-    /// an empty in-memory room (Issue #150). `ALHALTE_NO_PERSIST` is a value
-    /// switch: set it to `true` (or `false`).
-    #[arg(long, env = "ALHALTE_NO_PERSIST")]
-    pub no_persist: bool,
 }
 
 impl CliArgs {
@@ -175,25 +171,28 @@ mod tests {
         assert!(parse_room_id_arg("18446744073709551616").is_err());
     }
 
-    // spec: alhalte-banquette/persistence 0008 --no-persist disables cellar writes
+    // spec: alhalte-banquette/transport 0002 --pipe-name selects the Windows transport
     #[test]
-    fn parses_no_persist() {
+    fn parses_named_pipe_transport() {
         let args = CliArgs::try_parse_from([
             "alhalte-banquette",
             "--room-id",
             "777",
             "--admin",
             "1",
-            "--no-persist",
+            "--pipe-name",
+            r"\\.\pipe\alhalte-banquette-test",
         ])
         .unwrap();
-        assert!(args.no_persist);
+        assert_eq!(
+            args.pipe_name.as_deref(),
+            Some(r"\\.\pipe\alhalte-banquette-test")
+        );
 
-        // Persistence is on by default.
         let args =
             CliArgs::try_parse_from(["alhalte-banquette", "--room-id", "777", "--admin", "1"])
                 .unwrap();
-        assert!(!args.no_persist);
+        assert_eq!(args.pipe_name, None);
     }
 
     // spec: alhalte-banquette/persistence 0007 the room head comes from cellar, not argv

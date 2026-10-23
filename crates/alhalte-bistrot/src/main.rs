@@ -2,9 +2,9 @@
 
 #![deny(unsafe_code)]
 
-use alhalte_bistrot::{
-    BistrotError, SystemdOptions, encrypt_age_armored_value, encrypt_bistrot_toml,
-    generate_all_args, generate_module_args, generate_systemd_units, load_from_path_with_key,
+use alhalte_bistrot::{DEFAULT_SYSTEMD_BIN_DIR, SystemdOptions, generate_systemd_units};
+use alhalte_restaurant::{
+    encrypt_age_armored_value, encrypt_restaurant_toml, load_restaurant_from_path_with_key,
     write_secret_files,
 };
 use clap::{Parser, Subcommand};
@@ -17,12 +17,12 @@ use std::process::ExitCode;
     name = "alhalte-bistrot",
     author,
     version,
-    about = "Alhalte restaurant configuration manager, argument generator, and systemd unit generator"
+    about = "Generate Alhalte systemd units from Restaurant.toml"
 )]
 struct Cli {
-    /// Path to the Bistrot.toml configuration file.
-    #[arg(short, long, default_value = "Bistrot.toml")]
-    config: PathBuf,
+    /// Path to the Restaurant.toml configuration file (default: Restaurant.toml).
+    #[arg(short, long)]
+    config: Option<PathBuf>,
 
     /// Age secret key to decrypt secrets (overrides ROPS_AGE and ALHALTE_AGE_KEY).
     #[arg(long, env = "ROPS_AGE")]
@@ -34,17 +34,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Generate command-line arguments for Alhalte modules.
-    Args {
-        /// Target module name ("maitre-d", "cellar", or "all").
-        #[arg(default_value = "all")]
-        module: String,
-    },
-
     /// Generate systemd unit configuration files.
     Systemd {
         /// Directory where module binaries are installed.
-        #[arg(long, default_value = "/usr/local/bin")]
+        #[arg(long, default_value = DEFAULT_SYSTEMD_BIN_DIR)]
         bin_dir: PathBuf,
 
         /// Output directory to write unit files into (if omitted, prints to stdout).
@@ -55,13 +48,11 @@ enum Commands {
         #[arg(long)]
         working_dir: Option<PathBuf>,
 
-        /// Directory for alhalte-argenterie web frontend.
+        /// Directory containing the built SPA, passed as maitre-d --web-root.
+        ///
+        /// Defaults to `<data-dir>/web`.
         #[arg(long)]
-        web_dir: Option<PathBuf>,
-
-        /// Optional path to pnpm executable.
-        #[arg(long)]
-        pnpm_bin: Option<PathBuf>,
+        web_root: Option<PathBuf>,
 
         /// Linux user under which to execute services.
         #[arg(long)]
@@ -70,33 +61,12 @@ enum Commands {
         /// Linux group under which to execute services.
         #[arg(long)]
         group: Option<String>,
-
-        /// Optional extra PATH environment variable for services.
-        #[arg(long)]
-        extra_path: Option<String>,
-    },
-
-    /// Print the argenterie frontend URL.
-    Url {
-        /// Print the best-effort LAN URL instead of the loopback URL.
-        ///
-        /// Prints nothing (and exits successfully) when no LAN address can be
-        /// detected. Only meaningful with `[argenterie] lan = true`.
-        #[arg(long)]
-        lan: bool,
     },
 
     /// Validate configuration and print parsed summary.
     Validate,
 
-    /// Stage compiled extensions into output directory and generate manifest.json.
-    StageExtensions {
-        /// Target directory to copy .wasm files and write manifest.json.
-        #[arg(short, long)]
-        output_dir: PathBuf,
-    },
-
-    /// Encrypt a plain Bistrot.toml using an age public recipient key.
+    /// Encrypt a plain Restaurant.toml using an age public recipient key.
     Encrypt {
         /// Age recipient public key (e.g. `age1...`).
         #[arg(short, long)]
@@ -109,8 +79,9 @@ enum Commands {
 
     /// Encrypt one secret value from stdin into an age ASCII-armored block.
     ///
-    /// Paste the output into Bistrot.toml as the value of `maitre-d.client-secret`
-    /// or `cellar.service-token` using a TOML multi-line string.
+    /// Paste the output into Restaurant.toml as the value of
+    /// `maitre-d.client-secret` or `cellar.service-token` using a TOML
+    /// multi-line string.
     EncryptValue {
         /// Age recipient public key (e.g. `age1...`).
         #[arg(short, long)]
@@ -120,7 +91,6 @@ enum Commands {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
-
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -130,67 +100,41 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(cli: Cli) -> Result<(), BistrotError> {
+fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let config_path = cli
+        .config
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("Restaurant.toml"));
     match cli.command {
-        Commands::Args { module } => {
-            let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
-            // Secrets are injected as 0600 files (Issue #194); materialize them
-            // before printing the arguments that point at them.
-            let secrets = write_secret_files(&config)?;
-
-            if module.eq_ignore_ascii_case("all") {
-                let all_args = generate_all_args(&config);
-                println!("[alhalte-maitre-d]");
-                println!("{}", all_args.maitre_d.join(" "));
-                println!("\n[alhalte-cellar]");
-                println!("{}", all_args.cellar.join(" "));
-            } else {
-                let args = generate_module_args(&config, &module)?;
-                println!("{}", args.join(" "));
-            }
-            eprintln!(
-                "Secrets materialized in {} (mode 0600)",
-                secrets.dir.display()
-            );
-        }
         Commands::Systemd {
             bin_dir,
             output_dir,
             working_dir,
-            web_dir,
-            pnpm_bin,
+            web_root,
             user,
             group,
-            extra_path,
         } => {
-            let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
+            let mut config =
+                load_restaurant_from_path_with_key(&config_path, cli.age_key.as_deref())?;
+            let config_dir = config_path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("."));
+            config.resolve_relative_paths(&config_dir);
             // The units only reference secret files, so they must exist before
             // systemd starts the services.
             write_secret_files(&config)?;
-            let pnpm_bin = pnpm_bin.or_else(|| {
-                std::env::var_os("PATH").and_then(|paths| {
-                    std::env::split_paths(&paths).find_map(|dir| {
-                        let candidate = dir.join("pnpm");
-                        if candidate.is_file() {
-                            Some(candidate)
-                        } else {
-                            None
-                        }
-                    })
-                })
-            });
-            let extra_path = extra_path.or_else(|| std::env::var("PATH").ok());
+
+            let web_root = web_root.unwrap_or_else(|| config.restaurant.data_dir.join("web"));
             let options = SystemdOptions {
                 bin_dir,
                 working_dir,
-                web_dir,
-                pnpm_bin,
+                web_root: Some(web_root),
                 user,
                 group,
-                extra_path,
                 ..Default::default()
             };
-
             let units = generate_systemd_units(&config, &options);
 
             if let Some(dir) = output_dir {
@@ -200,53 +144,30 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
                     dir.display()
                 );
             } else {
+                println!("=== alhalte-cellar.service ===\n{}", units.cellar_service);
                 println!(
                     "=== alhalte-maitre-d.service ===\n{}",
                     units.maitre_d_service
                 );
-                println!("=== alhalte-cellar.service ===\n{}", units.cellar_service);
-                println!(
-                    "=== alhalte-argenterie.service ===\n{}",
-                    units.argenterie_service
-                );
-                println!("=== alhalte-bistrot.target ===\n{}", units.bistrot_target);
+                println!("=== alhalte.target ===\n{}", units.target);
             }
-        }
-        Commands::Url { lan } => {
-            let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
-            if lan {
-                // Best-effort: print every detected LAN URL, one per line, and
-                // say nothing when detection fails (the runner treats empty
-                // output as "no LAN URL").
-                if config.argenterie.lan {
-                    for url in alhalte_bistrot::detect_lan_urls(config.argenterie.port) {
-                        println!("{url}");
-                    }
-                }
-            } else {
-                println!("{}", config.argenterie_url());
-            }
+            Ok(())
         }
         Commands::Validate => {
-            let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
-            println!("Configuration in '{}' is valid.", cli.config.display());
+            let config = load_restaurant_from_path_with_key(&config_path, cli.age_key.as_deref())?;
+            println!("Configuration in '{}' is valid.", config_path.display());
             println!("  Domain:       {}", config.restaurant.domain);
             println!("  Host:         {}", config.restaurant.host);
             println!("  Data dir:     {}", config.restaurant.data_dir.display());
             println!("  Socket dir:   {}", config.restaurant.socket_dir.display());
             println!("  maitre-d port: {}", config.maitre_d.port);
             println!("  cellar port:   {}", config.cellar.port);
-            println!("  argenterie port: {}", config.argenterie.port);
-            println!("  argenterie bind: {}", config.argenterie_bind_host());
+            println!("  UI url:        {}", config.maitre_d_url());
+            println!("  public url:    {}", config.maitre_d_public_url());
             println!(
-                "  argenterie lan:  {}",
-                if config.argenterie.lan {
-                    "enabled (development only)"
-                } else {
-                    "disabled"
-                }
+                "  LAN exposed:   {}",
+                if config.is_lan_exposed() { "yes" } else { "no" }
             );
-            println!("  argenterie url:  {}", config.argenterie_url());
             println!(
                 "  banquette N:   {} (chunk size: {})",
                 config.banquette.chunk_size_exponent,
@@ -254,8 +175,6 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             );
             println!("  Extensions:    {} configured", config.extensions.len());
             for ext in &config.extensions {
-                // Display metadata comes from the wasm (Issue #274); `validate`
-                // only reports the configuration fields it owns.
                 println!(
                     "    - [{}] (path: {}, enabled: {})",
                     ext.id,
@@ -263,27 +182,18 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
                     ext.enabled
                 );
             }
-        }
-        Commands::StageExtensions { output_dir } => {
-            let config = load_from_path_with_key(&cli.config, cli.age_key.as_deref())?;
-            let base_dir = cli.config.parent();
-            let entries = config.stage_extensions_with_base(&output_dir, base_dir)?;
-            println!(
-                "Successfully staged {} extension(s) to {}",
-                entries.len(),
-                output_dir.display()
-            );
+            Ok(())
         }
         Commands::Encrypt { recipient, output } => {
-            let plain_content = std::fs::read_to_string(&cli.config)?;
-            let encrypted = encrypt_bistrot_toml(&plain_content, &recipient)?;
-
+            let plain_content = std::fs::read_to_string(&config_path)?;
+            let encrypted = encrypt_restaurant_toml(&plain_content, &recipient)?;
             if let Some(out_path) = output {
                 std::fs::write(&out_path, encrypted)?;
                 println!("Encrypted configuration written to {}", out_path.display());
             } else {
                 print!("{encrypted}");
             }
+            Ok(())
         }
         Commands::EncryptValue { recipient } => {
             let mut plaintext = String::new();
@@ -292,8 +202,7 @@ fn run(cli: Cli) -> Result<(), BistrotError> {
             let plaintext = plaintext.trim_end_matches(['\n', '\r']);
             let encrypted = encrypt_age_armored_value(plaintext, &recipient)?;
             println!("{encrypted}");
+            Ok(())
         }
     }
-
-    Ok(())
 }

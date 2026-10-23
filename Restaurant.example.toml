@@ -1,10 +1,10 @@
-# Bistrot.example.toml — Alhalte 構成ファイルのテンプレート（プレースホルダ）
+# Restaurant.example.toml — Alhalte 構成ファイルのテンプレート（プレースホルダ）
 #
 # このファイルはそのままでは起動できない。秘密値がプレースホルダのままで、
 # Bistrot は復号に失敗する（fail-closed）。実際に使うときは次の手順で
-# gitignore 済みの `Bistrot.local.toml` を作る:
+# gitignore 済みの `Restaurant.local.toml` を作る:
 #
-#   1. cp Bistrot.example.toml Bistrot.local.toml
+#   1. cp Restaurant.example.toml Restaurant.local.toml
 #   2. age の鍵を作る（既存の鍵があれば不要）
 #        age-keygen -o .alhalte/age-identity.txt      # 公開鍵 age1... が表示される
 #   3. 秘密値を armored 形式に変換する（標準入力の平文を暗号化する）
@@ -15,7 +15,7 @@
 #   4. 出力（-----BEGIN AGE ENCRYPTED FILE----- 〜 -----END ...-----）を
 #      下の `client-secret` / `service-token` の複数行文字列にそのまま貼る。
 #   5. 起動時に identity を渡す
-#        nix run .#bistrot -- --config Bistrot.local.toml
+#        nix run .#bistrot -- --config Restaurant.local.toml systemd ...
 #        # identity は --age-key / ROPS_AGE / ALHALTE_AGE_KEY の順で解決される
 #        export ROPS_AGE="$(cat .alhalte/age-identity.txt)"
 #
@@ -50,20 +50,15 @@ client-secret = """
 salt = "REPLACE_WITH_RANDOM_INSTANCE_SALT"
 # public-url は OAuth の redirect_uri の基点。省略時は restaurant.domain から導出。
 # public-url = "https://vtt.example.com"
-# 開発専用: アカウント名だけでサインインできるデバッグログインを有効にする。
-# 有効時は別 DB（<data-dir>/maitre-d-debug.sqlite3）が使われ、banquette は
-# cellar へ永続化しない。公開インスタンスでは絶対に有効にしない（Issue #150）。
-# debug-login = false
+# ローカル / 信頼できる LAN 用: アカウント名 + パスワードのローカルログイン。
+# アカウント / session / rooms は別 DB（<data-dir>/maitre-d-local.sqlite3）に
+# 分離され、部屋状態は通常どおり cellar に永続化される。UI は SPA の /login を
+# 使い、HTTP なのでインターネットには公開しないこと。
+# local-login = false
 
 [cellar]
 port = 8081
 anti-oracle = false
-# maitre-d の session 検証エンドポイント。省略時は
-# http://<restaurant.host>:<maitre-d.port>（0.0.0.0 / :: は 127.0.0.1）。
-# maitre-d-url = "http://127.0.0.1:8080"
-# maitre-d-socket = "/run/alhalte/maitre-d.sock"   # 指定時は url より優先
-# ローカル開発専用。true にするとすべての session を許可する（既定 false）。
-allow-all-sessions = false
 # maitre-d / banquette / cellar が共有する内部書き込み用トークン。
 # age armor で暗号化する（未設定なら banquette の部屋状態 persistence は拒否される）。
 service-token = """
@@ -74,16 +69,8 @@ service-token = """
 
 [banquette]
 chunk-size-exponent = 8
-
-[argenterie]
-port = 5173
-# 開発専用（Issue #229）: 同一イーサネット / LAN 内の端末から UI を開けるようにする。
-#
-# true にすると Vite が 0.0.0.0 で待ち受け、maitre-d が
-# http://<プライベート IPv4>:<argenterie.port> の origin を CORS / return_to に
-# 追加で許可する（ワイルドカードではない）。UI は TLS なしの HTTP なので、
-# 公開ネットワークでは絶対に有効にしない。既定は false（ループバックのみ）。
-# lan = false
+# 部屋状態を cellar に保存する間隔（秒）。ポータブル版は 60。
+# heartbeat-interval-secs = 240
 
 [[extensions]]
 id = "alhalte-dsl"

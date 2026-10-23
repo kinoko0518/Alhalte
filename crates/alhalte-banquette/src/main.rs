@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use alhalte_banquette::cellar_sink::{CellarSink, HttpCellarSink, InMemoryCellarSink};
+use alhalte_banquette::cellar_sink::{CellarSink, HttpCellarSink};
 use alhalte_banquette::cli::parse_cli_args;
 use alhalte_banquette::room::Room;
 use alhalte_banquette::server::{BanquetteServer, ServerConfig};
@@ -14,39 +14,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = parse_cli_args();
     tracing::info!(
-        "Starting alhalte-banquette room_id={:016x} admin={} socket={:?}",
+        "Starting alhalte-banquette room_id={:016x} admin={} socket={:?} pipe={:?}",
         args.room_id,
         args.admin,
-        args.socket
+        args.socket,
+        args.pipe_name
     );
 
-    // `--no-persist` (maitre-d --debug-login) keeps everything in process memory:
-    // no write, unregister, or download ever reaches the shared cellar, so a
-    // debug instance cannot disturb a real one (Issue #150).
-    let cellar: Arc<dyn CellarSink> = if args.no_persist {
-        tracing::warn!(
-            "No-persist mode: room {:016x} state and log chunks stay in process memory and are \
-             never written to cellar",
-            args.room_id
-        );
-        Arc::new(InMemoryCellarSink::new())
-    } else {
-        // The token comes from a 0600 file when maitre-d forwards one; argv and
-        // the environment stay backward compatible (Issue #194).
-        let service_token = args.resolve_service_token()?;
-        let mut cellar = HttpCellarSink::new(args.cellar_url);
-        match service_token {
-            Some(token) => cellar = cellar.with_service_token(token),
-            // Head alias writes are service-token only, so a token is now
-            // required for persistence even when a user session could authorize
-            // the store.
-            None => tracing::warn!(
-                "No --service-token-file configured: room state persistence will fail because the \
-                 room head alias is written with the cellar service token"
-            ),
-        }
-        Arc::new(cellar)
-    };
+    // The token comes from a 0600 file when maitre-d forwards one; argv and
+    // the environment stay backward compatible (Issue #194).
+    let service_token = args.resolve_service_token()?;
+    let mut http_cellar = HttpCellarSink::new(args.cellar_url);
+    match service_token {
+        Some(token) => http_cellar = http_cellar.with_service_token(token),
+        // Head alias writes are service-token only, so a token is now
+        // required for persistence even when a user session could authorize
+        // the store.
+        None => tracing::warn!(
+            "No --service-token-file configured: room state persistence will fail because the \
+             room head alias is written with the cellar service token"
+        ),
+    }
+    let cellar: Arc<dyn CellarSink> = Arc::new(http_cellar);
 
     // The room restores itself from cellar: the `room/<room_id>/head` alias is
     // the only source of a persisted head, so nothing is passed on the command
@@ -62,6 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = ServerConfig {
         socket_path: args.socket,
+        pipe_name: args.pipe_name,
         heartbeat_interval: Duration::from_secs(args.heartbeat_interval_secs),
     };
 
@@ -93,10 +83,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// Resolves when the process receives `SIGTERM` or `SIGINT`.
+/// Resolves when the process receives `SIGTERM` / `SIGINT` (Unix) or Ctrl+C
+/// (Windows).
 ///
 /// Used by the standalone binary only; tests drive [`BanquetteServer::run_until_shutdown`]
 /// directly with the same shutdown channel.
+#[cfg(unix)]
 async fn wait_for_termination_signal() -> std::io::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
 
@@ -109,4 +101,9 @@ async fn wait_for_termination_signal() -> std::io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(not(unix))]
+async fn wait_for_termination_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }

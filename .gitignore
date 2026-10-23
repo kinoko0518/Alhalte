@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 node_modules/
 dist/
 build/
@@ -12,6 +11,12 @@ build/
 result
 result-*
 /.alhalte
+/.nix-cache/
+/.pnpm-store/
+/.cargo-home/
 /.worktrees/
 /web/alhalte-argenterie/public/extensions/
-/Bistrot.local.toml
+/Restaurant.local.toml
+
+# Production SPA build (maitre-d --web-root)
+/web/alhalte-argenterie/dist-app/

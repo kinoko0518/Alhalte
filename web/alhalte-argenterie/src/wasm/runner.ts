@@ -531,7 +531,7 @@ export function deleteExtension(
 }
 
 /**
- * Default official extensions configured in Bistrot.toml.
+ * Default official extensions configured in Restaurant.toml.
  *
  * Offline / test fallback only: the display metadata of the real rows comes
  * from each staged wasm (`self_introduction`, ABI 2). The values here must stay

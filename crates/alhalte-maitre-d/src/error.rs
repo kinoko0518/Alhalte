@@ -20,10 +20,10 @@ pub enum MaitreDError {
 
     /// The configured authentication provider does not serve this flow.
     ///
-    /// `maitre-d --debug-login` installs the debug provider, which has no Google
+    /// `maitre-d --local-login` installs the local provider, which has no Google
     /// code exchange or ID token verification. The HTTP layer maps this to
     /// `401 Unauthorized`; the Google routes are not even registered while the
-    /// debug login is active.
+    /// local login is active.
     #[error("Authentication flow is not available: {0}")]
     AuthFlowUnavailable(&'static str),
 
@@ -34,6 +34,20 @@ pub enum MaitreDError {
     /// Unauthorized access or invalid session.
     #[error("Unauthorized: invalid account ID or session ID")]
     Unauthorized,
+
+    /// The local login account name or password did not match.
+    ///
+    /// Deliberately does not distinguish "no such account" from "wrong
+    /// password": the local login API answers the same 401 for both.
+    #[error("Unauthorized: invalid account name or password")]
+    InvalidCredentials,
+
+    /// An Argon2 password hash could not be created or parsed.
+    ///
+    /// The message is generic on purpose; neither the password nor the stored
+    /// hash may appear in an error or a log line.
+    #[error("password hashing error: {0}")]
+    PasswordHash(String),
 
     /// Account not found.
     #[error("Account not found: {0}")]

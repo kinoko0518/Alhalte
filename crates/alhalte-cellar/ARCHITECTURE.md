@@ -70,7 +70,7 @@ CLI（`CliArgs`）: `--host`、`--port`、`--storage-path`、`--db-path`、`--an
 
 ### 外部接続
 
-`MaitreDVerifier` は `alhalte-maitre-d` の `GET /api/verify-session?owner=...&session_id=...` を HTTP または UNIX ソケットで呼ぶ。テストでは `InMemorySessionVerifier` を使う。
+`MaitreDVerifier` は `alhalte-maitre-d` の `GET /api/verify-session?owner=...&session_id=...` を HTTP または UNIX ソケットで呼ぶ。UNIX ソケット経路は `#[cfg(unix)]` で、Windows は `--maitre-d-url`（HTTP）を使う。テストでは `InMemorySessionVerifier` を使う。
 
 ## データ形式
 

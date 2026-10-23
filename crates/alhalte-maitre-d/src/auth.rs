@@ -1,19 +1,17 @@
-//! Authentication providers: the Google OAuth flow and the isolated debug login.
+//! Authentication providers: Google OAuth and the local password login.
 //!
-//! Issue #150 made the authentication path a trait instead of a branch inside the
-//! Google flow. [`AuthProvider`] answers "how does this instance turn a browser
-//! request into an account?":
+//! [`AuthProvider`] answers "how does this instance turn a browser request into
+//! an account?":
 //!
 //! - [`GoogleAuthProvider`] is the normal flow: a single-use state, the fixed
 //!   `{public_url}/auth/google/callback` redirect URI, and a `sub` exchange.
-//! - [`DebugAuthProvider`] is the development-only flow enabled by
-//!   `maitre-d --debug-login`: an account name typed into a plain HTML form is
-//!   the whole credential, and the account is created on first use.
+//! - [`LocalAuthProvider`] is the local password flow enabled by
+//!   `maitre-d --local-login`: the browser is sent to the SPA `/login` route,
+//!   which posts the account name and password to `/api/auth/local/login`.
 //!
 //! Both resolve to an [`AuthIdentity`], which is hashed with the instance salt
-//! before it reaches SQLite. The debug login is isolated at the storage layer:
-//! `maitre-d` opens a separate SQLite file and never persists room state while it
-//! is active ([`crate::cli::CliArgs::active_db_path`]).
+//! before it reaches SQLite. The local login has its own SQLite file
+//! (`maitre-d-local.sqlite3`), so local accounts never mix with Google accounts.
 
 use std::fmt;
 use std::sync::Arc;
@@ -27,16 +25,16 @@ use crate::oauth::OAuthProvider;
 /// Default handle name of an account created by a provider.
 pub const DEFAULT_HANDLE_NAME: &str = "Anonymous";
 
-/// Maximum accepted account name length for the debug login form, in Unicode
+/// Maximum accepted account name length for the local login form, in Unicode
 /// scalar values.
-pub const MAX_DEBUG_ACCOUNT_NAME_LEN: usize = 100;
+pub const MAX_ACCOUNT_NAME_LEN: usize = 100;
 
-/// Prefix of the synthetic subject a debug login derives from an account name.
+/// Prefix of the synthetic subject a local login derives from an account name.
 ///
 /// The subject is hashed with the instance salt exactly like a Google `sub`, so
-/// the debug database stores a `sub_hash` and nothing that identifies the name
+/// the local database stores a `sub_hash` and nothing that identifies the name
 /// directly.
-pub const DEBUG_SUBJECT_PREFIX: &str = "alhalte/debug-login/";
+pub const LOCAL_SUBJECT_PREFIX: &str = "alhalte/local-login/";
 
 /// Which login flow an [`AuthProvider`] implements.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -44,29 +42,29 @@ pub enum AuthKind {
     /// Google OAuth 2.0 — the normal flow of a public instance.
     #[default]
     Google,
-    /// Debug login: an account name is the whole credential (Issue #150).
-    Debug,
+    /// Local password login: account name + password, backed by the local DB.
+    Local,
 }
 
 impl AuthKind {
-    /// Returns the stable name of the flow (`google` / `debug`).
+    /// Returns the stable name of the flow (`google` / `local`).
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Google => "google",
-            Self::Debug => "debug",
+            Self::Local => "local",
         }
     }
 
-    /// Returns true for [`AuthKind::Debug`].
-    pub fn is_debug(&self) -> bool {
-        matches!(self, Self::Debug)
+    /// Returns true for [`AuthKind::Local`].
+    pub fn is_local(&self) -> bool {
+        matches!(self, Self::Local)
     }
 }
 
 /// Identity a provider resolved from a request, before the account lookup.
 ///
 /// The subject is the raw provider identifier (a Google `sub`, or the synthetic
-/// debug key). [`AuthIdentity::into_sub_hash`] hashes and zeroizes it, so the raw
+/// local key). [`AuthIdentity::into_sub_hash`] hashes and zeroizes it, so the raw
 /// value never reaches SQLite, a log line, or an HTTP response; [`Debug`](fmt::Debug)
 /// redacts it for the same reason.
 #[derive(Clone, PartialEq, Eq)]
@@ -127,15 +125,15 @@ impl fmt::Debug for AuthIdentity {
     }
 }
 
-/// Validates and normalizes the account name submitted to the debug login form.
+/// Validates and normalizes the account name submitted to the local login form.
 ///
 /// Returns the trimmed name when it is non-empty, at most
-/// [`MAX_DEBUG_ACCOUNT_NAME_LEN`] characters, and contains no control characters.
-/// The trimmed name is both the login key and the initial handle name, so two
-/// logins with the same name land on the same account.
-pub fn parse_debug_account_name(raw: &str) -> Option<String> {
+/// [`MAX_ACCOUNT_NAME_LEN`] characters, and contains no control characters. The
+/// trimmed name is both the login key and the initial handle name, so two logins
+/// with the same name land on the same account.
+pub fn parse_local_account_name(raw: &str) -> Option<String> {
     let name = raw.trim();
-    if name.is_empty() || name.chars().count() > MAX_DEBUG_ACCOUNT_NAME_LEN {
+    if name.is_empty() || name.chars().count() > MAX_ACCOUNT_NAME_LEN {
         return None;
     }
     if name.chars().any(char::is_control) {
@@ -146,7 +144,7 @@ pub fn parse_debug_account_name(raw: &str) -> Option<String> {
 
 /// Percent-encodes `value` as a single query-string component.
 ///
-/// Used to build the debug login form URL and the OAuth authorization URL; the
+/// Used to build the local login redirect and the OAuth authorization URL; the
 /// encoding is RFC 3986 unreserved-set based, so `/`, `?`, `&` and `#` survive
 /// only in their escaped form.
 pub fn percent_encode(value: &str) -> String {
@@ -164,7 +162,7 @@ pub fn percent_encode(value: &str) -> String {
 
 /// Abstraction over the login flows `alhalte-maitre-d` can serve.
 ///
-/// The HTTP layer never branches on "debug or Google": it asks the provider for
+/// The HTTP layer never branches on "local or Google": it asks the provider for
 /// the next step. A provider that does not implement a flow returns `None` (for
 /// the methods that answer "is this step mine?") or
 /// [`MaitreDError::AuthFlowUnavailable`] (for the Google exchange calls).
@@ -179,11 +177,13 @@ pub trait AuthProvider: Send + Sync {
     /// issues a single-use state and redirects to `accounts.google.com`.
     fn login_redirect(&self, return_to: &str) -> Option<String>;
 
-    /// Resolves the identity of a debug login form submission.
+    /// Resolves the identity of a local login form submission.
     ///
     /// `None` means the name is unusable (empty, too long, or control characters)
-    /// or that this provider has no debug form.
-    fn debug_identity(&self, account_name: &str) -> Option<AuthIdentity>;
+    /// or that this provider has no local form.
+    fn local_identity(&self, _account_name: &str) -> Option<AuthIdentity> {
+        None
+    }
 
     /// Builds the Google authorization URL bound to `state`.
     ///
@@ -200,7 +200,7 @@ pub trait AuthProvider: Send + Sync {
 /// [`AuthProvider`] for the normal Google OAuth 2.0 flow.
 ///
 /// Wraps any [`OAuthProvider`], so `maitre-d` uses the same production provider
-/// and the same offline mock as before Issue #150.
+/// and the same offline mock as before.
 pub struct GoogleAuthProvider {
     oauth: Arc<dyn OAuthProvider>,
 }
@@ -233,10 +233,6 @@ impl AuthProvider for GoogleAuthProvider {
         None
     }
 
-    fn debug_identity(&self, _account_name: &str) -> Option<AuthIdentity> {
-        None
-    }
-
     fn authorization_url(&self, redirect_uri: &str, state: &str) -> Option<String> {
         Some(self.oauth.authorization_url(redirect_uri, state))
     }
@@ -252,39 +248,36 @@ impl AuthProvider for GoogleAuthProvider {
     }
 }
 
-/// [`AuthProvider`] for the isolated debug login (Issue #150).
+/// [`AuthProvider`] for the local password login.
 ///
-/// The credential is an account name. A name that has never been seen creates an
-/// account; a known name reuses it, because the derived subject is deterministic.
-/// Only `maitre-d --debug-login` installs this provider, and the account lives in
-/// the debug SQLite file, never in the normal one.
+/// The browser is sent to the SPA `/login` route. The account name and password
+/// are posted to `/api/auth/local/login`, which verifies the Argon2id hash in the
+/// local SQLite file. A name that has never been seen creates an account; a known
+/// name reuses it, because the derived subject is deterministic.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct DebugAuthProvider;
+pub struct LocalAuthProvider;
 
-impl DebugAuthProvider {
-    /// Creates the debug login provider.
+impl LocalAuthProvider {
+    /// Creates the local login provider.
     pub fn new() -> Self {
         Self
     }
 }
 
 #[async_trait]
-impl AuthProvider for DebugAuthProvider {
+impl AuthProvider for LocalAuthProvider {
     fn kind(&self) -> AuthKind {
-        AuthKind::Debug
+        AuthKind::Local
     }
 
     fn login_redirect(&self, return_to: &str) -> Option<String> {
-        Some(format!(
-            "/auth/debug/login?return_to={}",
-            percent_encode(return_to)
-        ))
+        Some(format!("/login?return_to={}", percent_encode(return_to)))
     }
 
-    fn debug_identity(&self, account_name: &str) -> Option<AuthIdentity> {
-        let name = parse_debug_account_name(account_name)?;
+    fn local_identity(&self, account_name: &str) -> Option<AuthIdentity> {
+        let name = parse_local_account_name(account_name)?;
         Some(AuthIdentity::new(
-            format!("{DEBUG_SUBJECT_PREFIX}{name}"),
+            format!("{LOCAL_SUBJECT_PREFIX}{name}"),
             name,
         ))
     }
@@ -311,33 +304,33 @@ mod tests {
     use super::*;
     use crate::oauth::MockOAuthProvider;
 
-    // spec: alhalte-maitre-d/debug-login 0002 the debug provider derives the
+    // spec: alhalte-maitre-d/local-login 0001 the local provider derives the
     // subject from the trimmed account name only
     #[test]
-    fn debug_provider_derives_a_deterministic_subject() {
-        let provider = DebugAuthProvider::new();
-        assert_eq!(provider.kind(), AuthKind::Debug);
-        assert!(provider.kind().is_debug());
-        assert_eq!(provider.kind().as_str(), "debug");
+    fn local_provider_derives_a_deterministic_subject() {
+        let provider = LocalAuthProvider::new();
+        assert_eq!(provider.kind(), AuthKind::Local);
+        assert!(provider.kind().is_local());
+        assert_eq!(provider.kind().as_str(), "local");
 
-        let identity = provider.debug_identity("  Alice  ").unwrap();
+        let identity = provider.local_identity("  Alice  ").unwrap();
         assert_eq!(identity.handle_name(), "Alice");
         assert_eq!(
             identity.subject(),
-            format!("{DEBUG_SUBJECT_PREFIX}Alice"),
-            "the trimmed name is the whole credential"
+            format!("{LOCAL_SUBJECT_PREFIX}Alice"),
+            "the trimmed name is the login key"
         );
 
         // The same name resolves to the same account, a different one does not.
-        let again = provider.debug_identity("Alice").unwrap();
-        let other = provider.debug_identity("Bob").unwrap();
+        let again = provider.local_identity("Alice").unwrap();
+        let other = provider.local_identity("Bob").unwrap();
         assert_eq!(
             identity.clone().into_sub_hash("salt"),
             again.into_sub_hash("salt")
         );
         assert_ne!(
             provider
-                .debug_identity("Alice")
+                .local_identity("Alice")
                 .unwrap()
                 .into_sub_hash("salt")
                 .0,
@@ -347,49 +340,47 @@ mod tests {
         // The subject is redacted from Debug and zeroized by the hash. The
         // handle name is not a secret, so only the subject itself must not leak.
         let debug = format!("{identity:?}");
-        assert!(!debug.contains(&format!("{DEBUG_SUBJECT_PREFIX}Alice")));
+        assert!(!debug.contains(&format!("{LOCAL_SUBJECT_PREFIX}Alice")));
         assert!(debug.contains("<redacted>"));
 
-        // The debug provider has no Google flow.
+        // The local provider has no Google flow.
         assert_eq!(provider.authorization_url("http://x/cb", "state"), None);
         assert!(provider.login_redirect("http://app.test/").is_some());
     }
 
-    // spec: alhalte-maitre-d/debug-login 0003 only sane account names are accepted
+    // spec: alhalte-maitre-d/local-login 0002 only sane account names are accepted
     #[test]
-    fn debug_account_names_are_validated() {
-        assert_eq!(parse_debug_account_name("  "), None);
-        assert_eq!(parse_debug_account_name(""), None);
-        assert_eq!(parse_debug_account_name("bad\nname"), None);
+    fn local_account_names_are_validated() {
+        assert_eq!(parse_local_account_name("  "), None);
+        assert_eq!(parse_local_account_name(""), None);
+        assert_eq!(parse_local_account_name("bad\nname"), None);
         assert_eq!(
-            parse_debug_account_name(&"x".repeat(MAX_DEBUG_ACCOUNT_NAME_LEN + 1)),
+            parse_local_account_name(&"x".repeat(MAX_ACCOUNT_NAME_LEN + 1)),
             None
         );
         assert_eq!(
-            parse_debug_account_name(&"x".repeat(MAX_DEBUG_ACCOUNT_NAME_LEN)),
-            Some("x".repeat(MAX_DEBUG_ACCOUNT_NAME_LEN))
+            parse_local_account_name(&"x".repeat(MAX_ACCOUNT_NAME_LEN)),
+            Some("x".repeat(MAX_ACCOUNT_NAME_LEN))
         );
         assert_eq!(
-            parse_debug_account_name("  アリス "),
+            parse_local_account_name("  アリス "),
             Some("アリス".to_string())
         );
     }
 
-    // spec: alhalte-maitre-d/debug-login 0004 the debug form URL keeps return_to
+    // spec: alhalte-maitre-d/local-login 0003 the SPA redirect keeps return_to
     #[test]
-    fn debug_login_redirect_encodes_return_to() {
-        let provider = DebugAuthProvider::new();
+    fn local_login_redirect_encodes_return_to() {
+        let provider = LocalAuthProvider::new();
         assert_eq!(
             provider
                 .login_redirect("http://app.test/rooms/1?x=1&y=2#key")
                 .as_deref(),
-            Some(
-                "/auth/debug/login?return_to=http%3A%2F%2Fapp.test%2Frooms%2F1%3Fx%3D1%26y%3D2%23key"
-            )
+            Some("/login?return_to=http%3A%2F%2Fapp.test%2Frooms%2F1%3Fx%3D1%26y%3D2%23key")
         );
         assert_eq!(
             provider.login_redirect("https://app.test/").as_deref(),
-            Some("/auth/debug/login?return_to=https%3A%2F%2Fapp.test%2F")
+            Some("/login?return_to=https%3A%2F%2Fapp.test%2F")
         );
     }
 
@@ -402,9 +393,9 @@ mod tests {
         let provider = GoogleAuthProvider::new(mock);
 
         assert_eq!(provider.kind(), AuthKind::Google);
-        assert!(!provider.kind().is_debug());
+        assert!(!provider.kind().is_local());
         assert_eq!(provider.login_redirect("http://app.test/"), None);
-        assert_eq!(provider.debug_identity("Alice"), None);
+        assert_eq!(provider.local_identity("Alice"), None);
         assert!(provider.authorization_url("http://x/cb", "state").is_some());
 
         let identity = provider

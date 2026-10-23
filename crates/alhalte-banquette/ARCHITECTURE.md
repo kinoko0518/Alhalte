@@ -6,7 +6,7 @@
 
 ## 責務
 
-部屋ごとに 1 プロセスで動くルームデーモン。何を交換するかではなく、どう交換するかを担う。scene のログ・state、character の所有権、クライアントの入退室、WebRTC signaling の中継、cellar への永続化と**部屋全体の復元**を持つ。HTTP サーバーは持たず、`alhalte-maitre-d` と UNIX ソケットで話す。
+部屋ごとに 1 プロセスで動くルームデーモン。何を交換するかではなく、どう交換するかを担う。scene のログ・state、character の所有権、クライアントの入退室、WebRTC signaling の中継、cellar への永続化と**部屋全体の復元**を持つ。HTTP サーバーは持たず、`alhalte-maitre-d` とローカル transport（Unix: UNIX socket、Windows: named pipe）で話す。
 
 ## 公開 API / 外部接続点
 
@@ -14,19 +14,20 @@
 
 | 接続先 | 方向 | 内容 |
 | --- | --- | --- |
-| `alhalte-maitre-d` | 双方向 | UNIX ドメインソケット。4 バイト big-endian 長 + postcard のフレーム。部屋 head はここでは報告しない（Issue #192）。 |
+| `alhalte-maitre-d` | 双方向 | ローカル transport（Unix: UNIX ドメインソケット、Windows: named pipe）。4 バイト big-endian 長 + postcard のフレーム。部屋 head はここでは報告しない（Issue #192）。 |
 | `alhalte-cellar` | 送信・取得 | `POST /store`、`POST /store/{tin_id}`、`GET /tin/{tin_id}`、`POST /unregister`、`GET` / `PUT /alias/{name}`。封入した chunk、scene、room の永続化、head alias の読み書き、旧 head の解放。内部書き込みは `X-Alhalte-Service-Token` で認可する。 |
 
 CLI（`CliArgs`）:
 
 - `--room-id` / `ALHALTE_ROOM_ID`: 16 hex（正）または移行用 decimal の `u64`。内部の `RoomData.room_id` は `u64` のまま。
 - `--admin`（別名 `--owner`）/ `ALHALTE_ADMIN_ACCOUNT`
-- `--socket` / `ALHALTE_SOCKET_PATH`（既定 `/tmp/alhalte-banquette.sock`）
+- `--socket` / `ALHALTE_SOCKET_PATH`（Unix。既定 `/tmp/alhalte-banquette.sock`）
+- `--pipe-name` / `ALHALTE_PIPE_NAME`（Windows。`\\.\pipe\...`。maitre-d の spawner が room ごとに生成する）
 - `--cellar-url` / `ALHALTE_CELLAR_URL`（既定 `http://127.0.0.1:8080`）。起動時の head 読み込みもここへ行う。
 - `--chunk-size-exponent` / `ALHALTE_CHUNK_SIZE_EXPONENT`（既定 8）
 - `--heartbeat-interval-secs` / `ALHALTE_HEARTBEAT_INTERVAL_SECS`（既定 240）
 - `--service-token` / `ALHALTE_SERVICE_TOKEN`: 内部書き込みと alias 更新用トークン（後方互換。argv に出るので非推奨）。値はログに出さない。
-- `--service-token-file` / `ALHALTE_SERVICE_TOKEN_FILE`: 内部書き込み用トークンを 0600 file から読む。maitre-d が Bistrot から受け取った path をそのまま転送する。
+- `--service-token-file` / `ALHALTE_SERVICE_TOKEN_FILE`: 内部書き込み用トークンを 0600 file から読む。maitre-d が alhalte-restaurant から受け取った path をそのまま転送する。
 - 復元用の引数は無い。head は cellar の `room/<room_id>/head` alias から読む（Issue #192）。旧 `--room-tin` / `ALHALTE_ROOM_TIN` は廃止し、指定すると clap が unknown argument で起動を拒否する。
 - 秘密 file は `alhalte_banquette::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
 
@@ -46,7 +47,7 @@ CLI（`CliArgs`）:
 | `ClientFrame` / `ServerFrame` | クライアントと banquette の論理フレーム。 |
 | `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`QueryAccountPermission` / `AccountPermissionResponse` で account の実効権限を返す。head を報告する frame は持たない（Issue #192）。 |
 | `ProtocolCodec<T>` | 長さ前置 postcard コーデック。 |
-| `BanquetteServer` / `ServerConfig` | UNIX ソケットサーバー。`run_until_shutdown` で明示的に停止できる。 |
+| `BanquetteServer` / `ServerConfig` | ローカル transport サーバー（`socket_path` / `pipe_name`）。`run_until_shutdown` で明示的に停止できる。 |
 | `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。`store_tin` / `download_tin` / `unregister_tin` / `get_alias` / `set_alias` を持つ。 |
 | `INTERNAL_WRITE_SESSION_ID` | 内部書き込みが送る session id（`0`）。合成 session は使わない。 |
 
@@ -102,7 +103,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
      - `Room::from_tin` が `RoomData` を復元し、root scene `/` の存在と `Room::validate`（Admin が 1 人以上、`accessible_scenes` の整合）を検証する。
      - `RoomData.room_id` が `--room-id` と一致することを検証する。
      - alias の読み込み・取得・復号・検証のいずれかが失敗したら**空部屋で起動せず**、明確なエラーで終了する。旧 schema（`done` フラグを持つ #199 以前の `RoomData`）は decode 失敗として扱い、変換しない。
-2. `BanquetteServer::run` が既存ソケットを削除し、UNIX ソケットを bind する。
+2. `BanquetteServer::run` が Unix では既存ソケットを削除して UNIX ソケットを bind し、Windows では `--pipe-name` の named pipe を作る。
 3. heartbeat タスクを起動する。初回 tick は捨てる。
 4. maitre-d からの接続ごとに `handle_connection` を spawn する。
 
@@ -112,7 +113,7 @@ state キーは 1 個以上の `::` を含む必要がある。値は `to_plaint
 - 保存に成功したら、まず `PUT /alias/room/<room_id>/head` で head alias を新しい tin へ移す。alias が唯一の復元点なので、この書き込みの失敗は `persist` の失敗として返す（旧 alias と旧 head は有効なまま残り、次周期に再試行する）。
 - alias の更新後に、直前の head tin を `CellarSink::unregister_tin` で best-effort に解放する。現在の head は alias が指しているので解放しない。解放失敗は警告ログのみで、保存自体は成功扱い。
 - 保存に成功した tin id は `HeartbeatResult::persisted_tin` に入る。保存失敗時は `None` で、ログに残して次周期に再試行する。maitre-d へ報告する frame は無い。
-- graceful shutdown（idle による `ShouldExit`、`run_until_shutdown`、または standalone バイナリの SIGTERM / SIGINT）では終了直前に `persist` をもう一度行い、alias を最終状態へ移してからソケットを閉じる。SIGTERM / SIGINT は `main.rs` で `watch` channel に配線し、`run_until_shutdown` へ渡す。
+- graceful shutdown（idle による `ShouldExit`、`run_until_shutdown`、または standalone バイナリの SIGTERM / SIGINT / Windows Ctrl+C）では終了直前に `persist` をもう一度行い、alias を最終状態へ移してから transport を閉じる。Unix の SIGTERM / SIGINT と Windows の Ctrl+C は `main.rs` で `watch` channel に配線し、`run_until_shutdown` へ渡す。
 - `room_id → head tin` のポインタは cellar の alias だけが持つ。maitre-d も banquette も DB / 専用ファイルに head を保存しない。
 
 ### クライアント接続

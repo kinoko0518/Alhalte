@@ -1,0 +1,63 @@
+# Restaurant.portable.toml — ポータブル（ワンショット）構成。
+#
+# このファイルはビルドスクリプトがパッケージ内の `Restaurant.toml` として
+# コピーする。相対パスは `Restaurant.toml` の親ディレクトリ（= パッケージ
+# ルート）基準で解決される。
+#
+# - ローカルパスワードログイン（Google OAuth 不要）。
+# - アカウント / session / rooms は data/maitre-d-local.sqlite3 に分離。
+# - 部屋状態は通常どおり cellar に永続化（60 秒間隔）。
+# - UI/API は LAN に公開するが、cellar は 127.0.0.1 のみ。
+# - HTTP なのでインターネットには公開しないこと。
+
+[restaurant]
+domain = "localhost"
+host = "0.0.0.0"
+data-dir = "data"
+socket-dir = "sockets"
+
+[maitre-d]
+port = 8080
+# local-login では Google OAuth を使わないので client-id / client-secret は不要。
+local-login = true
+salt = "alhalte-windows-local-salt-0001"
+
+[cellar]
+port = 8081
+anti-oracle = false
+service-token = "alhalte-windows-local-service-token"
+
+[banquette]
+chunk-size-exponent = 8
+# 強制終了時に失うのは最大この秒数分。
+heartbeat-interval-secs = 60
+
+[[extensions]]
+id = "alhalte-dsl"
+path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
+enabled = true
+
+[[extensions]]
+id = "markdown"
+path = "target/wasm32-unknown-unknown/release/markdown.wasm"
+enabled = true
+
+[[extensions]]
+id = "aozora"
+path = "target/wasm32-unknown-unknown/release/aozora.wasm"
+enabled = true
+
+[[extensions]]
+id = "coc-6"
+path = "target/wasm32-unknown-unknown/release/coc_6.wasm"
+enabled = false
+
+[[extensions]]
+id = "coc-7"
+path = "target/wasm32-unknown-unknown/release/coc_7.wasm"
+enabled = false
+
+[[extensions]]
+id = "emoklore"
+path = "target/wasm32-unknown-unknown/release/emoklore.wasm"
+enabled = false

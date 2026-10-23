@@ -1,7 +1,9 @@
-//! WebSocket room demultiplexer and UNIX socket communication bridge with `alhalte-banquette`.
+//! WebSocket room demultiplexer and local-transport bridge with `alhalte-banquette`.
+//!
+//! The protocol codec is transport-independent: Unix uses a UNIX domain socket,
+//! Windows uses a named pipe (Tokio 1.54 does not expose AF_UNIX on Windows).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,14 +13,25 @@ use alhalte_banquette::{
     ServerFrame,
 };
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio_util::codec::Framed;
 
 use crate::error::{MaitreDError, Result};
-use crate::spawner::BanquetteSpawner;
+use crate::spawner::{BanquetteEndpoint, BanquetteSpawner};
 
 type ExportResponseSender = oneshot::Sender<std::result::Result<Vec<u8>, String>>;
+
+/// A transport-agnostic banquette connection.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+type BoxedStream = Box<dyn AsyncReadWrite>;
 
 /// How long a one-shot permission request waits for an answer from banquette.
 ///
@@ -35,7 +48,7 @@ pub struct RoomBridge {
     clients: Arc<RwLock<HashMap<u64, mpsc::Sender<ServerFrame>>>>,
     /// Current scene association for each client.
     client_scenes: Arc<RwLock<HashMap<u64, String>>>,
-    /// Unbounded sender queue into the banquette UNIX socket.
+    /// Unbounded sender queue into the banquette transport.
     to_banquette_tx: mpsc::UnboundedSender<MaitreDToBanquette>,
     /// Pending export snapshot response senders.
     pending_exports: Arc<RwLock<HashMap<u64, ExportResponseSender>>>,
@@ -53,7 +66,7 @@ pub struct RoomBridge {
 }
 
 impl RoomBridge {
-    /// Spawns a banquette for `room_id`, connects to its UNIX socket, and returns the bridge.
+    /// Spawns a banquette for `room_id`, connects to its local endpoint, and returns the bridge.
     ///
     /// `admin_account` is the room creator, which banquette makes its initial
     /// `Admin` when the room starts from scratch. No room head is passed: banquette
@@ -64,8 +77,8 @@ impl RoomBridge {
     /// # Errors
     ///
     /// Returns an error when the spawner fails (including a persisted head that
-    /// cannot be downloaded, decoded, or validated) or the UNIX socket does not
-    /// become connectable in time.
+    /// cannot be downloaded, decoded, or validated) or the local transport does
+    /// not become connectable in time.
     pub async fn new(
         room_id: u64,
         admin_account: u64,
@@ -88,17 +101,18 @@ impl RoomBridge {
         let bridge_permission_queries = Arc::clone(&pending_permission_queries);
 
         tracing::info!("Launching banquette for room {room_id}...");
-        let socket_path = spawner.spawn_banquette(room_id, admin_account).await?;
+        let endpoint = spawner.spawn_banquette(room_id, admin_account).await?;
 
-        // Connect to UNIX domain socket with retry loop
-        let stream = Self::connect_with_retry(&socket_path, 60, Duration::from_millis(50)).await?;
+        // Connect to the local transport with a retry loop. Named-pipe/server
+        // startup can take longer than a UNIX socket bind, so allow 30 seconds.
+        let stream = Self::connect_with_retry(&endpoint, 600, Duration::from_millis(50)).await?;
 
         tracing::info!(
-            "Connected to banquette for room {room_id} at {:?}",
-            socket_path
+            "Connected to banquette for room {room_id} at {}",
+            endpoint.describe()
         );
 
-        let (read_half, write_half) = stream.into_split();
+        let (read_half, write_half) = tokio::io::split(stream);
         let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
         let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
 
@@ -162,23 +176,46 @@ impl RoomBridge {
         })
     }
 
-    /// Retries connecting to the UNIX domain socket until ready or timeout.
+    /// Retries connecting to the banquette local transport until ready or timeout.
     async fn connect_with_retry(
-        path: &PathBuf,
+        endpoint: &BanquetteEndpoint,
         max_attempts: usize,
         delay: Duration,
-    ) -> Result<UnixStream> {
+    ) -> Result<BoxedStream> {
         for _attempt in 0..max_attempts {
-            if path.exists()
-                && let Ok(stream) = UnixStream::connect(path).await
-            {
-                return Ok(stream);
+            match endpoint {
+                #[cfg(unix)]
+                BanquetteEndpoint::UnixSocket(path) => {
+                    if path.exists()
+                        && let Ok(stream) = UnixStream::connect(path).await
+                    {
+                        return Ok(Box::new(stream));
+                    }
+                }
+                #[cfg(windows)]
+                BanquetteEndpoint::NamedPipe(name) => {
+                    // ERROR_PIPE_BUSY (231) means the server exists but has no
+                    // free instance yet; NotFound means it has not created the
+                    // first instance. Both are retryable.
+                    match ClientOptions::new().open(name) {
+                        Ok(client) => return Ok(Box::new(client)),
+                        Err(error)
+                            if error.kind() == std::io::ErrorKind::NotFound
+                                || error.raw_os_error() == Some(231) => {}
+                        Err(error) => {
+                            return Err(MaitreDError::Banquette(format!(
+                                "Failed to connect to banquette {}: {error}",
+                                endpoint.describe()
+                            )));
+                        }
+                    }
+                }
             }
             tokio::time::sleep(delay).await;
         }
         Err(MaitreDError::Banquette(format!(
-            "Timed out waiting for banquette UNIX socket at {:?}",
-            path
+            "Timed out waiting for banquette {}",
+            endpoint.describe()
         )))
     }
 

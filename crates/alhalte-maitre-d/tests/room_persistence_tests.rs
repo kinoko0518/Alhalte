@@ -103,23 +103,24 @@ fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
     args.get(index + 1).map(String::as_str)
 }
 
-/// Reads the repository's default `Bistrot.toml` and returns the parsed config.
+/// Reads the repository's default `Restaurant.toml` and returns the parsed
+/// config.
 ///
 /// The bundled local development configuration keeps plaintext secrets, so it is
 /// parsed with the documented development escape hatch (Issue #194).
-fn default_bistrot_config() -> alhalte_bistrot::BistrotConfig {
+fn default_restaurant_config() -> alhalte_restaurant::RestaurantToml {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join("Bistrot.toml");
-    alhalte_bistrot::load_from_path_with_options(
+        .join("Restaurant.toml");
+    alhalte_restaurant::load_restaurant_from_path_with_options(
         &path,
-        &alhalte_bistrot::ParseOptions {
+        &alhalte_restaurant::ParseOptions {
             age_key: None,
             allow_plaintext_secrets: true,
         },
     )
-    .expect("the default Bistrot.toml must parse")
+    .expect("the default Restaurant.toml must parse")
 }
 
 // spec: alhalte-maitre-d/room-head 0002 whole room survives a banquette restart
@@ -618,27 +619,30 @@ fn test_process_spawner_forwards_no_room_tin_and_a_token_file() {
     assert!(debug.contains("<redacted>"));
 }
 
-// spec: alhalte-bistrot/service-token 0002 the default Bistrot.toml persists room state
-// spec: alhalte-bistrot/secrets 0006 the default config injects the token as a file
+// spec: alhalte-restaurant/service-token 0002 the default Restaurant.toml persists room state
+// spec: alhalte-restaurant/secrets 0006 the default config injects the token as a file
 #[tokio::test]
-async fn test_default_bistrot_config_authorizes_room_persistence() {
-    let config = default_bistrot_config();
+async fn test_default_restaurant_config_authorizes_room_persistence() {
+    let config = default_restaurant_config();
     let token = config
         .cellar
         .service_token
         .as_deref()
-        .expect("the default Bistrot.toml must configure an internal service token")
+        .expect("the default Restaurant.toml must configure an internal service token")
         .to_string();
 
-    // `nix run .#bistrot` passes the same secret file to both long-lived
-    // services, and neither argument list carries the value.
+    // cafe and bistrot pass the same secret file to both long-lived services,
+    // and neither argument list carries the value.
     let token_path = config
         .secrets_dir()
         .join("cellar-service-token")
         .display()
         .to_string();
-    let maitre_args = alhalte_bistrot::generate_maitre_d_args(&config);
-    let cellar_args = alhalte_bistrot::generate_cellar_args(&config);
+    let maitre_args = alhalte_restaurant::generate_maitre_d_args(
+        &config,
+        &alhalte_restaurant::MaitreDArgsOptions::default(),
+    );
+    let cellar_args = alhalte_restaurant::generate_cellar_args(&config);
     assert_eq!(
         arg_after(&maitre_args, "--service-token-file"),
         Some(token_path.as_str())
