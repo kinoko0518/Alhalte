@@ -3,3 +3,8 @@ declare module '*.svelte' {
   const component: Component<any, any, any>;
   export default component;
 }
+
+declare module '*.png' {
+  const src: string;
+  export default src;
+}

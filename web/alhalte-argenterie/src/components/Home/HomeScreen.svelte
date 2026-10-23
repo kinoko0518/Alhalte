@@ -8,8 +8,10 @@
    * - GitHub Issue #32: Rich Material 3 Expressive HomeScreen & theme selection
    */
   import { hexToBytes } from '@alhalte/pantry';
-  import { AppBar, Button, Card, ExtendedFab, IconButton, TextField } from 'noph-ui';
+  import { Button, Card, ExtendedFab, IconButton, TextField } from 'noph-ui';
   import { Icon } from 'noph-ui/icons';
+  import logoWhite from '../../../assets/logo-white.png';
+  import logoBlack from '../../../assets/logo-black.png';
   import type { VisitedRoom } from '../../types/index.js';
   import type { RecentRoom } from '../../utils/recentRooms.js';
   import {
@@ -207,62 +209,29 @@
   }
 </script>
 
-{#snippet appBarLeading()}
-  <div class="brand-emblem" aria-hidden="true">
-    <Icon>casino</Icon>
-  </div>
-{/snippet}
-
-{#snippet appBarTrailing()}
-  <div class="home-account-controls" data-testid="home-account-controls">
-    <AccountMenu />
-  </div>
-{/snippet}
-
 {#snippet fabAddIcon()}
   <Icon>add</Icon>
 {/snippet}
 
 <div class="home-container" data-testid="home-screen">
-  <AppBar
-    variant="small"
-    headline="Alhalte"
-    subtitle="Self-Hosted TRPG Virtual Tabletop"
-    leading={appBarLeading}
-    trailing={appBarTrailing}
-  />
+  <div class="home-account-controls" data-testid="home-account-controls">
+    <AccountMenu />
+  </div>
 
   <div class="home-content-wrapper">
     <!-- Expressive Hero Banner -->
     <section class="hero-banner" data-testid="home-hero-banner">
       <div class="hero-text-col">
-        <div class="hero-badge">
-          <Icon>encrypted</Icon>
-          <span>End-to-End URL Fragment Encryption</span>
+        <div class="hero-brand">
+          <img class="hero-logo logo-light" src={logoBlack} alt="Alhalte" />
+          <img class="hero-logo logo-dark" src={logoWhite} alt="Alhalte" />
+          <div class="hero-underline" aria-hidden="true"></div>
         </div>
-        <h1 class="home-title">テーブルを囲み、物語のシーンを紡ぐ</h1>
-        <p class="home-subtitle">
-          シーンを第一級概念として備えたセルフホストVTT。部屋の暗号鍵はURLフラグメントにのみ保持され、サーバーに知られることなく安全にセッションを進行できます。
-        </p>
-        <div class="hero-stats-row">
-          <div class="stat-pill">
-            <Icon>history</Icon>
-            <span>訪れた部屋: <strong>{visitedRooms.length}</strong> 件</span>
-          </div>
-
-        </div>
-      </div>
-
-      <div class="hero-action-col">
-        <Button variant="filled" size="m" start={fabAddIcon} onclick={openCreateDialog}>
-          新しい部屋を作成する
-        </Button>
       </div>
     </section>
 
     <div class="section-header-row">
       <h2 class="section-heading">訪れたことのある部屋</h2>
-      <span class="section-caption">ブラウザの履歴に保存されたプレイヤー参加ルーム</span>
     </div>
 
     <main class="rooms-grid" data-testid="visited-rooms-list">
@@ -355,7 +324,7 @@
   <div class="fab-container">
     <ExtendedFab
       variant="primary"
-      size="m"
+      size="s"
       icon={fabAddIcon}
       label="部屋の新規作成"
       onclick={openCreateDialog}
@@ -461,22 +430,11 @@
     font-family: Roboto, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     overflow-y: auto;
   }
-  .brand-emblem {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 40px;
-    height: 40px;
-    margin-inline-start: 8px;
-    border-radius: var(--np-shape-corner-medium);
-    background: var(--np-color-primary-container);
-    color: var(--np-color-on-primary-container);
-  }
   .home-account-controls {
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    padding-inline-end: 8px;
+    padding: 8px 16px 0;
   }
   .home-content-wrapper {
     width: 100%;
@@ -492,24 +450,59 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    justify-content: space-between;
+    justify-content: center;
     gap: 20px;
-    padding: 28px 32px;
-    border-radius: var(--np-shape-corner-extra-large);
-    background: linear-gradient(
-      135deg,
-      var(--np-color-primary-container) 0%,
-      var(--np-color-secondary-container) 60%,
-      var(--np-color-tertiary-container) 100%
-    );
-    color: var(--np-color-on-primary-container);
-    box-shadow: var(--np-elevation-1);
+    padding: 16px 8px 8px;
   }
   .hero-text-col {
     flex: 1 1 480px;
     display: flex;
     flex-direction: column;
+    align-items: center;
     gap: 10px;
+  }
+  .hero-brand {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: fit-content;
+    max-width: 100%;
+  }
+  /* Gradient underline spanning the logo width (replaces the old banner background). */
+  .hero-underline {
+    height: 7pt;
+    border-radius: var(--np-shape-corner-full);
+    background: linear-gradient(
+      90deg,
+      var(--np-color-primary) 0%,
+      var(--np-color-secondary) 55%,
+      var(--np-color-tertiary) 100%
+    );
+  }
+  .hero-logo {
+    max-width: 100%;
+    max-height: 144px;
+    width: auto;
+    object-fit: contain;
+  }
+  /* Light mode (default): black logo. */
+  .logo-dark {
+    display: none;
+  }
+  /* Dark mode: follow the OS unless the user forced a theme via data-theme. */
+  @media (prefers-color-scheme: dark) {
+    :global(:root:not([data-theme='light'])) .logo-light {
+      display: none;
+    }
+    :global(:root:not([data-theme='light'])) .logo-dark {
+      display: block;
+    }
+  }
+  :global(:root[data-theme='dark']) .logo-light {
+    display: none;
+  }
+  :global(:root[data-theme='dark']) .logo-dark {
+    display: block;
   }
   .hero-badge {
     display: inline-flex;

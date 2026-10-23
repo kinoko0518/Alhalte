@@ -802,10 +802,30 @@ pub fn create_router(state: AppState) -> Router {
                         StatusCode::NOT_FOUND.into_response(),
                     );
                 }
+                // Nix store files carry a 1970 mtime and no validators beyond
+                // that, so browsers would heuristically cache `index.html`
+                // for ages and keep serving a stale SPA after a rebuild.
+                // Hashed `/assets/*` files are immutable; everything else
+                // (`index.html` and the client-side route fallbacks) must be
+                // revalidated.
+                let cache_control = if path.starts_with("/assets/") {
+                    "public, max-age=31536000, immutable"
+                } else {
+                    "no-cache"
+                };
                 spa_service
                     .oneshot(request)
                     .await
-                    .map(axum::response::IntoResponse::into_response)
+                    .map(|response| {
+                        let mut response = axum::response::IntoResponse::into_response(response);
+                        if response.status().is_success() {
+                            response.headers_mut().insert(
+                                axum::http::header::CACHE_CONTROL,
+                                axum::http::HeaderValue::from_static(cache_control),
+                            );
+                        }
+                        response
+                    })
             }
         });
         router = router.fallback_service(spa);
