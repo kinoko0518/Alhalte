@@ -9,8 +9,8 @@
 //!    TOML and only secret string values are replaced with an ASCII-armored `age`
 //!    ciphertext. See [`crate::secrets`].
 
-use crate::config::BistrotConfig;
-use crate::error::{BistrotError, Result};
+use crate::config::RestaurantToml;
+use crate::error::{RestaurantError, Result};
 use crate::ffi::with_scoped_env_var;
 use crate::secrets::{
     allow_plaintext_secrets_from_env, contains_age_armored_value, decrypt_age_values,
@@ -27,7 +27,7 @@ use serde::Deserialize;
 use std::path::Path;
 use std::str::FromStr;
 
-/// Options controlling how `Bistrot.toml` is decrypted and validated.
+/// Options controlling how `Restaurant.toml` is decrypted and validated.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ParseOptions<'a> {
     /// Explicit age identity (`--age-key`). When `None`, `ROPS_AGE` and
@@ -58,74 +58,79 @@ pub fn is_rops_encrypted(content: &str) -> bool {
     content.contains("[sops]") || content.contains("ENC[")
 }
 
-/// Encrypts a plain TOML string using the provided age recipient public key (e.g. `age1...`).
+/// Encrypts a plain TOML string using the provided age recipient public key
+/// (e.g. `age1...`).
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::RopsEncrypt`] if parsing the recipient or encryption fails.
-pub fn encrypt_bistrot_toml(plain_toml: &str, recipient_str: &str) -> Result<String> {
+/// Returns [`RestaurantError::RopsEncrypt`] if parsing the recipient or
+/// encryption fails.
+pub fn encrypt_restaurant_toml(plain_toml: &str, recipient_str: &str) -> Result<String> {
     let recipient: age::x25519::Recipient = recipient_str
         .trim()
         .parse()
-        .map_err(|e: &str| BistrotError::RopsEncrypt(format!("invalid age recipient: {e}")))?;
+        .map_err(|e: &str| RestaurantError::RopsEncrypt(format!("invalid age recipient: {e}")))?;
 
     let builder = RopsFileBuilder::<TomlFileFormat>::new(plain_toml)
-        .map_err(|e| BistrotError::RopsEncrypt(format!("failed to parse plain TOML: {e}")))?;
+        .map_err(|e| RestaurantError::RopsEncrypt(format!("failed to parse plain TOML: {e}")))?;
 
     let encrypted_file = builder
         .add_integration_key::<AgeIntegration>(recipient)
         .encrypt::<AES256GCM, SHA512>()
-        .map_err(|e| BistrotError::RopsEncrypt(format!("failed to encrypt with rops: {e}")))?;
+        .map_err(|e| RestaurantError::RopsEncrypt(format!("failed to encrypt with rops: {e}")))?;
 
     Ok(encrypted_file.to_string())
 }
 
 /// Encrypts a single secret value and returns an ASCII-armored `age` block.
 ///
-/// This is the value-level counterpart of [`encrypt_bistrot_toml`]: the result
-/// can be pasted into `Bistrot.toml` as the value of `maitre-d.client-secret` or
-/// `cellar.service-token` (Issue #194).
+/// This is the value-level counterpart of [`encrypt_restaurant_toml`]: the
+/// result can be pasted into `Restaurant.toml` as the value of
+/// `maitre-d.client-secret` or `cellar.service-token` (Issue #194).
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::AgeEncrypt`] when the recipient is invalid or `age`
-/// fails to encrypt.
+/// Returns [`RestaurantError::AgeEncrypt`] when the recipient is invalid or
+/// `age` fails to encrypt.
 pub fn encrypt_age_armored_value(plaintext: &str, recipient_str: &str) -> Result<String> {
     let recipient = crate::secrets::parse_age_recipient(recipient_str)?;
     crate::secrets::encrypt_age_value(plaintext, &recipient)
 }
 
-/// Decrypts a rops-encrypted TOML string using available credentials (such as `ROPS_AGE` env var).
+/// Decrypts a rops-encrypted TOML string using available credentials (such as
+/// `ROPS_AGE` env var).
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::RopsDecrypt`] if decryption fails or MAC does not match.
+/// Returns [`RestaurantError::RopsDecrypt`] if decryption fails or MAC does not
+/// match.
 pub fn decrypt_rops_toml(encrypted_toml: &str) -> Result<String> {
     let parsed_encrypted =
         RopsFile::<EncryptedFile<AES256GCM, SHA512>, TomlFileFormat>::from_str(encrypted_toml)
-            .map_err(|e| BistrotError::RopsDecrypt(format!("failed to parse rops file: {e}")))?;
+            .map_err(|e| RestaurantError::RopsDecrypt(format!("failed to parse rops file: {e}")))?;
 
     let decrypted = parsed_encrypted
         .decrypt::<TomlFileFormat>()
-        .map_err(|e| BistrotError::RopsDecrypt(format!("failed to decrypt rops file: {e}")))?;
+        .map_err(|e| RestaurantError::RopsDecrypt(format!("failed to decrypt rops file: {e}")))?;
 
     let map = decrypted.into_inner_map();
     let table_val = toml::Value::Table(map);
     toml::to_string_pretty(&table_val).map_err(Into::into)
 }
 
-/// Decrypts a rops-encrypted TOML string with an explicitly specified age secret key.
+/// Decrypts a rops-encrypted TOML string with an explicitly specified age
+/// secret key.
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::RopsDecrypt`] if decryption fails.
+/// Returns [`RestaurantError::RopsDecrypt`] if decryption fails.
 pub fn decrypt_rops_toml_with_key(encrypted_toml: &str, age_key: &str) -> Result<String> {
     with_scoped_env_var("ROPS_AGE", age_key.trim(), || {
         decrypt_rops_toml(encrypted_toml)
     })
 }
 
-/// Parses a `Bistrot.toml` configuration string.
+/// Parses a `Restaurant.toml` configuration string.
 ///
 /// Handles both formats:
 /// - Whole-file `rops` encryption (`[sops]` / `ENC[`) using `ROPS_AGE`.
@@ -136,22 +141,27 @@ pub fn decrypt_rops_toml_with_key(encrypted_toml: &str, age_key: &str) -> Result
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError`] if decryption, parsing, or validation fails.
-pub fn parse_bistrot_toml(content: &str) -> Result<BistrotConfig> {
-    parse_bistrot_toml_with_options(content, &ParseOptions::from_env())
+/// Returns [`RestaurantError`] if decryption, parsing, or validation fails.
+pub fn parse_restaurant_toml(content: &str) -> Result<RestaurantToml> {
+    parse_restaurant_toml_with_options(content, &ParseOptions::from_env())
 }
 
-/// Parses a `Bistrot.toml` configuration string with an optional explicit age secret key.
+/// Parses a `Restaurant.toml` configuration string with an optional explicit age
+/// secret key.
 ///
 /// The key is used both for whole-file rops decryption and for value-level age
 /// armor. When `age_key` is `None`, `ROPS_AGE` and `ALHALTE_AGE_KEY` are
-/// consulted. Plaintext-secret handling follows `ALHALTE_ALLOW_PLAINTEXT_SECRETS`.
+/// consulted. Plaintext-secret handling follows
+/// `ALHALTE_ALLOW_PLAINTEXT_SECRETS`.
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError`] if decryption, parsing, or validation fails.
-pub fn parse_bistrot_toml_with_key(content: &str, age_key: Option<&str>) -> Result<BistrotConfig> {
-    parse_bistrot_toml_with_options(
+/// Returns [`RestaurantError`] if decryption, parsing, or validation fails.
+pub fn parse_restaurant_toml_with_key(
+    content: &str,
+    age_key: Option<&str>,
+) -> Result<RestaurantToml> {
+    parse_restaurant_toml_with_options(
         content,
         &ParseOptions {
             age_key,
@@ -160,20 +170,20 @@ pub fn parse_bistrot_toml_with_key(content: &str, age_key: Option<&str>) -> Resu
     )
 }
 
-/// Parses a `Bistrot.toml` configuration string with explicit options.
+/// Parses a `Restaurant.toml` configuration string with explicit options.
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::AgeKeyMissing`] when the document contains armored
-/// values and no identity is configured, [`BistrotError::AgeDecrypt`] when a
-/// value cannot be decrypted, [`BistrotError::PlaintextSecret`] when a secret is
-/// still plaintext and plaintext secrets are not allowed, and
-/// [`BistrotError::TomlDe`] / [`BistrotError::ConfigValidation`] for invalid
-/// configuration.
-pub fn parse_bistrot_toml_with_options(
+/// Returns [`RestaurantError::AgeKeyMissing`] when the document contains armored
+/// values and no identity is configured, [`RestaurantError::AgeDecrypt`] when a
+/// value cannot be decrypted, [`RestaurantError::PlaintextSecret`] when a secret
+/// is still plaintext and plaintext secrets are not allowed, and
+/// [`RestaurantError::TomlDe`] / [`RestaurantError::ConfigValidation`] for
+/// invalid configuration.
+pub fn parse_restaurant_toml_with_options(
     content: &str,
     options: &ParseOptions<'_>,
-) -> Result<BistrotConfig> {
+) -> Result<RestaurantToml> {
     let whole_file_encrypted = is_rops_encrypted(content);
     let identity_source = resolve_age_identity_source(options.age_key);
 
@@ -187,9 +197,9 @@ pub fn parse_bistrot_toml_with_options(
         toml::from_str(content)?
     };
 
-    // Plaintext secrets are detected on the *source* document, before anything is
-    // decrypted: once decrypted, every secret is plaintext in memory, which is
-    // exactly what the armored form is meant to become.
+    // Plaintext secrets are detected on the *source* document, before anything
+    // is decrypted: once decrypted, every secret is plaintext in memory, which
+    // is exactly what the armored form is meant to become.
     let plaintext_secrets = if whole_file_encrypted {
         Vec::new()
     } else {
@@ -199,55 +209,64 @@ pub fn parse_bistrot_toml_with_options(
     if contains_age_armored_value(&value) {
         let key = identity_source
             .as_deref()
-            .ok_or(BistrotError::AgeKeyMissing)?;
+            .ok_or(RestaurantError::AgeKeyMissing)?;
         let identity = parse_age_identity(key)?;
         decrypt_age_values(&mut value, &identity)?;
     }
 
-    // fail-closed: a secret that is still plaintext in an unencrypted document is
-    // rejected unless the development escape hatch is explicit. A rops-encrypted
-    // whole file is already encrypted at rest, so its decrypted values are fine.
+    // fail-closed: a secret that is still plaintext in an unencrypted document
+    // is rejected unless the development escape hatch is explicit. A
+    // rops-encrypted whole file is already encrypted at rest, so its decrypted
+    // values are fine.
     if !options.allow_plaintext_secrets && !plaintext_secrets.is_empty() {
-        return Err(BistrotError::PlaintextSecret(plaintext_secrets.join(", ")));
+        return Err(RestaurantError::PlaintextSecret(
+            plaintext_secrets.join(", "),
+        ));
     }
 
-    let config = BistrotConfig::deserialize(value)?;
+    let config = RestaurantToml::deserialize(value)?;
     config.validate()?;
     Ok(config)
 }
 
-/// Loads and parses a `Bistrot.toml` configuration from the specified file path.
+/// Loads and parses a `Restaurant.toml` configuration from the specified file
+/// path.
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError`] if reading the file, decrypting, or parsing fails.
-pub fn load_from_path(path: impl AsRef<Path>) -> Result<BistrotConfig> {
+/// Returns [`RestaurantError`] if reading the file, decrypting, or parsing
+/// fails.
+pub fn load_restaurant_from_path(path: impl AsRef<Path>) -> Result<RestaurantToml> {
     let content = std::fs::read_to_string(path)?;
-    parse_bistrot_toml(&content)
+    parse_restaurant_toml(&content)
 }
 
-/// Loads and parses a `Bistrot.toml` configuration from the specified file path with an optional age key.
+/// Loads and parses a `Restaurant.toml` configuration from the specified file
+/// path with an optional age key.
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError`] if reading the file, decrypting, or parsing fails.
-pub fn load_from_path_with_key(
+/// Returns [`RestaurantError`] if reading the file, decrypting, or parsing
+/// fails.
+pub fn load_restaurant_from_path_with_key(
     path: impl AsRef<Path>,
     age_key: Option<&str>,
-) -> Result<BistrotConfig> {
+) -> Result<RestaurantToml> {
     let content = std::fs::read_to_string(path)?;
-    parse_bistrot_toml_with_key(&content, age_key)
+    parse_restaurant_toml_with_key(&content, age_key)
 }
 
-/// Loads and parses a `Bistrot.toml` configuration from a file path with explicit options.
+/// Loads and parses a `Restaurant.toml` configuration from a file path with
+/// explicit options.
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError`] if reading the file, decrypting, or parsing fails.
-pub fn load_from_path_with_options(
+/// Returns [`RestaurantError`] if reading the file, decrypting, or parsing
+/// fails.
+pub fn load_restaurant_from_path_with_options(
     path: impl AsRef<Path>,
     options: &ParseOptions<'_>,
-) -> Result<BistrotConfig> {
+) -> Result<RestaurantToml> {
     let content = std::fs::read_to_string(path)?;
-    parse_bistrot_toml_with_options(&content, options)
+    parse_restaurant_toml_with_options(&content, options)
 }

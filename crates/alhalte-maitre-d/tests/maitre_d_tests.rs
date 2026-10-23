@@ -185,7 +185,7 @@ impl BanquetteSpawner for RecordingSpawner {
         &self,
         room_id: u64,
         admin_account: u64,
-    ) -> alhalte_maitre_d::Result<std::path::PathBuf> {
+    ) -> alhalte_maitre_d::Result<alhalte_maitre_d::BanquetteEndpoint> {
         self.calls.lock().unwrap().push((room_id, admin_account));
         self.inner.spawn_banquette(room_id, admin_account).await
     }
@@ -894,7 +894,7 @@ async fn test_oauth_login_and_callback_flow() {
     assert_eq!(auth_url.host_str(), Some("mock-google-oauth.example.com"));
     let params: std::collections::HashMap<String, String> =
         auth_url.query_pairs().into_owned().collect();
-    // The argenterie origin / port is never sent to Google.
+    // The UI origin / port is never sent to Google.
     assert_eq!(
         params.get("redirect_uri").map(String::as_str),
         Some("http://maitre-d.test/auth/google/callback")
@@ -1200,7 +1200,7 @@ fn test_cli_bistrot_argument_compatibility() {
     assert_eq!(parsed.salt, "instance-salt-67890");
     assert_eq!(parsed.public_url, "https://auth.example.com");
     assert_eq!(parsed.socket_dir, std::path::PathBuf::from("/run/alhalte"));
-    // Issue #229: the LAN origin switch is off unless Bistrot passes the flag.
+    // Issue #229: the LAN origin switch is off unless alhalte-restaurant passes the flag.
     assert!(parsed.allow_lan_origin_ports.is_empty());
 
     let repeated = parse_cli_args_from([

@@ -13,17 +13,15 @@
 //! - **Session Expiration at 4:00 AM**: Issues 64-bit session IDs (`alhalte/maitre-d/session-id`) with heartbeat
 //!   tracking. Every day at 4:00 AM local time, all sessions without a heartbeat since the previous 4:00 AM
 //!   are purged.
-//! - **Session Verification & Debug Login**: Exposes verification endpoints compatible with `alhalte-cellar`
-//!   and, with `--debug-login`, an isolated debug login. [`AuthProvider`] switches between the Google
-//!   OAuth flow and [`DebugAuthProvider`]; the debug flow accepts an account name alone, creates the
-//!   account on first use, and stores everything in a separate SQLite file
-//!   ([`CliArgs::active_db_path`]) so the normal database is never opened.
-//! - **Session Verification & Debug Accounts**: Exposes verification endpoints compatible with `alhalte-cellar`
-//!   and, in debug builds, creates throwaway accounts keyed by an unguessable synthetic subject.
+//! - **Session Verification & Local Login**: Exposes verification endpoints compatible with
+//!   `alhalte-cellar` and, with `--local-login`, a password login backed by a separate SQLite file
+//!   ([`CliArgs::active_db_path`]). Local accounts never mix with Google accounts. Room state is still
+//!   persisted to cellar normally.
 //! - **WebSocket Demultiplexer & Banquette Spawner**: Inspects incoming WebSocket headers (`X-Alhalte-Room`),
 //!   query parameters (`room`), and URL paths (`/room/{room_id}`) to demultiplex messages to `alhalte-banquette`
-//!   daemons via UNIX domain sockets. Spawning and the socket connection are awaited before a client is
-//!   registered, so a failed room restore is reported to the caller instead of silently starting empty.
+//!   daemons via a local transport (UNIX socket on Unix, named pipe on Windows). Spawning and the
+//!   transport connection are awaited before a client is registered, so a failed room restore is reported
+//!   to the caller instead of silently starting empty.
 //! - **Room state head**: owned by cellar, not by maitre-d. Banquette keeps the last persisted `RoomData`
 //!   under the alias `room/<room_id>/head` and restores itself from it on startup, so `maitre-d` passes no
 //!   head to the spawner and stores none (Issue #192).
@@ -57,6 +55,7 @@ pub mod error;
 pub mod gateway;
 pub mod labels;
 pub mod oauth;
+pub mod password;
 pub mod room_id;
 pub mod secret_file;
 pub mod server;
@@ -64,13 +63,13 @@ pub mod session;
 pub mod spawner;
 
 pub use auth::{
-    AuthIdentity, AuthKind, AuthProvider, DEBUG_SUBJECT_PREFIX, DEFAULT_HANDLE_NAME,
-    DebugAuthProvider, GoogleAuthProvider, MAX_DEBUG_ACCOUNT_NAME_LEN, parse_debug_account_name,
+    AuthIdentity, AuthKind, AuthProvider, DEFAULT_HANDLE_NAME, GoogleAuthProvider,
+    LOCAL_SUBJECT_PREFIX, LocalAuthProvider, MAX_ACCOUNT_NAME_LEN, parse_local_account_name,
     percent_encode,
 };
-pub use cli::{CliArgs, DEBUG_DB_FILE_NAME, parse_cli_args, parse_cli_args_from};
+pub use cli::{CliArgs, LOCAL_DB_FILE_NAME, parse_cli_args, parse_cli_args_from};
 pub use crypto::{SUB_HASH_BYTES, SUB_HASH_HEX_LEN, SubHash, hash_sub};
-pub use db::{Account, Database, OAUTH_STATE_TTL_SECS, Room, Session};
+pub use db::{Account, Database, LocalAccount, OAUTH_STATE_TTL_SECS, Room, Session};
 pub use error::{MaitreDError, Result};
 pub use gateway::{RoomBridge, RoomBridgeManager};
 pub use labels::{
@@ -79,20 +78,25 @@ pub use labels::{
     account_id_to_tin, session_id_from_tin, session_id_to_tin,
 };
 pub use oauth::{GoogleOAuthProvider, GoogleUserInfo, MockOAuthProvider, OAuthProvider};
+pub use password::{
+    MAX_PASSWORD_LEN, MIN_PASSWORD_LEN, hash_password, validate_password, verify_password,
+};
 pub use room_id::{RoomId, RoomIdParseError, parse_room_id};
 pub use server::{
     AccountResponse, AccountSearchItem, AppState, AuthResponse, CreateRoomRequest,
-    DEFAULT_ALLOWED_ORIGINS, DEFAULT_PUBLIC_URL, DebugLoginForm, DebugLoginQuery,
-    MAX_ROOM_NAME_LEN, OAuthLoginQuery, RoomInfoResponse, RoomPermissionItem, RoomRole,
-    RoomSessionQuery, SESSION_COOKIE_MAX_AGE_SECS, SearchAccountsQuery, ServerInfoResponse,
-    SessionResponse, SetRoomPermissionRequest, VerifySessionQuery, VerifySessionResponse,
-    create_router, extract_session_id_from_cookie, is_allowed_return_to,
-    is_allowed_return_to_with_lan, parse_session_id_from_cookie_str, session_cookie_header,
+    DEFAULT_ALLOWED_ORIGINS, DEFAULT_PUBLIC_URL, LocalLoginRequest, MAX_ROOM_NAME_LEN,
+    OAuthLoginQuery, RoomInfoResponse, RoomPermissionItem, RoomRole, RoomSessionQuery,
+    SESSION_COOKIE_MAX_AGE_SECS, SearchAccountsQuery, SessionResponse, SetRoomPermissionRequest,
+    VerifySessionQuery, VerifySessionResponse, create_router, extract_session_id_from_cookie,
+    is_allowed_return_to, is_allowed_return_to_with_lan, parse_session_id_from_cookie_str,
+    session_cookie_header,
 };
 pub use session::{
     cleanup_sessions_at, cleanup_sessions_with_cutoff, duration_until_next_4am, previous_4am_local,
     spawn_session_cleanup_task,
 };
+#[cfg(unix)]
+pub use spawner::InProcessBanquetteSpawner;
 pub use spawner::{
-    BanquetteSpawner, InProcessBanquetteSpawner, ProcessBanquetteSpawner, resolve_banquette_bin,
+    BanquetteEndpoint, BanquetteSpawner, ProcessBanquetteSpawner, resolve_banquette_bin,
 };

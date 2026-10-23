@@ -1,14 +1,15 @@
-//! Error types for `alhalte-bistrot`.
+//! Error types for `alhalte-restaurant`.
 
 use thiserror::Error;
 
-/// Result type alias for `alhalte-bistrot`.
-pub type Result<T> = std::result::Result<T, BistrotError>;
+/// Result type alias for `alhalte-restaurant`.
+pub type Result<T> = std::result::Result<T, RestaurantError>;
 
-/// Errors that can occur during `alhalte-bistrot` configuration parsing, decryption, or generation.
+/// Errors that can occur while reading, decrypting, or validating
+/// `Restaurant.toml`.
 #[derive(Debug, Error)]
-pub enum BistrotError {
-    /// I/O error when reading or writing configuration or systemd files.
+pub enum RestaurantError {
+    /// I/O error when reading or writing configuration, secret, or staged files.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -40,7 +41,7 @@ pub enum BistrotError {
     ///
     /// Pass `--age-key`, `ROPS_AGE`, or `ALHALTE_AGE_KEY`.
     #[error(
-        "age identity is required to decrypt armored values in Bistrot.toml; \
+        "age identity is required to decrypt armored values in Restaurant.toml; \
          pass --age-key, ROPS_AGE, or ALHALTE_AGE_KEY"
     )]
     AgeKeyMissing,
@@ -63,7 +64,7 @@ pub enum BistrotError {
     /// `alhalte-bistrot encrypt-value --recipient age1...` (Issue #194).
     /// `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` allows them for local development.
     #[error(
-        "plaintext secret(s) in Bistrot.toml: {0}; encrypt them with \
+        "plaintext secret(s) in Restaurant.toml: {0}; encrypt them with \
          `alhalte-bistrot encrypt-value --recipient age1...` or set \
          ALHALTE_ALLOW_PLAINTEXT_SECRETS=1 for local development only"
     )]
@@ -71,18 +72,14 @@ pub enum BistrotError {
 
     /// A configured extension `.wasm` file does not exist.
     ///
-    /// This is a `Bistrot.toml` configuration error (the path is wrong or the
-    /// wasm was not built). Staging fails instead of publishing a `manifest.json`
-    /// entry whose `url` would 404 in the browser.
-    #[error("extension '{id}' wasm not found: {path}; build it or fix the path in Bistrot.toml")]
+    /// This is a `Restaurant.toml` configuration error (the path is wrong or the
+    /// wasm was not built). Staging fails instead of publishing a
+    /// `manifest.json` entry whose `url` would 404 in the browser.
+    #[error("extension '{id}' wasm not found: {path}; build it or fix the path in Restaurant.toml")]
     ExtensionWasmMissing {
         /// Extension id from `[[extensions]]`.
         id: String,
         /// Path that was checked (configured path or `base_dir`-relative fallback).
         path: std::path::PathBuf,
     },
-
-    /// Unknown module name for argument generation.
-    #[error("Unknown module name '{0}'; expected 'maitre-d', 'cellar', 'banquette', or 'all'")]
-    UnknownModule(String),
 }

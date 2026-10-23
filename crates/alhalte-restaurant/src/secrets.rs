@@ -1,4 +1,5 @@
-//! Value-level `age` encryption for `Bistrot.toml`, and secret file materialization.
+//! Value-level `age` encryption for `Restaurant.toml`, and secret file
+//! materialization.
 //!
 //! Issue #194 makes per-value encryption the first-class secret format: the
 //! configuration stays a plain TOML document and only the string values that are
@@ -13,14 +14,14 @@
 //! """
 //! ```
 //!
-//! [`crate::rops::parse_bistrot_toml_with_options`] walks every TOML value,
+//! [`crate::rops::parse_restaurant_toml_with_options`] walks every TOML value,
 //! decrypts the armored strings, and only then deserializes the configuration.
 //! Decrypted secrets are never put on a command line: [`write_secret_files`]
 //! writes them to `<data-dir>/secrets/` with mode `0600` and the argument
 //! generators pass the file paths instead of the values.
 
-use crate::config::BistrotConfig;
-use crate::error::{BistrotError, Result};
+use crate::config::RestaurantToml;
+use crate::error::{RestaurantError, Result};
 use age::x25519::{Identity, Recipient};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -36,7 +37,8 @@ pub const AGE_ARMOR_BEGIN: &str = "-----BEGIN AGE ENCRYPTED FILE-----";
 /// Last line of an ASCII-armored `age` ciphertext.
 pub const AGE_ARMOR_END: &str = "-----END AGE ENCRYPTED FILE-----";
 
-/// Returns true when `value` is (or starts with) an ASCII-armored `age` ciphertext.
+/// Returns true when `value` is (or starts with) an ASCII-armored `age`
+/// ciphertext.
 pub fn is_age_armored_value(value: &str) -> bool {
     value.trim_start().starts_with(AGE_ARMOR_BEGIN)
 }
@@ -54,25 +56,25 @@ pub fn allow_plaintext_secrets_from_env() -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::AgeIdentity`] when the string is not a valid x25519
-/// identity.
+/// Returns [`RestaurantError::AgeIdentity`] when the string is not a valid
+/// x25519 identity.
 pub fn parse_age_identity(key: &str) -> Result<Identity> {
     key.trim()
         .parse::<Identity>()
-        .map_err(|e: &str| BistrotError::AgeIdentity(e.to_string()))
+        .map_err(|e: &str| RestaurantError::AgeIdentity(e.to_string()))
 }
 
 /// Parses an `age` x25519 recipient (e.g. `age1...`).
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::AgeEncrypt`] when the string is not a valid x25519
-/// recipient.
+/// Returns [`RestaurantError::AgeEncrypt`] when the string is not a valid
+/// x25519 recipient.
 pub fn parse_age_recipient(recipient: &str) -> Result<Recipient> {
     recipient
         .trim()
         .parse::<Recipient>()
-        .map_err(|e: &str| BistrotError::AgeEncrypt(format!("invalid age recipient: {e}")))
+        .map_err(|e| RestaurantError::AgeEncrypt(format!("invalid age recipient: {e}")))
 }
 
 /// Resolves the age identity source in the documented precedence order:
@@ -106,23 +108,23 @@ pub fn resolve_age_identity_source(explicit: Option<&str>) -> Option<String> {
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::AgeDecrypt`] when the armor is malformed, the identity
-/// does not match, or the plaintext is not valid UTF-8.
+/// Returns [`RestaurantError::AgeDecrypt`] when the armor is malformed, the
+/// identity does not match, or the plaintext is not valid UTF-8.
 pub fn decrypt_age_value(armored: &str, identity: &Identity) -> Result<String> {
     let plaintext = age::decrypt(identity, armored.trim().as_bytes())
-        .map_err(|e| BistrotError::AgeDecrypt(e.to_string()))?;
+        .map_err(|e| RestaurantError::AgeDecrypt(e.to_string()))?;
     String::from_utf8(plaintext)
-        .map_err(|e| BistrotError::AgeDecrypt(format!("decrypted value is not UTF-8: {e}")))
+        .map_err(|e| RestaurantError::AgeDecrypt(format!("decrypted value is not UTF-8: {e}")))
 }
 
 /// Encrypts `plaintext` to `recipient` and returns the ASCII-armored ciphertext.
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::AgeEncrypt`] when `age` fails to encrypt.
+/// Returns [`RestaurantError::AgeEncrypt`] when `age` fails to encrypt.
 pub fn encrypt_age_value(plaintext: &str, recipient: &Recipient) -> Result<String> {
     age::encrypt_and_armor(recipient, plaintext.as_bytes())
-        .map_err(|e| BistrotError::AgeEncrypt(e.to_string()))
+        .map_err(|e| RestaurantError::AgeEncrypt(e.to_string()))
 }
 
 /// Returns true when any string value in `value` is an armored age ciphertext.
@@ -142,8 +144,8 @@ pub fn contains_age_armored_value(value: &toml::Value) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::AgeDecrypt`] when an armored value cannot be decrypted
-/// with `identity`.
+/// Returns [`RestaurantError::AgeDecrypt`] when an armored value cannot be
+/// decrypted with `identity`.
 pub fn decrypt_age_values(value: &mut toml::Value, identity: &Identity) -> Result<usize> {
     match value {
         toml::Value::String(text) => {
@@ -174,7 +176,7 @@ pub fn decrypt_age_values(value: &mut toml::Value, identity: &Identity) -> Resul
 
 /// Returns the dotted paths of secret values that are still plaintext.
 ///
-/// Only the fields that are secrets in `Bistrot.toml` are inspected
+/// Only the fields that are secrets in `Restaurant.toml` are inspected
 /// (`maitre-d.client-secret` and `cellar.service-token`), including their
 /// snake_case aliases. Empty strings are ignored here: `validate` reports them.
 pub fn find_plaintext_secrets(value: &toml::Value) -> Vec<String> {
@@ -233,7 +235,7 @@ pub struct SecretFiles {
 }
 
 /// Computes the secret file paths for `config` without touching the filesystem.
-pub fn secret_files(config: &BistrotConfig) -> SecretFiles {
+pub fn secret_files(config: &RestaurantToml) -> SecretFiles {
     let dir = config.secrets_dir();
     let maitre_d_client_secret = if config.maitre_d.client_secret.trim().is_empty() {
         None
@@ -262,8 +264,9 @@ pub fn secret_files(config: &BistrotConfig) -> SecretFiles {
 ///
 /// # Errors
 ///
-/// Returns [`BistrotError::Io`] when the directory or a file cannot be written.
-pub fn write_secret_files(config: &BistrotConfig) -> Result<SecretFiles> {
+/// Returns [`RestaurantError::Io`] when the directory or a file cannot be
+/// written.
+pub fn write_secret_files(config: &RestaurantToml) -> Result<SecretFiles> {
     let files = secret_files(config);
     if files.maitre_d_client_secret.is_none() && files.service_token.is_none() {
         return Ok(files);

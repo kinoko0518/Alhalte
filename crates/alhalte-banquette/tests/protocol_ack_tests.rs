@@ -210,6 +210,7 @@ async fn start_test_server() -> (tempfile::TempDir, ClientSink, ServerStream, Jo
     let room = Room::new(3003, 10, 8).unwrap();
     let config = ServerConfig {
         socket_path: sock_path.clone(),
+        pipe_name: None,
         heartbeat_interval: Duration::from_secs(3600),
     };
 

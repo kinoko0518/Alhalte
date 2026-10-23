@@ -1,0 +1,64 @@
+# ローカル開発用の既定構成（`nix run .` が使う）。
+#
+# 秘密値（maitre-d.client-secret / cellar.service-token）はここでは平文。
+# この構成は local-login = true なので、cafe は平文 secret を許可する。
+# `alhalte-bistrot systemd` で unit を作る場合は、平文 secret の受理に
+# `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` が必要。
+# 本番・実 OAuth 資格情報は age armor で暗号化した値を Restaurant.local.toml
+# （gitignore 済み）に置く。手順は Restaurant.example.toml を参照。
+#   printf '%s' 'SECRET' | alhalte-bistrot encrypt-value --recipient age1...
+
+[restaurant]
+domain = "localhost"
+# 同一 LAN の端末から試せるように全インターフェースに bind する。
+# cellar は内部サービスなので常に 127.0.0.1 のみ。
+host = "0.0.0.0"
+data-dir = ".alhalte/data"
+socket-dir = ".alhalte/sockets"
+
+[maitre-d]
+port = 8080
+# アカウント名 + パスワードのローカルログイン。Google OAuth を使わないので
+# client-id / client-secret は不要。アカウント / session / rooms は
+# data-dir 配下の maitre-d-local.sqlite3 に分離され、部屋状態は通常どおり
+# cellar に永続化される。UI は SPA の同一 origin /login を使う。
+local-login = true
+salt = "alhalte-local-instance-salt-0001"
+
+[cellar]
+port = 8081
+anti-oracle = false
+service-token = "alhalte-local-service-token"
+
+[banquette]
+chunk-size-exponent = 8
+
+[[extensions]]
+id = "alhalte-dsl"
+path = "target/wasm32-unknown-unknown/release/alhalte_dsl.wasm"
+enabled = true
+
+[[extensions]]
+id = "markdown"
+path = "target/wasm32-unknown-unknown/release/markdown.wasm"
+enabled = true
+
+[[extensions]]
+id = "aozora"
+path = "target/wasm32-unknown-unknown/release/aozora.wasm"
+enabled = true
+
+[[extensions]]
+id = "coc-6"
+path = "target/wasm32-unknown-unknown/release/coc_6.wasm"
+enabled = false
+
+[[extensions]]
+id = "coc-7"
+path = "target/wasm32-unknown-unknown/release/coc_7.wasm"
+enabled = false
+
+[[extensions]]
+id = "emoklore"
+path = "target/wasm32-unknown-unknown/release/emoklore.wasm"
+enabled = false

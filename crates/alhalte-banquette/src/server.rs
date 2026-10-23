@@ -1,4 +1,7 @@
-//! UNIX domain socket server hosting the room process and communicating with `alhalte-maitre-d`.
+//! Local-transport server hosting the room process and communicating with `alhalte-maitre-d`.
+//!
+//! Unix uses a UNIX domain socket. Windows uses a named pipe because Tokio 1.54
+//! does not expose AF_UNIX there (`tokio::net::UnixStream` is Unix-only).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -6,7 +9,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncRead, AsyncWrite};
+#[cfg(unix)]
+use tokio::net::UnixListener;
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{NamedPipeServer, ServerOptions};
 use tokio::sync::{RwLock, mpsc, watch};
 use tokio_util::codec::Framed;
 
@@ -35,8 +42,12 @@ pub struct ConnectedClient {
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// UNIX domain socket path.
+    /// UNIX domain socket path (Unix).
     pub socket_path: PathBuf,
+    /// Windows named-pipe path (`\\.\pipe\...`).
+    ///
+    /// Required on Windows; ignored on Unix.
+    pub pipe_name: Option<String>,
     /// Heartbeat interval (default 4 minutes / 240 seconds).
     pub heartbeat_interval: Duration,
 }
@@ -45,8 +56,70 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             socket_path: PathBuf::from("/tmp/alhalte-banquette.sock"),
+            pipe_name: None,
             heartbeat_interval: Duration::from_secs(240),
         }
+    }
+}
+
+/// A transport-agnostic connection accepted from `maitre-d`.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+type BoxedStream = Box<dyn AsyncReadWrite>;
+
+/// Accepts connections from `maitre-d` over UNIX sockets or Windows named pipes.
+enum Listener {
+    /// UNIX domain socket listener (Unix).
+    #[cfg(unix)]
+    Unix(UnixListener),
+    /// Windows named-pipe listener.
+    #[cfg(windows)]
+    NamedPipe(NamedPipeListener),
+}
+
+impl Listener {
+    /// Accepts the next connection.
+    async fn accept(&mut self) -> std::io::Result<BoxedStream> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(Box::new(stream))
+            }
+            #[cfg(windows)]
+            Self::NamedPipe(listener) => listener.accept().await,
+        }
+    }
+}
+
+/// Windows named-pipe accept loop.
+#[cfg(windows)]
+struct NamedPipeListener {
+    name: String,
+    server: NamedPipeServer,
+}
+
+#[cfg(windows)]
+impl NamedPipeListener {
+    fn new(name: &str) -> std::io::Result<Self> {
+        let server = ServerOptions::new()
+            .first_pipe_instance(true)
+            .create(name)?;
+        Ok(Self {
+            name: name.to_string(),
+            server,
+        })
+    }
+
+    async fn accept(&mut self) -> std::io::Result<BoxedStream> {
+        self.server.connect().await?;
+        // Keep at least one server instance available for the next client before
+        // handing the connected instance to a task (Tokio's named-pipe guidance).
+        let next = ServerOptions::new().create(&self.name)?;
+        let connected = std::mem::replace(&mut self.server, next);
+        Ok(Box::new(connected))
     }
 }
 
@@ -140,17 +213,42 @@ impl BanquetteServer {
         self.run_inner(Some(shutdown)).await
     }
 
-    async fn run_inner(&self, shutdown: Option<watch::Receiver<bool>>) -> Result<()> {
-        let socket_path = &self.config.socket_path;
-        if socket_path.exists() {
-            let _ = std::fs::remove_file(socket_path);
+    fn bind_listener(&self) -> Result<Listener> {
+        #[cfg(unix)]
+        {
+            let socket_path = &self.config.socket_path;
+            if socket_path.exists() {
+                let _ = std::fs::remove_file(socket_path);
+            }
+
+            let listener = UnixListener::bind(socket_path)?;
+            tracing::info!(
+                "Banquette server listening on unix socket: {:?}",
+                socket_path
+            );
+            Ok(Listener::Unix(listener))
         }
 
-        let listener = UnixListener::bind(socket_path)?;
-        tracing::info!(
-            "Banquette server listening on unix socket: {:?}",
-            socket_path
-        );
+        #[cfg(windows)]
+        {
+            let Some(name) = self
+                .config
+                .pipe_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+            else {
+                return Err(BanquetteError::Protocol(
+                    "Windows banquette requires --pipe-name".to_string(),
+                ));
+            };
+            let listener = NamedPipeListener::new(name)?;
+            tracing::info!("Banquette server listening on named pipe: {name}");
+            Ok(Listener::NamedPipe(listener))
+        }
+    }
+
+    async fn run_inner(&self, shutdown: Option<watch::Receiver<bool>>) -> Result<()> {
+        let mut listener = self.bind_listener()?;
 
         let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -199,7 +297,7 @@ impl BanquetteServer {
                 }
                 accept_res = listener.accept() => {
                     match accept_res {
-                        Ok((stream, _)) => {
+                        Ok(stream) => {
                             let room = Arc::clone(&self.room);
                             let cellar = Arc::clone(&self.cellar);
                             let clients = Arc::clone(&self.clients);
@@ -223,8 +321,9 @@ impl BanquetteServer {
 
         self.persist_final().await;
 
-        if socket_path.exists() {
-            let _ = std::fs::remove_file(socket_path);
+        #[cfg(unix)]
+        if self.config.socket_path.exists() {
+            let _ = std::fs::remove_file(&self.config.socket_path);
         }
 
         Ok(())
@@ -247,13 +346,16 @@ impl BanquetteServer {
     }
 
     /// Handles a single incoming connection from `maitre-d`.
-    pub async fn handle_connection(
-        stream: UnixStream,
+    pub async fn handle_connection<S>(
+        stream: S,
         room: Arc<RwLock<Room>>,
         cellar: Arc<dyn CellarSink>,
         clients: Arc<RwLock<HashMap<u64, ConnectedClient>>>,
-    ) -> Result<()> {
-        let (read_half, write_half) = stream.into_split();
+    ) -> Result<()>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (read_half, write_half) = tokio::io::split(stream);
         let mut reader = Framed::new(read_half, ProtocolCodec::<MaitreDToBanquette>::new());
         let (out_tx, mut out_rx) = mpsc::channel::<BanquetteToMaitreD>(128);
 

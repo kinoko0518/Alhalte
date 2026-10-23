@@ -35,7 +35,7 @@ pub fn process_ast(ast: Generast, _speaker_id: u64) -> Generast {
 
 /// Returns self-introduction metadata `(id, name, icon_svg, description)` for Aozora Bunko.
 ///
-/// The id is the crate's package name, which must match the `Bistrot.toml`
+/// The id is the crate's package name, which must match the `Restaurant.toml`
 /// extension id (ABI 2, Issue #274).
 pub fn self_introduction_info() -> (&'static str, &'static str, &'static str, &'static str) {
     (

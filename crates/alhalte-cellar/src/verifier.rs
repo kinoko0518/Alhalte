@@ -1,7 +1,9 @@
 //! Session verification abstraction for checking storage permissions with `alhalte-maitre-d`.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -23,7 +25,8 @@ pub enum VerifierMode {
     AllowAll,
     /// Query `alhalte-maitre-d` over HTTP.
     Http(String),
-    /// Query `alhalte-maitre-d` over a UNIX domain socket.
+    /// Query `alhalte-maitre-d` over a UNIX domain socket (Unix only).
+    #[cfg(unix)]
     UnixSocket(PathBuf),
 }
 
@@ -46,8 +49,15 @@ impl VerifierMode {
         if allow_all_sessions {
             return Ok(Self::AllowAll);
         }
+        #[cfg(unix)]
         if let Some(socket_path) = maitre_d_socket {
             return Ok(Self::UnixSocket(socket_path));
+        }
+        #[cfg(not(unix))]
+        if maitre_d_socket.is_some() {
+            return Err(CellarError::Configuration(
+                "--maitre-d-socket is not supported on Windows; use --maitre-d-url".to_string(),
+            ));
         }
         if let Some(url) = maitre_d_url {
             return Ok(Self::Http(url));
@@ -71,6 +81,7 @@ impl VerifierMode {
         match self {
             Self::AllowAll => Arc::new(InMemorySessionVerifier::allow_all_verifier()),
             Self::Http(url) => Arc::new(MaitreDVerifier::new_http(url)),
+            #[cfg(unix)]
             Self::UnixSocket(socket_path) => Arc::new(MaitreDVerifier::new_unix(socket_path)),
         }
     }
@@ -81,6 +92,7 @@ impl std::fmt::Display for VerifierMode {
         match self {
             Self::AllowAll => f.write_str("allow-all (development only)"),
             Self::Http(url) => write!(f, "maitre-d HTTP ({url})"),
+            #[cfg(unix)]
             Self::UnixSocket(socket_path) => {
                 write!(f, "maitre-d UNIX socket ({})", socket_path.display())
             }
@@ -161,6 +173,7 @@ pub enum MaitreDTarget {
     /// HTTP host and port (e.g., `"127.0.0.1:8080"`).
     Http(String),
     /// Unix domain socket path (e.g., `"/run/alhalte/maitre-d.sock"`).
+    #[cfg(unix)]
     UnixSocket(PathBuf),
 }
 
@@ -188,6 +201,7 @@ impl MaitreDVerifier {
     }
 
     /// Creates a verifier communicating over a Unix domain socket.
+    #[cfg(unix)]
     #[must_use]
     pub fn new_unix(socket_path: impl AsRef<Path>) -> Self {
         Self {
@@ -267,6 +281,7 @@ impl SessionVerifier for MaitreDVerifier {
                 let (reader, writer) = stream.into_split();
                 self.send_query(reader, writer, owner, session_id).await
             }
+            #[cfg(unix)]
             MaitreDTarget::UnixSocket(path) => {
                 let stream = tokio::net::UnixStream::connect(path).await.map_err(|e| {
                     CellarError::Verifier(format!(

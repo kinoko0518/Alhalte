@@ -1,8 +1,11 @@
-//! FFI boundary for POSIX environment variable manipulation.
+//! Thread-safe scoped environment-variable manipulation.
 //!
-//! Under Rust 2024 edition, environment variable modification requires FFI.
-//! This module provides a thread-safe boundary for scoped environment modification.
+//! Under Rust 2024 edition, environment variable modification is unsafe. This
+//! module provides the single serialized boundary used by scoped `ROPS_AGE`
+//! replacement. Unix uses POSIX `setenv`/`unsetenv`; other platforms use the
+//! standard library calls while holding the same mutex.
 
+#[cfg(unix)]
 use std::ffi::CString;
 use std::sync::Mutex;
 
@@ -27,7 +30,8 @@ pub fn with_scoped_env_var<T>(key: &str, value: &str, f: impl FnOnce() -> T) -> 
     result
 }
 
-/// Sets an environment variable via POSIX FFI.
+/// Sets an environment variable on Unix via POSIX FFI.
+#[cfg(unix)]
 fn set_env_raw(key: &str, value: &str) {
     if let (Ok(c_key), Ok(c_val)) = (CString::new(key), CString::new(value)) {
         #[allow(unsafe_code)]
@@ -38,7 +42,8 @@ fn set_env_raw(key: &str, value: &str) {
     }
 }
 
-/// Unsets an environment variable via POSIX FFI.
+/// Unsets an environment variable on Unix via POSIX FFI.
+#[cfg(unix)]
 fn unset_env_raw(key: &str) {
     if let Ok(c_key) = CString::new(key) {
         #[allow(unsafe_code)]
@@ -46,5 +51,27 @@ fn unset_env_raw(key: &str) {
         unsafe {
             libc::unsetenv(c_key.as_ptr());
         }
+    }
+}
+
+/// Sets an environment variable on non-Unix platforms.
+#[cfg(not(unix))]
+fn set_env_raw(key: &str, value: &str) {
+    #[allow(unsafe_code)]
+    // SAFETY: Environment mutation is serialized by `ENV_MUTEX`, and this call
+    // does not run concurrently with another environment read/write in this
+    // process (the same contract the Unix path relies on).
+    unsafe {
+        std::env::set_var(key, value);
+    }
+}
+
+/// Unsets an environment variable on non-Unix platforms.
+#[cfg(not(unix))]
+fn unset_env_raw(key: &str) {
+    #[allow(unsafe_code)]
+    // SAFETY: Environment mutation is serialized by `ENV_MUTEX`.
+    unsafe {
+        std::env::remove_var(key);
     }
 }

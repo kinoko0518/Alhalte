@@ -7,11 +7,11 @@ use clap::Parser;
 
 use crate::secret_file::{SecretFileError, resolve_secret};
 
-/// File name of the isolated debug-login database created next to `--db-path`.
+/// File name of the isolated local-login database created next to `--db-path`.
 ///
-/// `maitre-d --debug-login` never opens the normal database; it opens
-/// `{db-path のディレクトリ}/maitre-d-debug.sqlite3` instead (Issue #150).
-pub const DEBUG_DB_FILE_NAME: &str = "maitre-d-debug.sqlite3";
+/// `maitre-d --local-login` never opens the normal (Google) database; it opens
+/// `{db-path のディレクトリ}/maitre-d-local.sqlite3` instead.
+pub const LOCAL_DB_FILE_NAME: &str = "maitre-d-local.sqlite3";
 
 /// Command-line arguments for the `alhalte-maitre-d` service.
 #[derive(Parser, Debug, Clone)]
@@ -33,31 +33,48 @@ pub struct CliArgs {
     #[arg(long, default_value = "maitre-d.sqlite3", env = "ALHALTE_DB_PATH")]
     pub db_path: PathBuf,
 
-    /// Enables the isolated debug login (Issue #150).
+    /// Enables the local password login.
     ///
-    /// While this flag is set, `GET /auth/login` redirects to
-    /// `/auth/debug/login`, where an account name alone signs in (creating the
-    /// account on first use). Accounts and sessions live in a separate SQLite
-    /// file — this process never opens or touches the normal database — and
-    /// spawned banquette processes run with `--no-persist`, so no room state is
-    /// written to the shared cellar.
+    /// While this flag is set, `GET /auth/login` redirects to the SPA `/login`
+    /// route, where an account name and password sign in. Accounts, sessions,
+    /// and the room registry live in a separate SQLite file
+    /// ([`LOCAL_DB_FILE_NAME`]); this process never opens the normal Google
+    /// database. Room state is persisted to cellar normally.
     ///
-    /// Intended for local development only. Never enable it on a public
-    /// instance: anyone who can reach the port can create an account.
+    /// Intended for local / trusted-LAN instances without Google OAuth. The
+    /// login is HTTP-only, so do not expose it to the public internet.
     ///
-    /// `ALHALTE_DEBUG_LOGIN` is a value switch: set it to `true` (or `false`) to
+    /// `ALHALTE_LOCAL_LOGIN` is a value switch: set it to `true` (or `false`) to
     /// enable / disable the flag, or omit it.
-    #[arg(long, env = "ALHALTE_DEBUG_LOGIN")]
-    pub debug_login: bool,
+    #[arg(long, env = "ALHALTE_LOCAL_LOGIN")]
+    pub local_login: bool,
 
-    /// SQLite file used while `--debug-login` is active.
+    /// SQLite file used while `--local-login` is active.
     ///
-    /// Defaults to [`DEBUG_DB_FILE_NAME`] next to `--db-path`. The same schema is
+    /// Defaults to [`LOCAL_DB_FILE_NAME`] next to `--db-path`. The same schema is
     /// applied, so the file is a normal account/session database, but it is a
-    /// different file: switching `--debug-login` on and off never mixes debug
-    /// accounts with real ones.
-    #[arg(long, env = "ALHALTE_DEBUG_DB_PATH")]
-    pub debug_db_path: Option<PathBuf>,
+    /// different file: local accounts never mix with Google accounts.
+    #[arg(long, env = "ALHALTE_LOCAL_DB_PATH")]
+    pub local_db_path: Option<PathBuf>,
+
+    /// Directory containing the built SPA (`index.html`, `assets/`, ...).
+    ///
+    /// When set, maitre-d serves the web UI itself (same origin as `/api` and
+    /// `/auth`). The Windows package sets this to the bundled `web/` directory.
+    #[arg(long, env = "ALHALTE_WEB_ROOT")]
+    pub web_root: Option<PathBuf>,
+
+    /// Heartbeat interval forwarded to every spawned banquette process.
+    ///
+    /// The interval controls how often a room is persisted to cellar. The
+    /// Windows package uses 60 seconds so a forced shutdown loses at most about
+    /// one minute of room state.
+    #[arg(
+        long,
+        default_value_t = 240,
+        env = "ALHALTE_BANQUETTE_HEARTBEAT_INTERVAL_SECS"
+    )]
+    pub banquette_heartbeat_interval_secs: u64,
 
     /// Google OAuth Client ID.
     #[arg(long, default_value = "", env = "ALHALTE_CLIENT_ID")]
@@ -76,7 +93,7 @@ pub struct CliArgs {
 
     /// File containing the Google OAuth client secret (mode 0600).
     ///
-    /// Bistrot writes the decrypted secret to `<data-dir>/secrets/` and passes
+    /// alhalte-restaurant writes the decrypted secret to `<data-dir>/secrets/` and passes
     /// this path, so the secret never appears in `ps` or in a systemd unit
     /// (Issue #194). Takes precedence over `--client-secret`.
     #[arg(long, env = "ALHALTE_CLIENT_SECRET_FILE")]
@@ -91,9 +108,9 @@ pub struct CliArgs {
     /// Google OAuth redirects back to `{public-url}/auth/google/callback`, so
     /// this value is the single fixed redirect URI registered with Google. It
     /// must be the origin where `/auth` reaches `maitre-d` (normally the
-    /// reverse-proxied argenterie origin or the restaurant domain). Bistrot
+    /// reverse-proxied UI origin or the restaurant domain). alhalte-restaurant
     /// derives it from `maitre-d.public-url`, the restaurant domain, or the
-    /// argenterie URL.
+    /// maitre-d URL.
     #[arg(
         long,
         default_value = "http://127.0.0.1:8080",
@@ -153,7 +170,7 @@ pub struct CliArgs {
     /// When omitted, only the local development origins
     /// (`http://127.0.0.1:5173`, `http://localhost:5173`) are accepted. CORS
     /// never falls back to `permissive()`; production deployments should pass
-    /// the restaurant's argenterie URL / domain here.
+    /// the restaurant's maitre-d public URL / domain here.
     #[arg(
         long = "cors-origin",
         env = "ALHALTE_CORS_ORIGINS",
@@ -162,12 +179,12 @@ pub struct CliArgs {
     )]
     pub cors_origins: Vec<String>,
 
-    /// Development-only: also accept `http://<private IPv4>:<PORT>` browser
+    /// Private-network LAN: also accept `http://<private IPv4>:<PORT>` browser
     /// origins for CORS and OAuth `return_to`.
     ///
-    /// The flag takes the argenterie port and is repeatable (comma-separated /
-    /// `ALHALTE_ALLOW_LAN_ORIGIN_PORTS`). Bistrot emits it only when
-    /// `[argenterie] lan = true` in the bundled local-development configuration
+    /// The flag takes the maitre-d port and is repeatable (comma-separated /
+    /// `ALHALTE_ALLOW_LAN_ORIGIN_PORTS`). alhalte-restaurant emits it only when
+    /// `restaurant.host = "0.0.0.0"` in the bundled local-development configuration
     /// (Issue #229), so phones on the same Ethernet can sign in without making
     /// CORS permissive:
     /// - only `http://` (never `https://`) origins are accepted,
@@ -197,21 +214,21 @@ where
 impl CliArgs {
     /// Returns the SQLite file this process actually opens.
     ///
-    /// Without `--debug-login` it is `--db-path`. With `--debug-login` it is
-    /// `--debug-db-path`, or [`DEBUG_DB_FILE_NAME`] in the `--db-path` directory,
-    /// so the normal database is never opened while debug login is active.
+    /// Without `--local-login` it is `--db-path`. With `--local-login` it is
+    /// `--local-db-path`, or [`LOCAL_DB_FILE_NAME`] in the `--db-path` directory,
+    /// so the normal Google database is never opened while local login is active.
     ///
-    /// spec: alhalte-maitre-d/debug-login 0001 debug login uses a separate SQLite file
+    /// spec: alhalte-maitre-d/local-login 0006 local login uses a separate SQLite file
     pub fn active_db_path(&self) -> PathBuf {
-        if !self.debug_login {
+        if !self.local_login {
             return self.db_path.clone();
         }
-        if let Some(path) = &self.debug_db_path {
+        if let Some(path) = &self.local_db_path {
             return path.clone();
         }
         match self.db_path.parent() {
-            Some(parent) if !parent.as_os_str().is_empty() => parent.join(DEBUG_DB_FILE_NAME),
-            _ => PathBuf::from(DEBUG_DB_FILE_NAME),
+            Some(parent) if !parent.as_os_str().is_empty() => parent.join(LOCAL_DB_FILE_NAME),
+            _ => PathBuf::from(LOCAL_DB_FILE_NAME),
         }
     }
 
@@ -252,12 +269,12 @@ pub fn parse_cli_args() -> CliArgs {
 }
 
 #[cfg(test)]
-mod debug_login_tests {
+mod local_login_tests {
     use super::*;
 
-    // spec: alhalte-maitre-d/debug-login 0001 debug login uses a separate SQLite file
+    // spec: alhalte-maitre-d/local-login 0006 local login uses a separate SQLite file
     #[test]
-    fn debug_login_selects_a_separate_database_file() {
+    fn local_login_selects_a_separate_database_file() {
         // Normal mode keeps the configured path.
         let args = CliArgs::try_parse_from([
             "alhalte-maitre-d",
@@ -265,46 +282,46 @@ mod debug_login_tests {
             "/var/lib/alhalte/maitre-d.sqlite3",
         ])
         .unwrap();
-        assert!(!args.debug_login);
-        assert_eq!(args.debug_db_path, None);
+        assert!(!args.local_login);
+        assert_eq!(args.local_db_path, None);
         assert_eq!(
             args.active_db_path(),
             PathBuf::from("/var/lib/alhalte/maitre-d.sqlite3")
         );
 
-        // Debug mode defaults to a sibling file and never the normal one.
+        // Local mode defaults to a sibling file and never the normal one.
         let args = CliArgs::try_parse_from([
             "alhalte-maitre-d",
             "--db-path",
             "/var/lib/alhalte/maitre-d.sqlite3",
-            "--debug-login",
+            "--local-login",
         ])
         .unwrap();
-        assert!(args.debug_login);
+        assert!(args.local_login);
         assert_eq!(
             args.active_db_path(),
-            PathBuf::from("/var/lib/alhalte/maitre-d-debug.sqlite3")
+            PathBuf::from("/var/lib/alhalte/maitre-d-local.sqlite3")
         );
         assert_ne!(args.active_db_path(), args.db_path);
 
-        // An explicit debug path wins.
+        // An explicit local path wins.
         let args = CliArgs::try_parse_from([
             "alhalte-maitre-d",
             "--db-path",
             "/var/lib/alhalte/maitre-d.sqlite3",
-            "--debug-login",
-            "--debug-db-path",
-            "/tmp/alhalte-debug.sqlite3",
+            "--local-login",
+            "--local-db-path",
+            "/tmp/alhalte-local.sqlite3",
         ])
         .unwrap();
         assert_eq!(
             args.active_db_path(),
-            PathBuf::from("/tmp/alhalte-debug.sqlite3")
+            PathBuf::from("/tmp/alhalte-local.sqlite3")
         );
 
-        // A bare relative --db-path keeps the debug file relative.
-        let args = CliArgs::try_parse_from(["alhalte-maitre-d", "--debug-login"]).unwrap();
-        assert_eq!(args.active_db_path(), PathBuf::from(DEBUG_DB_FILE_NAME));
+        // A bare relative --db-path keeps the local file relative.
+        let args = CliArgs::try_parse_from(["alhalte-maitre-d", "--local-login"]).unwrap();
+        assert_eq!(args.active_db_path(), PathBuf::from(LOCAL_DB_FILE_NAME));
     }
 }
 

@@ -1,7 +1,7 @@
 //! Reading secrets from owner-only files (Issue #194).
 //!
 //! Secrets are injected as files instead of command-line arguments so they never
-//! appear in `ps` output or in a generated systemd unit. Bistrot writes them with
+//! appear in `ps` output or in a generated systemd unit. alhalte-restaurant writes them with
 //! mode `0600` under `<data-dir>/secrets/`; a file that is accessible by group or
 //! others is rejected rather than silently accepted.
 

@@ -14,7 +14,7 @@ client 総体 = cutlery
 
 | 用語 | 意味 |
 | --- | --- |
-| restaurant | 1 つの Alhalte インスタンス全体。`Bistrot.toml` で構成する。 |
+| restaurant | 1 つの Alhalte インスタンス全体。`Restaurant.toml` で構成する。 |
 | franchise | restaurant から配布される構成単位。 |
 | cutlery | クライアント側モジュール総体。 |
 | tin | ラベル付き・自己記述的なバイナリコンテナ。暗号化と圧縮を opener で指定する。 |
@@ -42,7 +42,8 @@ client 総体 = cutlery
                          │ OAuth / account / session    │
                          │ room permission / WS demux   │
                          └───────┬──────────────────────┘
-                                 │ UNIX socket
+                                 │ local IPC
+                                 │ (UDS / named pipe)
                                  │ postcard
                                  ▼
                          ┌──────────────────────────────┐
@@ -58,7 +59,9 @@ client 総体 = cutlery
                          └──────────────────────────────┘
 
   pantry (browser) ── HTTP GET /tin/{id} ──▶ cellar
-  alhalte-bistrot ── Bistrot.toml ──▶ 引数 / systemd unit
+  alhalte-cafe ────── Restaurant.toml ──▶ cellar / maitre-d を直接起動（systemd なし）
+  alhalte-bistrot ─── Restaurant.toml ──▶ systemd unit
+  alhalte-glacier ─── NixOS options ────▶ systemd service（常駐）
 ```
 
 ### レイヤ
@@ -67,7 +70,7 @@ client 総体 = cutlery
 - **サーバー**: `alhalte-maitre-d`（認証・玄関口）、`alhalte-banquette`（部屋プロセス）、`alhalte-cellar`（重複排除ストレージ）。
 - **クライアント**: `web/alhalte-argenterie`（UI）、`web/alhalte-pantry`（tin キャッシュ・復号）、`alhalte-saignant`（HTML レンダラ、WASM でも動作）。
 - **変換・配布**: `alhalte-canner`（再エンコード・暗号化）、`extensions/*`（構文木変換 wasm）。`alhalte-kitchen` は `kitchen-freeze` ブランチに保存し、main からは削除した。
-- **運用**: `alhalte-bistrot`（設定・引数・systemd 生成）。
+- **運用**: `alhalte-restaurant`（設定・引数・秘密）、`alhalte-cafe`（ワンショット起動）、`alhalte-bistrot`（systemd 生成）、`alhalte-glacier`（NixOS module）。
 
 ## モジュール一覧
 
@@ -80,7 +83,10 @@ client 総体 = cutlery
 | alhalte-cellar | `crates/alhalte-cellar` | tin 実体の重複排除保存、参照管理、GC | [crates/alhalte-cellar/ARCHITECTURE.md](crates/alhalte-cellar/ARCHITECTURE.md) |
 | alhalte-canner | `crates/alhalte-canner` | 画像・音声の決定論的再エンコード、高低エントロピー暗号化 | [crates/alhalte-canner/ARCHITECTURE.md](crates/alhalte-canner/ARCHITECTURE.md) |
 | alhalte-saignant | `crates/alhalte-saignant` | log / Generast の HTML レンダリング、CSS、WASM ABI | [crates/alhalte-saignant/ARCHITECTURE.md](crates/alhalte-saignant/ARCHITECTURE.md) |
-| alhalte-bistrot | `crates/alhalte-bistrot` | `Bistrot.toml`、引数生成、systemd 生成、rops | [crates/alhalte-bistrot/ARCHITECTURE.md](crates/alhalte-bistrot/ARCHITECTURE.md) |
+| alhalte-restaurant | `crates/alhalte-restaurant` | `Restaurant.toml` のモデル、age/rops 復号、秘密 file、引数生成、拡張 staging | [crates/alhalte-restaurant/ARCHITECTURE.md](crates/alhalte-restaurant/ARCHITECTURE.md) |
+| alhalte-cafe | `crates/alhalte-cafe` | ワンショット起動（Linux/macOS/Windows）、SPA 配信、拡張 staging | [crates/alhalte-cafe/ARCHITECTURE.md](crates/alhalte-cafe/ARCHITECTURE.md) |
+| alhalte-bistrot | `crates/alhalte-bistrot` | `Restaurant.toml` → systemd unit の純粋関数的変換 | [crates/alhalte-bistrot/ARCHITECTURE.md](crates/alhalte-bistrot/ARCHITECTURE.md) |
+| alhalte-glacier | `nix/alhalte-glacier`（flake `nixosModules.default`） | NixOS 常駐サービスの module（`mk*Option`） | [nix/alhalte-glacier/ARCHITECTURE.md](nix/alhalte-glacier/ARCHITECTURE.md) |
 | alhalte-pantry | `web/alhalte-pantry` | ブラウザ側 tin キャッシュ、取得、復号、展開 | [web/alhalte-pantry/ARCHITECTURE.md](web/alhalte-pantry/ARCHITECTURE.md) |
 | alhalte-argenterie | `web/alhalte-argenterie` | Svelte 製 cutlery、部屋 UI、拡張機能ホスト | [web/alhalte-argenterie/ARCHITECTURE.md](web/alhalte-argenterie/ARCHITECTURE.md) |
 | 拡張機能 | `extensions/*` | `process_generast` を実装する wasm | [extensions/ARCHITECTURE.md](extensions/ARCHITECTURE.md) |
@@ -98,7 +104,7 @@ client 総体 = cutlery
 1. ブラウザは部屋 URL `/rooms/<roomId>#<roomKey>` を開く。`roomKey` はフラグメントにだけ存在し、サーバーへ送らない。
 2. `argenterie` は `maitre-d` の `/ws/room/<roomId>?account_id=...&session_id=...` へ WebSocket 接続する。
 3. `maitre-d` はセッションを検証し、`rooms` に登録済みか確認する。未登録は 404、権限が `Denied` なら 403 で拒否する。
-4. 許可された接続は `banquette` の UNIX ソケットへ `ClientConnected` として流し込む。bridge の `admin_account` は部屋の作成者（`rooms.creator_account`）で、接続順には依存しない。banquette が未起動なら起動する。復元点は cellar の alias `room/<room_id>/head` にあり、banquette 自身が起動時に読む（maitre-d は head を渡さない）。alias があり復元できない場合は 500 で失敗し、空部屋は作らない。alias がなければ新しい部屋を起動する。
+4. 許可された接続は `banquette` のローカル transport（Unix は UNIX socket、Windows は named pipe）へ `ClientConnected` として流し込む。bridge の `admin_account` は部屋の作成者（`rooms.creator_account`）で、接続順には依存しない。banquette が未起動なら起動する。復元点は cellar の alias `room/<room_id>/head` にあり、banquette 自身が起動時に読む（maitre-d は head を渡さない）。alias があり復元できない場合は 500 で失敗し、空部屋は作らない。alias がなければ新しい部屋を起動する。
 5. banquette はクライアントをルートシーン `/` に入室させる。
 
 ### 部屋の永続化
@@ -134,10 +140,13 @@ client 総体 = cutlery
 
 ### 起動
 
-1. `alhalte-bistrot` が `Bistrot.toml` を読み、rops で秘密情報を復号する。
-2. 各モジュールの引数と systemd unit を純粋関数で生成する。
-3. `nix run .#bistrot` はビルド、unit 登録、maitre-d / cellar / argenterie の起動、ブラウザ起動を行う。
-4. `banquette` は `maitre-d` が、`rooms` に登録済みの部屋を最初に WS / export で参照したときに部屋ごとに起動する。
+1. `alhalte-restaurant` が `Restaurant.toml` を読み、age armor / rops で秘密情報を復号し、検証する。
+2. 各モジュールの引数は `alhalte-restaurant` の純粋関数で生成する。
+3. `alhalte-cafe` は systemd を使わず、cellar → maitre-d（→ banquette は maitre-d が部屋ごとに spawn）を起動し、ビルド済み SPA を maitre-d の `--web-root` で配信する。`nix run .` は Nix でビルドした SPA を cafe に渡す。ポータブル版は `alhalte-cafe`（Windows は `alhalte-cafe.exe`）をダブルクリックで起動する。
+4. `alhalte-bistrot` は `Restaurant.toml` から `alhalte-cellar.service` / `alhalte-maitre-d.service` / `alhalte.target` を生成する。UI は maitre-d が SPA を配信するため、argenterie の systemd service は作らない。
+5. `alhalte-glacier` は NixOS の `services.alhalte.*` から同じ 2 service と target を定義する。秘密値は `clientSecretFile` / `serviceTokenFile` の path だけを受け取る。
+6. 認証は Google OAuth と local-login の二択。local-login は account 名 + パスワード（Argon2id）を使い、`maitre-d-local.sqlite3` に分離する。Google 用 DB とは rooms を含めて共有しない。local-login でも部屋状態は通常どおり cellar に永続化する。
+7. `banquette` は `maitre-d` が、`rooms` に登録済みの部屋を最初に WS / export で参照したときに部屋ごとに起動する。ローカル transport は Unix が UNIX socket、Windows が named pipe。
 
 
 ## 横断的規約
@@ -178,11 +187,11 @@ client 総体 = cutlery
 
 ブラウザ以外の内部書き込み（banquette の部屋状態 persistence）は、ユーザー session を詐称せず `cellar.service-token` を使う。
 
-- `Bistrot.toml` の `[cellar] service-token`（age armor で値単位暗号化。rops 全体暗号化も後方互換で可）を `maitre-d` と `cellar` に渡す。
-- リポジトリ同梱の `Bistrot.toml` はローカル開発専用の平文既定値 `service-token = "alhalte-local-service-token"` を設定し、`maitre-d` / 各 banquette / `cellar` が同じ値を使う（平文 secret は `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` のときだけ受理）。本番は age armor の値に必ず差し替える（`Bistrot.example.toml` / gitignore 済み `Bistrot.local.toml`）。
-- Bistrot は復号した `client-secret` / `service-token` を `<data-dir>/secrets/` に 0600 で書き、引数には `--client-secret-file` / `--service-token-file` の path だけを渡す。`maitre-d` は spawn する banquette に `--service-token-file` を伝播し、banquette は同じファイルから読んだトークンを `X-Alhalte-Service-Token` で cellar に送る。
+- `Restaurant.toml` の `[cellar] service-token`（age armor で値単位暗号化。rops 全体暗号化も後方互換で可）を `maitre-d` と `cellar` に渡す。
+- リポジトリ同梱の `Restaurant.toml` はローカル開発専用の平文既定値 `service-token = "alhalte-local-service-token"` を設定し、`maitre-d` / 各 banquette / `cellar` が同じ値を使う（平文 secret は `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` または cafe の local-login 受理で扱う）。本番は age armor の値に必ず差し替える（`Restaurant.example.toml` / gitignore 済み `Restaurant.local.toml`）。
+- `alhalte-restaurant` は復号した `client-secret` / `service-token` を `<data-dir>/secrets/` に 0600 で書き、引数には `--client-secret-file` / `--service-token-file` の path だけを渡す。`maitre-d` は spawn する banquette に `--service-token-file` を伝播し、banquette は同じファイルから読んだトークンを `X-Alhalte-Service-Token` で cellar に送る。
 - cellar は提示されたトークンを定数時間比較し、一致すれば内部書き込みを許可する。ユーザー session の検証は公開 proxy / 通常クライアント経路で維持する。
-- トークンと OAuth client secret はログにも `ps` にも systemd unit にも出さない。`--service-token` / `--client-secret` の argv 指定は後方互換のため受理するが、Bistrot は生成しない。
+- トークンと OAuth client secret はログにも `ps` にも systemd unit にも出さない。`--service-token` / `--client-secret` の argv 指定は後方互換のため受理するが、cafe / bistrot / glacier は生成しない。
 
 ## 拡張機能
 
@@ -228,13 +237,19 @@ nix develop -c cargo test --workspace
 nix develop -c bash -c 'cd web && pnpm install && pnpm -r test'
 ```
 
-ローカル起動:
+ローカル起動（引数なしで SPA ビルド → cafe 起動）:
 
 ```bash
-nix run .#bistrot -- --config Bistrot.toml
+nix run . -- --no-browser
 ```
 
-`Bistrot.toml` の例はリポジトリルートにあり、`restaurant`、`maitre-d`、`cellar`、`banquette`、`argenterie`、`[[extensions]]` を持つ。各設定値と生成される引数・unit は [alhalte-bistrot](crates/alhalte-bistrot/ARCHITECTURE.md) を参照。
+systemd unit の生成:
+
+```bash
+nix run .#bistrot -- --config Restaurant.toml systemd --web-root "$PWD/web/alhalte-argenterie/dist-app"
+```
+
+`Restaurant.toml` の例はリポジトリルートにあり、`restaurant`、`maitre-d`、`cellar`、`banquette`、`[[extensions]]` を持つ（`[argenterie]` は廃止）。各設定値と生成される引数・unit は [alhalte-restaurant](crates/alhalte-restaurant/ARCHITECTURE.md) / [alhalte-bistrot](crates/alhalte-bistrot/ARCHITECTURE.md) を参照。Windows / Linux / macOS のポータブル版は `Restaurant.portable.toml` を使い、`nix run .#windows-bundle` / `nix run .#portable-bundle` でフォルダを作る。NixOS は `nixosModules.default`（glacier）を使う。
 
 ## ドキュメント運用
 

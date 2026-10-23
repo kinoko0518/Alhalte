@@ -773,6 +773,7 @@ async fn test_move_character_into_an_unloaded_scene_reports_a_reload_failure() {
     let server = BanquetteServer::new(
         ServerConfig {
             socket_path: sock_path.clone(),
+            pipe_name: None,
             heartbeat_interval: Duration::from_secs(3600),
         },
         room,
@@ -961,6 +962,7 @@ async fn test_unix_socket_server_integration() {
 
     let config = ServerConfig {
         socket_path: sock_path.clone(),
+        pipe_name: None,
         heartbeat_interval: Duration::from_secs(3600), // large interval
     };
 
@@ -1488,6 +1490,7 @@ async fn test_heartbeat_moves_the_room_head_alias() {
     let server = BanquetteServer::new(
         ServerConfig {
             socket_path: sock_path.clone(),
+            pipe_name: None,
             heartbeat_interval: Duration::from_millis(50),
         },
         Room::new(room_id, 10, 8).unwrap(),
@@ -1561,6 +1564,7 @@ async fn test_graceful_shutdown_moves_the_room_head_alias() {
     let server = BanquetteServer::new(
         ServerConfig {
             socket_path: sock_path.clone(),
+            pipe_name: None,
             heartbeat_interval: Duration::from_secs(3600),
         },
         room,
@@ -1902,6 +1906,7 @@ async fn test_export_room_frame_returns_zip_bytes() {
 
     let config = ServerConfig {
         socket_path: sock_path.clone(),
+        pipe_name: None,
         heartbeat_interval: Duration::from_secs(3600),
     };
     let server = BanquetteServer::new(config, room, cellar);
@@ -2019,77 +2024,4 @@ async fn test_export_zip_after_restore() {
             );
         }
     }
-}
-// spec: alhalte-maitre-d/debug-login 0002 --no-persist keeps the room out of cellar
-#[tokio::test]
-async fn test_no_persist_never_writes_cellar() {
-    use alhalte_cellar::{CellarService, InMemorySessionVerifier};
-
-    // A real cellar HTTP service: anything uploaded would be visible here.
-    let storage = tempdir().unwrap();
-    let verifier = Arc::new(InMemorySessionVerifier::new());
-    let service =
-        Arc::new(CellarService::new_with_in_memory_db(storage.path(), verifier, false).unwrap());
-    let app = Arc::clone(&service).into_router();
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let cellar_addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let _ = axum::serve(listener, app).await;
-    });
-
-    let dir = tempdir().unwrap();
-    let sock_path = dir.path().join("banquette.sock");
-    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_alhalte-banquette"))
-        .args(["--room-id", "6161616161616161", "--admin", "10"])
-        .arg("--socket")
-        .arg(&sock_path)
-        .arg("--cellar-url")
-        .arg(format!("http://{cellar_addr}"))
-        .args(["--heartbeat-interval-secs", "3600", "--no-persist"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn the banquette binary");
-
-    for _ in 0..100 {
-        if sock_path.exists() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(sock_path.exists(), "banquette did not bind its UNIX socket");
-
-    let stream = UnixStream::connect(&sock_path).await.unwrap();
-    let (read_half, write_half) = stream.into_split();
-    let mut reader = Framed::new(read_half, ProtocolCodec::<BanquetteToMaitreD>::new());
-    let mut writer = Framed::new(write_half, ProtocolCodec::<MaitreDToBanquette>::new());
-    // The room works without any cellar round trip.
-    writer.send(MaitreDToBanquette::Ping).await.unwrap();
-    loop {
-        match tokio::time::timeout(Duration::from_secs(2), reader.next()).await {
-            Ok(Some(Ok(BanquetteToMaitreD::Pong))) => break,
-            Ok(Some(Ok(_))) => continue,
-            other => panic!("expected Pong from the no-persist binary: {other:?}"),
-        }
-    }
-    // Give the spawned signal task a chance to install its handlers.
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let pid = child.id().expect("child pid");
-    // SAFETY: `kill(2)` is an FFI call to the OS and `pid` is a live child of
-    // this test; no pointer or Rust memory is involved.
-    let sent = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-    assert_eq!(sent, 0, "failed to send SIGTERM to banquette");
-
-    // No head is reported in no-persist mode: the room lives only in the child's
-    // in-memory sink, so there is no tin to download from the shared cellar.
-
-    let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
-        .await
-        .expect("banquette must exit after SIGTERM")
-        .unwrap();
-    assert!(
-        status.success(),
-        "banquette must exit cleanly, got {status:?}"
-    );
 }

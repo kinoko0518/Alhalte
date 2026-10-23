@@ -1,0 +1,20 @@
+[package]
+name = "alhalte-restaurant"
+version = "0.1.0"
+edition = "2024"
+description = "Shared Restaurant.toml configuration, secret handling, and argument generation for Alhalte"
+repository = "https://github.com/kinoko0518/Alhalte"
+
+[dependencies]
+rops = { version = "0.1.7", default-features = false, features = ["toml", "age", "aes-gcm", "sha2"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "2.0"
+age = { version = "0.11", features = ["armor"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

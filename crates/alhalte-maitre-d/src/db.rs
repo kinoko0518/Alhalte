@@ -34,6 +34,30 @@ pub struct Account {
     pub created_at: i64,
 }
 
+/// Local account row with its optional password hash.
+///
+/// The hash is stored separately from [`Account`] so the public account DTO and
+/// the Google/debug paths never carry it. `Debug` redacts the hash.
+#[derive(Clone, PartialEq, Eq)]
+pub struct LocalAccount {
+    /// Public account entity.
+    pub account: Account,
+    /// Argon2id PHC string, if the account has a local password.
+    pub password_hash: Option<String>,
+}
+
+impl std::fmt::Debug for LocalAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LocalAccount")
+            .field("account", &self.account)
+            .field(
+                "password_hash",
+                &self.password_hash.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
 /// Active session entity stored in SQLite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
@@ -147,7 +171,8 @@ impl Database {
                 sub_hash TEXT NOT NULL UNIQUE,
                 handle_name TEXT NOT NULL,
                 icon_tin_id BLOB,
-                created_at INTEGER NOT NULL
+                created_at INTEGER NOT NULL,
+                password_hash TEXT
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -174,6 +199,11 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_oauth_states_created ON oauth_states(created_at);
             ",
         )?;
+
+        // Local accounts store an Argon2id PHC string. The column is nullable:
+        // Google accounts and pre-local accounts keep NULL. `ALTER TABLE ... ADD
+        // COLUMN` is safe for existing databases and preserves every row.
+        Self::migrate_password_hash_column(&conn)?;
 
         // `room_heads` used to hold the `room_id -> RoomData tin` pointer. Issue
         // #192 moved it to cellar's `room/<room_id>/head` alias, so a database
@@ -262,6 +292,24 @@ impl Database {
             return Err(MaitreDError::LegacySubSchema);
         }
 
+        Ok(())
+    }
+
+    /// Adds the nullable `accounts.password_hash` column to an older database.
+    ///
+    /// The column is additive and optional, so unlike the pre-#190 / #200
+    /// schemas there is no reason to refuse an existing database. Rows created
+    /// before local login keep `NULL`; the first local login with that name sets
+    /// the hash.
+    fn migrate_password_hash_column(conn: &Connection) -> Result<()> {
+        let has_password_hash: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('accounts') WHERE name = 'password_hash')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_password_hash {
+            conn.execute_batch("ALTER TABLE accounts ADD COLUMN password_hash TEXT")?;
+        }
         Ok(())
     }
 
@@ -415,6 +463,96 @@ impl Database {
             .optional()?;
 
         Ok(account)
+    }
+
+    /// Retrieves a local account by its salted subject hash, including its
+    /// password hash.
+    ///
+    /// The password hash is returned separately so callers can verify it outside
+    /// the database lock and never expose it through [`Account`].
+    pub fn get_local_account(&self, sub_hash: &SubHash) -> Result<Option<LocalAccount>> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {ACCOUNT_COLUMNS}, password_hash FROM accounts WHERE sub_hash = ?1 LIMIT 1"
+        ))?;
+
+        let account = stmt
+            .query_row(params![sub_hash.as_hex()], |row| {
+                Ok(LocalAccount {
+                    account: account_from_row(row)?,
+                    password_hash: row.get(5)?,
+                })
+            })
+            .optional()?;
+
+        Ok(account)
+    }
+
+    /// Sets `accounts.password_hash` only when it is currently NULL.
+    ///
+    /// Returns `true` when this call set the hash, `false` when another request
+    /// won the race. The caller re-reads and verifies in that case.
+    pub fn set_local_password_hash(&self, account_id: u64, password_hash: &str) -> Result<bool> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let affected = conn.execute(
+            "UPDATE accounts SET password_hash = ?1 WHERE account_id = ?2 AND password_hash IS NULL",
+            params![password_hash, account_id as i64],
+        )?;
+        Ok(affected > 0)
+    }
+
+    /// Creates a local account with an Argon2id password hash.
+    ///
+    /// A concurrent insert with the same `sub_hash` fails on the UNIQUE
+    /// constraint; the caller re-reads the account and verifies the password.
+    pub fn create_local_account(
+        &self,
+        sub_hash: &SubHash,
+        handle_name: &str,
+        password_hash: &str,
+        now: i64,
+    ) -> Result<Account> {
+        let conn = self.conn.lock().map_err(|e| {
+            MaitreDError::Database(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::other(e.to_string()),
+            )))
+        })?;
+
+        let next_id: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(account_id), 0) + 1 FROM accounts",
+            [],
+            |row| row.get(0),
+        )?;
+
+        conn.execute(
+            "INSERT INTO accounts (account_id, sub_hash, handle_name, icon_tin_id, created_at, password_hash)
+             VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+            params![
+                next_id,
+                sub_hash.as_hex(),
+                handle_name,
+                now,
+                password_hash
+            ],
+        )?;
+
+        Ok(Account {
+            account_id: next_id as u64,
+            sub_hash: *sub_hash,
+            handle_name: handle_name.to_string(),
+            icon_tin_id: None,
+            created_at: now,
+        })
     }
 
     /// Updates the handle name and/or avatar icon for an account.

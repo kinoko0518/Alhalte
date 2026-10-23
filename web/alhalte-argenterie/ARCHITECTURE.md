@@ -107,15 +107,19 @@
 3. 成功時だけ、返却された `room_id` とクライアント生成の部屋鍵から招待 URL を作り、最近の部屋へ保存して入室する。`role` はサーバーが返した値を localStorage 互換の `isAdmin` に反映するだけ。
 4. 401 はサインイン導線、403 / 通信失敗 / その他の HTTP 失敗はダイアログ内のエラーとして表示し、ローカル部屋の作成や入室は行わない。ダイアログは開いたまま再試行できる。
 
-### デバッグログインの警告（Issue #150）
+### ローカルログイン画面
 
-ホーム画面は mount 時に `fetchServerInfo`（`GET /api/server-info`）を呼び、`debug_login === true` なら全画面警告を出す。`alhalte-maitre-d --debug-login` は account 名だけでサインインできるため、公開インスタンスで有効にしてはならない。
+`maitre-d --local-login` のとき、`GET /auth/login` は SPA の `/login?return_to=...` へ 302 する。`main.ts` は `pathname === '/login'` を検出すると `LoginScreen` を mount し、`completeGoogleSignIn()` は呼ばない（未ログインの 401 で sessionStorage の戻り先と部屋鍵 fragment が消えるのを防ぐ）。
 
-- 警告は `role="alertdialog"` / `aria-modal="true"` の fixed 全画面レイヤ（`data-testid="debug-login-warning"`）。ホーム画面の内容の上に重ねる。
-- 中央大文字の見出し「管理者向けの警告」と、本文「現在デバッグログインが有効になっています。公開されるインスタンスでこの機能を利用するのは推奨されません。」
-- 「閉じる」ボタン（`data-testid="debug-login-warning-close"`）でそのマウント中は非表示にできる。再読み込みすると再表示される。
-- `fetchServerInfo` は 404 / 通信失敗 / 不正な body をすべて `{ debug_login: false }` に落とす。警告の取得失敗でホーム画面を壊さない。
-- サインイン導線は従来どおり `GET /auth/login` のままで、debug 時は maitre-d が `/auth/debug/login` へ 302 する。argenterie 側に分岐は無い。
+- 画面は noph-ui の `Card` / `TextField`（account 名、`type="password"`）/ `Button`（filled）で構成し、自作の input / button は使わない。
+- `POST /api/auth/local/login` に `{ account_name, password }` を JSON で送る。成功時は `return_to`（same-origin のみ。cross-origin は `/`）へ遷移する。
+- 401 は「アカウント名またはパスワードが違います」、400 はサーバーの入力エラー、404 は「ローカルログインが無効」、その他は汎用エラーをフォーム内に `aria-live` で出す。
+- 遷移後、アプリ mount の `completeGoogleSignIn()` が `/api/session` を Cookie 付きで呼び、account / session と部屋鍵 fragment を復元する。処理名は Google 固有だが、実装は任意の session 復帰に使える（Issue #294）。
+- ホーム画面のデバッグ警告と `GET /api/server-info` / `fetchServerInfo` は削除した。
+
+### 本番 SPA ビルド
+
+`vite.config.ts` はライブラリ用で `index.html` を出さない。ポータブル版・`nix run .`・`maitre-d --web-root` 向けに `vite.config.web.ts` と `pnpm run build:app` を追加し、`dist-app/`（`index.html`、assets、`public/` の wasm）を生成する。`maitre-d` は `ServeDir` + `index.html` fallback で `/login` や `/rooms/<id>` を配信する。
 
 ### 門前払い画面
 
@@ -221,7 +225,7 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 ### 拡張機能
 
 - メタデータは `/` scene の state key `extension::<id>` に `{ id, name, description, icon, priority, enabled, tinId }` の JSON Tin で保存する。wasm 本体は cellar に RoomKey 暗号化で置き、`tinId` だけを state に持つ（4KiB 制限を守る）。
-- **ABI 2 と自己紹介 id（Issue #274）**: 拡張機能の表示メタデータ（id / name / icon / description）の正は wasm の `self_introduction`。ABI 2 は postcard の `(id, name, icon_svg, description)` を返し、`id` は公式拡張では package 名（= manifest id）と一致する。ホストは ABI 1（`(name, icon_svg, description)`、id なし）と ABI 2 を受け入れ、それ以外を拒否する。ABI 2 の自己紹介 id が manifest id と一致しない wasm は `wasmMissing: true` として実行しない（fail-closed）。`Bistrot.toml` は `id` / wasm path / `enabled` だけを持ち、`name` は持たない。オフライン / テスト用の `DEFAULT_OFFICIAL_EXTENSIONS` はフォールバックとして残すが、staged wasm の自己紹介と一致することをテストで固定する。
+- **ABI 2 と自己紹介 id（Issue #274）**: 拡張機能の表示メタデータ（id / name / icon / description）の正は wasm の `self_introduction`。ABI 2 は postcard の `(id, name, icon_svg, description)` を返し、`id` は公式拡張では package 名（= manifest id）と一致する。ホストは ABI 1（`(name, icon_svg, description)`、id なし）と ABI 2 を受け入れ、それ以外を拒否する。ABI 2 の自己紹介 id が manifest id と一致しない wasm は `wasmMissing: true` として実行しない（fail-closed）。`Restaurant.toml` は `id` / wasm path / `enabled` だけを持ち、`name` は持たない。オフライン / テスト用の `DEFAULT_OFFICIAL_EXTENSIONS` はフォールバックとして残すが、staged wasm の自己紹介と一致することをテストで固定する。
 - **一度だけの seed とサーバー正**: 部屋 root state の `extension::__seeded` を seed 済みマーカーとする。マーカーが無い部屋では、拡張機能タブを開いた GM がサーバーに無い公式既定拡張のメタデータを `requestUpdateState` で書き、最後にマーカーを書く（途中で失敗するとマーカーが無いため、再接続時に残りを seed し直す）。既存 room もマーカーが無ければ移行として一度だけ seed し、すでにサーバーにあるメタデータは上書きしない。GM 以外は seed せず、公式既定を読み取り専用で表示する。
 - マーカーがある場合、サーバー state が正。公式既定 id でもサーバーに無ければ削除済みとして扱い、再入室・再接続で再追加しない。マーカーが無い legacy room に限り、サーバーに無い公式既定 id をローカルの wasm ごと保持する。サーバーに無いカスタム id は削除する。同じ id でサーバーの `tinId` が変わった場合だけ wasm を取り直し、それ以外はローカルの `wasmBytes` を保持する。手元に wasm が無い場合は `tinId` から cellar で取得する。
 - **wasm 欠落**: `loadDefaultExtensions` は manifest にある wasm の取得・instantiate に失敗した拡張を `wasmMissing: true` で返す。`applyRemoteExtensions` は `tinId` の download に失敗した拡張も `wasmMissing: true` にする。タブは該当行に「wasm がありません」を出し、有効化 Switch を無効にする（並べ替え・削除は可能）。`ExtensionPipeline.executePipeline` は wasm の無い有効拡張を黙って skip せず、`getLastWarnings()` / `onWarning` に警告を残す。送信時 pipeline の警告はフッター上部の `pipeline-warning` に表示し、原文（ext-io Tin）はそのまま送信する。
@@ -270,6 +274,6 @@ BGM と背景画像は Argenterie の都合であり、banquette はこれらの
 - 入室 preflight のネットワーク / 5xx 失敗は 2 秒間隔・最大 5 回で打ち切り、preflight エラー画面の「再試行」ボタンだけを導線にする。403 / 401 / 404 は再試行しない。401 は `GateScreen`（サインイン導線）として扱う。グローバルな接続バナーは無く、失敗は操作したタブ / エディタ内で告知する（Issue #261）。
 - 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。`App` は `roomKey` prop → `currentRoom.url` のフラグメント → `window.location.hash` の順に解決し、64 hex を検証する。鍵が無い場合、アセット・拡張 wasm の cellar upload は試行せずエラーを表示する。
 - ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
-- Google OAuth の `redirect_uri` は maitre-d の固定 URL（`{public_url}/auth/google/callback`）だけを Google Cloud Console に登録する。argenterie の origin / port は登録しない。`return_to` は maitre-d が CORS allow-list と照合する。`/api/session` を Cookie 付きで呼ぶため、開発では `public_url` を argenterie の dev origin（Vite の `/auth` proxy）に合わせる必要がある。
+- Google OAuth の `redirect_uri` は maitre-d の固定 URL（`{public_url}/auth/google/callback`）だけを Google Cloud Console に登録する。argenterie の origin / port は登録しない。`return_to` は maitre-d が CORS allow-list と照合する。`/api/session` を Cookie 付きで呼ぶため、開発で Vite dev server を使う場合は `public_url` を Vite の dev origin に合わせる。cafe / ポータブル / `nix run .` では maitre-d が SPA を同一 origin で配信する。
 - `AccountMenu` は account ごとに `GET /api/account/{id}` を呼ぶ。プロフィール取得に失敗してもサインイン状態は維持し、イニシャル表示にフォールバックする。
 - 入室可否は `GET /api/rooms/{id}` の preflight を正とする。`isForbidden`（= `denied`）は WebSocket の `Error` frame / close code でもフォールバックとして立つが、権限表 (`PermissionsSnapshot`) からは導出しない。`PermissionsSnapshot` は要求元にしか返らず、`SetMemberPermission` / `SetDefaultPermission` の ack も broadcast されないため、他クライアントによる降格は再接続時の `QueryPermissions`（`App` は接続のたびに問い合わせる）まで見えない。participant のアクセス可能 scene は `PermissionsSnapshot` に含まれないので、UI は現在の scene だけを送信可能として扱い、最終認可は banquette に委ねる。

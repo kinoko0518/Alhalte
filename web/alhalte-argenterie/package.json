@@ -16,6 +16,7 @@
     "dev": "vite",
     "preview": "vite preview --host 127.0.0.1 --port 5173",
     "build": "vite build && tsc --emitDeclarationOnly",
+    "build:app": "vite build --config vite.config.web.ts",
     "test": "vitest run"
   },
   "dependencies": {

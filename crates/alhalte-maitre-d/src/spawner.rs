@@ -1,15 +1,48 @@
 //! Banquette process and server spawning abstractions.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::sync::Arc;
-use std::time::Duration;
 
-use alhalte_banquette::{BanquetteServer, CellarSink, InMemoryCellarSink, Room, ServerConfig};
 use async_trait::async_trait;
-use tokio::sync::{Mutex, watch};
 
 use crate::error::{MaitreDError, Result};
+
+#[cfg(unix)]
+use alhalte_banquette::{BanquetteServer, CellarSink, InMemoryCellarSink, Room, ServerConfig};
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(unix)]
+use std::time::Duration;
+#[cfg(unix)]
+use tokio::sync::{Mutex, watch};
+
+/// How `alhalte-maitre-d` reaches a room's `alhalte-banquette` process.
+///
+/// The protocol codec is transport-independent. Unix uses a UNIX domain socket;
+/// Windows uses a named pipe because Tokio 1.54 does not expose AF_UNIX there
+/// (`tokio::net::UnixStream` is `cfg_net_unix!`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BanquetteEndpoint {
+    /// UNIX domain socket path (Unix).
+    #[cfg(unix)]
+    UnixSocket(PathBuf),
+    /// Windows named-pipe path (`\\.\pipe\...`).
+    #[cfg(windows)]
+    NamedPipe(String),
+}
+
+impl BanquetteEndpoint {
+    /// Returns a human-readable description for logs and errors.
+    pub fn describe(&self) -> String {
+        match self {
+            #[cfg(unix)]
+            Self::UnixSocket(path) => format!("UNIX socket {}", path.display()),
+            #[cfg(windows)]
+            Self::NamedPipe(name) => format!("named pipe {name}"),
+        }
+    }
+}
 
 /// Trait defining how `alhalte-maitre-d` launches room daemon instances.
 #[async_trait]
@@ -22,8 +55,8 @@ pub trait BanquetteSpawner: Send + Sync {
     /// ID is an error, so a spawner must never fall back to an empty room. With
     /// no alias, banquette starts a brand-new room.
     ///
-    /// Returns the UNIX domain socket path where the `banquette` server is listening.
-    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf>;
+    /// Returns the local transport endpoint where the `banquette` server listens.
+    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<BanquetteEndpoint>;
 }
 
 /// Spawns external `alhalte-banquette` executable binaries as OS child processes.
@@ -38,9 +71,9 @@ pub struct ProcessBanquetteSpawner {
     socket_dir: PathBuf,
     cellar_url: String,
     chunk_size_exponent: u8,
+    heartbeat_interval_secs: u64,
     service_token: Option<String>,
     service_token_file: Option<PathBuf>,
-    no_persist: bool,
 }
 
 impl std::fmt::Debug for ProcessBanquetteSpawner {
@@ -50,12 +83,12 @@ impl std::fmt::Debug for ProcessBanquetteSpawner {
             .field("socket_dir", &self.socket_dir)
             .field("cellar_url", &self.cellar_url)
             .field("chunk_size_exponent", &self.chunk_size_exponent)
+            .field("heartbeat_interval_secs", &self.heartbeat_interval_secs)
             .field(
                 "service_token",
                 &self.service_token.as_ref().map(|_| "<redacted>"),
             )
             .field("service_token_file", &self.service_token_file)
-            .field("no_persist", &self.no_persist)
             .finish()
     }
 }
@@ -73,28 +106,21 @@ impl ProcessBanquetteSpawner {
             socket_dir: socket_dir.into(),
             cellar_url: cellar_url.into(),
             chunk_size_exponent,
+            heartbeat_interval_secs: 240,
             service_token: None,
             service_token_file: None,
-            no_persist: false,
         }
     }
 
-    /// Disables room state persistence in every spawned banquette.
+    /// Sets the heartbeat interval forwarded to every spawned banquette.
     ///
-    /// `maitre-d --debug-login` sets this: banquette keeps room state and log
-    /// chunks in process memory (`--no-persist`) instead of writing them to the
-    /// shared `alhalte-cellar`, so a debug instance never touches the normal
-    /// cellar (Issue #150).
+    /// The interval controls how often the room is persisted to cellar. The
+    /// Windows package uses 60 seconds so a forced shutdown loses at most about
+    /// one minute of room state.
     #[must_use]
-    pub fn with_no_persist(mut self) -> Self {
-        self.no_persist = true;
+    pub fn with_heartbeat_interval_secs(mut self, seconds: u64) -> Self {
+        self.heartbeat_interval_secs = seconds;
         self
-    }
-
-    /// Returns whether spawned banquette processes run with `--no-persist`.
-    #[must_use]
-    pub fn is_no_persist(&self) -> bool {
-        self.no_persist
     }
 
     /// Configures the internal cellar service token passed to spawned banquette processes.
@@ -123,41 +149,76 @@ impl ProcessBanquetteSpawner {
         self
     }
 
-    /// Builds the argument list passed to the spawned `alhalte-banquette` binary.
+    /// Builds the argument list for a specific transport endpoint.
     ///
     /// Exposed so tests can assert the "no secret in argv" property and that no
     /// room head is passed: the room restores itself from cellar's
     /// `room/<room_id>/head` alias (Issue #192).
-    pub fn command_args(
+    pub fn command_args_for_endpoint(
         &self,
         room_id: u64,
         admin_account: u64,
-        socket_path: &std::path::Path,
+        endpoint: &BanquetteEndpoint,
     ) -> Vec<String> {
         let mut args = vec![
             "--room-id".to_string(),
             format!("{room_id:016x}"),
             "--admin".to_string(),
             admin_account.to_string(),
-            "--socket".to_string(),
-            socket_path.display().to_string(),
+        ];
+
+        match endpoint {
+            #[cfg(unix)]
+            BanquetteEndpoint::UnixSocket(path) => {
+                args.push("--socket".to_string());
+                args.push(path.display().to_string());
+            }
+            #[cfg(windows)]
+            BanquetteEndpoint::NamedPipe(name) => {
+                args.push("--pipe-name".to_string());
+                args.push(name.clone());
+            }
+        }
+
+        args.extend([
             "--cellar-url".to_string(),
             self.cellar_url.clone(),
             "--chunk-size-exponent".to_string(),
             self.chunk_size_exponent.to_string(),
-        ];
+            "--heartbeat-interval-secs".to_string(),
+            self.heartbeat_interval_secs.to_string(),
+        ]);
 
         if let Some(path) = self.service_token_file.as_deref() {
             args.push("--service-token-file".to_string());
             args.push(path.display().to_string());
         }
 
-        // Debug login: no room state or log chunk may reach the shared cellar.
-        if self.no_persist {
-            args.push("--no-persist".to_string());
-        }
-
         args
+    }
+
+    /// Builds the argument list for a UNIX socket endpoint.
+    #[cfg(unix)]
+    pub fn command_args(
+        &self,
+        room_id: u64,
+        admin_account: u64,
+        socket_path: &std::path::Path,
+    ) -> Vec<String> {
+        self.command_args_for_endpoint(
+            room_id,
+            admin_account,
+            &BanquetteEndpoint::UnixSocket(socket_path.to_path_buf()),
+        )
+    }
+
+    /// Passes the service token to the child without putting it in argv.
+    fn configure_env(&self, cmd: &mut tokio::process::Command) {
+        if self.service_token_file.is_none()
+            && let Some(token) = self.service_token.as_deref()
+        {
+            cmd.env("ALHALTE_SERVICE_TOKEN", token);
+        }
     }
 }
 
@@ -170,18 +231,31 @@ impl ProcessBanquetteSpawner {
 /// 3. Alongside the current executable (`std::env::current_exe()`)
 /// 4. Directories listed in the `PATH` environment variable
 ///
-/// If not found in any candidate locations, returns `binary_path.to_path_buf()` as fallback.
+/// On Windows the resolved name gets the `.exe` suffix when it does not already
+/// have one.
 pub fn resolve_banquette_bin(binary_path: &std::path::Path) -> PathBuf {
     if binary_path.is_file() {
         return binary_path.to_path_buf();
     }
 
-    let bin_name = binary_path.file_name().unwrap_or(binary_path.as_os_str());
+    let mut bin_name = binary_path
+        .file_name()
+        .unwrap_or(binary_path.as_os_str())
+        .to_os_string();
+    let suffix = std::env::consts::EXE_SUFFIX;
+    if !suffix.is_empty()
+        && !bin_name
+            .to_string_lossy()
+            .to_ascii_lowercase()
+            .ends_with(suffix)
+    {
+        bin_name.push(suffix);
+    }
 
     // 1. Current working directory target/debug and target/release
     let candidates = [
-        PathBuf::from("target/debug").join(bin_name),
-        PathBuf::from("target/release").join(bin_name),
+        PathBuf::from("target/debug").join(&bin_name),
+        PathBuf::from("target/release").join(&bin_name),
     ];
     for candidate in &candidates {
         if candidate.is_file() {
@@ -193,7 +267,7 @@ pub fn resolve_banquette_bin(binary_path: &std::path::Path) -> PathBuf {
     if let Ok(current_exe) = std::env::current_exe()
         && let Some(parent) = current_exe.parent()
     {
-        let candidate = parent.join(bin_name);
+        let candidate = parent.join(&bin_name);
         if candidate.is_file() {
             return candidate;
         }
@@ -202,7 +276,7 @@ pub fn resolve_banquette_bin(binary_path: &std::path::Path) -> PathBuf {
     // 3. Search in PATH
     if let Some(path_var) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join(bin_name);
+            let candidate = dir.join(&bin_name);
             if candidate.is_file() {
                 return candidate;
             }
@@ -214,51 +288,67 @@ pub fn resolve_banquette_bin(binary_path: &std::path::Path) -> PathBuf {
 
 #[async_trait]
 impl BanquetteSpawner for ProcessBanquetteSpawner {
-    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf> {
-        tokio::fs::create_dir_all(&self.socket_dir)
-            .await
-            .map_err(MaitreDError::Io)?;
-
-        let socket_path = self.socket_dir.join(format!("banquette-{room_id}.sock"));
-
-        if socket_path.exists() {
-            let _ = tokio::fs::remove_file(&socket_path).await;
-        }
-
+    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<BanquetteEndpoint> {
         let resolved_bin = resolve_banquette_bin(&self.binary_path);
         tracing::debug!(
             "Spawning banquette for room {room_id} with binary: {:?}",
             resolved_bin
         );
 
-        let mut cmd = tokio::process::Command::new(&resolved_bin);
-        cmd.args(self.command_args(room_id, admin_account, &socket_path));
-        // The token never goes on the command line. When only the value is known
-        // (no forwarded file path) hand it to the child through the environment.
-        if self.service_token_file.is_none()
-            && let Some(token) = self.service_token.as_deref()
+        #[cfg(unix)]
         {
-            cmd.env("ALHALTE_SERVICE_TOKEN", token);
+            tokio::fs::create_dir_all(&self.socket_dir)
+                .await
+                .map_err(MaitreDError::Io)?;
+
+            let socket_path = self.socket_dir.join(format!("banquette-{room_id}.sock"));
+            if socket_path.exists() {
+                let _ = tokio::fs::remove_file(&socket_path).await;
+            }
+
+            let endpoint = BanquetteEndpoint::UnixSocket(socket_path);
+            let mut cmd = tokio::process::Command::new(&resolved_bin);
+            cmd.args(self.command_args_for_endpoint(room_id, admin_account, &endpoint));
+            self.configure_env(&mut cmd);
+            cmd.spawn().map_err(|e| {
+                MaitreDError::Banquette(format!(
+                    "Failed to spawn banquette binary at {:?} (resolved: {:?}): {e}",
+                    self.binary_path, resolved_bin
+                ))
+            })?;
+            Ok(endpoint)
         }
 
-        cmd.spawn().map_err(|e| {
-            MaitreDError::Banquette(format!(
-                "Failed to spawn banquette binary at {:?} (resolved: {:?}): {e}",
-                self.binary_path, resolved_bin
-            ))
-        })?;
-
-        Ok(socket_path)
+        #[cfg(windows)]
+        {
+            let pipe_name = format!(
+                r"\\.\pipe\alhalte-banquette-{room_id:016x}-{:016x}",
+                rand::random::<u64>()
+            );
+            let endpoint = BanquetteEndpoint::NamedPipe(pipe_name);
+            let mut cmd = tokio::process::Command::new(&resolved_bin);
+            cmd.args(self.command_args_for_endpoint(room_id, admin_account, &endpoint));
+            self.configure_env(&mut cmd);
+            cmd.spawn().map_err(|e| {
+                MaitreDError::Banquette(format!(
+                    "Failed to spawn banquette binary at {:?} (resolved: {:?}): {e}",
+                    self.binary_path, resolved_bin
+                ))
+            })?;
+            Ok(endpoint)
+        }
     }
 }
 
 /// A running in-process room server together with its graceful shutdown handle.
+#[cfg(unix)]
 struct InProcessRoom {
     shutdown: watch::Sender<bool>,
     handle: tokio::task::JoinHandle<()>,
 }
 
 /// Spawns in-process [`BanquetteServer`] instances for automated testing without child processes.
+#[cfg(unix)]
 #[derive(Clone)]
 pub struct InProcessBanquetteSpawner {
     socket_dir: PathBuf,
@@ -268,6 +358,7 @@ pub struct InProcessBanquetteSpawner {
     rooms: Arc<Mutex<HashMap<u64, InProcessRoom>>>,
 }
 
+#[cfg(unix)]
 impl InProcessBanquetteSpawner {
     /// Creates a new [`InProcessBanquetteSpawner`].
     pub fn new(
@@ -338,9 +429,10 @@ impl InProcessBanquetteSpawner {
     }
 }
 
+#[cfg(unix)]
 #[async_trait]
 impl BanquetteSpawner for InProcessBanquetteSpawner {
-    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<PathBuf> {
+    async fn spawn_banquette(&self, room_id: u64, admin_account: u64) -> Result<BanquetteEndpoint> {
         tokio::fs::create_dir_all(&self.socket_dir)
             .await
             .map_err(MaitreDError::Io)?;
@@ -371,6 +463,7 @@ impl BanquetteSpawner for InProcessBanquetteSpawner {
 
         let config = ServerConfig {
             socket_path: socket_path.clone(),
+            pipe_name: None,
             heartbeat_interval: self.heartbeat_interval,
         };
 
@@ -390,6 +483,6 @@ impl BanquetteSpawner for InProcessBanquetteSpawner {
             },
         );
 
-        Ok(socket_path)
+        Ok(BanquetteEndpoint::UnixSocket(socket_path))
     }
 }

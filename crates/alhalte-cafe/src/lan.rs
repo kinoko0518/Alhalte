@@ -1,10 +1,10 @@
 //! Best-effort detection of the host's LAN address.
 //!
-//! `nix run .#bistrot` prints the loopback URL as before, and additionally a
-//! LAN URL when an address can be detected, so the URL can be typed on a phone.
-//! Detection is deliberately advisory: sign-in works for the whole private
-//! network through `maitre-d --allow-lan-origin-port`, not just for the address
-//! printed here (Issue #229).
+//! `alhalte-cafe` prints the loopback URL and additionally a LAN URL when an
+//! address can be detected, so the URL can be typed on a phone. Detection is
+//! deliberately advisory: sign-in works for the whole private network through
+//! `maitre-d --allow-lan-origin-port`, not just for the address printed here
+//! (Issue #229).
 //!
 //! No packet is sent: the kernel only picks the source address it would use for
 //! an off-link destination, which is the address of the interface holding the
@@ -45,15 +45,14 @@ pub fn detect_lan_ipv4_addresses() -> Vec<Ipv4Addr> {
     addresses
 }
 
-/// Formats the browser URL for one LAN address and the argenterie port.
+/// Formats the browser URL for one LAN address and the `maitre-d` port.
 pub fn lan_url(ip: Ipv4Addr, port: u16) -> String {
     format!("http://{ip}:{port}/")
 }
 
 /// Returns the browser URLs for every detected LAN address.
 ///
-/// Best-effort: an empty vector means no LAN address could be detected. The
-/// port is the argenterie port even when the Vite bind host is `0.0.0.0`.
+/// Best-effort: an empty vector means no LAN address could be detected.
 pub fn detect_lan_urls(port: u16) -> Vec<String> {
     detect_lan_ipv4_addresses()
         .into_iter()
@@ -65,12 +64,12 @@ pub fn detect_lan_urls(port: u16) -> Vec<String> {
 mod tests {
     use super::*;
 
-    // spec: alhalte-bistrot/lan 0003 LAN URLs keep the argenterie port
+    // spec: alhalte-cafe/lan 0003 LAN URLs keep the maitre-d port
     #[test]
     fn lan_url_formats_the_private_address_and_port() {
         assert_eq!(
-            lan_url(Ipv4Addr::new(192, 168, 1, 42), 5173),
-            "http://192.168.1.42:5173/"
+            lan_url(Ipv4Addr::new(192, 168, 1, 42), 8080),
+            "http://192.168.1.42:8080/"
         );
         assert_eq!(
             lan_url(Ipv4Addr::new(10, 0, 0, 7), 3000),
