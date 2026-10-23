@@ -1,0 +1,99 @@
+name: Release alhalte-cafe
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset: alhalte-cafe-linux-x86_64
+            ext: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: alhalte-cafe-windows-x86_64.exe
+            ext: ".exe"
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build alhalte-cafe
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p alhalte-cafe --target "${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/alhalte-cafe${{ matrix.ext }}" "${{ matrix.asset }}"
+
+      - name: Upload release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" "$ASSET" --clobber
+
+  macos:
+    name: Build alhalte-cafe-macos-universal
+    runs-on: macos-latest
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-universal
+
+      - name: Build alhalte-cafe (universal)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p alhalte-cafe --target aarch64-apple-darwin
+          cargo build --release --locked -p alhalte-cafe --target x86_64-apple-darwin
+          lipo -create \
+            -output alhalte-cafe-macos-universal \
+            target/aarch64-apple-darwin/release/alhalte-cafe \
+            target/x86_64-apple-darwin/release/alhalte-cafe
+          file alhalte-cafe-macos-universal
+
+      - name: Upload release asset
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" alhalte-cafe-macos-universal --clobber
