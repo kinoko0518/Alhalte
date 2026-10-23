@@ -8,9 +8,10 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
     flake-utils.url = "github:numtide/flake-utils";
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, fenix, flake-utils, ... }:
+  outputs = { self, nixpkgs, fenix, crane, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -30,14 +31,13 @@
           fx.targets.wasm32-wasip1.stable.rust-std
           fx.targets.x86_64-pc-windows-gnu.stable.rust-std
         ];
-        hostRustPlatform = pkgs.makeRustPlatform {
-          cargo = fx.stable.cargo;
-          rustc = fx.stable.rustc;
-        };
-        wasmRustPlatform = pkgs.makeRustPlatform {
-          cargo = toolchain;
-          rustc = toolchain;
-        };
+        # crane builds the Cargo workspace in two steps (dependencies, then the
+        # workspace crates) so dependency artifacts are cached across edits.
+        # The host build uses the plain fenix stable cargo/rustc; the WASM build
+        # uses the combined toolchain that carries the wasm32 std.
+        craneLib = crane.mkLib pkgs;
+        hostCraneLib = craneLib.overrideToolchain (_: fx.combine [ fx.stable.cargo fx.stable.rustc ]);
+        wasmCraneLib = craneLib.overrideToolchain (_: toolchain);
         # The portable Windows bundle is built from x86_64-linux with the
         # mingw-w64 cross compiler. Other hosts still get the normal devShell.
         windowsTarget = pkgs.stdenv.hostPlatform.system == "x86_64-linux";
@@ -49,36 +49,79 @@
         };
         wasiCflags = "--target=wasm32-wasip1 --sysroot=${wasiSysroot} -isystem ${wasiSysroot}/include/wasm32-wasip1";
 
+        # Sources for the crane builds. Only the Cargo workspace is included, so
+        # edits under `web/`, `scripts/`, docs, etc. do not invalidate the Rust
+        # dependency cache. Non-`.rs` files such as the `include_str!` CSS live
+        # inside `crates/` and `extensions/`, so they are kept.
+        rustSrc = lib.fileset.toSource {
+          root = ./.;
+          fileset = lib.fileset.unions [
+            ./Cargo.toml
+            ./Cargo.lock
+            ./crates
+            ./extensions
+          ];
+        };
+
+        # Vendor the Cargo dependencies once and share them between the host and
+        # WASM builds. The `aozora-rs` git checkout contains a crate whose
+        # manifest points at `readme = "../README.md"`, which makes crane's
+        # `cargo package -l` step fail, so the readme keys are stripped first.
+        cargoVendorDir = craneLib.vendorCargoDeps {
+          src = rustSrc;
+          inherit cargoVendorDir;
+          overrideVendorGitCheckout = ps: drv:
+            if lib.any (p: lib.hasPrefix "git+https://github.com/kinoko0518/aozora-rs" p.source) ps then
+              drv.overrideAttrs (_: {
+                postPatch = ''
+                  find . -name Cargo.toml -exec sed -i '/^readme[[:space:]]*=/d' {} +
+                '';
+              })
+            else
+              drv;
+        };
+
         # The five long-lived/local binaries. `alhalte-cafe` is the one-shot
         # launcher; `alhalte-bistrot` only generates systemd units.
-        alhaltePackage = hostRustPlatform.buildRustPackage {
+        hostCommonArgs = {
           pname = "alhalte";
           version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoLock.outputHashes = {
-            "aozora-rs-core-0.1.0" = "sha256-afTno53wXFdOW8x24SAA61DfFha8x+CNftsTfYPvIDg=";
-          };
-          cargoBuildFlags = [ "--bins" ];
+          src = rustSrc;
+          inherit cargoVendorDir;
+          strictDeps = true;
+          cargoExtraArgs = "--locked --bins";
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.openssl pkgs.sqlite ];
           doCheck = false;
+        };
+        hostCargoArtifacts = hostCraneLib.buildDepsOnly hostCommonArgs;
+        alhaltePackage = hostCraneLib.buildPackage (hostCommonArgs // {
+          cargoArtifacts = hostCargoArtifacts;
           meta = {
             description = "Alhalte binaries (cafe, bistrot, maitre-d, cellar, banquette)";
             mainProgram = "alhalte-cafe";
           };
-        };
+        });
 
         # Saignant and the official extension wasm, built for
         # wasm32-unknown-unknown. The SPA build stages these files.
-        wasmArtifacts = wasmRustPlatform.buildRustPackage {
+        wasmCommonArgs = {
           pname = "alhalte-wasm";
           version = "0.1.0";
-          src = ./.;
-          cargoLock.lockFile = ./Cargo.lock;
-          cargoLock.outputHashes = {
-            "aozora-rs-core-0.1.0" = "sha256-afTno53wXFdOW8x24SAA61DfFha8x+CNftsTfYPvIDg=";
-          };
+          src = rustSrc;
+          inherit cargoVendorDir;
+          strictDeps = true;
+          cargoExtraArgs = lib.concatStringsSep " " [
+            "--locked"
+            "-p alhalte-saignant"
+            "-p alhalte-dsl"
+            "-p markdown"
+            "-p aozora"
+            "-p coc-6"
+            "-p coc-7"
+            "-p emoklore"
+          ];
+          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
           nativeBuildInputs = [
             llvm.clang-unwrapped
             llvm.llvm
@@ -87,24 +130,17 @@
           CC_wasm32_unknown_unknown = "${llvm.clang-unwrapped}/bin/clang";
           AR_wasm32_unknown_unknown = "${llvm.llvm}/bin/llvm-ar";
           CFLAGS_wasm32_unknown_unknown = "--target=wasm32-unknown-unknown";
-          buildPhase = ''
-            runHook preBuild
-            cargo build --offline --locked --release --target wasm32-unknown-unknown \
-              -p alhalte-saignant \
-              -p alhalte-dsl \
-              -p markdown \
-              -p aozora \
-              -p coc-6 \
-              -p coc-7 \
-              -p emoklore
-            runHook postBuild
-          '';
           doCheck = false;
-          installPhase = ''
-            mkdir -p $out
-            find target -name '*.wasm' -type f -exec cp {} $out/ \;
-          '';
         };
+        wasmCargoArtifacts = wasmCraneLib.buildDepsOnly wasmCommonArgs;
+        wasmArtifacts = wasmCraneLib.buildPackage (wasmCommonArgs // {
+          cargoArtifacts = wasmCargoArtifacts;
+          doNotPostBuildInstallCargoBinaries = true;
+          installPhaseCommand = ''
+            mkdir -p $out
+            find target/wasm32-unknown-unknown/release -maxdepth 1 -name '*.wasm' -type f -exec cp {} $out/ \;
+          '';
+        });
 
         # Production SPA for `maitre-d --web-root` and the glacier module.
         # `pnpm.fetchPnpmDeps` pins the workspace lockfile; the hash is updated
