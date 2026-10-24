@@ -2,240 +2,162 @@
 
 > 上位文書: [../../ARCHITECTURE.md](../../ARCHITECTURE.md)  
 > 実装: `crates/alhalte-maitre-d`  
-> テスト: `crates/alhalte-maitre-d/tests/maitre_d_tests.rs`
+> テスト: `crates/alhalte-maitre-d/tests/spec_tests.rs`
 
 ## 責務
 
-restaurant の認証・玄関口。Google OAuth で `sub` だけを継承し、インスタンス固有の salt を key にした BLAKE3 の 128bit hash（`sub_hash`）にして account を作る。生の `sub` は hash 計算後に zeroize し、DB・ログ・HTTP 応答のどこにも残さない（Issue #190）。64bit の session を発行・失効させる。HTTP API と WebSocket を提供し、部屋 ID ごとに通信を demultiplex して `alhalte-banquette` のローカル transport（Unix: UNIX socket、Windows: named pipe）へ流す。SQLite に部屋 registry（`rooms`）を持ち、部屋作成 API と ZIP export も持つ。部屋状態の head は持たない: banquette が cellar の `room/<room_id>/head` alias を読み書きする（Issue #192）。
+ブラウザ（cutlery）が直接通信する唯一の HTTP / WebSocket ゲートウェイ（玄関口）である。以下の責務を担う。
 
-認証経路は trait（`AuthProvider`）で切り替える。通常は Google OAuth（`GoogleAuthProvider`）を使い、`--local-login` を指定したときだけ、account 名 + パスワードのローカルログイン（`LocalAuthProvider` + Argon2id）に差し替わる。local 有効時は **別の SQLite ファイル**（`maitre-d-local.sqlite3`）を開き、通常の Google 用 DB には一切触らない。部屋状態は local でも cellar に永続化する。
+- Google OAuth 2.0 およびローカルログイン（アカウント名 + Argon2id パスワード）による認証、アカウント作成・検索・更新、セッション管理。
+- 部屋レジストリ（`rooms` テーブル）の管理と、必要に応じた `alhalte-banquette` 子プロセスのオンデマンド起動・監視・グレースフルシャットダウン・回収（reap）。
+- クライアント WebSocket 接続の終端と、部屋ごとのローカル IPC（UNIX ドメインソケット / Windows 名前付きパイプ）への多重化・逆多重化（mux / demux）。
+- `alhalte-cellar` に対する認証付きリバースプロキシ（`/api/cellar/*`）。
+- ビルド済み SPA（`--web-root`）およびステージング済み公式拡張機能（`/extensions/*`）の同一オリジン配信。
 
 ## 公開 API / 外部接続点
 
-### HTTP API
+### CLI（`alhalte-maitre-d` バイナリ）
 
-| メソッド | パス | 内容 |
+| 引数 / 環境変数 | 既定値 | 内容 |
 | --- | --- | --- |
-| `GET` | `/api/verify-session` | `owner` / `account_id` と `session_id` の有効性を返す。cellar の `MaitreDVerifier` と互換。 |
-| `GET` | `/api/session` | `session_id`（Cookie / ヘッダ / クエリ）から `account`（`AccountResponse`）と `session_id` を返す。argenterie が OAuth 後に account を得るための軽量 API。 |
-| `POST` | `/api/heartbeat` | `session_id` の `last_heartbeat` を更新する。 |
-| `GET` | `/auth/login` | 絶対 URL の `return_to` を受け、state を発行して Google へ 302 する。`return_to` の origin は CORS allow-list のみ許可（オープンリダイレクト禁止）。`prompt` も任意で透過する。local 有効時は state を発行せず SPA の `/login?return_to=...` へ 302 する。 |
-| `POST` | `/api/auth/local/login` | local 有効時のみ登録。JSON `{ account_name, password }` を検証し、Argon2id の PHC 文字列と照合して `session_id` Cookie を設定する。成功は `{ "status": "ok" }`、失敗は 400 / 401 / 500 の JSON。 |
-| `GET` | `/auth/google/callback` | Google からの固定 callback。state を単回消費し、コードを交換して account / session を作り、`session_id` Cookie を設定して `return_to` へ 302 する。local 有効時は登録されない（404）。 |
-| `POST` | `/auth/google/token` | ID token を検証し、account と session を返す。local 有効時は登録されない（404）。 |
-| `GET` / `PATCH` | `/api/account/{account_id}` | 認証必須。account の取得（`sub_hash` を含まない `AccountResponse`）・handle name / icon の更新。 |
-| `GET` | `/api/accounts/search?q=...` | 認証必須。handle name / ID で account を検索。 |
-| `POST` | `/api/rooms` | 認証必須。部屋を `rooms` に登録し、作成者を `gm` にする。banquette は起動しない。 |
-| `GET` | `/api/rooms/{room_id}` | 認証必須。部屋名・caller の role・done を返す。非メンバーかつ done=false は 403、未知は 404。 |
-| `GET` / `POST` | `/api/room/{room_id}/permissions` | GET は認証 + メンバー、POST は認証 + GM。 |
-| `DELETE` | `/api/room/{room_id}/permissions/{account_id}` | 認証 + GM。 |
-| `GET` | `/api/room/{room_id}/export/zip?type=full|logs` | 部屋またはログの ZIP。cellar の head alias から復元できなければ 5xx。 |
-| `POST` | `/api/cellar/store` | 認証付き cellar proxy。body は `{ tin_id, size, wrapped_key }` のみ（`owner` / `session_id` は 400）。cellar の `POST /store`（store check）へ転送し、`200 OK` + `{"result": ...}` の status / body をそのまま返す。 |
-| `POST` / `PUT` | `/api/cellar/store/{tin_id}` | 認証付き cellar proxy。Tin 本体を cellar の `POST` / `PUT /store/{tin_id}` へ転送する。 |
-| `GET` | `/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。本体と `X-Alhalte-Wrapped-Key` を返す。 |
-| `POST` | `/api/debug/account` | debug ビルドのみ。推測不能な合成 `sub` を hash した account を作る（テスト用。active DB に書く）。 |
+| `--host` / `ALHALTE_HOST` | `127.0.0.1` | 待ち受けホスト。 |
+| `--port` / `ALHALTE_PORT` | `8080` | 待ち受けポート。 |
+| `--db-path` / `ALHALTE_DB_PATH` | `maitre-d.sqlite3` | SQLite データベースのパス。`--local-login` 有効時は同じディレクトリ内の `maitre-d-local.sqlite3` に自動分離される。 |
+| `--salt` / `ALHALTE_SALT` | 必須 | アカウント識別子（Google `sub` 等）を BLAKE3 key 導出でハッシュ化するためのインスタンス固有ソルト。 |
+| `--local-login` / `ALHALTE_LOCAL_LOGIN` | `false` | Google OAuth の代わりにアカウント名 + パスワードによるローカル認証を有効にする。 |
+| `--google-client-id` / `ALHALTE_GOOGLE_CLIENT_ID` | `--local-login` 時は不要 | Google OAuth クライアント ID。 |
+| `--client-secret-file` / `ALHALTE_GOOGLE_CLIENT_SECRET_FILE` | 任意 | Google OAuth クライアントシークレットを格納したファイルのパス。 |
+| `--google-client-secret` / `ALHALTE_GOOGLE_CLIENT_SECRET` | 任意 | クライアントシークレットの直接指定（後方互換用。`--client-secret-file` を優先）。 |
+| `--public-url` / `ALHALTE_PUBLIC_URL` | `http://{host}:{port}` | 外部公開ベース URL。OAuth の固定 `redirect_uri`（`{public_url}/auth/google/callback`）や Cookie の `Secure` 属性判定、CORS 許可オリジンの基準に使われる。 |
+| `--allowed-origin` / `ALHALTE_ALLOWED_ORIGINS` | 任意（カンマ区切り） | 追加で許可する CORS オリジンおよび OAuth `return_to` オリジン。 |
+| `--cellar-url` / `ALHALTE_CELLAR_URL` | `http://127.0.0.1:8081` | `alhalte-cellar` のベース URL。`CellarProxy` および spawn する `banquette` に渡す。 |
+| `--service-token-file` / `ALHALTE_CELLAR_SERVICE_TOKEN_FILE` | 任意 | `cellar` の内部書き込み認証トークンを格納したファイルのパス。spawn する `banquette` にそのまま伝播する。 |
+| `--service-token` / `ALHALTE_CELLAR_SERVICE_TOKEN` | 任意 | 内部書き込み認証トークンの直接指定（後方互換用）。 |
+| `--socket-dir` / `ALHALTE_SOCKET_DIR` | `/tmp/alhalte-sockets` | `banquette` とのローカル IPC ソケットを配置するディレクトリ（Windows では名前付きパイプ名にハッシュ化される）。 |
+| `--banquette-bin` / `ALHALTE_BANQUETTE_BIN` | `alhalte-banquette` | 部屋プロセスとして起動する実行ファイルのパス（未指定時は現行実行ファイルの隣接バイナリを優先）。 |
+| `--chunk-size-exponent` / `ALHALTE_CHUNK_SIZE_EXPONENT` | `8` | spawn する `banquette` に渡すチャンクサイズ指数 $n$（$2^n$ 件）。 |
+| `--heartbeat-interval-secs` / `ALHALTE_HEARTBEAT_INTERVAL_SECS` | `240` | spawn する `banquette` に渡すハートビート・永続化間隔（秒）。 |
+| `--max-tin-size` / `ALHALTE_MAX_TIN_SIZE` | `67108864` (64 MiB) | `/api/cellar/store/{tin_id}` が受け付ける最大ボディサイズ（バイト）。spawn する `banquette` にも `--max-tin-size` として伝播する（Issue #299）。 |
+| `--web-root` / `ALHALTE_WEB_ROOT` | 任意 | ビルド済み SPA（`alhalte-argenterie/dist-app`）のディレクトリパス。指定時は静的ファイルと `index.html` フォールバックを配信する。 |
+| `--extensions-dir` / `ALHALTE_EXTENSIONS_DIR` | `<data-dir>/extensions` | ステージング済み公式拡張機能（`manifest.json` と `.wasm`）のディレクトリ。`/extensions/*` で配信する。 |
 
-`/accounts/search`、`/room/{room_id}/permissions`、`/room/{room_id}/export/zip` など、`/api` なしの別名も登録されている。CORS は明示的な origin allow-list で、`permissive()` は使わない。既定はローカル開発用の `http://127.0.0.1:5173` / `http://localhost:5173` で、`--cors-origin`（または `ALHALTE_CORS_ORIGINS`）で置き換える。alhalte-restaurant は `maitre_d_public_url()` と `restaurant.domain` から origin を生成して渡す。`allow_credentials` を使うため `Allow-Headers: *` は使わず、`X-Alhalte-*` を明示する。同じ allow-list が `GET /auth/login` の `return_to` 検証にも使われる。
+### HTTP エンドポイント
 
-#### room ID 契約
+#### 認証・セッション・アカウント
 
-room-scoped route の `{room_id}` は `RoomId`（`crates/alhalte-maitre-d/src/room_id.rs`）で受ける。
+| メソッド・パス | 認証 | 内容 |
+| --- | --- | --- |
+| `GET /auth/login?return_to=...&prompt=...` | 不要 | サインイン開始エンドポイント。Google OAuth モードでは `return_to` を検証して `oauth_states` に保存し、Google 認可 URL へ 302 リダイレクトする。`--local-login` モードでは SPA の `/login?return_to=...` へ 302 リダイレクトする。 |
+| `GET /auth/google/callback?code=...&state=...` | 不要 | Google OAuth の固定コールバック。`state` を単発消費してトークン交換・ID トークン検証を行い、`session_id` Cookie（`SameSite=Lax; Path=/`）を発行して `return_to` へ 302 リダイレクトする。 |
+| `POST /auth/google/token` | 不要 | `{ id_token, handle_name? }` を検証してアカウントとセッションを発行する API。 |
+| `POST /api/auth/local/login` | 不要 | `--local-login` 専用。`{ account_name, password }` を受け取り、未登録なら Argon2id ハッシュで新規作成、登録済みなら照合して `session_id` Cookie と `AuthResponse` を返す（誤パスワードは 401、Google モード時は 404）。 |
+| `GET /api/session` | 要セッション | Cookie・`X-Alhalte-Session` ヘッダ・クエリのいずれかからセッションを解決し、`{ account, session_id }` を返す。サインイン後の `completePendingSignIn()` が利用する（Issue #294）。 |
+| `GET /api/account/{account_id}` | 要セッション | 指定アカウントの公開プロフィール（`account_id`, `handle_name`, `icon_tin_id`, `created_at`）を返す。`sub_hash` は含めない。 |
+| `PATCH /api/account/{account_id}` | 要本人セッション | 表示名（`handle_name`）やアイコン（`icon_tin_id`）を更新する。 |
+| `GET /api/accounts/search?q={query}` | 要セッション | ハンドル名の部分一致またはアカウント ID でアカウントを検索し、最大 20 件返す。 |
+| `POST /api/debug/account` | 不要（debug ビルド限定） | テスト用の合成アカウントとセッションを発行する（`#[cfg(debug_assertions)]` のみ有効）。 |
 
-- 正は **16 hex**（`generateRoomUrl` が作る形）。`RoomId` の `Display` は常に 16 hex 小文字。
-- 移行用に decimal の `u64` 文字列も受理する。16 文字すべてが数字の場合は hex として解釈する。`POST /api/rooms` も両方を受け付け、保存・返却は常に canonical 16 hex にする。
-- 不正な ID は Axum の path / query 抽出で **400 Bad Request**。
-- 未知の ID は部屋 registry（`rooms`）にないため **404 Not Found**。登録済みでも、account に role がなく `done=false` の場合は **403 Forbidden**。`done=true` なら非メンバーは `viewer` として扱う。
-- `room_permissions.room_id` には `RoomId` の `Display`（16 hex）を保存する。WebSocket の権限判定も同じ正規形を使う。
-- `GET /ws?room=<id>` と `X-Alhalte-Room` ヘッダも `RoomId` として解釈する。
+#### 部屋管理・権限・エクスポート
 
-### WebSocket
+| メソッド・パス | 認証 | 内容 |
+| --- | --- | --- |
+| `POST /api/rooms` | 要セッション | `{ name, room_id? }` で部屋を `rooms` テーブルに登録し、呼び出し元を `creator_account` として記録する。この時点では `banquette` をまだ起動せず、`role: "admin"` を含む `RoomInfoResponse` を返す。 |
+| `GET /api/rooms/{room_id}` | 要セッション | 入室プリフライト。`rooms` 未登録なら 404。登録済みなら `banquette` ブリッジを起動・接続して `QueryAccountPermission` で呼び出し元の権限を照会し、`Denied` なら 403、それ以外は `{ room_id, name, role }` を 200 で返す。 |
+| `GET /api/room/{room_id}/permissions` | 要セッション | `banquette` に `QueryPermissions` を送り、返された権限マップに `accounts` テーブルの表示名・アイコン URL を結合して返す。 |
+| `POST /api/room/{room_id}/permissions` | 要セッション | `{ account_id, role }` を受け取り、`banquette` に `SetMemberPermission` を転送する（`Admin` 以外は `banquette` が拒否して 403）。 |
+| `DELETE /api/room/{room_id}/permissions/{account_id}` | 要セッション | 対象アカウントに `RoomPermissionLevel::Denied` を設定する `SetMemberPermission` を `banquette` に送る。 |
+| `GET /api/room/{room_id}/export/zip?type=full\|logs`（別名 `/room/{room_id}/export/zip`） | セッション任意 | `rooms` 未登録なら 404。`banquette` に実効権限を照会して `Denied` なら 403。許可された場合は `ExportRoom` を送り、`banquette` が生成した ZIP バイト列を `application/zip` で返す。 |
 
-| パス | 内容 |
-| --- | --- |
-| `/ws` | クエリ `room` またはヘッダ `X-Alhalte-Room` で部屋を指定（16 hex / decimal）。 |
-| `/ws/room/{room_id}` | パスで部屋を指定（16 hex / decimal）。 |
-| `/room/{room_id}` | 招待 URL 互換。 |
-| `/room/{room_id}/ws` | 同上。 |
+#### 認証付き Cellar リバースプロキシ（`/api/cellar/*`）
 
-認証情報はクエリ `account_id` / `session_id`、ヘッダ `X-Alhalte-Account` / `X-Alhalte-Session`、Cookie `session_id` の順で解決する。`account_id` 単独は 401。`account_id` + 有効な session は両者が一致すれば受理し、`session_id` だけなら session から account を引く。どちらもない匿名接続は、`done=true` の公開部屋でのみ viewer として受理し、private 部屋は 403。
+ブラウザは `alhalte-cellar` に直接アクセスせず、必ず `maitre-d` の `/api/cellar/*` を経由する。
 
-### 外部接続
+| メソッド・パス | 認証 | 転送先と動作 |
+| --- | --- | --- |
+| `POST /api/cellar/store` | 要セッション | クライアントからは `{ tin_id, size, wrapped_key }` のみを受け取る（ボディに `owner` や `session_id` が含まれていれば 400 で拒否）。セッションから解決したアカウント ID を `owner` として注入し、`cellar` の `POST /store` へ転送する。 |
+| `PUT /api/cellar/store/{tin_id}` | 要セッション | ボディ上限は `--max-tin-size`（既定 64 MiB、Issue #299）。セッションから解決した `X-Alhalte-Owner`（および必要に応じて `X-Alhalte-Wrapped-Key`）を付与して `cellar` の `PUT /store/{tin_id}` へ転送する。 |
+| `GET /api/cellar/tin/{tin_id}` | 不要（公開取得） | `cellar` の `GET /tin/{tin_id}` へ転送し、レスポンスボディと `content-type` / `content-disposition` / `x-alhalte-wrapped-key` ヘッダをブラウザへ返す。セッションがあれば `owner` クエリを付与して所有者固有の `wrapped_key` 解決を補助する。 |
 
-| 接続先 | 内容 |
-| --- | --- |
-| Google OAuth | `accounts.google.com` の認可 URL、`oauth2.googleapis.com/token`、`tokeninfo`。 |
-| `alhalte-banquette` | ローカル transport（Unix: UNIX socket、Windows: named pipe）。`ProcessBanquetteSpawner` または Unix の `InProcessBanquetteSpawner` が起動し、長さ前置 postcard で通信する。export ZIP も banquette が組み立てる（#193）。 |
-| `alhalte-cellar` | `--cellar-url` を base に `/api/cellar/*` を HTTP で転送する（`CellarProxy`）。 |
+### WebSocket エンドポイント
 
-`/api/cellar/store`、`/api/cellar/store/{tin_id}` は Axum 既定の 2 MiB を超える Tin（アセット・拡張 wasm）を通すため、`DefaultBodyLimit::max(64 MiB)` を route 単位で設定する。他の route は既定のまま。
+- パス: `/ws/room/{room_id}`（別名 `/room/{room_id}`、`/room/{room_id}/ws`、および `room` クエリ / `X-Alhalte-Room` ヘッダ付きの `/ws`）。
+- 認証パラメータ: `session_id` Cookie、`X-Alhalte-Session` / `X-Alhalte-Account` ヘッダ、または `?account_id=...&session_id=...` クエリ。
+  - `account_id` のみで `session_id` が無い場合、またはセッションと `account_id` が一致しない場合は `401 Unauthorized` で拒否する。
+  - 有効な `session_id` があれば対応する `account_id` を採用する。
+  - どちらも無い場合は匿名接続（`account_id = 0, session_id = 0`）として扱う。
+- 認可: `rooms` に未登録の `room_id` は `404 Not Found` で拒否し、`banquette` を起動しない。登録済みの場合は `banquette` ブリッジを起動・取得し、`QueryAccountPermission(auth_account)` で実効権限を照会する。結果が `Denied` の場合は WebSocket アップグレード前に `403 Forbidden` で拒否する。
+- アップグレード後: クライアントからは JSON テキスト（または `postcard` バイナリ）で `ClientFrame` を受け取り、そのまま `MaitreDToBanquette::ClientMessage` として `banquette` へ転送する。`banquette` からの `ServerFrame` は JSON テキストとしてクライアントへ送信する。権限検査はすべて `banquette` が担い、`maitre-d` 側でフレームの遮断や書き換えは行わない。
 
-CLI（`CliArgs`）: `--host`、`--port`、`--db-path`、`--client-id`、`--client-secret`、`--salt`、`--public-url`（`ALHALTE_PUBLIC_URL`、既定 `http://127.0.0.1:8080`）、`--socket-dir`、`--banquette-bin`、`--cellar-url`、`--chunk-size-exponent`（既定 8）、`--banquette-heartbeat-interval-secs`（既定 240）、`--local-login`（`ALHALTE_LOCAL_LOGIN`）、`--local-db-path`（`ALHALTE_LOCAL_DB_PATH`）、`--web-root`（`ALHALTE_WEB_ROOT`）、`--unix-socket`（Unix のみ）、`--client-secret-file`（`ALHALTE_CLIENT_SECRET_FILE`、0600 file から読む。`--client-secret` より優先）、`--service-token-file`（`ALHALTE_SERVICE_TOKEN_FILE`、0600 file から読む。各 banquette へ path を転送する）、`--service-token`（`ALHALTE_SERVICE_TOKEN`、後方互換）、`--cors-origin`（繰り返し / カンマ区切り、`ALHALTE_CORS_ORIGINS`）。`--public-url` は OAuth の `redirect_uri`（`{public_url}/auth/google/callback`）と Cookie の `Secure` 判定に使う。alhalte-restaurant は `maitre-d.public-url` があればそれを、なければ `restaurant.domain` が非ループバックなら `https://{domain}`、ループバックなら maitre-d URL を渡す。
+## データ形式
 
-`--local-login` は account 名 + パスワードのローカル認証。開く DB は `CliArgs::active_db_path()` が返す **別ファイル**（`--local-db-path`、未指定なら `{--db-path のディレクトリ}/maitre-d-local.sqlite3`、`LOCAL_DB_FILE_NAME`）で、スキーマは通常 DB と同一。通常の Google 用 DB は開かない。部屋状態は通常どおり cellar に永続化し、`--no-persist` は存在しない。`--web-root` があると maitre-d が SPA を同一 origin で配信する。
+### SQLite スキーマ
 
-秘密値（`--client-secret-file` / `--service-token-file`）は `alhalte_maitre_d::secret_file::read_secret_file` が 0600 file から読み、group/other に読める file は拒否する（Issue #194）。alhalte-restaurant は復号した秘密を `<data-dir>/secrets/` に 0600 で書き、引数には path だけを渡す。`--service-token-file` の path は spawner が各 banquette に `--service-token-file` として転送する。
+Google OAuth モードでは `--db-path`（既定 `maitre-d.sqlite3`）、`--local-login` モードでは同じディレクトリの `maitre-d-local.sqlite3` を使用する。両モードの DB はテーブルも部屋も共有しない。
 
-### 主な公開型
+- **`accounts`**:
+  - `account_id INTEGER PRIMARY KEY AUTOINCREMENT`
+  - `sub_hash BLOB NOT NULL UNIQUE`: Google の `sub`（またはローカルログイン識別子）をインスタンスの `salt` と BLAKE3 `derive_key("alhalte/maitre-d/sub-hash v1", ...)` でハッシュ化した 32 バイト値。平文の `sub` は一切保存せず、ハッシュ計算後にメモリ上からゼロ消去（zeroize）する。
+  - `handle_name TEXT NOT NULL`
+  - `icon_tin_id BLOB`: 任意（32 バイトの `TinId`）。
+  - `created_at INTEGER NOT NULL`
+- **`local_credentials`**（`--local-login` 用）:
+  - `account_name TEXT PRIMARY KEY`: 正規化済みのアカウント名（1〜64 文字、制御文字不可）。
+  - `password_hash TEXT NOT NULL`: Argon2id（PHC 文字列形式）のパスワードハッシュ。
+  - `account_id INTEGER NOT NULL UNIQUE REFERENCES accounts(account_id) ON DELETE CASCADE`
+  - `created_at INTEGER NOT NULL`
+- **`sessions`**:
+  - `session_id INTEGER PRIMARY KEY`: 暗号論的乱数による非ゼロの `u64`（SQLite には `i64` ビットパターンで格納）。
+  - `account_id INTEGER NOT NULL REFERENCES accounts(account_id)`
+  - `created_at INTEGER NOT NULL`
+  - `expires_at INTEGER NOT NULL`: 発行から 30 日（`SESSION_TTL_SECS = 2_592_000`）。
+- **`oauth_states`**:
+  - `state TEXT PRIMARY KEY`: 32 バイト乱数の 64 桁 hex。
+  - `return_to TEXT NOT NULL`: リダイレクト先の URL（オリジン検証済み）。
+  - `created_at INTEGER NOT NULL`、`expires_at INTEGER NOT NULL`（TTL 10 分、単発消費）。
+- **`rooms`**:
+  - `room_id TEXT PRIMARY KEY`: 正規化された 16 桁小文字 hex。
+  - `name TEXT NOT NULL`: 部屋名（1〜100 文字、制御文字不可）。
+  - `creator_account INTEGER NOT NULL`: 部屋を作成したアカウント ID。初回 `banquette` 起動時の `--admin-account` に渡される。
+  - `created_at INTEGER NOT NULL`
 
-- `RoomId`、`RoomIdParseError`、`parse_room_id`
-- `Database`、`Account`、`Session`、`Room`、`RoomRole`、`RoomPermissionItem`（`Database::create_room` / `get_room` / `create_oauth_state` / `consume_oauth_state` を含む）、`OAUTH_STATE_TTL_SECS`
-- `CreateRoomRequest`、`RoomInfoResponse`、`RoomSessionQuery`、`MAX_ROOM_NAME_LEN`
-- `AccountResponse`（`sub_hash` を含まない account 応答 DTO）、`SessionResponse`、`DEFAULT_ALLOWED_ORIGINS`、`DEFAULT_PUBLIC_URL`、`SESSION_COOKIE_MAX_AGE_SECS`
-- `OAuthProvider`、`GoogleOAuthProvider`、`MockOAuthProvider`、`GoogleUserInfo`、`OAuthLoginQuery`
-- `AuthProvider`、`AuthKind`、`AuthIdentity`、`GoogleAuthProvider`、`LocalAuthProvider`、`DEFAULT_HANDLE_NAME`、`LOCAL_SUBJECT_PREFIX`、`MAX_ACCOUNT_NAME_LEN`、`parse_local_account_name`、`percent_encode`
-- `LocalLoginRequest`、`LOCAL_DB_FILE_NAME`、`hash_password`、`verify_password`、`validate_password`
-- `RoomBridge`、`RoomBridgeManager`、`BanquetteSpawner`、`BanquetteEndpoint`、`ProcessBanquetteSpawner`、`InProcessBanquetteSpawner`（Unix）
-- `AppState`、`create_router`、`extract_session_id_from_cookie`、`is_allowed_return_to`、`session_cookie_header`
-- `SubHash`、`hash_sub`、`SUB_HASH_BYTES`、`SUB_HASH_HEX_LEN`
-- session cleanup: `previous_4am_local`、`cleanup_sessions_at`、`spawn_session_cleanup_task`
-
-`RoomBridgeManager::new(spawner)` は registry だけで、DB も head も共有しない。`get_or_create_room` は banquette の起動とローカル transport 接続までを await して `Result` を返す。Issue #199 で DB role を実行中の部屋へ push する経路（`SetAdmins` / `sync_room_admins`）を、Issue #192 で head の受け渡しを撤去したため、起動時に渡すのは `spawn_banquette(room_id, admin_account)` だけである。`banquette` は cellar の `room/<room_id>/head` alias から自分で復元し、alias が無ければ `Room::new` が `admin_account` を `Admin` にする。復元失敗は spawn のエラーになる。
+※ 旧スキーマに存在した `room_permissions`、`room_heads`、`rooms.done`、`accounts.sub_encrypted` が残っている DB は、データ不整合や意図しない権限リセットを防ぐため起動時に `LegacySchemaUnsupported` 等で拒否する（fail-closed）。
 
 ## 内部フロー
 
-### Google 認証
+### サインイン（Google OAuth / ローカルログイン）とセッション復元（Issue #294）
 
-OAuth の `redirect_uri` は常に `{public_url}/auth/google/callback` で、Google Cloud Console に登録する値もこれだけ。UI の origin / port は Google に渡さない。
+1. クライアント（`argenterie`）の `beginSignIn()` は、部屋鍵フラグメントを含む現在の完全な URL を `sessionStorage` に保存した上で、フラグメントを除いた URL を `return_to` パラメータに指定して `GET /auth/login?return_to=...` へ画面遷移する。
+2. **Google OAuth モード (`--local-login` 無効時)**:
+   - `maitre-d` は `return_to` のオリジンが許可リスト（`public_url`、`allowed_origins`、または `host = 0.0.0.0` 時のプライベート LAN オリジン）に含まれるか検証し、`oauth_states` にワンタイム `state` を保存して Google 認可画面へ 302 リダイレクトする。
+   - 認可後、Google から固定コールバック `GET /auth/google/callback` に戻る。`maitre-d` は `state` を単発消費して認可コードをトークンに交換し、`sub` から `sub_hash` を導出してアカウントを取得または作成する。
+   - 新規セッションを発行し、`Set-Cookie: session_id=...; Path=/; SameSite=Lax`（HTTPS 時は `; Secure`）を付与して `return_to` へ 302 リダイレクトする。
+3. **ローカルログインモード (`--local-login` 有効時)**:
+   - `GET /auth/login` は同一オリジンの `/login?return_to=...` へ 302 リダイレクトし、SPA が `LoginScreen` を表示する。
+   - ユーザーがアカウント名とパスワードを入力すると、`POST /api/auth/local/login` が Argon2id で照合（未登録なら新規作成）し、`session_id` Cookie を設定してレスポンスを返す。その後クライアントは `return_to` へ遷移する。
+4. **セッション復元**:
+   - リダイレクト先のアプリマウント時に `completePendingSignIn()` が `GET /api/session` を Cookie 付きで呼び出し、`account` と `session_id` を受け取って保存するとともに、`sessionStorage` に退避していた元の URL（部屋鍵フラグメントを含む）を `history.replaceState` で復元する（Issue #294）。
 
-1. argenterie は現在の URL（クエリ・部屋鍵フラグメントを含む）を sessionStorage に退避し、fragment を除いた絶対 URL を `return_to` として `GET /auth/login` へ遷移する。
-2. `/auth/login` は `return_to` の origin を CORS allow-list と照合する。`//evil`、別 origin、`javascript:` / `data:`、userinfo 付き URL は 400。問題なければ 32 byte の state を発行し、`oauth_states(state, return_to, created_at)` に保存して Google の認可 URL へ 302 する。`prompt` は `select_account` / `consent` / `none` のみ透過する。
-3. `GET /auth/google/callback` は `state` を `consume_oauth_state` で単回消費する（10 分 TTL。使用済み・期限切れ・未知は 400）。state に結びついた `return_to` で再度 allow-list を検証する。
-4. `exchange_code(code, redirect_uri)` が Google から `sub` を取得する。`redirect_uri` はリクエスト値ではなく固定の `{public_url}/auth/google/callback` を使う。
-5. `hash_sub(salt, sub)` で 128bit hash を作り（`sub` はその場で zeroize される）、`get_or_create_account` → `create_session` の順で account と session を作る。
-6. callback は `session_id` Cookie（`Path=/; Max-Age=30 日; SameSite=Lax`、public_url が https なら `Secure`）を設定し、`return_to` へ 302 する。
-7. argenterie は `GET /api/session` を Cookie 付きで呼び、account と session を localStorage / Cookie に保存する。sessionStorage の完全な戻り先 URL を `history.replaceState` で復元し、部屋鍵フラグメントを戻す。
+### `ProcessBanquetteSpawner` と部屋プロセスのライフサイクル管理（Issue #291, #292）
 
-`POST /auth/google/token` は ID token 用に残し、同じ account に新しい session を発行する。旧 `GET /auth/google/url` と、クライアントが `redirect_uri` を指定する `POST /auth/google/callback` は廃止した（既存アカウントがないため互換性は切っている）。
+1. **オンデマンド起動**:
+   - `RoomManager::get_or_create_room(room_id, creator_account)` は、対象部屋のアクティブな `RoomBridge` が存在すればそれを再利用し、無ければ `BanquetteSpawner::spawn` を呼び出す。
+   - `ProcessBanquetteSpawner` は `alhalte-banquette` 子プロセスに `--room-id`、`--socket`、`--admin-account`、`--cellar-url`、`--chunk-size-exponent`、`--heartbeat-interval-secs`、`--max-tin-size`、`--service-token-file` を渡して起動し、ローカルソケット（または名前付きパイプ）への接続が確立するまで指数バックオフで待機する。
+   - `banquette` は起動時に自ら `cellar` の `room/<room_id>/head` エイリアスから状態を復元する。復元に失敗して `banquette` が即座に終了した場合、`maitre-d` は 500 エラーを返し、空の部屋で上書きしない。
+2. **子プロセスの保持・監視・回収 (Reap)（Issue #292）**:
+   - `ProcessBanquetteSpawner` は起動した各部屋の `tokio::process::Child` ハンドルを内部テーブルに保持し、プロセスの終了を監視して確実に `wait`（reap）する。これによりゾンビプロセスの残留を防ぐ。
+   - 同じ `room_id` を再起動する際、もし古い `banquette` 子プロセスが残っていれば、新しいプロセスを起動する前に古いプロセスを停止・回収し、ソケットパスや `room/<room_id>/head` エイリアスの競合を防ぐ。
+3. **グレースフルシャットダウン（Issue #291, #292）**:
+   - 部屋のシャットダウン時または `maitre-d` 自身の停止時には、アクティブな各 `RoomBridge` から `MaitreDToBanquette::ShutdownRoom` フレームを送信する。
+   - `banquette` は `ShutdownRoom` を受けて最終状態を `cellar` に永続化してから終了する。`ProcessBanquetteSpawner` は子プロセスの正常終了をタイムアウト付きで待機し、期限内に終了しない場合のみ強制終了（kill）して reap する。これにより Unix と Windows の双方で未保存状態の消失と孤児プロセスの残留を防ぐ。
 
-Google から継承するのは `sub` のみ。`sub` はその場で hash 化・zeroize され、DB には `sub_hash` だけが残る。`sub_hash` は account を引くための key で、`Account`（DB エンティティ）は `Serialize` せず、HTTP 応答は `AccountResponse` を使う。`SubHash` の `Debug` は `SubHash(<redacted>)`、`GoogleUserInfo` の `Debug` も `sub` を伏せるので、ログ・エラー・`Debug` に生 `sub` も hash も出ない。handle name は初回の既定値で、後から `PATCH /api/account/{id}` で変更できる。
+## 不変条件・エラー
 
-### ローカルログイン（local-login）
-
-`--local-login` を付けたプロセスだけが通る、Google とは別の認証経路。`AuthProvider` が Google と Local を切り替え、`/auth/login` 以降の分岐は provider への問い合わせだけで決まる（`oauth_login_handler` は `login_redirect` が返ったらそこで 302 し、Google の state を発行しない）。
-
-1. 起動時に `CliArgs::active_db_path()` で DB を選ぶ。local 有効なら `--local-db-path`、未指定なら `{--db-path のディレクトリ}/maitre-d-local.sqlite3`。通常の Google 用 DB は開かない（同一スキーマを適用する）。rooms registry も local DB に入るため、Google 用 DB とは部屋一覧を共有しない。
-2. argenterie はサインイン導線から従来どおり `GET /auth/login?return_to=...` へ遷移する。`return_to` の allow-list 検証は Google と同じで、問題なければ `/login?return_to=<encoded>`（SPA）へ 302 する。
-3. SPA の `/login` は noph-ui のフォームで account 名とパスワードを受け取り、`POST /api/auth/local/login` に JSON を送る。パスワードはログにも応答にも出さない。
-4. ハンドラは名前を trim し、`alhalte/local-login/<name>` を合成 `sub` として `hash_sub` で `sub_hash` にする。既存 account の Argon2id PHC 文字列を DB ロック外で照合し、未知の名前は新しい account を作る。同じ名前は同じ account（名前が identity の key）。名前は 1〜100 文字（`MAX_ACCOUNT_NAME_LEN`）で制御文字を含まず、パスワードは 8〜128 文字。
-5. 成功時は `session_id` Cookie を設定して `{ "status": "ok" }` を返す。SPA は `return_to` へ戻り、アプリ mount の `GET /api/session` が account / session を保存して部屋鍵フラグメントを復元する。
-6. local 有効時は `POST /api/auth/local/login` だけを登録し、`/auth/google/callback` と `/auth/google/token` は登録しない（404）。Google 有効時は local API が 404 になる。
-7. local でも banquette は通常どおり cellar へ永続化する（`--no-persist` は存在しない）。強制終了時は最大 heartbeat 分だけ失われる。
-
-### session 失効
-
-`spawn_session_cleanup_task` は次回のローカル 4:00 まで sleep し、`cleanup_sessions_at` を実行する。`previous_4am_local` は実行時刻が 4:00〜4:05 の場合は前日 4:00 を返し、それ以外は当日 4:00 を返す。`last_heartbeat` が cutoff より前の session を削除する。
-
-### WebSocket 接続
-
-1. クエリ・ヘッダ・Cookie から account / session を解決する。
-2. `account_id` があり session がない場合は **401**。`account_id` + session は `is_session_valid` で一致を検証し、`session_id` だけなら session から account を導出する。どちらもない場合だけ匿名として扱う。
-3. `rooms` を引き、未登録なら **404**。`get_or_create_room` は呼ばない。
-4. 登録済みでも、匿名かつ `done=false` は **403**。account に role がなく `done=false` も **403** と「全体公開されていない部屋です。部屋の管理者に権限をリクエストしてください」を返す。`argenterie` はこの拒否を門前払い画面（`GateScreen`）として表示し、アカウントのサインイン・切り替えを促す。`done=true` の非メンバー / 匿名は `viewer` として接続できる。
-5. bridge の `admin_account` は DB の GM（`room_permissions.role = 'gm'`）、なければ `rooms.creator_account` から決める。接続順や接続者を admin にしない。
-6. `RoomBridgeManager::get_or_create_room` で部屋の bridge を取得する。bridge は banquette を起動してローカル transport へ接続する。head の有無は maitre-d では判定せず、banquette が cellar の alias を読んで復元する。復元に失敗した場合、この時点で **500** を返し、空部屋を起動しない。
-7. bridge に client を登録し、`ClientConnected` を banquette へ送る。初期 scene は `/`。
-8. クライアントからの `ClientFrame` は JSON または postcard で受け取り、viewer の mutate を遮断してから bridge へ渡す。遮断は `room_permissions` の `viewer` 行だけを見る暫定ゲートで、`banquette` 側の権限表とは独立している（#200 で一本化）。
-9. banquette からの `ServerFrame` は client_id 宛、scene 宛、room 全体宛に振り分ける。
-9. banquette からの `ServerFrame` は client_id 宛、scene 宛、room 全体宛に振り分ける。head を報告する `RoomPersisted` は #192 で撤去したので、maitre-d が head を記録する経路はない。
-10. banquette からの `ServerFrame::PermissionsUpdated` を受けたときだけ bridge の in-memory 権限を更新し、そのままクライアントへ転送する。`SetMemberPermission` / `SetDefaultPermission` のリクエスト時点では DB / shadow を更新しない。
-11. banquette からの `AccountPermissionResponse` は `QueryAccountPermission` の応答として `GET /api/rooms/{id}` と WS ゲートが使う。
-
-`is_mutate_frame` は `AppendLog`、`EditLog`、`DeleteLog`、`RewindLog`、`UpdateState`、`DeleteState`、`CreateScene`、`DeleteScene`、`SetMemberPermission`、`SetDefaultPermission`、`CreateCharacter`、`UpdateCharacter`、`DeleteCharacter`、`MoveCharacter` を mutate とみなす。旧 `SetDone` は #199 で撤去した。
-
-### cellar proxy
-
-1. `resolve_caller` が Cookie `session_id` / クエリ / ヘッダから session を解決し、DB から account を引く。リクエストの `owner` / `session_id` は認可に使わない。
-2. `/api/cellar/store` の JSON body は `{ tin_id, size, wrapped_key }` のみを受理し、`X-Alhalte-Owner` / `X-Alhalte-Session-Id` を session 由来の値で付与してから body をそのまま cellar へ送る。body に `owner` / `session_id` が入っていれば 400。クライアントは owner を詐称できない（クエリ / ヘッダの `owner` が session と食い違えば 403）。
-3. `/api/cellar/store/{tin_id}` は `X-Alhalte-Owner` / `X-Alhalte-Session-Id` を付与し、`X-Alhalte-Wrapped-Key` と `Content-Type` を透過する。`tin_id` は 64 hex を検証してから転送する。
-4. `GET /api/cellar/tin/{tin_id}` は session を検証するが、`X-Alhalte-Owner` / `X-Alhalte-Session-Id` を上流へ転送しない。cellar は tin id に一致する任意の参照を解決する（`owner` は参照ラベルの絞り込みにすぎない）。認証は proxy が担い、機密性は部屋鍵（`X-Alhalte-Wrapped-Key`）が担保するので、`X-Alhalte-Wrapped-Key` をレスポンスへ透過する（Issue #245）。
-5. 上流の status / body はそのまま返し、接続失敗は 502、timeout は 504 に変換して内部 URL を漏らさない。cellar 未設定時は 503。
-
-### 部屋作成
-
-1. `POST /api/rooms` は session を検証する（401）。
-2. `room_id` があれば `RoomId` として parse し、canonical 16 hex に正規化する。不正なら 400。なければ非ゼロのランダム u64 を生成する。
-3. 名前を trim し、空・制御文字を含む・`MAX_ROOM_NAME_LEN`（100 文字）超を 400 で拒否する。
-4. `rooms` に insert する。作成者は `creator_account` として記録し、banquette spawn 時の初期 Admin にだけ使う。既存 ID は 409 Conflict。
-5. banquette は起動しない。最初の WS / export までプロセスは作られない。
-
-### 権限管理
-
-`rooms(room_id, name, creator_account, created_at)` が部屋の registry で、`room_id` は `RoomId` の正規形（16 hex 小文字）。権限は `banquette` の `RoomData.default_permission` / `permissions` が正で、`maitre-d` は権限テーブルを持たない。`RoomRole` は `admin` / `participant` / `viewer` / `denied` の transport DTO にすぎない。
-
-`GET /api/rooms/{id}` / WebSocket / export は、bridge を spawn した後に `QueryAccountPermission` で banquette に問い合わせ、`Denied` を 403 / 4403 で拒否する。`creator_account` は spawn 時の初期 Admin にだけ使う。接続順や DB role から admin を決めない。
-
-HTTP 権限 API は banquette への薄い proxy で、`QueryPermissions` / `SetMemberPermission` / `SetDefaultPermission` を転送する。DB は読まない/書かない。`rooms.done` と `room_permissions` は撤去済みで、旧行が残っている DB は起動時に `LegacyRoomPermissions` / `LegacyRoomDone` で拒否する（移行なし）。pre-spawn の `done` gate は存在しない。
-
-### ZIP export
-
-1. `type` が `full` / `logs` 以外なら 400。
-2. account と session が片方だけなら 401。両方あれば session を検証する。
-3. `rooms` を引き、未登録なら **404**。登録済みでも banquette に問い合わせた caller の実効権限が `Denied` なら **403**。どちらも banquette を起動しない。
-4. bridge の admin は WS と同じく `rooms.creator_account` から決める。権限の正は banquette の `RoomData` で、`maitre-d` は権限表を持たない。
-5. `get_or_create_room` で bridge を取得する。banquette が cellar の head alias から部屋を復元してから `ExportRoom` に応答する。復元に失敗した場合は **500** を返し、空の ZIP を返さない。
-6. bridge に `ExportRoom { caller_account, include_state: type == "full" }` を送り、banquette が組み立てた ZIP bytes を受け取る。scene の絞り込みと `logs` の state 消去は banquette が行う（#193）。
-7. 受け取った bytes に `application/zip` と `Content-Disposition` を付けて返す。`maitre-d` は ZIP を組み立てない。
-
-### 部屋 head と復元
-
-- `maitre-d` は部屋 head を持たない。`room_id → RoomData tin id` のポインタは cellar の alias `room/<room_id>/head` にあり、banquette が persist のたびに更新する（Issue #192）。
-- `get_or_create_room` は spawn 前に何も読まず、`spawn_banquette(room_id, admin)` を呼ぶ。
-  - `ProcessBanquetteSpawner` は `--room-tin` を渡さない（引数自体が廃止された）。
-  - `InProcessBanquetteSpawner` は banquette と同じ `Room::load_or_create` を呼ぶ。
-- banquette は alias が無ければ `Room::new` で新しい部屋を作り、あれば `Room::load_from_cellar` で復元する。
-- 復元失敗（tin 不在・復号不能・内容 hash 不一致・room_id 不一致・root scene 不在）は spawn の失敗として扱い、WS は 500、export は 5xx を返す。maitre-d は空部屋にフォールバックしない。
-- 旧 head の unregister は banquette が行う。`maitre-d` は head を記録しないので、置き換え前の tin id も知らない。
-
-- local-login も通常の Google 経路と同じく、spawn した banquette に `--service-token-file` を伝播し、heartbeat ごとに cellar の head alias を更新する。`--no-persist` は撤去した。
-
-## データベース
-
-SQLite のテーブル:
-
-```sql
-accounts(account_id INTEGER PRIMARY KEY, sub_hash TEXT NOT NULL UNIQUE,
-         handle_name TEXT, icon_tin_id BLOB, created_at INTEGER)
-sessions(session_id INTEGER PRIMARY KEY, account_id INTEGER, last_heartbeat INTEGER,
-         created_at INTEGER)
-rooms(room_id TEXT PRIMARY KEY, name TEXT NOT NULL, creator_account INTEGER NOT NULL,
-      created_at INTEGER NOT NULL)
-oauth_states(state TEXT PRIMARY KEY, return_to TEXT NOT NULL, created_at INTEGER NOT NULL)
-```
-
-`accounts.sub_hash` は `UNIQUE` で、account の同一性は生の Google `sub` ではなく salt 付き 128bit hash で決まる（`SubHash`、32 hex。`maitre-d` に逆変換はなく、hash から `sub` は復元できない）。session は account に外部キーで紐づき、account 削除時に cascade する。`room_id` は文字列（`RoomId` の 16 hex 正規形）。`rooms` が部屋の第一級エンティティで、権限も head も持たない（権限の正は `banquette` の `RoomData`、head は cellar の `room/<room_id>/head` alias）。
-
-`oauth_states` はログイン中の OAuth state を `return_to` と結びつけて保持する。`consume_oauth_state` は同じ transaction で SELECT と DELETE を行い、単回使用を保証する。`created_at` が 10 分（`OAUTH_STATE_TTL_SECS`）より古い state は削除して `None` を返す。`create_oauth_state` は期限切れ行を opportunistic に削除する。
-
-`accounts` には migration がない。Issue #190 で復号可能な `encrypted_sub` を one-way な `sub_hash` に置き換えた際、既存 account は存在しない前提で互換性を切っている。旧 schema（`accounts.encrypted_sub` がある、または `sub_hash` がない `accounts`）を検出すると、起動時に `MaitreDError::LegacySubSchema` で明示的に失敗する（自動移行も破壊的な作り直しもしない）。
-
-`--local-login` は同じスキーマを持つ **別の SQLite ファイル**（既定 `maitre-d-local.sqlite3`）を開く。local account は `sub_hash` に `alhalte/local-login/<account 名>` の hash が入り、`accounts.password_hash` に Argon2id の PHC 文字列を持つ。分離はファイル単位なので、local と Google で account / session / rooms が混ざることはない。代償として rooms registry も分かれるため、local で作った部屋は Google モードの `rooms` には現れない（Issue #287）。
-
-起動時の schema 処理:
-
-1. `accounts` が旧 `encrypted_sub` schema、または `sub_hash` を持たない場合は `LegacySubSchema` で起動を拒否する。
-2. `room_heads` テーブルに行が残っていれば `LegacyRoomHeads` で起動を拒否する。空ならテーブルを drop する（Issue #192。移行なし）。
-3. `room_permissions` テーブルに行が残っていれば `LegacyRoomPermissions` で起動を拒否する。空ならテーブルを drop する。
-4. `rooms.done` 列があり、`done <> 0` の行があれば `LegacyRoomDone` で起動を拒否する。空なら列を drop する。
+- `#![forbid(unsafe_code)]`。ライブラリコード内で `unwrap` / `expect` / `panic!` を使用しない。
+- Google の生 `sub`、OAuth クライアントシークレット、ローカルログインの平文パスワード、`cellar.service-token` は DB・ログ・エラーレスポンス・コマンドライン引数（cafe / bistrot / glacier 経由時）に出力しない。
+- `POST /api/cellar/store` でクライアントが `owner` または `session_id` フィールドを送った場合は `400 Bad Request` で拒否し、所有者の偽装を許さない（Issue #191）。
+- `/api/cellar/store/{tin_id}` のリクエストボディ上限は `--max-tin-size`（既定 64 MiB）で制限し、超過時は `413 Payload Too Large` を返す（Issue #299）。
 
 ## 既知の差分・制約
 
-- 部屋の権限の正は `banquette` の `RoomData.permissions` / `default_permission`（4 段階）にある。`maitre-d` は権限テーブルを持たず、`RoomRole` は transport DTO にすぎない。旧 `room_permissions` / `rooms.done` の行が残っている DB は起動時に拒否する（移行なし）。
-- `GET /api/rooms/{id}` / WS / export は spawn 後に `QueryAccountPermission` を問い合わせ、`Denied` を 403 / 4403 で拒否する。pre-spawn の `done` gate はない。匿名は account_id `0` として default permission を問い合わせる。
-- 旧 `gm` / `pl` の serde alias は削除した。role は `admin` / `participant` / `viewer` / `denied` のみ。
-- `maitre-d` は部屋 head を持たない。`room_heads` テーブルと `get_room_head` / `set_room_head` / `--room-tin` / `RoomPersisted` 処理は #192 で撤去した。旧 `room_heads` に行が残る DB は起動時に `LegacyRoomHeads` で拒否する（移行なし、DB リセット）。
-- 旧 head の unregister もしない。banquette が alias を移した後に自分の直前 head を解放する。
-- 内部資格情報は alhalte-restaurant が `Restaurant.toml` の age armor 値を復号し、0600 の file に書いて `--client-secret-file` / `--service-token-file` で渡す。argv / `ps` / systemd unit に秘密値は出ない。詳細は [alhalte-bistrot](../alhalte-bistrot/ARCHITECTURE.md)。
-- `get_or_create_room` は接続待ちの間（最大約 3 秒）manager の write lock を保持する。部屋数の多い同時接続ではボトルネックになり得る。
-- `ProcessBanquetteSpawner` が起動した子プロセスは maitre-d 側で reap しない。maitre-d が再起動すると、古い banquette が残っていれば同じ socket path と head alias を奪い合う。systemd の cgroup（既定 `KillMode=control-group`）で一緒に停止する運用を前提とする。
-- `POST /api/rooms` は `rooms` に行を書くだけで、権限行も banquette も作らない。最初の WS / export で起動し、creator が初期 Admin になる。
-- `GET /api/rooms`（自分の role を持つ部屋一覧）は未実装。
-- debug ビルド限定の `POST /api/debug/account` は「`alhalte/debug/` + 32 byte 乱数」を合成 `sub` として `hash_sub` し、通常の account と同じ経路で作る（テスト用。旧 `encrypted_sub = "0"` の特別扱い（`decrypt_sub`）は #190 で撤去）。これは認証モードではなく、local-login でも通常 DB でも同じ active DB に書く。
-- `--local-login` はパスワード付きのローカル認証。`/api/auth/local/login` に CSRF token もレート制限もないため、信頼できる LAN 専用とする。パスワードは Argon2id で保存し、HTTP で送られる。
-- local-login でも部屋状態は通常どおり cellar に永続化する。強制終了時に失われるのは最大 heartbeat（Windows パッケージは 60 秒）分。
-- local-login は別 DB なので、rooms registry も Google 用 DB と分かれる。両モードで部屋を共有したい場合は rooms を別 DB に分離する設計変更が必要（Issue #287）。
-- CORS は明示的な origin allow-list。`--cors-origin` 未指定時はローカル開発 origin のみで、本番では alhalte-restaurant が maitre-d public URL / domain から生成した値を渡す。reverse proxy 側での制限も併用できる。
-- OAuth の `redirect_uri` は `--public-url` から作る固定値だけで、UI の origin / port は Google に渡さない。旧 `GET /auth/google/url` / `POST /auth/google/callback` は削除した（互換性なし）。`GET /auth/login` の `return_to` は CORS allow-list の origin のみ許可し、`//evil`・別 origin・`javascript:` / `data:`・userinfo 付き URL は 400。
-- callback の `session_id` Cookie は `{public_url}` の origin に付く。ブラウザから `/api/session` を Cookie 付きで呼ぶには、`public_url` の origin と UI の origin が一致している必要がある。ローカル開発では maitre-d が SPA を同一 origin で配信し、`--public-url` もその origin になる（Vite dev は任意）。本番は reverse proxy で UI と API を同一 origin に揃える。
-- `GET /api/session` は Cookie / `X-Alhalte-Session` / クエリのいずれかで session を解決し、未認証は 401。`account` は `AccountResponse` で `sub_hash` を含まない。
-- cellar proxy はリクエスト / レスポンスを全量メモリにバッファする（`reqwest` / `Bytes`、上限 64 MiB）。大きな Tin ほど maitre-d のメモリを消費する。
-
+- `/api/cellar/store/{tin_id}` および `/api/cellar/tin/{tin_id}` は転送対象の `Tin` バイト列を `Bytes` としてメモリ上にバッファリングする（最大 `--max-tin-size`、既定 64 MiB）。
+- `POST /api/debug/account` は `#[cfg(debug_assertions)]` でのみビルドに含まれ、リリースバイナリには存在しない。

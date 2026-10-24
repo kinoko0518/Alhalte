@@ -2,155 +2,120 @@
 
 > 上位文書: [../../ARCHITECTURE.md](../../ARCHITECTURE.md)  
 > 実装: `crates/alhalte-cellar`  
-> テスト: `crates/alhalte-cellar/tests/cellar_tests.rs`
+> テスト: `crates/alhalte-cellar/tests/spec_tests.rs`
 
 ## 責務
 
-tin の実体をファイルとして保存し、`(tin_id, owner, wrapped_key)` の参照行を SQLite に持つ、重複排除ストレージ。所有者の session を検証し、既に実体がある場合は再送させず参照だけを追加する。信頼された内部サービス（`alhalte-banquette`）は `X-Alhalte-Service-Token` で書き込める。参照されなくなった実体を GC で削除する。
-
-汎用 alias（`name -> tin_id` の単一ポインタ）も持つ。`alhalte-banquette` は部屋の head を `room/<room_id>/head` としてここに置き、起動時に自分で読む（Issue #192）。alias は参照の一種で、GC は alias の指す実体を削除しない。
+`Tin` 実体の重複排除（deduplication）ストレージ、所有者ごとの参照管理、汎用エイリアス（部屋の永続化 head ポインタ等）の管理、および未参照実体のガベージコレクション（GC）を担う内部 HTTP サービスである。`cellar` 自身は `Tin` の復号や内部の `TinContent`（ラベル・ペイロード）の解釈を行わず、ワイヤー表現のバイト列とメタデータのみを管理する。
 
 ## 公開 API / 外部接続点
 
-### HTTP API
+### CLI（`alhalte-cellar` バイナリ）
 
-| メソッド | パス | 内容 |
+| 引数 / 環境変数 | 既定値 | 内容 |
 | --- | --- | --- |
-| `GET` | `/health` | ヘルスチェック。 |
-| `POST` | `/store` | `StoreRequest` を受け取り、`200 OK` と `StoreResponse`（`{"result": ...}`）を返す。 |
-| `POST` / `PUT` | `/store/{tin_id}` | 本体をアップロードする。 |
-| `POST` / `PUT` | `/tin/{tin_id}` | 同上。 |
-| `GET` | `/tin/{tin_id}` | 本体を返す。wrapped key があれば `X-Alhalte-Wrapped-Key` に hex で付ける。 |
-| `GET` | `/tin/{tin_id}/meta` | `tin_id`、size、wrapped key を JSON で返す。 |
-| `GET` | `/download/{tin_id}` | 本体を返す。 |
-| `GET` | `/download/{tin_id}/meta` | メタデータを返す。 |
-| `POST` | `/unregister` | `UnregisterRequest` で参照を削除する。 |
-| `DELETE` | `/store/{tin_id}` / `/tin/{tin_id}` | 参照を削除する。 |
-| `POST` | `/gc` | GC を実行し、`GcStats` を返す。 |
-| `GET` | `/alias/{name}` | alias の `AliasResponse`（`{"tin_id": ...}`）を返す。未登録は 404。 |
-| `PUT` | `/alias/{name}` | `AliasRequest`（`{"tin_id": ...}`）で alias を設定する。service token 必須。 |
-| `DELETE` | `/alias/{name}` | alias を削除し、`{"deleted": bool}` を返す。service token 必須。 |
+| `--host` / `ALHALTE_CELLAR_HOST` | `127.0.0.1` | 待ち受けホスト（内部サービスのためループバック固定を推奨）。 |
+| `--port` / `ALHALTE_CELLAR_PORT` | `8081` | 待ち受けポート。 |
+| `--data-dir` / `ALHALTE_CELLAR_DATA_DIR` | `./cellar-data` | SQLite DB（`cellar.db`）および実体ファイル（`entities/`）の保存先ディレクトリ。 |
+| `--anti-oracle` / `ALHALTE_CELLAR_ANTI_ORACLE` | `false` | `true` の場合、他アカウントのみが所有する既存 `Tin` に対しても `POST /store` で常に `upload_required` を返し、クロスアカウントの存在確認（情報漏洩オラクル）を防ぐ。 |
+| `--max-tin-size` / `ALHALTE_MAX_TIN_SIZE` | `67108864` (64 MiB) | 保存を許可する 1 つの `Tin` の最大サイズ（バイト）。`POST /store` の事前検査および `PUT /store/{tin_id}` のボディ上限に適用する（Issue #299）。 |
+| `--gc-interval-secs` / `ALHALTE_CELLAR_GC_INTERVAL_SECS` | `21600` (6 時間) | 定期ガベージコレクションの実行間隔（秒）。 |
+| `--service-token-file` / `ALHALTE_CELLAR_SERVICE_TOKEN_FILE` | 任意 | 内部サービス（`maitre-d` / `banquette`）からの書き込みを認可する共有トークンを格納したファイルのパス。 |
+| `--service-token` / `ALHALTE_CELLAR_SERVICE_TOKEN` | 任意 | 共有トークンの直接指定（後方互換用。`--service-token-file` を優先）。 |
 
-`{name}` は `room/<room_id>/head` のような `/` を含む階層名を取れる wildcard（`/alias/{*name}`）。名前は 1〜256 バイトの ASCII 英数字と `-_.:/` のみ（`validate_alias_name`）。alias 名はファイルパスではなく DB のキーで、実体ファイルとの対応は `tin_id` だけが決める。
+### HTTP エンドポイント
 
-書き込みの認証情報はヘッダ `X-Alhalte-Owner` / `X-Alhalte-Session-Id` のみで受け取る。クエリ `owner` / `session_id` は受理しない（ダウンロードの `owner` は参照行の絞り込み専用）。wrapped key は `X-Alhalte-Wrapped-Key`（hex）またはクエリ `wrapped_key`。`StoreRequest` / `UnregisterRequest` の body は `tin_id`（と `POST /store` では `size` / `wrapped_key`）だけで、`owner` / `session_id` を body で送ると 400 になる（Issue #191）。
+| メソッド・パス | 認可 | 内容 |
+| --- | --- | --- |
+| `POST /store` | ユーザーセッション または `X-Alhalte-Service-Token` | 保存前のメタデータハンドシェイク。JSON `{ tin_id, owner, size, wrapped_key, session_id? }` を受け取り、`200 OK` で `{ "result": "upload_required" \| "deduplicated" \| "already_owned" }` を返す。`size > max_tin_size` の場合は `413 Payload Too Large` で拒否する。 |
+| `PUT /store/{tin_id}` | ユーザーセッション または `X-Alhalte-Service-Token` | `Tin` ワイヤーバイト列のアップロード。ヘッダ `X-Alhalte-Owner`（必須）と `X-Alhalte-Wrapped-Key`（任意、hex）を受け取る。上限 `max_tin_size`（既定 64 MiB）を超えるボディは `413 Payload Too Large` で拒否する。 |
+| `GET /tin/{tin_id}` | 不要 | `Tin` ワイヤーバイト列を取得する（`application/octet-stream`）。対象参照に `wrapped_key` が記録されている場合は `X-Alhalte-Wrapped-Key` ヘッダ（hex）を付与する。`?owner=` または `X-Alhalte-Owner` 指定時はその所有者の参照行を優先する。 |
+| `DELETE /tin/{tin_id}` | ユーザーセッション または `X-Alhalte-Service-Token` | `?owner=` または `X-Alhalte-Owner` で指定された所有者の `(tin_id, owner)` 参照行を削除する。実体ファイルの削除は後続の GC に委ねる。 |
+| `GET /alias/{*name}` | 不要 | 指定名のエイリアス（例: `room/<room_id>/head`）を解決し、`{ name, tin_id, updated_at }` を返す（未登録は 404）。 |
+| `PUT /alias/{*name}` | `X-Alhalte-Service-Token` 必須 | `{ tin_id }`（64 桁 hex）を受け取り、エイリアスを原子的に更新する。対象 `tin_id` の実体ファイルが `entities/` に存在しない場合は `404 Not Found` で拒否する。 |
+| `DELETE /alias/{*name}` | `X-Alhalte-Service-Token` 必須 | 指定エイリアスを削除する（存在すれば `204 No Content`、無ければ `404 Not Found`）。 |
 
-`/store`、`/store/{tin_id}`、`/tin/{tin_id}`（upload）、`/unregister` はヘッダ `X-Alhalte-Service-Token` でも認可できる。これは `--service-token` で設定した内部トークンとの一致だけを検証し、ユーザー session とは独立している。ヘッダを付けたリクエストは session 検証へフォールバックしない（不一致は 401）。ヘッダのないリクエストは従来どおり `SessionVerifier` で検証する。
+### 認証・認可モデル
 
-`PUT` / `DELETE /alias/{name}` は service token 専用で、有効なユーザー session でも書けない。alias は利用者ごとの参照行ではなくサービス間で共有するインフラ状態（部屋 head）だから。`GET /alias/{name}` は download と同じく認可しない（alias は tin を名指しするだけで、本体は従来の download 経路で取る）。
-
-`/store/{tin_id}` と `/tin/{tin_id}` の upload は Axum 既定の 2 MiB を超える Tin を受け取れるよう、`DefaultBodyLimit::max(64 MiB)`（`MAX_STORE_BODY_BYTES`）を route 単位で設定する。他の route は既定のまま。
-
-### ステータス
-
-`POST /store` の store check は常に `200 OK` を返し、body の `result` で結果を表す。
-
-| `result` | 意味 |
-| --- | --- |
-| `upload_required` | Upload Required。本体を送る必要がある。 |
-| `deduplicated` | Deduplicated。実体は既にあり、参照行を追加した。 |
-| `already_owned` | Already Owned。同じ owner が既に参照を持つ。 |
-
-anti-oracle が有効な場合、`/store` は常に `upload_required` を返し、既存実体への再送は破棄する。
-
-認可・入力・未検出・内部エラーは従来どおり HTTP status（401 / 400 / 404 / 5xx）で返す。旧 210 / 211 / 212 は廃止し、受理しない。
-
-### 主な公開型
-
-- `CellarConfig`、`CellarService`
-- `StoreRequest`、`StoreResponse`、`StoreResult`、`StoreStatus`、`UnregisterRequest`、`WriteCredentials`、`TinReference`、`GcStats`
-- `AliasRequest`、`AliasResponse`、`MAX_ALIAS_NAME_BYTES`、`validate_alias_name`
-- `Database`、`StorageManager`、`SessionVerifier`、`InMemorySessionVerifier`、`MaitreDVerifier`
-- `create_router`、`run_garbage_collection`、`parse_tin_id` / `format_tin_id`
-- `CellarService::with_service_token` / `has_service_token` と `store_check_with_token` / `store_payload_with_token` / `unregister_with_token` / `get_alias` / `set_alias_with_token` / `delete_alias_with_token`、`handlers::SERVICE_TOKEN_HEADER` / `OWNER_HEADER` / `SESSION_ID_HEADER`
-
-`StoreRequest` / `UnregisterRequest` は `#[serde(deny_unknown_fields)]` で、body の未知フィールド（旧 `owner` / `session_id` を含む）は 400 になる。認可と参照ラベルは `CellarService` が `WriteCredentials`（ヘッダ由来）と service token から決める。`WriteCredentials::session(owner, session_id)` と `WriteCredentials::service()` がその構築口。
-
-CLI（`CliArgs`）: `--host`、`--port`、`--storage-path`、`--db-path`、`--anti-oracle`、`--maitre-d-url`、`--maitre-d-socket`、`--allow-all-sessions`、`--service-token`（`ALHALTE_SERVICE_TOKEN`、後方互換）、`--service-token-file`（`ALHALTE_SERVICE_TOKEN_FILE`、0600 file から読む。file が優先）、`--gc-interval-secs`。秘密 file は `alhalte_cellar::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
-
-### 外部接続
-
-`MaitreDVerifier` は `alhalte-maitre-d` の `GET /api/verify-session?owner=...&session_id=...` を HTTP または UNIX ソケットで呼ぶ。UNIX ソケット経路は `#[cfg(unix)]` で、Windows は `--maitre-d-url`（HTTP）を使う。テストでは `InMemorySessionVerifier` を使う。
+- **内部書き込み (`X-Alhalte-Service-Token`)**:
+  - `banquette` による部屋状態・ログチャンクの永続化やエイリアス更新（`PUT / DELETE /alias/{*name}`）は、`X-Alhalte-Service-Token` ヘッダを用いて認証する。
+  - `cellar` は設定されたサービストークンと定数時間比較（constant-time comparison）で照合する。トークン未設定時または不一致時は内部専用操作を `401 Unauthorized` で拒否する。
+- **ユーザー経由の書き込み (`SessionValidator`)**:
+  - ブラウザからのアップロードは `maitre-d` の `/api/cellar/*` リバースプロキシを経由する。`maitre-d` が Cookie セッションを検証した上で確定した `owner` と `session_id` を注入して `cellar` に転送する。
 
 ## データ形式
 
-### DB
+### `Tin` コンテナと暗号方式ごとの扱い（Issue #272, #298）
 
-```sql
-tin_references(
-  tin_id BLOB NOT NULL,
-  owner INTEGER NOT NULL,
-  wrapped_key BLOB,
-  PRIMARY KEY (tin_id, owner)
-)
+`tin` クレート（`crates/tin-rs`）において、平文の `(label, payload)` を表す `TinContent` と、ワイヤー上の `Opener`（暗号・圧縮指定）および `TinId` を統合した `Tin` が定義される（Issue #272）。`cellar` はシリアライズされた `Tin` のワイヤーバイト列をそのまま保存し、先頭 1 バイトの `Opener` に応じて整合性検証と `wrapped_key` の管理を行う。
 
-aliases(
-  name TEXT PRIMARY KEY,
-  tin_id BLOB NOT NULL,
-  updated_at INTEGER NOT NULL
-)
-```
+| 暗号方式 (`Opener.encryption`) | `TinId` の導出規則 | `cellar` での検証と `wrapped_key` の扱い |
+| --- | --- | --- |
+| `Plaintext` (`0000`) | ワイヤーバイト列全体の BLAKE3-256 | `PUT /store/{tin_id}` 時に受信バイト列の BLAKE3-256 を計算し、URL の `tin_id` と一致することを検証する。`wrapped_key` は不要（`None`）。 |
+| `RoomKey` (`0010`) | ワイヤーバイト列全体の BLAKE3-256 | 部屋鍵と 12 バイトのランダム Nonce で直接暗号化されるため、部屋鍵ごとに異なる `tin_id` を持つ（Issue #298）。`PUT /store/{tin_id}` 時にワイヤー全体の BLAKE3-256 と `tin_id` の一致を検証する。`wrapped_key` は不要（`None`）。 |
+| `Convergent` (`0001`) | 平文（`TinContent`）の BLAKE3 XOF 512bit の前半 256bit | `cellar` は平文を持たないため `PUT /store/{tin_id}` 時の BLAKE3 再計算をスキップする（クライアントが復号後に検証する）。後半 256bit の収束鍵を部屋鍵でラップした 60 バイト（`12B nonce ‖ 48B ciphertext`）を `(tin_id, owner)` ごとに `wrapped_key` として保存し、`GET /tin/{tin_id}` の `X-Alhalte-Wrapped-Key` ヘッダで返す。 |
 
-`tin_id` は 32 バイト BLOB。実体ファイルの位置は列に持たず、常に `hex(tin_id)` から導出する。索引は `tin_id`。
+### SQLite スキーマ（`<data-dir>/cellar.db`）
 
-`aliases` は `name` 一意の単一ポインタ。1 つの名前は 1 つの tin だけを指し、同じ tin を複数の名前が指してよい。`updated_at` は設定時刻（UNIX 秒）。`tin_references` と独立していて、alias だけが参照する tin も存在しうる（それが部屋 head の通常状態）。`tin_id` が 32 バイトでない行は壊れた DB としてエラーにする（黙って無視すると GC が参照先を消してしまうため）。
+WAL モード（`PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;`）で動作する。
 
-旧 schema の `path` 列と `idx_tin_references_path` は `Database::init_schema` が起動時に削除する。`path` は常に `hex(tin_id)` の重複だったため、`tin_id` / `owner` / `wrapped_key` を保ったまま lossless に移行できる。
+- **`tin_references`**:
+  ```sql
+  CREATE TABLE IF NOT EXISTS tin_references (
+      tin_id BLOB NOT NULL,
+      owner INTEGER NOT NULL,
+      wrapped_key BLOB,
+      PRIMARY KEY (tin_id, owner)
+  );
+  CREATE INDEX IF NOT EXISTS idx_tin_references_tin_id ON tin_references(tin_id);
+  ```
+  - `tin_id`: 32 バイトの `TinId`。
+  - `owner`: 所有者アカウント ID（`u64` を `i64` ビットパターンで格納。`banquette` によるシステム所有は `0`）。
+  - `wrapped_key`: 任意のラップ済み収束鍵バイト列。同一 `(tin_id, owner)` への再登録時は `COALESCE(excluded.wrapped_key, tin_references.wrapped_key)` により既存の鍵を保持または更新する。
+- **`aliases`**:
+  ```sql
+  CREATE TABLE IF NOT EXISTS aliases (
+      name TEXT PRIMARY KEY,
+      tin_id BLOB NOT NULL,
+      updated_at INTEGER NOT NULL
+  );
+  ```
+  - `name`: エイリアス名（先頭・末尾の `/` を除いた文字列。空文字や `..` セグメント、制御文字は不可）。
+  - `tin_id`: 指し示す 32 バイトの `TinId`。
+  - `updated_at`: 更新時の UNIX 秒。
 
-### ファイル
+### ディスク上の実体配置
 
-`StorageManager` は `storage_path/<tin_id hex>` に実体を置く。ファイル名は常に `hex(tin_id)` で、`path` のような別名は持たない。書き込みは一時ファイル + `sync_all` + rename で原子的に行う。`.tmp.*` は GC の走査対象外。
+- 実体ファイルは `<data-dir>/entities/{hex(tin_id)}`（64 桁小文字 hex）に配置する。ファイル名は常に `tin_id` から一意に定まるため、DB にはファイルパスを保存しない。
+- 書き込み時は `<data-dir>/entities/.tmp-{hex(tin_id)}-{random}` に書き出してから `rename` することで、クラッシュ時や並行読み取り時に不完全なファイルが見えることを防ぐ。
 
 ## 内部フロー
 
-### store check
+### 2 段階保存フロー（`POST /store` → `PUT /store/{tin_id}`）
 
-1. ヘッダの `X-Alhalte-Owner` / `X-Alhalte-Session-Id` を `WriteCredentials` として読む。`X-Alhalte-Service-Token` がある場合はトークンだけを検証し、`owner` ヘッダは無視して参照ラベルを `SYSTEM_OWNER` にする。トークンがない場合は `verify_session(owner, session_id)`。
-2. anti-oracle なら常に `upload_required`。
-3. 同じ参照ラベルの参照があれば `already_owned`。
-4. 実体ファイルがあれば、参照行を追加して `deduplicated`。
-5. どちらもなければ `upload_required`。
+1. クライアントまたは `banquette` が `POST /store` に `{ tin_id, owner, size, wrapped_key }` を送信する。
+2. `size > max_tin_size`（既定 64 MiB）の場合は直ちに `413 Payload Too Large` を返す（Issue #299）。
+3. `tin_references` と `entities/{hex(tin_id)}` の有無を確認する:
+   - すでに同じ `(tin_id, owner)` の参照行が存在し、実体ファイルも存在する場合は `already_owned` を返す（`wrapped_key` が指定されていれば更新する）。
+   - `--anti-oracle` が `false` で、別オーナーの参照行および実体ファイルが既に存在する場合は、新しい `(tin_id, owner, wrapped_key)` 参照行を DB に追加した上で `deduplicated` を返す（本体アップロード不要）。
+   - 実体ファイルが存在しない場合（または `--anti-oracle` が `true` で呼び出し元が未所有の場合）は `upload_required` を返す。
+4. `upload_required` を受け取った呼び出し元は、`PUT /store/{tin_id}` で `Tin` のワイヤーバイト列を送信する。
+5. `cellar` はボディサイズが `max_tin_size` 以下であることを確認し、`Opener` を検査して `Plaintext` / `RoomKey` なら `BLAKE3(body) == tin_id` を検証する。検証通過後、実体ファイルを原子的に書き出し、`tin_references` に `(tin_id, owner, wrapped_key)` を登録する。
 
-いずれの結果も `200 OK` + `{"result": ...}` で返す。body に `owner` / `session_id` が入っている場合はこの段階に到達せず 400 を返す。
+### ガベージコレクション（GC）
 
-### store payload
+1. `gc_interval` ごと（または `CellarService::run_gc` 呼び出し時）に実行される。
+2. `tin_references` テーブル内の全 `tin_id` 集合と、`aliases` テーブルが指し示す全 `tin_id` 集合の和集合（参照集合 $R$）を取得する。**エイリアスも有効な参照として扱う**ため、`room/<room_id>/head` が指している最新の部屋状態 `Tin` が誤って回収されることはない。
+3. `<data-dir>/entities/` 内のファイルを走査し、一時ファイル（`.` 始まり）を除いて $R$ に含まれない `{hex(tin_id)}` ファイルを削除する。
 
-1. 認可（session または service token）を再検証する。
-2. anti-oracle かつ実体が既にある場合はデータを捨てる。
-3. 実体がなければ原子的に書き込む。
-4. `(tin_id, owner, wrapped_key)` を upsert する。
-5. `StoreResult` を返す。
+## 不変条件・エラー
 
-### 内部サービス認可
-
-`authorize` は service token が提示された場合、設定済みトークンと定数時間比較し、一致しなければ 401 を返す。トークン未設定の cellar にトークンが提示された場合も 401（設定情報を漏らさない）。トークンが提示されず、かつ `X-Alhalte-Owner` / `X-Alhalte-Session-Id` が揃っている場合は session 検証だけを行う。所有者ヘッダが片方でも欠ける場合は 401。トークンはログに出さず、`CellarService` の `Debug` にも含めない（`CellarService` は `Debug` を実装しない）。
-
-### download
-
-`owner` が指定された場合はその owner の参照を、指定されなければ任意の参照を引く。参照がなければ 404。実体を読んで返す。
-
-### unregister / GC
-
-`unregister` は認可（session または service token）を検証して `(tin_id, owner)` の参照を削除する。GC は storage 配下の tin ファイルを走査し、`tin_references` にも `aliases` にも参照がないファイルを削除する（参照集合は 2 つの `DISTINCT tin_id` の union）。`gc_interval` があればバックグラウンドで定期実行する。banquette は部屋の新 head を保存したあと alias を新 head へ移し、その後に旧 head を `POST /unregister` するため、旧 `RoomData` は alias からも参照行からも外れて次の GC で回収される。現在の head は alias が指しているので削除されない。
-
-### alias
-
-1. 名前を `validate_alias_name` で検証する（違反は 400）。
-2. `PUT` / `DELETE` は service token を定数時間比較で検証する（不一致・未設定は 401）。
-3. `PUT` は既存の値を読んでから upsert し、置き換え前の tin id を返す。`DELETE` は削除したかを返す。
-4. `GET` は未登録なら 404（`CellarError::AliasNotFound`）。
-5. 参照先の tin が既に storage にあるかは検証しない。呼び出し側（banquette）は store 成功後に alias を移すので、alias 書き込みが失敗した場合は旧 head が有効なまま残る。
+- `#![forbid(unsafe_code)]`。ライブラリコード内で `unwrap` / `expect` / `panic!` を使用しない。
+- `tin_references` と `aliases` のいずれからも参照されていない実体ファイルのみが GC で削除される。
+- `PUT /alias/{*name}` は実体ファイルが存在しない `tin_id` へのポインタ設定を `EntityNotFound`（404）で拒否し、ダングリングエイリアスの作成を防ぐ。
+- `max_tin_size`（既定 64 MiB）を超える `Tin` はハンドシェイク段階と実体アップロード段階の双方で `PayloadTooLarge`（413）として拒否する。
 
 ## 既知の差分・制約
 
-- ダウンロードは session 検証を行わない。`owner` は参照の絞り込みにだけ使う。
-- `/store` は常に `200 OK` を返し、結果は body の `result`（`upload_required` / `deduplicated` / `already_owned`）で表す。旧 210 / 211 / 212 は廃止済みで、受理しない。
-- `path` 列は廃止した。実体ファイル名は常に `hex(tin_id)` で、別名を持たない。既存 DB は起動時 migration で `path` 列を落とす（参照行は失わない）。
-- anti-oracle 時の破棄は `StorageManager::discard` による no-op で、実際のファイルディスクリプタは開かない。
-- GC は DB の参照だけを見る。参照集合は `tin_references` と `aliases` の `DISTINCT tin_id` の union から `hex(tin_id)` を作って得て、ファイル名と照合する。tin 間の参照関係（chunk 内の tin id など）は追跡しない。
-- alias は名前空間を共有する単一ポインタで、名前ごとの所有権・認可は持たない。書けるのは service token を持つサービスのみ。名前を消しても実体は GC まで残る。
-- alias 名は 256 バイトまで。`/` を含む階層名を許すが、`.` / `..` のようなパス解決は行わない（DB のキーであってパスではない）。
-- upload は `Bytes` extractor でリクエスト全量をメモリにバッファする（上限 64 MiB）。maitre-d proxy も同じ上限・同じバッファリングを行う。
-- service token は平文で設定・比較する。ローテーション機構はなく、変更するには `cellar` / `maitre-d` / 全 banquette の再起動と設定更新が必要。
-- service token は `--service-token` 引数でも渡せるため `ps` から読める。本番では環境変数か systemd の `EnvironmentFile` を使うのが望ましい。
-- `owner` は参照ラベルであり認可境界ではない。ユーザー session の書き込みは session の account を、service token の書き込みは常に `SYSTEM_OWNER` をラベルにする。body やクエリで owner を指定する経路はない（ヘッダのみ）。
+- `PUT /store/{tin_id}` および `GET /tin/{tin_id}` は `Tin` 全体をメモリ上のバイト列（最大 `--max-tin-size`、既定 64 MiB）として送受信する。
+- `GET /tin/{tin_id}` は `TinId`（256bit 暗号論的ハッシュ）を知っている呼び出し元に対して認証なしで暗号化済みバイト列を返す。機密性は `Tin` 自体の暗号化（部屋鍵暗号化または収束暗号化）によって保証される。

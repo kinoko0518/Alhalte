@@ -2,77 +2,64 @@
 
 > 上位文書: [../../ARCHITECTURE.md](../../ARCHITECTURE.md)  
 > 実装: `crates/alhalte-bistrot`  
-> テスト: `crates/alhalte-bistrot/tests/systemd_tests.rs`
+> テスト: `crates/alhalte-bistrot/tests/spec_tests.rs`
 
 ## 責務
 
-`Restaurant.toml` から systemd unit を生成する**純粋関数的変換**だけを担う。
-
-- `alhalte-cellar.service`
-- `alhalte-maitre-d.service`
-- `alhalte.target`
-
-設定のパース・秘密復号・引数生成は [alhalte-restaurant](../alhalte-restaurant/ARCHITECTURE.md)、ワンショット起動は [alhalte-cafe](../alhalte-cafe/ARCHITECTURE.md)、NixOS 常駐サービスは [alhalte-glacier](../../nix/alhalte-glacier/ARCHITECTURE.md) が持つ。bistrot は `serve`、Vite dev server、Windows バンドル、拡張 staging を行わない。
+`Restaurant.toml` から systemd ユニット定義（`alhalte-cellar.service`、`alhalte-maitre-d.service`、`alhalte.target`）を純粋関数的に生成するデプロイ補助ツールである。設定のパース・検証・age 復号・シークレットファイルの書き出し・引数生成・拡張機能ステージングはすべて [`alhalte-restaurant`](../alhalte-restaurant/ARCHITECTURE.md) に委譲し、`bistrot` 自身は systemd ユニット文字列の組み立てとファイル出力に特化する。
 
 ## 公開 API / 外部接続点
 
-外部接続点は `Restaurant.toml` と CLI のみ。ネットワークアクセスはない。
+### CLI（`alhalte-bistrot` バイナリ）
 
-### CLI
+| 引数 / サブコマンド | 既定値 | 内容 |
+| --- | --- | --- |
+| `--config <path>` | `Restaurant.toml` | 読み込む設定ファイルのパス。 |
+| `--age-key <identity>` | `ROPS_AGE` / `ALHALTE_AGE_KEY` 環境変数 | age armor / rops 復号用の age 秘密鍵。 |
+| `validate` | — | 設定の復号とバリデーションのみを行い、結果を報告する。 |
+| `systemd` | — | シークレットファイルと拡張機能を書き出し、systemd ユニットファイルを生成する。 |
+| `systemd --output-dir <dir>` | 省略時は標準出力 | 生成したユニットファイル（`.service` / `.target`）を書き出すディレクトリ。 |
+| `systemd --bin-dir <dir>` | `/usr/local/bin` | `ExecStart` 内の各バイナリ（`alhalte-cellar`、`alhalte-maitre-d`、`alhalte-banquette`）の配置ディレクトリ。 |
+| `systemd --user <user>` | `alhalte` | サービスの実行ユーザーおよびグループ（`User=` / `Group=`）。 |
+| `systemd --web-root <dir>` | 任意 | `alhalte-maitre-d` に `--web-root` として渡すビルド済み SPA ディレクトリ。 |
+| `stage-extensions --output-dir <dir>` | `<data-dir>/extensions` | `[[extensions]]` の WASM 検証と `manifest.json` 書き出しのみを実行する。 |
+| `encrypt-value --recipient <age1...>` | — | 標準入力の平文シークレットを age armor に暗号化して標準出力へ書き出す。 |
 
-```text
-alhalte-bistrot [--config Restaurant.toml] [--age-key KEY] <command>
-```
+### ライブラリ API（`alhalte_bistrot::systemd`）
 
-| コマンド | 内容 |
-| --- | --- |
-| `systemd` | unit を stdout または `--output-dir` に出力する。秘密 file も `<data-dir>/secrets/` に書き出す。 |
-| `validate` | 設定を検証し、要約を出力する。ファイルは書き出さない。 |
-| `encrypt --recipient age1...` | 平文 TOML を rops で全体暗号化する（後方互換）。 |
-| `encrypt-value --recipient age1...` | stdin の平文 1 値を age armor で暗号化し stdout へ。 |
-
-`systemd` の主なオプション:
-
-- `--bin-dir DIR`（既定 `/usr/local/bin`）
-- `--output-dir DIR`（省略時は stdout）
-- `--working-dir DIR`
-- `--web-root DIR`（省略時は `{data-dir}/web`。`maitre-d --web-root` に渡す）
-- `--user` / `--group`
-
-### 主な公開型
-
-- `SystemdOptions`、`SystemdUnits`
-- `generate_systemd_units`、`generate_cellar_service`、`generate_maitre_d_service`、`generate_alhalte_target`
-- `DEFAULT_SYSTEMD_BIN_DIR`
-
-## 内部フロー
-
-### systemd 生成
-
-1. `Restaurant.toml` を読み、`alhalte-restaurant` で復号・検証する。
-2. 設定ファイルの親ディレクトリ基準で `data-dir` / `socket-dir` を絶対化する（cwd 非依存）。
-3. 秘密 file を `<data-dir>/secrets/` に 0600 で書き出す。
-4. `generate_systemd_units` が 3 unit を組み立てる。
-   - `alhalte-cellar.service`: `generate_cellar_args` の引数。cellar は常に `127.0.0.1` に bind し、session verifier は `http://127.0.0.1:{maitre-d.port}`。
-   - `alhalte-maitre-d.service`: `generate_maitre_d_args` の引数 + `--web-root`。SPA は maitre-d が同一 origin で配信する。
-   - `alhalte.target`: 2 service を `Wants=` / `WantedBy=multi-user.target`。
-5. `--output-dir` 指定時は `<dir>/alhalte-cellar.service`、`<dir>/alhalte-maitre-d.service`、`<dir>/alhalte.target` に書く。
-
-ExecStart の引数は空白・引用符・バックスラッシュをエスケープする。unit に秘密値は含まれず、`--client-secret-file` / `--service-token-file` の path だけが入る。
+- `generate_units(config, options, secrets) -> SystemdUnits`: 設定と `SystemdOptions`（`bin_dir`, `user`, `web_root`）および `SecretFilePaths` から、`cellar_service`、`maitre_d_service`、`target` の各ユニット文字列を生成する純粋関数。
+- `write_units(units, output_dir)`: 生成された 3 つのユニットファイルを指定ディレクトリへ書き出す。
 
 ## データ形式
 
-`Restaurant.toml` のスキーマと秘密値の扱いは [alhalte-restaurant](../alhalte-restaurant/ARCHITECTURE.md) を参照。bistrot が生成する unit のファイル名は次の 3 つだけ。
+### 生成される systemd ユニット
 
-- `alhalte-cellar.service`
-- `alhalte-maitre-d.service`
-- `alhalte.target`
+| ユニット名 | 役割と依存関係 |
+| --- | --- |
+| `alhalte-cellar.service` | `alhalte-cellar` 常駐サービス。`After=network.target`、`PartOf=alhalte.target`。`ReadWritePaths=<data-dir>` と systemd サンドボックス設定（`NoNewPrivileges=true`、`ProtectSystem=strict`、`ProtectHome=true`、`PrivateTmp=true`）を持つ。 |
+| `alhalte-maitre-d.service` | `alhalte-maitre-d` 常駐サービス。`After=network.target alhalte-cellar.service`、`Requires=alhalte-cellar.service`、`PartOf=alhalte.target`。`ReadWritePaths=<data-dir> <socket-dir>` を持ち、必要に応じて `alhalte-banquette` を同一 cgroup 内で子プロセスとして起動する。 |
+| `alhalte.target` | インスタンス全体を束ねるターゲットユニット。`Requires=alhalte-cellar.service alhalte-maitre-d.service`、`After=alhalte-cellar.service alhalte-maitre-d.service`。 |
+
+- UI（`alhalte-argenterie`）はビルド済み SPA として `alhalte-maitre-d --web-root` から同一オリジン配信されるため、独立したフロントエンド用 systemd サービスは生成しない。
+- `[cellar] max-tin-size`（既定 64 MiB）は `alhalte-restaurant` の引数生成を通じて `alhalte-cellar.service` と `alhalte-maitre-d.service` の双方の `ExecStart=` に `--max-tin-size` として反映され、`maitre-d` から起動される `alhalte-banquette` にも伝播する（Issue #299）。
+- `ExecStart=` の各引数は空白や特殊文字を含んでも安全に解釈されるよう systemd 形式でクォート・エスケープされ、秘密値は `--client-secret-file` / `--service-token-file` のファイルパスのみが出力される。
+
+## 内部フロー
+
+### `alhalte-bistrot systemd` の実行手順
+
+1. `alhalte-restaurant::load_config` で `Restaurant.toml` を読み込み、age 秘密鍵で `client-secret` / `service-token` を復号して設定値を検証する。
+2. `write_secret_files` で `<data-dir>/secrets/`（権限 `0700`）にシークレットファイル（権限 `0600`）を書き出す。
+3. `[[extensions]]` が定義されている場合、`stage_extensions` で WASM バイナリの ABI と自己紹介メタデータを検証し、`<data-dir>/extensions/` に `.wasm` と `manifest.json` を配置する。
+4. `generate_units` で `alhalte-cellar.service`、`alhalte-maitre-d.service`、`alhalte.target` の内容を組み立てる。
+5. `--output-dir` が指定されていれば各ファイルへ書き出し、未指定であれば標準出力へ出力する。
+
+## 不変条件・エラー
+
+- `#![forbid(unsafe_code)]`。ライブラリコード内で `unwrap` / `expect` / `panic!` を使用しない。
+- 生成されるユニットファイル内には平文の `client-secret` や `service-token` を一切含めない（`systemctl cat` 等で第三者に秘密値が漏洩するのを防ぐため）。
+- 設定検証または拡張機能 WASM の検証に失敗した場合はユニットファイルを生成せずエラー終了する（fail-closed）。
 
 ## 既知の差分・制約
 
-- `serve` / `url` / `args` / `stage-extensions` サブコマンドは削除した。起動は cafe、staging は cafe の `stage-extensions` を使う。
-- `alhalte-argenterie.service` は生成しない。UI は maitre-d の `--web-root` 配信に統一した。
-- `maitre-d.web-root` / `banquette-bin` は TOML に持たない。web-root は CLI / cafe / glacier の配置情報。
-- `nix run .#bistrot` はビルド済みバイナリを実行するだけ。開発用のワンショット起動は `nix run .`（cafe）を使う。
-- unit の `WorkingDirectory` は省略可能。相対パスは `systemd` 実行時に絶対化される。
-- NixOS ではこの crate ではなく `nixosModules.default`（glacier）を使う。bistrot は NixOS 以外の systemd 向け。
+- `alhalte-bistrot` はユニットファイルとシークレットファイル・拡張機能の配置までを行い、`systemctl daemon-reload` や `systemctl enable --now alhalte.target`、および OS ユーザー（`alhalte`）やデータディレクトリの所有者変更（`chown`）は運用者またはパッケージマネージャ側で実行する前提とする。NixOS 環境でこれらを含めて宣言的に管理する場合は [`alhalte-glacier`](../../nix/alhalte-glacier/ARCHITECTURE.md) を使用する。
