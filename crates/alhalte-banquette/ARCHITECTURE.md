@@ -6,206 +6,183 @@
 
 ## 責務
 
-部屋ごとに 1 プロセスで動くルームデーモン。何を交換するかではなく、どう交換するかを担う。scene のログ・state、character の所有権、クライアントの入退室、WebRTC signaling の中継、cellar への永続化と**部屋全体の復元**を持つ。HTTP サーバーは持たず、`alhalte-maitre-d` とローカル transport（Unix: UNIX socket、Windows: named pipe）で話す。
+1 つの部屋（room）を管理する独立プロセスである。シーン（scene）、ログチャンク（log chunk）、シーン状態（scene state）、キャラクター（character）、および部屋内のアカウント権限をメモリ上に保持し、`alhalte-maitre-d` から多重化されたローカル IPC 接続を受け付ける。定期的なハートビートおよび終了時（アイドルタイムアウト・`ShutdownRoom` 受信・シグナル受信）に、部屋全体の状態を `alhalte/banquette` ラベルの `Tin` として `alhalte-cellar` へ永続化する。
 
 ## 公開 API / 外部接続点
 
-### 外部接続点
+### CLI（`alhalte-banquette` バイナリ）
 
-| 接続先 | 方向 | 内容 |
+| 引数 / 環境変数 | 既定値 | 内容 |
 | --- | --- | --- |
-| `alhalte-maitre-d` | 双方向 | ローカル transport（Unix: UNIX ドメインソケット、Windows: named pipe）。4 バイト big-endian 長 + postcard のフレーム。部屋 head はここでは報告しない（Issue #192）。 |
-| `alhalte-cellar` | 送信・取得 | `POST /store`、`POST /store/{tin_id}`、`GET /tin/{tin_id}`、`POST /unregister`、`GET` / `PUT /alias/{name}`。封入した chunk、scene、room の永続化、head alias の読み書き、旧 head の解放。内部書き込みは `X-Alhalte-Service-Token` で認可する。 |
+| `--room-id` / `ALHALTE_ROOM_ID` | 必須 | 16 桁 hex の部屋 ID（内部表現は `u64`、10 進文字列も受理）。 |
+| `--socket` / `ALHALTE_BANQUETTE_SOCKET` | 必須 | ローカル IPC のエンドポイント（Unix は UNIX ドメインソケットのパス、Windows は `\\.\pipe\...` の名前付きパイプ）。 |
+| `--admin-account` / `ALHALTE_ADMIN_ACCOUNT` | `0` | 部屋の新規作成時に初期 `Admin` として登録するアカウント ID。 |
+| `--cellar-url` / `ALHALTE_CELLAR_URL` | 任意 | 永続化先の `alhalte-cellar` ベース URL。省略時はインメモリの `MemoryCellarSink` を使用する。 |
+| `--chunk-size-exponent` / `ALHALTE_CHUNK_SIZE_EXPONENT` | `8` | 1 チャンクあたりのログ収容数 $2^n$ の指数 $n$（既定は $2^8 = 256$ 件）。 |
+| `--heartbeat-interval-secs` / `ALHALTE_HEARTBEAT_INTERVAL_SECS` | `240` | ハートビートおよび定期永続化の間隔（秒）。 |
+| `--max-tin-size` / `ALHALTE_MAX_TIN_SIZE` | `67108864` (64 MiB) | `cellar` と送受信する `Tin` の最大バイト数。 |
+| `--service-token-file` / `ALHALTE_CELLAR_SERVICE_TOKEN_FILE` | 任意 | `cellar` への内部書き込み認証トークンを格納したファイルのパス。 |
+| `--service-token` / `ALHALTE_CELLAR_SERVICE_TOKEN` | 任意 | 内部書き込み認証トークンの直接指定（後方互換用。`--service-token-file` を優先）。 |
 
-CLI（`CliArgs`）:
+### ローカル IPC（対 `alhalte-maitre-d`）
 
-- `--room-id` / `ALHALTE_ROOM_ID`: 16 hex（正）または移行用 decimal の `u64`。内部の `RoomData.room_id` は `u64` のまま。
-- `--admin`（別名 `--owner`）/ `ALHALTE_ADMIN_ACCOUNT`
-- `--socket` / `ALHALTE_SOCKET_PATH`（Unix。既定 `/tmp/alhalte-banquette.sock`）
-- `--pipe-name` / `ALHALTE_PIPE_NAME`（Windows。`\\.\pipe\...`。maitre-d の spawner が room ごとに生成する）
-- `--cellar-url` / `ALHALTE_CELLAR_URL`（既定 `http://127.0.0.1:8080`）。起動時の head 読み込みもここへ行う。
-- `--chunk-size-exponent` / `ALHALTE_CHUNK_SIZE_EXPONENT`（既定 8）
-- `--heartbeat-interval-secs` / `ALHALTE_HEARTBEAT_INTERVAL_SECS`（既定 240）
-- `--service-token` / `ALHALTE_SERVICE_TOKEN`: 内部書き込みと alias 更新用トークン（後方互換。argv に出るので非推奨）。値はログに出さない。
-- `--service-token-file` / `ALHALTE_SERVICE_TOKEN_FILE`: 内部書き込み用トークンを 0600 file から読む。maitre-d が alhalte-restaurant から受け取った path をそのまま転送する。
-- 復元用の引数は無い。head は cellar の `room/<room_id>/head` alias から読む（Issue #192）。旧 `--room-tin` / `ALHALTE_ROOM_TIN` は廃止し、指定すると clap が unknown argument で起動を拒否する。
-- 秘密 file は `alhalte_banquette::secret_file::read_secret_file` が読み、group/other に読める file は拒否する（Issue #194）。
+プラットフォーム固有のローカル IPC（Unix: `tokio::net::UnixListener`、Windows: `tokio::net::windows::named_pipe`）上で、4 バイトのビッグエンディアン長プレフィックス付き `postcard` フレームを送受信する（1 フレーム最大 16 MiB）。1 本の IPC 接続上で複数クライアントのセッションを多重化する。
 
-### 主な公開型
+#### `MaitreDToBanquette`（`maitre-d` → `banquette`）
 
-| API | 内容 |
+| フレーム | 内容 |
 | --- | --- |
-| `Room` / `RoomData` / `RoomPermissionLevel` | 部屋全体。scene biblio、character biblio、権限（`default_permission` / `permissions` / `accessible_scenes`）、chunk exponent。`room_id` は `u64`。 |
-| `Room::persist` / `Room::load_or_create` / `Room::load_from_cellar` / `Room::from_tin_with_head` / `Room::validate` | 部屋全体の保存・復元・不変条件検証。`persist` は store 後に head alias を移し、`load_or_create` は起動時に alias を読んで復元する（未設定なら新規部屋）。復元は room_id、root scene、権限表を検証する。 |
-| `room_head_alias(room_id)` | 部屋 head を置く cellar alias 名（`room/<room_id 16 hex>/head`）。 |
-| `HeartbeatOutcome` / `HeartbeatResult` | heartbeat の継続判定と、保存に成功した `RoomData` tin id。 |
-| `Scene` / `SceneData` | 独立した log と state を持つ scene。 |
-| `SceneLog` / `LogBiblio` / `LogChunk` | chunk 化された log と head。 |
-| `SceneState` | `BTreeMap<String, Tin>`。4KiB 制限と `::` 名前空間検証。 |
-| `Character` / `CharacterBiblio` | `HashMap<String, Tin>` と所有権。 |
-| `RoomArchive` / `export_room_to_zip` | export ZIP（`room.tin` + `chunks/<tin-id>.tin`）の組み立てと読み戻し。`include_state=false` で scene state だけを落とす（#193）。 |
-| `ClientFrame` / `ServerFrame` | クライアントと banquette の論理フレーム。 |
-| `MaitreDToBanquette` / `BanquetteToMaitreD` | maitre-d と banquette の制御フレーム。`QueryAccountPermission` / `AccountPermissionResponse` で account の実効権限を返す。head を報告する frame は持たない（Issue #192）。 |
-| `ProtocolCodec<T>` | 長さ前置 postcard コーデック。 |
-| `BanquetteServer` / `ServerConfig` | ローカル transport サーバー（`socket_path` / `pipe_name`）。`run_until_shutdown` で明示的に停止できる。 |
-| `CellarSink` / `HttpCellarSink` / `InMemoryCellarSink` | cellar 永続化の抽象。`store_tin` / `download_tin` / `unregister_tin` / `get_alias` / `set_alias` を持つ。 |
-| `INTERNAL_WRITE_SESSION_ID` | 内部書き込みが送る session id（`0`）。合成 session は使わない。 |
+| `ClientConnected { client_id, account_id, session_id }` | クライアントの接続通知。`account_id == 0` は匿名接続を表す。 |
+| `ClientDisconnected { client_id }` | クライアントの切断通知。全シーンから退去させる。 |
+| `ClientMessage { client_id, frame: ClientFrame }` | クライアントから送信された操作・照会フレーム。 |
+| `ExportRoom { request_id, caller_account, include_state }` | 部屋のエクスポート要求。呼び出し元の権限に応じた ZIP バイト列を返す。 |
+| `QueryAccountPermission { request_id, account_id }` | 指定アカウントの実効権限（`RoomPermissionLevel`）の照会。 |
+| `SetMemberPermission { request_id, caller_account, target_account, permission }` | 指定アカウントの権限変更または削除（`Admin` のみ実行可）。 |
+| `SetDefaultPermission { request_id, caller_account, permission }` | 部屋の既定権限の変更（`Admin` のみ実行可）。 |
+| `QueryPermissions { request_id, caller_account }` | 既定権限および個別権限マップの照会。 |
+| `ShutdownRoom` | `maitre-d` からのグレースフルシャットダウン要求。受信すると最終状態を `cellar` に永続化してプロセスを正常終了する（Issue #291）。 |
 
-### プロトコル
+#### `BanquetteToMaitreD`（`banquette` → `maitre-d`）
 
-`MaitreDToBanquette` は `ClientConnected`、`ClientDisconnected`、`ClientMessage`、`Ping`、`ExportRoom { request_id, caller_account, include_state }`、`QueryAccountPermission { request_id, account_id }` を持つ。
+| フレーム | 内容 |
+| --- | --- |
+| `SendToClient { client_id, frame: ServerFrame }` | 特定クライアントへのレスポンスまたは通知。 |
+| `BroadcastToAll { frame: ServerFrame }` | 部屋内の全接続クライアントへのブロードキャスト。 |
+| `BroadcastToScene { scene_id, frame: ServerFrame }` | 指定シーンに在籍するクライアントへのブロードキャスト。 |
+| `DisconnectClient { client_id, reason }` | クライアントの強制切断要求。 |
+| `ExportRoomResponse { request_id, result: Result<Vec<u8>, String> }` | `ExportRoom` に対する ZIP アーカイブの応答。 |
+| `AccountPermissionResponse { request_id, permission }` | `QueryAccountPermission` に対する実効権限の応答。 |
+| `PermissionMutationResponse { request_id, result }` | `SetMemberPermission` / `SetDefaultPermission` の成否応答。 |
+| `PermissionsResponse { request_id, default_permission, permissions }` | `QueryPermissions` に対する権限表スナップショットの応答。 |
 
-`BanquetteToMaitreD` は `SendToClient`、`BroadcastToScene`、`BroadcastToRoom`、`Pong`、`RoomTerminated`、`ExportRoomResponse { request_id, result: Result<Vec<u8>, String> }`、`AccountPermissionResponse` を持つ。head を報告する `RoomPersisted` は Issue #192 で削除した（head は cellar の alias が持つ）。`ExportRoomResponse` は ZIP bytes を運び、組み立ては banquette が行う（#193）。
+#### `ClientFrame` / `ServerFrame`（WebSocket クライアントとの論理プロトコル）
 
-`QueryAccountPermission` は `maitre-d` が「この部屋でのこの account の実効権限」を尋ねる制御フレームで、`Room::get_account_permission` の結果を `AccountPermissionResponse { request_id, account_id, permission }` で返す。DB の role と部屋の権限表を突き合わせるのは `maitre-d` 側の責務（#200）で、banquette は自分の権限表だけを答える。旧 `SetAdmins` / `AdminsUpdated`（DB の GM 集合を実行中の部屋へ push する経路）は #199 で撤去した。
+- **クライアント → サーバー (`ClientFrame`)**:
+  - シーン操作: `CreateScene { id, name? }`、`DeleteScene { id }`、`EnterScene { scene_id }`、`LeaveScene { scene_id }`、`ListScenes`
+  - ログ操作: `AppendLog { scene_id, entry: TinContent }`、`EditLog { scene_id, chunk_index, position, new_entry: TinContent }`、`RewindLog { scene_id, to_chunk_index, to_position }`、`QueryLogBiblio { scene_id }`、`QueryLogChunk { scene_id, chunk_index }`
+  - ステート操作: `UpdateState { scene_id, key, value: TinContent }`、`DeleteState { scene_id, key }`、`QueryState { scene_id }`
+  - キャラクター操作: `CreateCharacter { character_id?, data: HashMap<String, TinContent> }`、`UpdateCharacter { character_id, data: HashMap<String, TinContent> }`、`DeleteCharacter { character_id }`、`GetCharacter { character_id }`、`ListCharacters`、`MoveCharacter { character_id, to_scene_id }`
+  - 権限操作: `SetMemberPermission { account_id, permission }`、`SetDefaultPermission { permission }`、`QueryPermissions`
+  - 死活監視: `HeartbeatResponse { timestamp }`
+- **サーバー → クライアント (`ServerFrame`)**:
+  - シーン通知: `SceneList { scenes: Vec<SceneSummary> }`、`SceneInfo(SceneSummary)`、`SceneCreated { id }`、`SceneDeleted { id }`
+  - ログ通知: `LogEventAppended { scene_id, chunk_index, position, entry: TinContent }`、`LogEventEdited { scene_id, chunk_index, position, new_entry: TinContent }`、`LogEventRewound { scene_id, to_chunk_index, to_position }`、`LogChunkSealed { scene_id, chunk_index, tin_id }`、`LogBiblioSnapshot { scene_id, biblio }`、`LogChunkSnapshot { scene_id, chunk_index, entries: Vec<Option<TinContent>> }`
+  - ステート通知: `StateUpdated { scene_id, key, value: TinContent }`、`StateDeleted { scene_id, key }`、`StateSnapshot { scene_id, entries: BTreeMap<String, TinContent> }`
+  - キャラクター通知: `CharacterCreated { character_id }`、`CharacterUpdated { character_id }`、`CharacterDeleted { character_id }`、`CharacterMoved { character_id, from_scene_id, to_scene_id }`、`CharacterInfo { character_id, data: HashMap<String, TinContent> }`、`CharacterList { characters: HashMap<u64, HashMap<String, TinContent>> }`
+  - 権限通知: `PermissionsUpdated { default_permission, permissions }`、`PermissionsSnapshot { default_permission, permissions }`
+  - 死活監視・エラー: `HeartbeatPing { timestamp }`、`Error { code, message }`
 
-権限変更はクライアント由来の `SetMemberPermission` / `SetDefaultPermission` だけで行う。成功すると `ServerFrame::PermissionsUpdated { default_permission, permissions }` を要求元へ返し、失敗時は `SetMemberPermissionFailed` / `SetDefaultPermissionFailed` の `Error` のみで、部屋の状態は変わらない。最後の Admin の降格は `LastAdminDemotion` で拒否する。`maitre-d` は成功 frame を観測するまで `rooms.done` を更新しない。
+### HTTP（対 `alhalte-cellar`）
 
-`ClientFrame` は scene 一覧・詳細・作成・削除・入退室、state の取得・更新・削除、log の append/edit/delete/rewind/取得、character の CRUD・移動、権限の変更・取得、WebRTC signaling、heartbeat 応答を持つ。`ServerFrame` はその結果と broadcast を返す。
+`CellarSink` トレイトの HTTP 実装（`HttpCellarSink`）が `alhalte-cellar` と通信する。内部書き込みにはすべて `X-Alhalte-Service-Token` ヘッダを付与し、`X-Alhalte-Owner: 0`（システム所有）として扱う。
 
-- `SetMemberPermission { account_id, permission }` / `SetDefaultPermission { permission }` / `QueryPermissions` が権限フレーム。変更は Admin のみ、`QueryPermissions` は部屋に入れる account なら誰でもよい。成功時は `PermissionsUpdated`、取得時は `PermissionsSnapshot` を要求元だけに返す（部屋全体へは broadcast しない）。`can_access_scene` を満たさない account への応答は他の query と同じく無言。
-- 全 mutate frame は `Room` の権限チェックを通る。`AppendLog` / `EditLog` / `DeleteLog` / `RewindLog` / `UpdateState` / `DeleteState` は対象 scene の `can_send_to_scene`、`CreateScene` / `DeleteScene` / `MoveCharacter` は Admin、character の CRUD は書き込み可能（`Participant` 以上）かつ所有者または Admin。`Viewer` は全 mutate が拒否される。拒否は `*Failed` の `Error` frame になる。
-- `ListScenes` / `CreateScene` / `DeleteScene` / `MoveCharacter` の scene 一覧は `SceneSummary`（`id`、`name`、`present_character_count`、`present_characters`、`active_client_count`、`is_loaded`）の列 `SceneList` として返す。`present_characters` は scene に在籍する character id の昇順リストで、クライアントはこれで `scene.members` を再構築する。`name` は scene state `std::name` の UTF-8 文字列で、未設定なら scene id、`/` は作成時に `メインシーン` が入る。`SceneSummary` は protocol 上の summary であり、`RoomData` / `SceneData` の wire schema は変えず、永続化は従来どおり `SceneData.present_characters` が持つ。
-- `CreateScene { scene_id, inherit_juices, name }` は `name` を `std::name` へ作成と同時に書き、`SceneCreated` を要求元へ返し、`SceneList` と新 scene の `SceneInfo` を room 全体へ broadcast する。`std::name` は juice 継承の対象外。scene の作成・削除は Admin のみ。
-- `UpdateState` で `key == "std::name"` が成功したときは `StateUpdated` の ack / scene broadcast に加えて `SceneInfo` を room 全体へ broadcast する。これにより他クライアントは再読み込みなしで rename を反映できる。
-- `EnterScene` は `can_access_scene` を満たす場合だけ入室を記録し、その scene の `StateSnapshot` を直接返す。満たさない場合は無言で何もしない（presence も記録しない）。クライアントは入室ごとの `QueryState` を必要としない（`QueryState` は従来どおり明示問い合わせ用に残る）。
-- `CreateScene` / `DeleteScene` の成功時は要求元へ `SceneCreated` / `SceneDeleted` を返し、更新後の scene 一覧を `SceneList` として room 全体へ broadcast する。`MoveCharacter` の成功時は要求元への `CharacterMoved` ack に加えて room 全体へも `CharacterMoved` を broadcast し、移動元・移動先の `SceneInfo` を broadcast する。移動先 scene が暗黙に作られた場合は `SceneList` も broadcast する。ack と broadcast が重複してもクライアント側は冪等に適用する。
-- character の CRUD は room 全体へ同期する（#160）。`CreateCharacter` 成功時は要求元へ `CharacterCreated`（採番 id）を返し、room 全体へ `CharacterInfo { character_id, data }` と、新しい character が入った scene の `SceneInfo` を broadcast する。新規 character は要求元が現在入室している scene（不明なら `/`）に所属する。`UpdateCharacter` 成功時は `CharacterUpdated` ack と room 全体への `CharacterInfo`（保存後の属性）を送る。`DeleteCharacter` 成功時は `CharacterDeleted` を room 全体へ broadcast し、全 scene の `present_characters` から除去したうえで `SceneInfo` を、残っている `piece::<id>::placed` / `piece::<id>::pos` を削除して `StateDeleted` を broadcast する。scene membership は `Scene.present_characters` が正で、`character::<id>::scene` mirror は書かない。
-- state の `UpdateState` / `DeleteState` 成功時は、要求元への直接 ack と対象 scene への broadcast の両方を行う。ルート scene `/` の state は他 scene から編集される（アセット・拡張機能）ため、要求元が対象 scene に居なくても ack が届く。両方を受け取ったクライアントは同じ frame を 2 回適用するが、state 更新・削除は冪等。
+- `POST /store` および `PUT /store/{tin_id}`: チャンク `Tin`（`alhalte/banquette/log/chunk`）および部屋状態 `Tin`（`alhalte/banquette`）の保存。リクエスト・レスポンスの上限は `--max-tin-size`（既定 64 MiB）に従う。
+- `DELETE /tin/{tin_id}`: チャンク再封印時や旧 head 置き換え時の参照削除（ベストエフォート）。
+- `GET /alias/room/{room_id}/head` および `PUT /alias/room/{room_id}/head`: 部屋の永続化 head ポインタの取得と原子的更新。
+- `GET /tin/{tin_id}`: 起動時の部屋状態復元およびエクスポート時の過去チャンク取得。
 
 ## データ形式
 
-| ラベル | 内容 |
-| --- | --- |
-| `alhalte/banquette` | 部屋全体の状態（`RoomData`）。 |
-| `alhalte/banquette/scene` | scene の state と log biblio（`SceneData`）。 |
-| `alhalte/banquette/log/chunk` | `Vec<Option<Tin>>` の log chunk。 |
-| `alhalte/banquette/log/biblio` | 封入済み chunk の tin id 列と head `(u32, u32)`。 |
-| `alhalte/banquette/log/character-came` | scene への入室イベント。 |
-| `alhalte/banquette/log/character-gone` | scene からの退場イベント。 |
+### `Tin` と `TinContent`（Issue #272）
 
-予約 state キー:
+`tin` クレート（`crates/tin-rs`）の型分離に従い、ラベルとペイロードの組は `TinContent`（`label: u64`, `payload: Vec<u8>`）、ワイヤー上の圧縮・暗号化情報（`Opener`）と識別子（`TinId`）を伴うコンテナは `Tin` として扱う。
 
-- scene 名の `std::name`（scene state の UTF-8 文字列。character 属性にも同名キーがある）
-- character 属性の `std::name`、`std::owner_account`
-- cutlery 予約: `asset::<id>`（`/` のアセットメタデータ）、`extension::<id>`（`/` の拡張機能メタデータ）
+- メモリ上のシーン state（`SceneState`）、キャラクター属性（`Character`）、ログエントリ（`LogChunk`）、および IPC / WebSocket フレーム内の値はすべて `TinContent` を保持する。
+- 文字列や整数などのプリミティブ値と `TinContent` の相互変換には、標準の `From` / `TryFrom`（`TryInto`）実装（`TinContent::from("...")`、`String::try_from(&content)`、`u64::try_from(&content)` など）を用いる。
+- `cellar` に保存・取得するチャンクや部屋全体のスナップショットは、`TinContent` を `Opener`（平文 + LZ4 または無圧縮）でエンコードした `Tin` として扱う。
 
-state キーは 1 個以上の `::` を含む必要がある。値は `to_plaintext().len()` が 4KiB 以下。管理者専用の state キーは無く、書き込みの可否は部屋の権限表（`can_send_to_scene`）だけで決まる。旧 `std::admins`（`/` に置いていた管理者リスト）は #199 で廃止し、管理者は `RoomData.permissions` が持つ。
+### ラベル定義
+
+`label_hash(ident)`（XXH64, seed = 0）により以下のラベルを使用する。
+
+| 識別子 | 定数名 | 用途 |
+| --- | --- | --- |
+| `alhalte/banquette` | `LABEL_BANQUETTE` | 部屋全体の永続化スナップショット（`RoomData` の postcard 直列化）。 |
+| `alhalte/banquette/log/biblio` | `LABEL_LOG_BIBLIO` | シーンのログ書誌情報（`LogBiblio` の postcard 直列化）。 |
+| `alhalte/banquette/log/chunk` | `LABEL_LOG_CHUNK` | ログチャンク（`Vec<Option<TinContent>>` の postcard 直列化）。 |
+| `alhalte/banquette/log/character-came` | `LABEL_CHARACTER_CAME` | キャラクター入室システムログ（`(character_id: u64, from_scene: Option<String>)`）。 |
+| `alhalte/banquette/log/character-gone` | `LABEL_CHARACTER_GONE` | キャラクター退室システムログ（`(character_id: u64, to_scene: Option<String>)`）。 |
+
+### 永続化構造（`RoomData`）
+
+```rust
+pub struct RoomData {
+    pub room_id: u64,
+    pub chunk_size_exponent: u8,
+    pub scenes: BTreeMap<String, PersistedScene>,
+    pub characters: HashMap<u64, HashMap<String, TinContent>>,
+    pub next_character_id: u64,
+    pub default_permission: RoomPermissionLevel,
+    pub permissions: BTreeMap<u64, RoomPermissionLevel>,
+    pub accessible_scenes: BTreeMap<u64, BTreeSet<String>>,
+}
+```
+
+- **ルートシーン `/` (`ROOT_SCENE_ID`)**: すべての部屋に必ず存在し、削除できない。部屋全体の共有設定（拡張機能メタデータ `extension::*` や部屋アセット `asset::*` など）の格納先としても使われる。
+- **シーン状態 (`SceneState`)**: `BTreeMap<String, TinContent>`。1 エントリあたりの平文サイズ（`TinContent::to_plaintext().len()`、すなわち 8 バイトの label + payload）は最大 **4 KiB（4,096 バイト）** に制限される。予約キー `std::name`（`primitive/string`）をシーンの表示名として扱う。
+- **キャラクター (`Character`)**: `HashMap<String, TinContent>`。予約キー `std::name`（表示名）と `std::owner_account`（所有者アカウント ID、`primitive/u64`）を持つ。
+- **権限 (`RoomPermissionLevel`)**:
+  - `Denied`: 入室・閲覧・操作すべて不可。
+  - `Viewer`: 全シーンの閲覧（ステート・ログ・キャラクター・エクスポート）が可能。書き込みは不可。
+  - `Participant`: ルートシーン `/` および `accessible_scenes` で許可されたシーン（自キャラクターが移動したシーンを含む）の閲覧・書き込みが可能。自キャラクターの作成・編集・削除が可能。
+  - `Admin`: 全シーンの閲覧・書き込み、シーン作成・削除、全キャラクターの操作・移動、部屋の権限設定が可能。部屋には常に最低 1 人の `Admin` が存在しなければならない。
 
 ## 内部フロー
 
-### 起動
+### 起動と状態復元
 
-1. `Room::load_or_create(cellar, room_id, admin_account, chunk_exponent)` が cellar の `room/<room_id>/head` alias を読む（`room_head_alias`）。
-   - alias が未設定なら、部屋は一度も永続化されていない。`Room::new` が `/` を作り、作成者を `Admin`、`default_permission` を `Denied`、作成者の `accessible_scenes` を `["/"]` にして `RoomData` に持たせる。
-   - alias があれば、`Room::load_from_cellar` が cellar から tin を取得して復元する。
-     - `Tin::decode` で復号し、tin id（内容ハッシュ）が alias の指す head と一致することを確認する。
-     - `Room::from_tin` が `RoomData` を復元し、root scene `/` の存在と `Room::validate`（Admin が 1 人以上、`accessible_scenes` の整合）を検証する。
-     - `RoomData.room_id` が `--room-id` と一致することを検証する。
-     - alias の読み込み・取得・復号・検証のいずれかが失敗したら**空部屋で起動せず**、明確なエラーで終了する。旧 schema（`done` フラグを持つ #199 以前の `RoomData`）は decode 失敗として扱い、変換しない。
-2. `BanquetteServer::run` が Unix では既存ソケットを削除して UNIX ソケットを bind し、Windows では `--pipe-name` の named pipe を作る。
-3. heartbeat タスクを起動する。初回 tick は捨てる。
-4. maitre-d からの接続ごとに `handle_connection` を spawn する。
+1. `maitre-d`（またはスタンドアロン起動）から `--room-id`、`--socket`、`--admin-account`、`--cellar-url`、`--service-token-file`、`--max-tin-size` 等を受け取って起動する。
+2. `cellar` のエイリアス `GET /alias/room/{room_id}/head` を照会する。
+   - **エイリアスが存在する場合**: 指し示された `tin_id` を `GET /tin/{tin_id}` で取得し、`Tin::decode` で検証・展開して `Room::from_persisted` で復元する。`room_id` の不一致、フォーマット破損、または `Room::validate`（最低 1 人の `Admin`、実在シーンのみの参照など）の失敗時はエラーで即座に終了し、**空の部屋で上書きしない**（fail-closed）。
+   - **エイリアスが存在しない場合（404）**: `Room::new(room_id, chunk_size_exponent, admin_account)` でルートシーン `/` を持つ新規部屋を作成する。
+3. ローカルソケット（または名前付きパイプ）をバインドし、`maitre-d` からの IPC 接続を待ち受ける。
 
-### 部屋状態の永続化と復元
+### クライアント接続とシーン入退室
 
-- heartbeat ごとに `Room::persist` が部屋全体を `alhalte/banquette` Tin（Zstd）として cellar に保存する。内部書き込みは `INTERNAL_WRITE_SESSION_ID = 0` と `X-Alhalte-Service-Token` を使い、合成 session は使わない。
-- 保存に成功したら、まず `PUT /alias/room/<room_id>/head` で head alias を新しい tin へ移す。alias が唯一の復元点なので、この書き込みの失敗は `persist` の失敗として返す（旧 alias と旧 head は有効なまま残り、次周期に再試行する）。
-- alias の更新後に、直前の head tin を `CellarSink::unregister_tin` で best-effort に解放する。現在の head は alias が指しているので解放しない。解放失敗は警告ログのみで、保存自体は成功扱い。
-- 保存に成功した tin id は `HeartbeatResult::persisted_tin` に入る。保存失敗時は `None` で、ログに残して次周期に再試行する。maitre-d へ報告する frame は無い。
-- graceful shutdown（idle による `ShouldExit`、`run_until_shutdown`、または standalone バイナリの SIGTERM / SIGINT / Windows Ctrl+C）では終了直前に `persist` をもう一度行い、alias を最終状態へ移してから transport を閉じる。Unix の SIGTERM / SIGINT と Windows の Ctrl+C は `main.rs` で `watch` channel に配線し、`run_until_shutdown` へ渡す。
-- `room_id → head tin` のポインタは cellar の alias だけが持つ。maitre-d も banquette も DB / 専用ファイルに head を保存しない。
+1. `ClientConnected` を受信すると、該当クライアントをルートシーン `/` に配置し、`SceneList` および `CharacterList` を送信する。
+2. クライアントが `EnterScene { scene_id }` を送ると、`can_access_scene` で閲覧権限を検査する。許可されていれば対象シーンにクライアントを参加させ、そのシーンの `StateSnapshot` を即座に返す。
+3. `CreateCharacter` では作成者のアカウント ID を `std::owner_account` に自動設定し、初期配置としてルートシーン `/` に参加させる。
+4. `MoveCharacter`（`Admin` のみ実行可）では、移動元シーンに `character-gone`、移動先シーンに `character-came` のシステムログを追記し、対象キャラクターの所有者（`Participant`）の `accessible_scenes` に移動先シーンを追加する。
 
-### クライアント接続
+### ログの追記とチャンク封印
 
-1. `ClientConnected` で `ConnectedClient` を登録し、クライアントを `/` に入室させる。
-2. `ClientMessage` を `ClientFrame` として処理する。`EnterScene` は `can_access_scene` を満たす場合だけ入室を記録して `StateSnapshot` を返し、クライアントは scene の state を即座に復元できる。満たさない場合は無言で何もしない。
-3. `ClientDisconnected` で scene から退室させ、必要なら scene を永続化してメモリを解放する。
-4. `Ping` には `Pong` を返す。
+1. `AppendLog` / `EditLog` 受信時、送信者が対象シーンへの書き込み権限（`can_send_to_scene`）を持つか検査する。さらにログエントリに話者（`speaker_id`）が含まれる場合、`Admin` でなければ自身の所有キャラクター（`std::owner_account == caller`）であることを検証し、違反時は `SpeakerNotOwned` エラーを返す（Issue #271）。
+2. アクティブチャンク（末尾の未封印チャンク）に `TinContent` を追加し、シーン内のクライアントに `LogEventAppended` をブロードキャストする。
+3. アクティブチャンクのエントリ数が $2^{\text{chunk\_size\_exponent}}$ に達すると、チャンクを `alhalte/banquette/log/chunk` ラベルの `Tin`（LZ4 圧縮・平文）にエンコードして `cellar` に保存し、`LogBiblio` に `TinId` を記録して `LogChunkSealed` を通知する。
+4. 封印済みチャンクに対して `EditLog` や `RewindLog` が行われた場合、`cellar` から該当チャンクを取得・変更して再封印し、旧チャンクの参照を `cellar` から削除する。
 
-### log
+### ハートビート・永続化・グレースフルシャットダウン（Issue #291）
 
-`SceneLog` は `1 << N` 件の chunk を持つ。`head = (chunk_index, position)`。
+1. `heartbeat_interval` ごとに全クライアントへ `HeartbeatPing` を送り、応答のない非アクティブクライアントを切断する。
+2. 続けて `Room::persist` を実行する:
+   - 未封印のアクティブチャンクも含め、必要なチャンクを `cellar` に保存する。
+   - `RoomData` を `alhalte/banquette` ラベルの `Tin` にエンコードして `cellar` に保存する。
+   - 保存成功後、`PUT /alias/room/{room_id}/head` でエイリアスを新しい `TinId` に更新する。
+   - 更新前の旧 head `TinId`（および更新された旧チャンク）の参照を `DELETE /tin/{old_id}` でベストエフォート削除し、`cellar` の GC が回収できるようにする。
+3. **グレースフルシャットダウン**:
+   - 以下のいずれかの終了契機が発生した場合、ハートビートループを停止し、終了直前に最終の `Room::persist` を 1 回実行してからプロセスを正常終了する:
+     1. **IPC シャットダウン要求 (`MaitreDToBanquette::ShutdownRoom`)**: `maitre-d` が部屋を閉じる、または `maitre-d` 自身が停止する際に送信する制御フレーム（Issue #291）。Windows の名前付きパイプ環境を含め、OS シグナルに依存せず確実に最終永続化を行える。
+     2. **アイドルタイムアウト (`HeartbeatOutcome::ShouldExit`)**: 接続クライアントが 0 人のままハートビート周期が経過した場合。
+     3. **OS シグナル (`SIGTERM` / `SIGINT` / Windows Ctrl+C)**: `run_until_shutdown` に配線されたシャットダウンチャネル経由で捕捉した場合。
 
-- `append`: head 位置へ `Some(Tin)` を書き、head を進める。chunk が満杯なら `LogChunk` Tin に封入し、Zstd で cellar へ保存して biblio に tin id を追加する。
-- `append` の成功は `LogOperationEvent::Appended { position, entry }` を返し、`LogEventAppended` には append 後の head ではなく **実際に書き込んだ位置** を載せる。以前は append 後の head を送っていたため、クライアントの position が 1 進んでいた。
-- `edit`: head より前の位置を `Some(Tin)` で上書きする。封入済み chunk の場合は再 Tin 化して cellar へ再送する。
-- `delete`: head より前の位置を `None`（tombstone）で上書きする。
-- `rewind`: head を過去へ戻し、以降を切り捨てる。
-- `read_chunk`: active chunk、メモリ上の sealed cache、cellar の順に読む。
-- `append` / `edit` は entry の `speakerId` を認可する（Issue #271）。entry の payload が JSON object で `speakerId` を持つ場合、その character が実在し、`std::owner_account` が呼び出し元と一致するか、呼び出し元が `Admin` であることを要求する。`speakerId` が無い / `null` / entry が非 JSON ならナレーションとして許可する。違反は `BanquetteError::SpeakerNotOwned` になり、要求元へ `Error { code: "SpeakerNotOwned" }` を返す。came/gone は `speakerId` を持たないため従来どおり通る。
+### エクスポート
 
-各操作は `LogOperationEvent` になり、同一 scene のクライアントへ `LogEventAppended` / `Edited` / `Deleted` / `Rewound` として配信される。
+1. `ExportRoom { request_id, caller_account, include_state }` を受信すると、まずメモリ上の最新状態を `cellar` にフラッシュし、呼び出し元が閲覧可能なシーンだけを抽出する。
+2. `include_state == false`（`type=logs`）の場合は、全シーンの `state` を空にしてから `RoomData` を構築する。
+3. `room.tin`（フィルタ済み `RoomData`）と `chunks/<tin_id_hex>.tin`（対象シーンの全チャンク）を無圧縮（Stored）の ZIP アーカイブにまとめ、`ExportRoomResponse` で `maitre-d` に返す。
 
-### state
+## 不変条件・エラー
 
-`SceneState` はキー検証と値サイズ検証を行う。管理者専用の state キーは持たず、書き込みの可否は `Room` の権限チェック（`can_send_to_scene`）で決まる。更新・削除は同一 scene のクライアントへ `StateUpdated` / `StateDeleted` として配信される。WebRTC DataChannel が確立している場合の state 中継は signaling の枠組みだけを持ち、実データ経路はクライアント側の実装に委ねる。
-
-### scene のライフサイクル
-
-- scene からクライアントがいなくなったら、`/` 以外は `persist_and_unload` で `alhalte/banquette/scene` Tin として cellar に保存し、active chunk と sealed cache を解放する。
-- 再度アクセスされたら `reload_if_needed` で cellar から復元する。
-- 開かれていない scene への membership / log 書き込み（`MoveCharacter` など）は、`Room::ensure_scene_loaded` で対象 scene を先に復元してから行う。未ロードのまま書き込むと次の `reload_if_needed` が tin で上書きするため、書き込みは失われる（#240）。
-- heartbeat では、前回の周期以降にクライアント活動がなければ `missed_heartbeats` を増やす。3 回連続で応答がなければ `HeartbeatOutcome::ShouldExit` を返し、サーバーは終了する。
-
-### character
-
-`CharacterBiblio` は `next_id` を単調増加させて ID を払い出す。作成時に `std::owner_account` がなければ作成者を設定する。CRUD は `Participant` 以上かつ所有者または `Admin` のみ。`MoveCharacter` は **Admin のみ**が実行でき（`Participant` は自分の character でも動かせない）、移動元 scene に `character-gone`、移動先に `character-came` の log を追記し、移動先 scene を owner の `accessible_scenes` に追加する。これが participant に scene を開く唯一の経路である。scene membership は各 `Scene.present_characters` が保持し、`RoomData` の `SceneData.present_characters` として永続化されるため、reload / reconnect 後も復元される。`character::<id>::scene` は write-only の mirror だったため廃止し、`SceneInfo` / `SceneList` の `present_characters` を正とする。
-
-### export
-
-`ExportRoom { caller_account, include_state }` を受けると、呼び出し元がアクセスできる scene の `RoomData` と chunk を集め、`src/export.rs` の `export_room_to_zip` で ZIP を組み立てて `ExportRoomResponse { result: Result<Vec<u8>, String> }` として返す（#193）。scene の絞り込みは `Room::can_access_scene` に従う（`Viewer` / `Admin` は全 scene、`Participant` は `/` と付与された scene、`Denied` は無し）。`caller_account` が無い export は `default_permission` に従い、`RoomData` の構造を保つため `/` は常に含める。active chunk も export 用に封入する。
-
-ZIP の構成は `room.tin`（`RoomData` Tin）と `chunks/<tin-id>.tin`（`LogChunk` Tin）で、各 entry は plaintext（Zstd 圧縮）の Tin。banquette は room key を持たないため room-key 暗号化はしない。`include_state == false`（`type=logs`）は各 scene の `states` だけを空にし、scene の同一性・biblio・present characters・character 表・権限表は残す。`RoomArchive::load_from_slice` が同じ ZIP を `RoomData` と chunk に読み戻す。
-
-## 権限モデル
-
-`RoomPermissionLevel { Denied, Viewer, Participant, Admin }` が部屋の全 scene の read / write を決める。権限の正は `RoomData` で、`permissions`（account ごとの上書き、`Denied` の明示も可）と `default_permission`（未登録 account の既定）を持ち、`Room` も同じフィールドを持つ。
-
-- `Denied`: 読み書き不可。読み取り query には**無言**で応答しない（接続時の入場可否は現状 `maitre-d` のゲートが担う）。
-- `Viewer`: 全 scene の log / state を受信できる。全 mutate を拒否される。
-- `Participant`: 管理者に移動させられた scene と root `/` の log / state を送受信できる。`CreateScene` / `DeleteScene` / `MoveCharacter` は不可。log の `speakerId` には自分の保有 character だけを使える。
-- `Admin`: 全 scene の送受信と権限変更。すべての実在 character を話者にできる（GM 代演、Issue #271）。
-
-### `Room::new`
-
-作成者を `Admin`、`default_permission` を `Denied`、作成者の `accessible_scenes` を `["/"]` にする（部屋は既定で閉じている）。
-
-### `Room::validate`
-
-load 後と権限変更後に呼び、次を検証する。違反は `InvalidRoomData` で、起動時は空部屋にフォールバックしない。
-
-- Admin が最低 1 人いる（`default_permission == Admin` でも満たす）。`room_id` の一致は `load_from_cellar` が別途検証する。
-- 最後の Admin の降格は `set_member_permission` / `set_default_permission` が `LastAdminDemotion` で拒否する。
-- `accessible_scenes` は実在する scene のみを指し、`can_write()`（`Participant` / `Admin`）の account にだけ付く。`Admin` の項目は不活性（`can_access_scene` は Admin を全許可）。scene 削除や降格で無効になった項目は `normalize_accessible_scenes` が落とす。
-
-### 認可関数
-
-- `is_admin(account)`: 実効権限が `Admin`。
-- `get_account_permission(account)`: `permissions` の上書き、無ければ `default_permission`。
-- `can_access_scene(account, scene)`: read 可否。`Denied` は常に false、`Viewer` / `Admin` は常に true、`Participant` は `/` と付与 scene のみ。
-- `can_send_to_scene(account, scene)`: write 可否。`can_access_scene` と同じ scene 集合だが `Viewer` は常に false。
-
-### 権限変更
-
-`SetMemberPermission` / `SetDefaultPermission` は Admin のみ。成功すると `PermissionsUpdated` を要求元へ返し、`RoomData` に反映して次回 persist で永続化する。`maitre-d` の DB role は実行中の部屋へ push しない（`SetAdmins` は撤去）。DB role と部屋権限表の突き合わせは `QueryAccountPermission` を使う #200 の仕事で、それまでの `rooms.done` は `default_permission` の射影にすぎない。
+- `#![forbid(unsafe_code)]`。ライブラリコード内で `unwrap` / `expect` / `panic!` を使用しない。
+- `Room::validate` による不変条件:
+  - ルートシーン `/` が常に存在する。
+  - `permissions` 内に最低 1 人の `Admin` が存在する（最後の `Admin` の降格・削除は `LastAdminRemoval` で拒否）。
+  - `accessible_scenes` は実在するシーンのみを含み、書き込み権限を持たないアカウント（`Denied` / `Viewer`）のエントリを持たない。
+- シーン状態の 1 キーあたりの平文サイズ上限は 4 KiB（`StateValueTooLarge`）。`cellar` へ永続化する `Tin` 全体の上限は `--max-tin-size`（既定 64 MiB）に従う。
+- 永続化データの復元失敗時は空の部屋へフォールバックせず、起動エラーとして終了する。
 
 ## 既知の差分・制約
 
-- Issue #199 で `done` / `SetDone` / `std::admins` を撤去し、`RoomData` の wire schema を切った。旧 schema の部屋は decode 失敗として起動しない（変換しない）。`RoomData` の JSON / postcard 互換性は保証しない。
-- `maitre-d` の DB role（`room_permissions`）と部屋の権限表はまだ接続していない。`SetAdmins` を撤去したため、実行中の部屋の権限は `SetMemberPermission` / `SetDefaultPermission` でしか変わらず、DB の role 変更は次回 spawn でも反映されない。接続は #200。
-- その帰結として、`maitre-d` の DB で `pl` / `viewer` の account も banquette からは `Denied`（`default_permission`）に見える。`Viewer` の mutate 遮断は当面 `maitre-d` の WS ゲートが担い、banquette 側の拒否と二重になる。#200 で DB role を部屋権限表へ移すと解消する。
-- `maitre-d` の pre-spawn gate（`rooms.done`）は #200 で部屋権限表に置き換えた。banquette は `QueryAccountPermission` で実効権限を答えるだけで、head や `default_permission` を報告しない（head 報告の `RoomPersisted` は #192 で削除）。
-- `alhalte-kitchen` は main から削除し、`kitchen-freeze` ブランチに保存した（#184）。banquette の export は `RoomData` をそのまま ZIP に格納し、`export.rs` の `RoomArchive` で権限表ごと読み戻す。`done` 射影は持たない（#193）。
-- `SetMemberPermission` / `SetDefaultPermission` の ack は要求元にだけ返し、部屋全体へは broadcast しない。降格された account は次回 `QueryPermissions` まで自分の権限変化を知らない（UI 追従は #201）。
-- `EnterScene` は権限が無い場合に無言で何もしない。`maitre-d` は自前の `client_scenes` で broadcast 先を決めるため、接続時の入場可否は当面 `maitre-d` のゲートが正で、banquette 側の判定は defense in depth。#200 で一本化する。
-- log の実体は `HashMap<String, Tin>` を duck typing する運用で、`content` / `speaker` / `timestamp` のキー規約は cutlery と saignant に委ねる。ただし `speakerId` だけは認可のため banquette が解釈する（Issue #271）。entry が JSON object のときだけ読み、非 JSON / キー無しはナレーションとして扱う。
-- WebRTC の DataChannel は signaling の中継までを実装し、state の DataChannel 経路そのものは未実装。
-- `RoomData` は `HashMap` を含むため、内容が同じでも postcard の map 順序が変わり tin id が変わることがある。heartbeat ごとに head が作り直されるが、旧 head の unregister と GC で回収される。
-- `persist` の失敗はログのみで、次周期までの再試行はない。メトリクスや専用の再試行キューは持たない。
-- 合成 session（旧 `system_session_id = 1`）は廃止した。`--service-token` が未設定の場合、内部書き込みは cellar の session 検証に失敗し、alias 書き込みも service token 必須なので 401 になる（persist は失敗し、次周期に再試行する）。
-- graceful shutdown の経路は idle 終了と `run_until_shutdown`（および standalone バイナリの SIGTERM / SIGINT）。SIGTERM / SIGINT は `main.rs` で捕捉し、最終 persist を含む同じ graceful path に入る。シグナル配線そのものはプロセス起動を伴う統合テスト（`tests/spec_tests.rs` の `test_sigterm_runs_graceful_final_persist`）で確認する。
-- `Room::load_from_cellar` の download は cellar 側で認証されない（現行 cellar の download は session 検証を行わない）。service token は書き込みだけを守る。
-- `Room::load_or_create` は alias を読んでから復元する。alias が壊れた tin を指す・hash が一致しない・`RoomData.room_id` が違う場合は起動失敗で、空部屋にフォールバックしない。壊れた alias は自動修復しない（運用者が cellar 側で直す）。
-- `maitre-d` は head を一切持たない（`room_heads` は撤去）。別インスタンスが persist して alias を置き換えた場合、旧 head の解放はそれを行った banquette が担う。
-
+- シーン状態における BGM（`std::bgm*` / `bgm::*`）、背景画像（`std::b-img*`）、駒配置（`piece::*`）、アセット（`asset::*`）、拡張機能（`extension::*`）の各キーはクライアント（`alhalte-argenterie`）側の規約であり、`banquette` 自身は `std::name` 以外のステートキーを特別扱いしない（Issue #186）。
+- `character-came` / `character-gone` のシステムログはペイロード内に時刻を持たない。クライアントやエクスポート変換側でチャンク内の順序に基づいて扱う。
+- キャラクターを削除すると、全シーンのステートから `piece::<character_id>::*` キーがベストエフォートで削除され、`StateDeleted` がブロードキャストされる。

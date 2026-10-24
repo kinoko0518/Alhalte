@@ -2,58 +2,67 @@
 
 > 上位文書: [../../ARCHITECTURE.md](../../ARCHITECTURE.md)  
 > 実装: `crates/alhalte-cafe`  
-> テスト: `crates/alhalte-cafe/tests/cafe_tests.rs`
+> テスト: `crates/alhalte-cafe/tests/spec_tests.rs`
 
 ## 責務
 
-Linux / macOS / Windows 共通のワンショット起動。systemd を経由せずに Alhalte インスタンスを立ち上げる。
+systemd を使用せず、Linux / macOS / Windows のローカル環境で Alhalte インスタンス全体をワンショット起動するランチャーである。`nix run .` による開発・試用起動、および配布用ポータブルバンドル（`alhalte-cafe` / `alhalte-cafe.exe` のダブルクリック起動）のエントリポイントを担う。
 
-- ポータブルフォルダの実行ファイル1つ（`alhalte-cafe` / `alhalte-cafe.exe`）からの起動
-- 開発中の試運転（`nix run .`）
-- ビルド済み SPA を maitre-d の `--web-root` で配信
-- 拡張 wasm の staging（ビルド補助）
-
-設定のパース・秘密復号・引数生成は [alhalte-restaurant](../alhalte-restaurant/ARCHITECTURE.md) を使う。systemd 生成は [alhalte-bistrot](../alhalte-bistrot/ARCHITECTURE.md)、NixOS 常駐サービスは [alhalte-glacier](../../nix/alhalte-glacier/ARCHITECTURE.md)。
+具体的には、`alhalte-restaurant` を用いて `Restaurant.toml` の検証・秘密値復号・拡張機能 WASM のステージングを行った上で、`alhalte-cellar` と `alhalte-maitre-d` を子プロセスとして直接起動・監視し、終了時に逆順で停止する。
 
 ## 公開 API / 外部接続点
 
-### CLI
+### CLI（`alhalte-cafe` バイナリ）
 
-```text
-alhalte-cafe [--config Restaurant.toml] [--age-key KEY] [--web-root DIR] [--no-browser]
-alhalte-cafe [--config Restaurant.toml] stage-extensions --output-dir DIR
-```
+| 引数 / サブコマンド | 既定値 | 内容 |
+| --- | --- | --- |
+| `--config <path>` | カレントディレクトリまたは実行ファイル隣接の `Restaurant.toml` | 読み込む設定ファイルのパス。 |
+| `--age-key <identity>` | `ROPS_AGE` / `ALHALTE_AGE_KEY` 環境変数 | age armor / rops 復号用の age 秘密鍵。 |
+| `--bin-dir <dir>` | 実行ファイルと同じディレクトリ（無ければ `PATH`） | `alhalte-cellar` / `alhalte-maitre-d` / `alhalte-banquette` を探索するディレクトリ。 |
+| `--web-root <dir>` | 実行ファイル隣接の `web` または `web/alhalte-argenterie/dist-app` | `maitre-d` に `--web-root` として渡すビルド済み SPA ディレクトリ。 |
+| `--no-browser` | `false` | 起動完了時に既定ブラウザを自動で開かない。 |
+| `up`（省略時の既定サブコマンド） | — | `cellar` と `maitre-d` を起動し、シグナルまたは子プロセス異常終了まで待機する。 |
+| `stage-extensions --output-dir <dir>` | — | サーバーを起動せず、`Restaurant.toml` の `[[extensions]]` を検証して指定ディレクトリに `.wasm` と `manifest.json` を書き出す。 |
+| `encrypt-value --recipient <age1...>` | — | 標準入力から読んだ平文シークレットを age armor に暗号化して標準出力へ書き出す。 |
 
-- サブコマンドなし = serve。
-- `--web-root` 省略時は `<config-dir>/web` → `<exe-dir>/web` の順で SPA を探す。
-- `--no-browser` / `ALHALTE_NO_BROWSER` でブラウザ起動を抑制する。
+### ライブラリ API（`alhalte_cafe`）
 
-### 主な公開型
-
-- `CafeOptions`、`CafePlan`、`CafeError`
-- `prepare_cafe`、`build_cafe_plan`、`run_cafe`
-- `detect_lan_ipv4_addresses`、`detect_lan_urls`、`lan_url`
-
-## 起動フロー
-
-1. `--config` → cwd の `Restaurant.toml` → 実行ファイル隣の `Restaurant.toml` の順で設定を解決する。
-2. 設定ファイルの親ディレクトリ基準で `data-dir` / `socket-dir` を絶対化する。
-3. SPA を解決し、`index.html` を要求する。`nix run .` は Nix ビルドの SPA を `--web-root` で渡す。
-4. `alhalte-maitre-d` / `alhalte-cellar` / `alhalte-banquette` を実行ファイル隣から解決する。存在しなければ「フォルダ全体を展開する」ようエラーを出す。
-5. 秘密 file を `<data-dir>/secrets/` に 0600 で書き出す。平文 secret は `local-login = true` のときだけ許可する（`ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` でも可）。
-6. cellar → maitre-d の順に spawn し、TCP 待受を待つ。maitre-d には `--web-root <解決済み SPA>` を渡す。banquette は maitre-d が部屋ごとに spawn する。
-7. ブラウザを開く。macOS は `open`、Windows は `cmd /C start`、その他 Unix は `xdg-open`。
-8. Ctrl+C または子の終了まで poll する。Windows は `taskkill /T /F`、Unix は子を kill。graceful な最終 persist は行わない（最大 heartbeat 分の損失）。
-9. LAN 公開時（`restaurant.host` が wildcard / 非 loopback）は maitre-d のポートで LAN URL を表示する。
+- `prepare_launch(config_path, age_key, bin_dir, web_root) -> Result<LaunchPlan>`: 設定読み込み、ディレクトリ作成、シークレットファイル書き出し（`<data-dir>/secrets/`）、拡張機能ステージング（`<data-dir>/extensions/`）、および `cellar` / `maitre-d` の起動コマンド構築（`--max-tin-size` 等の伝播を含む）を一括で行う。
+- `ChildSupervisor`: 起動した `alhalte-cellar` と `alhalte-maitre-d` の子プロセスを保持し、終了監視と逆順停止（`maitre-d` → `cellar`）を担う。
 
 ## データ形式
 
-`Restaurant.toml` のスキーマは [alhalte-restaurant](../alhalte-restaurant/ARCHITECTURE.md) を参照。cafe は追加の設定ファイルを持たない。
+`alhalte-cafe` 固有の永続データ形式は持たない。設定ファイルの構造・バリデーション規則・シークレットファイル形式はすべて [`alhalte-restaurant`](../alhalte-restaurant/ARCHITECTURE.md) に従う。
+
+- **ローカル開発時の平文シークレット許容**: `Restaurant.toml` で `[maitre-d] local-login = true` が有効な場合、または `ALHALTE_ALLOW_PLAINTEXT_SECRETS=1` が設定されている場合に限り、ローカル即起動の利便性のため平文の `service-token` / `client-secret` を受理する。Google OAuth モード（`local-login = false`）では既定で age armor 暗号化を必須とする。
+
+## 内部フロー
+
+### ワンショット起動フロー（`alhalte-cafe [up]`）
+
+1. **パスの解決**:
+   - `--config` が省略された場合、カレントディレクトリの `Restaurant.toml`、続いて `alhalte-cafe` 実行ファイルと同じディレクトリの `Restaurant.toml` を探索する（ポータブル版を任意の作業ディレクトリやエクスプローラーからダブルクリック起動できるようにするため）。
+   - 相対パスの `data-dir`、`socket-dir`、`[[extensions]].path` はすべて `Restaurant.toml` が置かれたディレクトリを基準に解決する。
+2. **準備 (`prepare_launch`)**:
+   - `alhalte-restaurant` で `Restaurant.toml` を読み込み、検証する。
+   - `data-dir` および `socket-dir` を作成し、復号した秘密値を `<data-dir>/secrets/`（権限 `0600`）に書き出す。
+   - `[[extensions]]` の WASM ファイルを検証し、`<data-dir>/extensions/` に `.wasm` と `manifest.json` をステージングする。
+   - `alhalte-restaurant` の引数生成関数を用いて、`alhalte-cellar` と `alhalte-maitre-d` の起動引数を構築する。`[cellar] max-tin-size`（既定 64 MiB）は両方のプロセスに `--max-tin-size` として渡され、さらに `maitre-d` に `--banquette-bin`、`--web-root`、`--extensions-dir` を付与する（Issue #299）。
+3. **プロセス起動とヘルスチェック**:
+   - 最初に `alhalte-cellar` を起動し、`127.0.0.1:<cellar.port>` への TCP 接続が可能になるまで待機する（起動直後にクラッシュした場合は即座にエラー終了）。
+   - 次に `alhalte-maitre-d` を起動し、`<maitre-d.port>` への TCP 接続が可能になるまで待機する。
+   - `--no-browser` が指定されていなければ、OS 標準のブラウザ起動コマンド（Linux: `xdg-open`、macOS: `open`、Windows: `cmd /C start`）で公開 URL（`0.0.0.0` バインド時は `http://localhost:<port>`）を開く。
+4. **監視とシャットダウン（Issue #291, #292）**:
+   - `SIGINT`（Ctrl+C）/ `SIGTERM`（Unix）の受信、または `cellar` / `maitre-d` いずれかの予期しない終了を待機する。
+   - シャットダウン時は **`maitre-d` → `cellar` の逆順**で停止する。`maitre-d` は停止時にアクティブな各 `banquette` へ `ShutdownRoom` フレームを送信し、`banquette` がその時点の最新状態を起動中の `cellar` へ永続化して終了・reap された後に `cellar` を停止する。これにより、Unix と Windows の双方で部屋の状態を失わずに安全に終了できる。
+
+## 不変条件・エラー
+
+- `#![forbid(unsafe_code)]`。ライブラリコード内で `unwrap` / `expect` / `panic!` を使用しない。
+- `alhalte-cellar`、`alhalte-maitre-d`、`alhalte-banquette` のいずれかのバイナリが見つからない場合や、設定・拡張機能の検証に失敗した場合は、子プロセスを起動する前にエラーで終了する。
+- 片方のサーバープロセスが異常終了した場合、残りのプロセスも即座に停止・reap して非ゼロ終了コードを返す。
 
 ## 既知の差分・制約
 
-- systemd を使わない。自動再起動・ファイルログ・OS サービス登録はない。
-- Vite dev server は起動しない。UI は常にビルド済み SPA を maitre-d が配信する。HMR が必要な場合は開発者が `pnpm dev` を別途使う。
-- `--web-root` を明示した場合、相対パスはプロセスの cwd 基準。
-- 兄弟バイナリが見つからない場合は起動しない（部分起動しない）。
-- `stage-extensions` は `--config` をサブコマンドより前に置く必要がある（clap のグローバル引数）。
+- `alhalte-cafe` 自身はデーモン化や自動再起動を行わない。常駐サーバー運用には `alhalte-bistrot`（systemd ユニット生成）または `alhalte-glacier`（NixOS モジュール）を使用する。
+- ブラウザの自動起動はベストエフォートであり、ヘッドレス環境などでブラウザ起動コマンドが失敗してもサーバー自体はそのまま稼働を継続する。

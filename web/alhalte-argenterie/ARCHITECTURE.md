@@ -1,12 +1,14 @@
 # alhalte-argenterie
 
 > 上位文書: [../../ARCHITECTURE.md](../../ARCHITECTURE.md)  
-> 実装: `web/alhalte-argenterie`（package `@alhalte/argenterie`）  
+> 実装: `web/alhalte-argenterie`（パッケージ名 `@alhalte/argenterie`）  
 > テスト: `web/alhalte-argenterie/tests/*.test.ts`
 
 ## 責務
 
-公式 cutlery。Svelte 5 と Noph UI で部屋 UI を提供する。部屋への入室、scene / character / log の表示と操作、拡張機能の管理と実行、Saignant WASM によるログ描画、オフライン時の操作キュー通知を担う。画面は Material 3 Expressive に準拠する。グローバルな接続状態バナーは持たず、通信失敗は操作したタブ / エディタ内で告知する（Issue #261）。
+Alhalte の公式 Web クライアント（cutlery）。Svelte 5 と Noph UI を用いて部屋 UI を構築する。部屋への入室、シーン・キャラクター・ログの表示と操作、拡張機能の管理と実行、Saignant WASM によるログ描画、およびオフライン時の操作キュー通知を担う。
+
+クライアント側のローカル状態・ストレージ管理（シーン単位の State 管理、シーン単位の Log 管理、`cellar` との Tin 送受信・メディア再エンコード・キャッシュ管理）は `@alhalte/pantry` に委譲し、`argenterie` は `pantry` の状態変更通知を購読して UI と拡張機能パイプラインへ反映する（Issue #301 / #302）。画面デザインは Material 3 Expressive に準拠し、グローバルな接続状態バナーは持たず、通信失敗は操作したタブやエディタ内で通知する（Issue #261）。
 
 ## 公開 API / 外部接続点
 
@@ -14,44 +16,45 @@
 
 | 接続先 | 内容 |
 | --- | --- |
-| `maitre-d` `POST /api/rooms` | 認証必須。`{ name, room_id? }` で部屋を登録し、作成者を `admin` にする（`utils/home.ts` の `createRoom`）。`room_id` はクライアント生成の 16 hex を送ってもよいが、返却値が正。 |
-| `maitre-d` `GET /api/rooms/{room_id}` | 入室 preflight。部屋名と呼び出し元の `role`（`admin` / `participant` / `viewer` / `denied`）を返す（`utils/home.ts` の `fetchRoomInfo`）。`denied` は 403 で返るため、403 は `GateScreen`、404 は not-found として事前に判別する。旧 `done` フラグは #200 で廃止され、返ってきても UI は使わない。 |
-| `maitre-d` `/api/accounts/search` | account 検索。 |
-| `maitre-d` `/api/account/{account_id}` | account 取得・更新。アカウントメニューの表示名・アイコン取得に使う（`utils/account.ts`）。 |
-| `maitre-d` `GET /auth/login?return_to=...&prompt=...` | Google サインインの入口。絶対 URL の `return_to`（fragment を除く）へ遷移する（`utils/account.ts`）。state と `redirect_uri` は maitre-d が持つ。 |
-| `maitre-d` `GET /auth/google/callback` | Google からの固定 callback。ブラウザが直接踏む。maitre-d が `session_id` Cookie を設定して `return_to` へ 302 する。アプリは関与しない。 |
-| `maitre-d` `GET /api/session` | OAuth 後に Cookie から `account`（`AccountResponse`）と `session_id` を取得する（`utils/account.ts`）。 |
-| `maitre-d` `/api/room/{room_id}/export/zip?type=full|logs` | ZIP ダウンロード（`CommonHeader.svelte`）。 |
-| `maitre-d` `/api/cellar/store`、`/api/cellar/store/{tin_id}`、`/api/cellar/tin/{tin_id}` | 認証付き cellar proxy。アセット・拡張 wasm の Tin を XHR で送受信する（`utils/cellarTransfer.ts`）。store check は `200 OK` + body の `result`（`upload_required` / `deduplicated` / `already_owned`）で判定し、`upload_required` のときだけ本体を PUT する。handshake body は `{ tin_id, size, wrapped_key }` のみで、`owner` / `session_id` は送らない（maitre-d が session から付与する。送ると 400）。進捗は `upload.onprogress`、失敗は型付き `CellarTransferError`。 |
-| Vite dev proxy | `/api`、`/auth`、`/room` を `http://127.0.0.1:8080`、`/ws` を `ws://127.0.0.1:8080` へ転送。`/auth` はサインイン開始（`/auth/login`）と Google callback の両方に必要で、maitre-d の `--public-url` がこの dev origin を指すことで Cookie が UI と同一 origin に付く。 |
+| `maitre-d` `POST /api/rooms` | 認証必須。`{ name, room_id? }` で部屋を登録し、作成者を `admin` に設定する（`utils/home.ts` の `createRoom`）。クライアントで生成した 16 文字 hex の `room_id` を送信できるが、最終的な部屋 ID はサーバーの返却値を正とする。 |
+| `maitre-d` `GET /api/rooms/{room_id}` | 入室前の preflight。部屋名と呼び出し元の `role`（`admin` / `participant` / `viewer` / `denied`）を返す（`utils/home.ts` の `fetchRoomInfo`）。`denied` は HTTP 403 で返るため、403 は `GateScreen`、404 は not-found 画面として WebSocket 接続前に判別する。旧 `done` フラグは Issue #200 で廃止されており、レスポンスに含まれていても UI では参照しない。 |
+| `maitre-d` `/api/accounts/search` | アカウント検索。 |
+| `maitre-d` `/api/account/{account_id}` | アカウント情報の取得・更新。アカウントメニューの表示名やアイコンの取得に使用する（`utils/account.ts`）。 |
+| `maitre-d` `GET /auth/login?return_to=...&prompt=...` | サインインの入口。フラグメントを除いた絶対 URL を `return_to` に指定して遷移する（`utils/account.ts` の `beginSignIn`）。OAuth の `state` と `redirect_uri` は `maitre-d` 側で管理する。 |
+| `maitre-d` `GET /auth/google/callback` | Google OAuth の固定コールバック。ブラウザが直接アクセスし、`maitre-d` が `session_id` Cookie を設定したうえで `return_to` へ 302 リダイレクトする（フロントエンドは直接関与しない）。 |
+| `maitre-d` `GET /api/session` | サインイン完了後に Cookie から `account`（`AccountResponse`）と `session_id` を取得する（`utils/account.ts` の `completePendingSignIn`、Issue #294）。 |
+| `maitre-d` `/api/room/{room_id}/export/zip?type=full\|logs` | 部屋データ・ログの ZIP エクスポート（`CommonHeader.svelte`）。 |
+| `maitre-d` `/api/cellar/store`、`/api/cellar/store/{tin_id}`、`/api/cellar/tin/{tin_id}` | 認証付き `cellar` プロキシ。`pantry` の Tin 管理（`get` / `put`）および `utils/cellarTransfer.ts` を通じてアセットや拡張機能 WASM の Tin を送受信する。事前確認（store check）は `200 OK` とレスポンスボディの `result`（`upload_required` / `deduplicated` / `already_owned`）で判定し、`upload_required` のときのみ本体を `PUT` する。ハンドシェイクのボディは `{ tin_id, size, wrapped_key }` のみとし、`owner` / `session_id` は送信しない（`maitre-d` がセッションから付与するため、クライアントから送ると 400 になる）。進捗通知には `upload.onprogress` を用い、失敗時は型付きの `CellarTransferError` を返す。 |
+| Vite dev proxy | 開発時に `/api`・`/auth`・`/room` を `http://127.0.0.1:8080` へ、`/ws` を `ws://127.0.0.1:8080` へ転送する。`/auth` はサインイン開始（`/auth/login`）とコールバックの双方で使われ、`maitre-d` の `--public-url` を Vite の dev オリジンに合わせることで Cookie が UI と同一オリジンに設定される。 |
 
-### WebSocket
+### WebSocket と `pantry` 連携
 
-`utils/roomSocket.ts` の `RoomSocket` が `/ws/room/{roomId}?account_id=...&session_id=...` へ接続する。`ClientFrame` を JSON で送り、`ServerFrame` を JSON で受ける。heartbeat ping には自動で `HeartbeatResponse` を返す。未接続時の送信はキューに積み、再接続後に flush する。
+`utils/roomSocket.ts` の `RoomSocket` が `/ws/room/{roomId}?account_id=...&session_id=...` へ接続し、`ClientFrame` の送信と `ServerFrame` の受信を JSON で行う。ハートビート ping には自動で `HeartbeatResponse` を返す。シーン単位の State と Log の状態管理は `pantry` が担い、`RoomSocket` で送受信される State / Log イベントと連携する（Issue #302）。
 
-- **URL 構築**: `buildRoomWebSocketUrl` は招待ページ URL（`https://host/rooms/<id>#<key>`）からは **origin だけ** を使い、`ws(s)://host/ws/room/<id>` を組み立てる。`/rooms/<id>` などのパスを WebSocket URL に引き継がない。明示的な `ws(s)://.../ws/room/...` だけをそのまま使い、それ以外の `ws(s)` URL も origin から作り直す。
-- **room ID 検証**: `utils/home.ts` の `parseRoomUrl` は 16 hex（または移行用 decimal）だけを受理し、`room-1` のような任意文字列は `null` で拒否する。`generateRoomUrl` は 16 hex を作る。
-- **close 通知と再接続**: `RoomSocket` は `onclose(event)` を `onClose` callback と `getLastCloseEvent()` で公開する。`1008` / `4403` / `4404` は再試行不能として自動再接続を止め、`App` はこれらを `denied`（`GateScreen`）に反映する。入室前の HTTP 403（`denied`） / 404 は `GET /api/rooms/{id}` の preflight で判別する。
-- **権限 frame (Issue #201)**: 権限表は HTTP ではなく WS で扱う。`ClientFrame::QueryPermissions`（`PermissionsSnapshot` が返る）、`SetMemberPermission { account_id, permission }` と `SetDefaultPermission { permission }`（成功で `PermissionsUpdated`、失敗で `SetMemberPermissionFailed` / `SetDefaultPermissionFailed` の `Error`）を `requestQueryPermissions` / `requestSetMemberPermission` / `requestSetDefaultPermission` で送る。level は banquette の Serde 表記（`Admin` / `Participant` / `Viewer` / `Denied`）で送受信し、UI の role（小文字）とは `roleToPermissionLevel` / `permissionLevelToRole` で変換する。ack は要求元にしか届かず、部屋全体へは broadcast されない。
-
-- **Tin エンコード**: banquette が `Tin` を期待する frame（`AppendLog.entry`、character の `data`）は、`jsonToTin` / `logRecordToTin` / `characterToTinMap` で Tin JSON `{ label, payload }` に変換してから送る。label は pantry の `labelHash` で用途別定数（`LABEL_LOG_RECORD`、`LABEL_JSON` など）を使う。受信側は `tinToJson` / `tinToLogRecord` / `tinMapToCharacter` で戻す。`CharacterList` / `CharacterInfo` も `tinMapToCharacter` で全属性（statuses / parameters / chatPalette / icon / color / piecePosition など）を decode する。
-- **Promise API と ack**: mutate 用の `request*` と query 用の `query*` が Promise を返す。既存の void API（`appendLog`、`updateState`、`createCharacter` など）は残している。
-  - `AppendLog` は payload に `clientOpId` を埋め、同じ id を持つ `LogEventAppended` だけで resolve する（他クライアントの echo では resolve しない）。
-  - `UpdateState` / `DeleteState` は `scene_id` + `key`（更新は値も比較）で照合する。
-  - Character CRUD は `CharacterCreated` / `CharacterUpdated` / `CharacterDeleted` を FIFO で照合する（UI は同時操作を直列化する前提）。
-  - `CreateScene` / `DeleteScene` / `MoveCharacter` は新設の `SceneCreated` / `SceneDeleted` / `CharacterMoved` で resolve する。
+- **URL 構築**: `buildRoomWebSocketUrl` は招待ページ URL（`https://host/rooms/<id>#<key>`）から **オリジンのみ** を取り出し、`ws(s)://host/ws/room/<id>` を組み立てる（`/rooms/<id>` などのパスは引き継がない）。明示的な `ws(s)://.../ws/room/...` のみをそのまま採用し、それ以外の `ws(s)` URL もオリジンから再構築する。
+- **部屋 ID 検証**: `utils/home.ts` の `parseRoomUrl` は 16 文字の 16 進文字列（または移行用の 10 進数値文字列）のみを受理し、`room-1` のような任意文字列は `null` として拒否する。`generateRoomUrl` は 16 文字の 16 進文字列を生成する。
+- **切断通知と再接続**: `RoomSocket` は `onclose(event)` を `onClose` コールバックと `getLastCloseEvent()` で公開する。クローズコード `1008` / `4403` / `4404` は再試行不能とみなして自動再接続を停止し、`App` はこれらを `denied`（`GateScreen`）として反映する。入室前の HTTP 403（`denied`）および 404 は `GET /api/rooms/{id}` の preflight で判別する。
+- **権限フレーム（Issue #201）**: 権限表は HTTP ではなく WebSocket で操作する。`ClientFrame::QueryPermissions`（応答は `PermissionsSnapshot`）、`SetMemberPermission { account_id, permission }`、および `SetDefaultPermission { permission }`（成功時は `PermissionsUpdated`、失敗時は `SetMemberPermissionFailed` / `SetDefaultPermissionFailed` の `Error`）を `requestQueryPermissions` / `requestSetMemberPermission` / `requestSetDefaultPermission` で送信する。権限レベルは `banquette` の Serde 表記（`Admin` / `Participant` / `Viewer` / `Denied`）で送受信し、UI 側の小文字ロール名とは `roleToPermissionLevel` / `permissionLevelToRole` で相互変換する。応答（ack）は要求元にのみ返り、部屋全体へはブロードキャストされない。
+- **Tin エンコード**: `banquette` が `Tin` 形式を要求するフィールド（`AppendLog.entry` やキャラクターの `data`）は、`jsonToTin` / `logRecordToTin` / `characterToTinMap` で Tin JSON `{ label, payload }` に変換してから送信する。`label` には `pantry` の `labelHash` による用途別定数（`LABEL_LOG_RECORD`、`LABEL_JSON` など）を用いる。受信時は `tinToJson` / `tinToLogRecord` / `tinMapToCharacter` でデコードし、`CharacterList` / `CharacterInfo` でも全属性（`statuses` / `parameters` / `chatPalette` / `icon` / `color` / `piecePosition` など）を復元する。
+- **Promise API と ack 照合**: 更新系の `request*` と参照系の `query*` は Promise を返す（既存の void API である `appendLog`、`updateState`、`createCharacter` なども併用可能）。
+  - `AppendLog` はペイロードに `clientOpId` を埋め込み、同一 ID を持つ `LogEventAppended` のみで resolve する（他クライアントの発言エコーでは resolve しない）。
+  - `UpdateState` / `DeleteState` は `scene_id` + `key`（更新時は値も比較）で照合する。
+  - キャラクターの CRUD は `CharacterCreated` / `CharacterUpdated` / `CharacterDeleted` を FIFO 順で照合する（UI 側で同時操作を直列化する前提）。
+  - `CreateScene` / `DeleteScene` / `MoveCharacter` は `SceneCreated` / `SceneDeleted` / `CharacterMoved` で resolve する。
   - `RewindLog` は `LogEventRewound` で resolve する。
-  - `Error` は対応する `*Failed` code と `PermissionDenied` で reject する。`SpeakerNotOwned`（話者の所有権違反、Issue #271）は再試行不能として扱い、outbox に積まない。
-  - 応答が無い場合は `DEFAULT_OPERATION_TIMEOUT_MS = 8000` で `OperationTimeoutError`（`code: 'timeout'`）にし、pending を必ず破棄する。サーバー由来の失敗は `ServerOperationError`（`code` 付き）で返す。
-- 未処理だった `StateSnapshot` / `LogBiblioSnapshot` / `LogChunkSnapshot` / `CharacterInfo` / `LogEventRewound` / `SceneCreated` / `SceneDeleted` / `CharacterMoved` も dispatch し、`onServerFrame` と個別 callback の両方へ流す。
-- **SceneList / SceneInfo**: `SceneList.scenes` は `SceneSummary`（`id`、`name`、`present_character_count`、`present_characters`、`active_client_count`、`is_loaded`）の列で、旧サーバーの bare id 列も受理する。`present_characters` は scene 在籍 character id の昇順リストで、`App` はこれで `scene.members` を再構築する（reload / reconnect 後も復元）。`RoomSocket` は id 列を `getScenes()`、summary を `getSceneSummaries()` に保持し、`onSceneInfo` で create / rename / membership の broadcast を通知する。
-- **StateSnapshot hydration**: `EnterScene` の成功応答として banquette が `StateSnapshot` を返す（access 可能な場合）。`App` は `onStateSnapshot`（real socket）と subscribe（custom / test socket）の両経路で受け、`std::name` / `std::bgm<N>` / `bgm::<slot>::playing` / `bgm::<slot>::volume` / `bgm::<slot>::started_at` / `bgm::<slot>::paused_at` / `bgm::<slot>::removed` / `std::b-img*` / `view::transform` / `piece::<id>::*` を冪等に適用する。BGM は removed → track → timestamps → playing / volume の順に適用する。再接続・scene 切替でも同じ snapshot が再適用される。
+  - `Error` フレームは対応する `*Failed` コードおよび `PermissionDenied` で reject する。`SpeakerNotOwned`（話者の所有権違反、Issue #271）は再試行不能として扱い、送信保留キューには積まない。
+  - 応答がない場合は `DEFAULT_OPERATION_TIMEOUT_MS = 8000`（8 秒）で `OperationTimeoutError`（`code: 'timeout'`）として reject し、保留中の待機エントリを確実に破棄する。サーバー由来の失敗は `ServerOperationError`（`code` 付き）で返す。
+- **`ServerFrame` のディスパッチ**: `StateSnapshot` / `LogBiblioSnapshot` / `LogChunkSnapshot` / `CharacterInfo` / `LogEventRewound` / `SceneCreated` / `SceneDeleted` / `CharacterMoved` を含む各フレームをディスパッチし、`pantry` の State・Log 管理および UI の個別コールバックへ流す。
+- **`SceneList` / `SceneInfo`**: `SceneList.scenes` は `SceneSummary`（`id`、`name`、`present_character_count`、`present_characters`、`active_client_count`、`is_loaded`）の配列であり、旧サーバーの裸の ID 配列も受理する。`present_characters` はそのシーンに在籍するキャラクター ID の昇順リストであり、`App` はこれを正として `scene.members` を再構築する（リロードや再接続後も復元される）。`RoomSocket` は ID 列を `getScenes()`、サマリ列を `getSceneSummaries()` に保持し、`onSceneInfo` でシーンの作成・改名・在籍変更のブロードキャストを通知する。
+- **State の同期と `StateSnapshot` ハイドレーション（Issue #301 / #302）**: `pantry` がルートシーン `/` および各シーンの State を保持・管理する。入室時およびシーン入場時（`EnterScene`）の `StateSnapshot`、ならびに常時届く `StateUpdated` / `StateDeleted` を `pantry` が受け取り、変更通知を通じて `App` と各タブへ即座に反映する。
+  - ルートシーン `/` の `extension::<id>` / `extension::__seeded` / `asset::<id>` は、拡張機能タブを開いているか否か、また現在どのシーンを表示しているかにかかわらず入室中常時同期される。管理者が拡張機能の ON/OFF や優先度を変更すると、`pantry` からの State 変更通知によって参加者の `extensions` と送信用の `ExtensionPipeline`、および開いている拡張機能タブの表示が即座に更新される（Issue #301）。
+  - 各シーンの State（`std::name`、`std::bgm<N>`、`bgm::<slot>::playing`、`bgm::<slot>::volume`、`bgm::<slot>::started_at`、`bgm::<slot>::paused_at`、`bgm::<slot>::removed`、`std::b-img*`、`view::transform`、`piece::<id>::*`）も `pantry` から冪等に適用される。BGM 関連キーのスナップショット適用時は、辞書順に左右されないよう `removed` → トラック（`std::bgm<N>`）→ タイムスタンプ（`started_at` / `paused_at`）→ `playing` / `volume` の順で処理する。再接続やシーン切り替え時にも同じスナップショットが安全に再適用される。
 
 ### WASM
 
-- `utils/saignant.ts`: `/wasm/alhalte_saignant.wasm` を読み、`render_generast_abi_v2`（存在すれば）または `render_generast_abi` と `get_full_css_abi` を呼ぶ。現在の `characters` から `{ "<id>": "<name>" }` を作って v2 に渡し、mention / `fluct` / `assign` の名前を解決する。v2 をエクスポートしない wasm では v1 にフォールバックし、名前は渡さない。render cache key は characters signature を含み、`CharacterList` / `CharacterInfo` 更新時は `LogTab` が cache と `renderedContentMap` を破棄する。Vitest では `node:fs` で実ファイルを読む。
-- `wasm/runner.ts`: 拡張機能 wasm の `alhalte_abi_version`（1 または 2）、`alloc`、`dealloc`、`process_generast`、任意の `self_introduction` を呼ぶ。ABI 1 は tuple3（id なし）、ABI 2 は tuple4 `(id, name, icon_svg, description)` を decode する。ABI 2 の id が manifest id と一致しない wasm は `wasmMissing: true` にする。`ExtensionPipeline` は有効な拡張機能を priority 昇順に適用する。
-- 開発時のビルド / 配置は `nix run .#saignant-wasm`（または `nix develop -c ./scripts/build-saignant-wasm.sh`）。`public/wasm/alhalte_saignant.wasm` は commit 対象で、Rust の `abi::ABI_VERSION` と一致することを `crates/alhalte-saignant/tests/artifact_test.rs` が検証する。
+- `utils/saignant.ts`: `/wasm/alhalte_saignant.wasm` を読み込み、`render_generast_abi_v2`（存在する場合）または `render_generast_abi` と `get_full_css_abi` を呼び出す。現在の `characters` から `{ "<id>": "<name>" }` の名前マップを構築して v2 ABI に渡し、メンションや `fluct` / `assign` 内のキャラクター名を解決する（v2 をエクスポートしない古い WASM では v1 にフォールバックし、名前マップは渡さない）。描画キャッシュのキーにはキャラクター一覧のシグネチャを含め、`CharacterList` / `CharacterInfo` が更新された際は `LogTab` がキャッシュと `renderedContentMap` を破棄して再描画する。Vitest 実行時は `node:fs` で実ファイルを読み込む。
+- `wasm/runner.ts`: 拡張機能 WASM の `alhalte_abi_version`（1 または 2）、`alloc`、`dealloc`、`process_generast`、および任意の `self_introduction` を呼び出す。ABI 1 は 3 要素タプル（ID なし）、ABI 2 は 4 要素タプル `(id, name, icon_svg, description)` をデコードする。ABI 2 の自己紹介 ID がマニフェストの ID と一致しない WASM は `wasmMissing: true` として扱い実行しない。`ExtensionPipeline` は有効（`enabled: true`）な拡張機能を `priority` 昇順に適用する。
+- 開発時のビルドと配置には `nix run .#saignant-wasm`（または `nix develop -c ./scripts/build-saignant-wasm.sh`）を用いる。`public/wasm/alhalte_saignant.wasm` はリポジトリへのコミット対象であり、Rust 側の `abi::ABI_VERSION` と一致することを `crates/alhalte-saignant/tests/artifact_test.rs` で検証する。
 
 ### 主な画面・コンポーネント
 
@@ -61,13 +64,13 @@
 | ホーム | `Home/HomeScreen.svelte`、`utils/home.ts`、`utils/recentRooms.ts` |
 | フィールド | `Field/FieldPanel.svelte`、`Field/FieldPiece.svelte`、`lib/components/BoardCanvas.svelte` |
 | コントロール | `Control/ControlPanel.svelte`、`CommonHeader.svelte`、`CommonFooter.svelte`、`SceneSwitcher.svelte` |
-| タブ | `LogTab`、`SceneGraphTab`（グラフ / リスト）、`SceneManagementTab`、`CharacterManagementTab`、`ExtensionManagementTab` |
+| タブ | `LogTab`、`SceneGraphTab`（グラフ / リスト）、`SceneManagementTab`（`SceneSettingsTab`）、`CharacterManagementTab`、`ExtensionManagementTab` |
 | モーダル | `AssetPickerModal`、`CharacterEditModal`、`SceneMoveModal`、`RoomPermissionModal`、`GenericImagePicker`、`IconImagePicker` |
 | アカウント | `Control/AccountMenu.svelte`、`utils/account.ts` |
 | 門前払い | `Gate/GateScreen.svelte` |
 | 接続状態 | `utils/connection.ts`（グローバルバナーは持たない） |
 
-横長画面ではフィールド左・コントロール右、縦長画面ではフィールド全体＋ボトムシート。コントロールパネルはサイドシート / ボトムシートの 2 形態と開閉状態を持つ。縦長のボトムシートはドラッグハンドルと半開状態を持たず、開くと常に全開（ビューポートから noph-ui の上部マージンだけ引いた高さ）になる（Issue #262）。
+横長画面では左側にフィールド・右側にコントロールパネルを配置し、縦長画面ではフィールド全面表示＋ボトムシート構成とする。コントロールパネルはサイドシートとボトムシートの 2 形態および開閉状態を持つ。縦長画面のボトムシートはドラッグハンドルや半開状態を持たず、開くと常に全開（ビューポート高さから noph-ui の上部マージンのみを引いた高さ）となる（Issue #262）。
 
 ## データ形式・状態
 
@@ -76,204 +79,210 @@
 - `VisitedRoom` / `RecentRoom`
 - `Character`（`statuses`、`parameters`、`chatPalette`、`hideStatus`、`isNarrative`、`placedAsPiece`、`piecePosition`）
 - `Scene`（`juices`、`viewTransform`、`members`）
-- `LogRecord`（`content`、`speaker`、`speakerId`、`timestamp`、`chunkId`、任意の `chunkIndex` / `position` / `contentTin` / `kind` / `event` / `cached`）
+- `LogRecord`（`content`、`speaker`、`speakerId`、`timestamp`、`chunkId`、および任意の `chunkIndex` / `position` / `contentTin` / `kind` / `event` / `cached`）
 - `ExtensionItem`（`wasmBytes`、`priority`、`enabled`、`cellarTinId`）
 
-### ローカル保存
+### ローカル保存と `pantry` ストレージ（Issue #302）
 
-- `localStorage`: account ID、session ID、訪問済み部屋、最近の部屋、アセット（`alhalte_pantry_assets`）、部屋ログのキャッシュ（`alhalte:room-logs:<roomId>`）、テーマ（`alhalte:theme`）、共通フッターのダイスピッカー表示設定（`alhalte:dice-picker-visible`、`'true'` / `'false'`、既定は表示。読み書きの失敗・不正値は表示として扱う）。部屋ログは `kind` / `event` / `contentTin` を含めて保存し、復元時は cache-origin として扱う。オフライン表示専用で、サーバーの biblio / chunk snapshot が届いた scene はキャッシュではなくサーバーを正とする。
-- IndexedDB `alhalte-argenterie-outbox`（store `outbox`）: 送信できなかった message / character（拡張用に state / asset も型として許容）を `{ id, roomId, kind, createdAt, payload }` で保存する。`createdAt` から `OUTBOX_TTL_MS = 30 日` を超えたエントリは読み出し時に prune する。IndexedDB が無い環境ではメモリ実装へフォールバックする。
-- Cookie: `session_id`（`SameSite=Lax`）。
-- `sessionStorage`: サインイン前の完全な戻り先 URL（クエリと部屋鍵フラグメントを含む）。サインイン中だけ保持し、`/api/session` 完了時に削除する。OAuth の `state` と `redirect_uri` は maitre-d が保持するためアプリは持たない。
-- URL フラグメント: 部屋鍵。`generateRoomUrl` は `/rooms/<roomId>#<roomKey>` を作る。
+- **`pantry` による管理（State / Log / Tin）**:
+  - **Scene State**: シーンごとの State を `pantry` が保持し、変更を `argenterie` へ通知する。
+  - **Scene Log**: シーンごとの `biblio`（確定済み `frozen chunk` の `TinId` 列）、`active chunk`、`head`、および通信失敗時の未送信リクエスト保留キュー（pending queue）を `pantry` が管理する。起動時・オンライン復帰時は `biblio`・`active chunk`・`head` をサーバーと同期したうえで保留キューを再送する。
+  - **Tin キャッシュとアップロード状態**: 画像（長辺最大 1920px の WebP へ変換）・音声（最大 128kbps の Opus へ変換）・拡張機能 WASM などの Tin を `pantry` のキャッシュアダプタ（CacheStorage / IndexedDB / Memory）に保持し、`"putted"` / `"put-failed"` の状態を追跡する。オンライン復帰時には `"put-failed"` の Tin を自動再送する。
+- **`localStorage`**: アカウント ID、セッション ID、訪問済み部屋、最近の部屋、個人・部屋アセットのメタデータ（`alhalte_pantry_assets`）、部屋ログのローカルキャッシュ（`alhalte:room-logs:<roomId>`）、テーマ設定（`alhalte:theme`）、共通フッターのダイスピッカー表示設定（`alhalte:dice-picker-visible`、`'true'` / `'false'`、既定値は表示。読み書き失敗や不正値も表示として扱う）を保存する。
+- **IndexedDB `alhalte-argenterie-outbox`（ストア名 `outbox`）**: 送信できなかった `message` / `character` 操作（型定義上は `state` / `asset` も許容）を `{ id, roomId, kind, createdAt, payload }` 形式で永続化する。`createdAt` から `OUTBOX_TTL_MS = 30 日` を超えたエントリは読み出し時に破棄（prune）する。IndexedDB が利用できない環境ではメモリストアへフォールバックする。
+- **Cookie**: `session_id`（`SameSite=Lax`）。
+- **`sessionStorage`**: サインイン遷移前の完全な戻り先 URL（クエリパラメータと部屋鍵フラグメントを含む）。サインイン処理中のみ保持し、`completePendingSignIn()`（`/api/session`）完了時に削除する。OAuth の `state` と `redirect_uri` は `maitre-d` が管理するためクライアントでは保持しない。
+- **URL フラグメント**: 32 バイト（64 hex）の部屋鍵。`generateRoomUrl` は `/rooms/<roomId>#<roomKey>` を生成する。
 
 ## 内部フロー
 
 ### 入室
 
-1. `main.ts` が `App` を mount する。管理者は `isAdmin` ではなくサーバーの `role` から決める。
-2. `App.svelte` は `resolveRoomFromLocation` で URL から部屋を解決する。
-3. 入室前に `GET /api/rooms/{room_id}` を preflight する。成功時は返却された `name` を `currentRoom.name` に、`role`（4 段階）を `userRole` に反映してから `RoomSocket` を作る。403（`denied`） / 401 は `GateScreen`、404 は not-found 画面、ネットワーク / 5xx は 2 秒間隔・最大 5 回の再試行後に再試行 UI を出す。403 / 404 は再試行しない。
-4. `RoomSocket` を作り、account / session をクエリに付けて接続する。preflight が `ok` になるまで WebSocket は開かない。`initialRoom` prop はテスト / プレビュー用の明示 override で、preflight と `userRole` の上書きをスキップする。
-5. `ServerFrame` の `SceneList`（`SceneSummary` の列）、`SceneInfo`、`CharacterList`、`CharacterInfo`、`StateSnapshot`、`StateUpdated`、`StateDeleted`、`LogEventAppended`、`SceneCreated` / `SceneDeleted` / `CharacterMoved` / `CharacterDeleted` などを Svelte の state に反映する。`SceneList` / `StateSnapshot` がシーン名・BGM・背景・view・駒の権威で、`SceneList` / `SceneInfo` の `present_characters` が `scene.members` の権威、`CharacterInfo` / `CharacterDeleted` / `CharacterMoved` が character 一覧の権威。`SceneInfo` は create / rename / membership を他クライアントへ即時反映する。
-6. ログタブは入室時と scene 切り替え時に最新 chunk を読む（後述）。WebSocket の `Error` frame や close code（`1008` / `4403` / `4404`）も `denied`（`isForbidden`）のフォールバックとして `GateScreen` を出す。
+1. `main.ts` が `App` をマウントする。管理者権限の有無は props の `isAdmin` ではなくサーバーが返す `role` から決定する。
+2. `App.svelte` は `resolveRoomFromLocation` で現在の URL から部屋 ID と部屋鍵を解決する。訪問済み部屋（`VisitedRoom` / `RecentRoom`）の保存時は、URL フラグメントの部屋鍵（`#<roomKey>`）が失われないよう保持する（Issue #298）。
+3. WebSocket を開く前に `GET /api/rooms/{room_id}` で入室 preflight を行う。成功時は返却された `name` を `currentRoom.name` に、`role`（4 段階）を `userRole` に反映してから `RoomSocket` を生成する。HTTP 403（`denied`）および 401 は `GateScreen`、404 は not-found 画面を表示し、ネットワークエラーや 5xx は 2 秒間隔・最大 5 回の自動再試行後に再試行ボタン付きエラー画面を表示する（403 / 401 / 404 は自動再試行しない）。
+4. preflight が成功したら `RoomSocket` を生成し、アカウント ID とセッション ID をクエリに付与して接続する（`initialRoom` prop が指定されたテスト・プレビュー時は preflight と `userRole` の上書きをスキップする）。
+5. 接続後、`pantry` に部屋の `roomKey` を設定し、ルートシーン `/` と現在のシーンの State および Log を同期する。`ServerFrame` の `SceneList`、`SceneInfo`、`CharacterList`、`CharacterInfo`、`StateSnapshot`、`StateUpdated`、`StateDeleted`、`LogEventAppended`、`LogEventEdited`、`LogEventDeleted`、`LogEventRewound`、`SceneCreated`、`SceneDeleted`、`CharacterMoved`、`CharacterDeleted` などを `pantry` および Svelte のリアクティブ状態へ反映する。
+   - シーン名・BGM・背景画像・視点・駒配置・拡張機能設定は `pantry` が管理する Scene State（`StateSnapshot` / `StateUpdated` / `StateDeleted`）を正とする。
+   - `scene.members` は `SceneList` / `SceneInfo` の `present_characters` を正とする。
+   - キャラクター一覧は `CharacterList` / `CharacterInfo` / `CharacterDeleted` / `CharacterMoved` を正とする。
+6. WebSocket の `Error` フレームや再試行不能なクローズコード（`1008` / `4403` / `4404`）を受信した場合も、`denied`（`isForbidden`）のフォールバックとして `GateScreen` を表示する。
 
-`RoomRole` は `admin` / `participant` / `viewer` / `denied` の 4 段階で、`utils/session.ts` の `roomRoleCapabilities` が `isAdmin` / `isParticipant` / `isViewer` / `isDenied` と `canSend` / `canManageScenes` / `canManageCharacters` / `canManageExtensions` / `canManageRoom` を導出する。`isAdmin` は `effectiveRole === "admin"`、`isViewer` は `viewer` のみで、participant を viewer 扱いしない。`isAdmin` prop はテスト / プレビュー用の明示 override に限定し、role が未確定（preflight 前）のときだけ participant 相当として扱う。`VisitedRoom.isAdmin` は localStorage 互換のために保存するだけで、権限判定には使わない。
+`RoomRole` は `admin` / `participant` / `viewer` / `denied` の 4 段階であり、`utils/session.ts` の `roomRoleCapabilities` から `isAdmin` / `isParticipant` / `isViewer` / `isDenied` と各操作権限（`canSend` / `canManageScenes` / `canManageCharacters` / `canManageExtensions` / `canManageRoom`）を導出する。`isAdmin` は `effectiveRole === "admin"`、`isViewer` は `viewer` のみであり、`participant` を `viewer` 扱いにすることはない。`VisitedRoom.isAdmin` は `localStorage` の後方互換のためにのみ保存し、実際の権限判定には使用しない。
 
 ### 部屋作成
 
-1. ホーム画面の「部屋の新規作成」は、表示用に 16 hex の `room_id` と 32 byte の部屋鍵をクライアントで生成する。
-2. 「入室する」で `POST /api/rooms` に `{ name, room_id }` を送る。account / session が無い場合は送信せず、ダイアログ内にサインイン導線を出す。
-3. 成功時だけ、返却された `room_id` とクライアント生成の部屋鍵から招待 URL を作り、最近の部屋へ保存して入室する。`role` はサーバーが返した値を localStorage 互換の `isAdmin` に反映するだけ。
-4. 401 はサインイン導線、403 / 通信失敗 / その他の HTTP 失敗はダイアログ内のエラーとして表示し、ローカル部屋の作成や入室は行わない。ダイアログは開いたまま再試行できる。
+1. ホーム画面の「部屋の新規作成」ダイアログでは、表示用に 16 文字 hex の `room_id` と 32 バイト（64 文字 hex）の部屋鍵をクライアント側で生成する。
+2. 「入室する」を押すと `POST /api/rooms` に `{ name, room_id }` を送信する。未サインイン（アカウント ID またはセッション ID がない）の場合はリクエストを送らず、ダイアログ内にサインイン導線を表示する。
+3. リクエストが成功したときのみ、サーバーから返却された `room_id` とクライアントで生成した部屋鍵から招待 URL（`/rooms/<roomId>#<roomKey>`）を組み立て、「最近の部屋」へ保存して入室する。
+4. HTTP 401 はサインイン導線、403・通信失敗・その他の HTTP エラーはダイアログ内のエラーメッセージとして表示し、ローカルのみでの部屋作成や入室は行わない（ダイアログを閉じずにそのまま再試行できる）。
 
-### ローカルログイン画面
+### ローカルログイン画面とサインイン復帰（Issue #294）
 
-`maitre-d --local-login` のとき、`GET /auth/login` は SPA の `/login?return_to=...` へ 302 する。`main.ts` は `pathname === '/login'` を検出すると `LoginScreen` を mount し、`completeGoogleSignIn()` は呼ばない（未ログインの 401 で sessionStorage の戻り先と部屋鍵 fragment が消えるのを防ぐ）。
+`maitre-d --local-login` が有効な環境では、`GET /auth/login` は SPA の `/login?return_to=...` へ 302 リダイレクトする。`main.ts` は `pathname === '/login'` を検出すると `LoginScreen` をマウントし、この時点では `completePendingSignIn()` を呼ばない（未ログイン状態の 401 応答によって `sessionStorage` 内の戻り先 URL と部屋鍵フラグメントが消去されるのを防ぐため）。
 
-- 画面は noph-ui の `Card` / `TextField`（account 名、`type="password"`）/ `Button`（filled）で構成し、自作の input / button は使わない。
-- `POST /api/auth/local/login` に `{ account_name, password }` を JSON で送る。成功時は `return_to`（same-origin のみ。cross-origin は `/`）へ遷移する。
-- 401 は「アカウント名またはパスワードが違います」、400 はサーバーの入力エラー、404 は「ローカルログインが無効」、その他は汎用エラーをフォーム内に `aria-live` で出す。
-- 遷移後、アプリ mount の `completeGoogleSignIn()` が `/api/session` を Cookie 付きで呼び、account / session と部屋鍵 fragment を復元する。処理名は Google 固有だが、実装は任意の session 復帰に使える（Issue #294）。
-- ホーム画面のデバッグ警告と `GET /api/server-info` / `fetchServerInfo` は削除した。
+- 画面は noph-ui の `Card` / `TextField`（アカウント名、および `type="password"`）/ `Button`（filled）で構成し、独自の生 `<input>` / `<button>` は使用しない。
+- `POST /api/auth/local/login` に `{ account_name, password }` を JSON で送信し、成功時は `return_to`（同一オリジンのみ許可し、クロスオリジンは `/` にフォールバック）へ遷移する。
+- HTTP 401 は「アカウント名またはパスワードが違います」、400 はサーバー側の入力エラー、404 は「ローカルログインが無効」、その他は汎用エラーをフォーム内の `aria-live` 領域に表示する。
+- 遷移後、アプリのマウント時に `completePendingSignIn()` が `/api/session` を Cookie 付きで呼び出し、アカウント ID・セッション ID と部屋鍵フラグメントを含む元の URL を復元する。サインイン開始・復帰の関数名は認証方式に依存しない `beginSignIn` / `completePendingSignIn` に統一されており、Google OAuth とローカルログインの双方で共通のセッション復帰フローとして動作する（Issue #294）。
 
 ### 本番 SPA ビルド
 
-`vite.config.ts` はライブラリ用で `index.html` を出さない。ポータブル版・`nix run .`・`maitre-d --web-root` 向けに `vite.config.web.ts` と `pnpm run build:app` を追加し、`dist-app/`（`index.html`、assets、`public/` の wasm）を生成する。`maitre-d` は `ServeDir` + `index.html` fallback で `/login` や `/rooms/<id>` を配信する。
+`vite.config.ts` はライブラリビルド用であり `index.html` を出力しない。ポータブル版・`nix run .`・`maitre-d --web-root` 向けには `vite.config.web.ts` と `pnpm run build:app` を使用し、`dist-app/`（`index.html`、アセット一式、`public/` 配下の WASM）を生成する。`maitre-d` は `ServeDir` と `index.html` フォールバックによって `/login` や `/rooms/<id>` を配信する。
 
-### 門前払い画面
+### 門前払い画面（`GateScreen`）
 
-`GateScreen` はフィールドやコントロールパネルの代わりに全画面で表示する。4 段階 role では `denied` がこれに当たる（preflight の 403、role が `denied` の応答、WebSocket の `1008` / `4403` / `4404`）。
+ロールが `denied` の場合（preflight の HTTP 403、`role: "denied"` の応答、または WebSocket の `1008` / `4403` / `4404` 切断）、フィールドやコントロールパネルの代わりに全画面で `GateScreen` を表示する。
 
-- 中央大文字: 「アカウントに入室権限がありません」
-- 説明: 「部屋の管理者に権限をリクエストしてください。正しいアカウントを使っていますか？」
-- 主操作: 「サインイン・アカウント切り替え」。サインイン済みならローカル session を破棄してから `prompt=select_account` 付きの Google 認可 URL を開く。
-- 右上: `AccountMenu`。サインイン・アカウント切り替え・サインアウトを行える。
-- 副操作: 「ホームに戻る」（`isForbidden` を解除して `/` へ戻る）。
+- 中央見出し: 「アカウントに入室権限がありません」
+- 説明文: 「部屋の管理者に権限をリクエストしてください。正しいアカウントを使っていますか？」
+- 主操作ボタン: 「サインイン・アカウント切り替え」。すでにサインイン済みの場合はローカルセッションを破棄してから、`prompt=select_account` 付きのサインイン URL（`beginSignIn`）へ遷移する。
+- 右上: `AccountMenu`（サインイン・アカウント切り替え・サインアウトが可能）。
+- 副操作ボタン: 「ホームに戻る」（`isForbidden` を解除して `/` へ遷移する）。
 
-### アカウントUI / Googleサインイン
+### アカウント UI / サインインフロー（Issue #294）
 
-1. `AccountMenu` は account ID と session ID の両方が保存されている場合だけサインイン済みとみなす。
-2. サインイン済みなら `GET /api/account/{account_id}` で表示名とアイコン Tin ID を取得し、32 byte の Tin ID から `/api/cellar/tin/<hex>` を組み立ててアバターにする。取得中・取得失敗時はイニシャルまたは `account_circle` を表示する。
-3. アバター押下で M3 Menu を開き、「別のアカウントでログイン」「サインアウト」を出す。サインアウトは account / session（`alhalte:account-id` / `alhalte:session-id` と `session_id` Cookie）と OAuth 用 sessionStorage を消す。端末嗜好（`alhalte:theme` / `alhalte:dice-picker-visible`）は残す。部屋鍵フラグメントは保持する。
-4. 未サインインなら Filled tonal の「サインイン」を出す。
-5. サインインは現在の完全な URL（クエリ・部屋鍵フラグメントを含む）を sessionStorage に保存し、fragment を除いた絶対 URL を `return_to` にして `GET /auth/login` へ遷移する。`prompt=select_account` はアカウント切り替え時に付ける。`return_to` の origin 検証・state 発行・Google への `redirect_uri` はすべて maitre-d の責務で、Google に argenterie の origin / port は渡らない。
-6. callback は maitre-d が処理し、`session_id` Cookie を設定して同じ `return_to` へ 302 する。アプリ起動時（`main.ts`）に sessionStorage の戻り先 URL があれば `GET /api/session` を Cookie 付きで呼び、account / session を保存して `history.replaceState` で元の URL（fragment 含む）を復元する。401 なら未サインインのまま戻り先の保存を消す。
-7. 配置はホーム画面の AppBar trailing、フィールド画面の右上、門前払い画面の右上。ホーム画面のテーマ設定 UI は削除し、テーマ選択はコントロールパネル共通ヘッダーの gear menu に集約する。フィールドの `.field-container` は盤面 pan 用に pointer capture を取るが、`field-account-layer` / `field-overlay-layer` とボタン・入力要素からの pointerdown は pan の対象外にし、オーバーレイ上の操作（アバターの Menu など）を奪わない（Issue #268）。
+1. `AccountMenu` はアカウント ID とセッション ID の両方が保存されている場合のみサインイン済みとみなす。
+2. サインイン済みの場合は `GET /api/account/{account_id}` で表示名とアイコンの `TinId` を取得し、32 バイトの `TinId` から `/api/cellar/tin/<hex>`（または `pantry.get`）でアバター画像を表示する。取得中または取得失敗時はイニシャルまたは `account_circle` アイコンを表示する。
+3. アバターを押すと M3 の `Menu` が開き、「別のアカウントでログイン」と「サインアウト」を選択できる。サインアウト時はアカウント・セッション情報（`alhalte:account-id` / `alhalte:session-id` および `session_id` Cookie）とサインイン用 `sessionStorage` を消去する。端末ごとの表示設定（`alhalte:theme` / `alhalte:dice-picker-visible`）および URL の部屋鍵フラグメントは保持する。
+4. 未サインイン時は Filled tonal ボタンの「サインイン」を表示する。
+5. `beginSignIn` は現在の完全な URL（クエリと `#<roomKey>` フラグメントを含む）を `sessionStorage` に保存し、フラグメントを除いた絶対 URL を `return_to` に指定して `GET /auth/login` へ遷移する（アカウント切り替え時は `prompt=select_account` を付与する）。`return_to` のオリジン検証・`state` 発行・OAuth プロバイダへの `redirect_uri` 指定はすべて `maitre-d` の責務であり、外部認可サーバーに `argenterie` のオリジンやポートが直接渡ることはない。
+6. コールバックまたはローカルログイン完了後、`maitre-d`（または `LoginScreen`）は `return_to` へ遷移させる。アプリ起動時（`main.ts`）に `sessionStorage` に戻り先 URL が保存されていれば、`completePendingSignIn()` が `GET /api/session` を Cookie 付きで呼び出し、アカウント ID とセッション ID を保存したうえで `history.replaceState` により元の URL（部屋鍵フラグメントを含む）を復元する。401 の場合は未サインイン状態のまま保存済みの戻り先 URL を消去する。
+7. `AccountMenu` はホーム画面の AppBar 右端、フィールド画面の右上、および門前払い画面の右上に配置する。テーマ設定はコントロールパネル共通ヘッダーのギアメニューに集約している。フィールドの `.field-container` は盤面パン操作のために pointer capture を行うが、`field-account-layer` / `field-overlay-layer` およびボタン・入力要素からの `pointerdown` はパンの対象外とし、アバターメニュー等のオーバーレイ操作を阻害しない（Issue #268）。
 
-### 発言とログ表示
+### 発言とログ表示・Log 管理（Issue #302）
 
-1. `handleSendMessage` は送信前に extension pipeline を実行し、入力 `(Generast::String, speaker_id)` の ext-io Tin から得た結果を `LogRecord.contentTin` に保存する。pipeline を実行できない場合は `content` のみ保存し、`pipeline-warning` を表示する。この時点では `ChunkLogManager` に追加しない。`isSending` を立てて `requestAppendLog` を await する（`CommonFooter` は送信ボタンを波線 `CircularProgress` に差し替え、フッターを `aria-busy` で暗転し、二重送信を防ぐ）。
-2. 成功時はサーバーの `LogEventAppended` echo を待つ。`RoomSocket` は echo を `ChunkLogManager` に追加してから購読者へ通知するため、`App` 側でローカル追加しない（二重追加しない）。`clientOpId` による照合で他クライアントの echo とは区別する。
-3. タイムアウト / 通信エラー時は `kind: 'message'` として IndexedDB outbox に積む。ログタブは現在 scene のキューのうち、まだ描画されていない `LogRecord` を取得済みログの下に表示し、その上に波線 `OfflineQueueNotice kind="message"`（「サーバーと通信できませんでした」「メッセージは次回の接続時に送信されます」、件数付き）を置く（Issue #148）。フッター上部の重複通知は出さない。入力欄へは復元しない。再接続で FIFO flush し、各メッセージは echo 後にのみ描画する。flush 中に echo とキューが併存しても `LogRecord.id` で dedupe する。オフライン時は `RoomSocket` のメモリキューを使わず outbox へ直接積む（二重送信を避ける）。
-4. ログタブは `ChunkLogManager` の変更を購読し、未描画の record を処理する。`contentTin`（送信時に保存した extension 適用後の `alhalte/generast` Tin）があれば extension pipeline を再実行せず Saignant に渡す。旧レコードだけ `buildGenerastFromText` で有効な拡張機能を priority 昇順に適用する。
-5. `renderGenerast` が Saignant WASM で HTML にし、`{@html}` で表示する。現在の `characters` を名前マップとして渡すため、本文中の mention / `fluct` / `assign` もキャラクター名で描画される（Issue #163）。WASM 未初期化時は HTML エスケープしたテキストを返す。
-6. `character-came` / `character-gone` の Tin は label で postcard payload を decode し、`kind: 'system'` の控えめな M3 行として時刻付きで表示する。postcard bytes を UTF-8 のチャット本文として decode しない。ラベル不明は従来どおりテキスト fallback にする。
-7. **話者の所有権（Issue #271）**: `speakerId` を持たない record はナレーションとして誰でも送れる。`speakerId` を持つ record は、実在する character で、かつ `std::owner_account` が送信者と一致する場合だけ送れる（admin は全 character を代演できる）。最終認可は banquette が `AppendLog` / `EditLog` の entry を検査して行い、違反は `SpeakerNotOwned` になる。UI はフッターのピッカーに `speakableCharacters`（admin=全件 / participant=保有分 / viewer・denied=空）だけを出し、既定話者もその先頭（無ければナレーション）にする。`SpeakerNotOwned` は再試行せず、キュー済みの record は一度だけナレーションへ変換し、それでも拒否されたら破棄する。`LogTab` は `speakerId` がある record でキャラクターの現在名を優先し、未知 id は中立ラベルにする。
+1. `handleSendMessage` は送信前に有効な拡張機能の `ExtensionPipeline` を実行し、入力 `(Generast::String, speaker_id)` の ext-io Tin から得た変換結果を `LogRecord.contentTin` に格納する。パイプラインを実行できない場合は平文の `content` のみを保持し、`pipeline-warning` を表示する。`isSending` を立ててログ追記を要求する（送信中は `CommonFooter` の送信ボタンを波線 `CircularProgress` に差し替え、フッター全体を `aria-busy` で暗転させて二重送信を防ぐ）。
+2. シーンごとのログ状態（`biblio`・`active chunk`・`head`）は `pantry` が管理する（Issue #302）。`AppendLog` がサーバーに受理され `LogEventAppended` が返ると、`pantry` が `active chunk` と `head` を更新し（`active chunk` が上限に達した場合は `frozen chunk` として `biblio` に `TinId` を追加し、新しい `active chunk` を作って `head` を `0` にリセットする）、購読している `LogTab` へ通知する。同様にして編集（`EditLog` / `LogEventEdited`）・削除（`DeleteLog` / `LogEventDeleted`）・巻き戻し（`RewindLog` / `LogEventRewound`）も `pantry` を通じて処理・通知される。
+3. オフラインやタイムアウト等でリクエストが失敗した場合、`pantry` はエラーとともに未送信リクエストの保留キュー（pending queue）一覧を返す。`LogTab` は現在シーンの保留キューにある未送信レコードを取得済みログの末尾に表示し、その直上に波線 `OfflineQueueNotice kind="message"`（「サーバーと通信できませんでした」「メッセージは次回の接続時に送信されます」、件数付き）を表示する（Issue #148）。入力欄へのテキスト巻き戻しやフッター上部の重複バナー表示は行わない。
+4. 起動時およびオンライン復帰時には、`pantry` がサーバーから最新の `biblio`・`active chunk`・`head` を同期したうえで、保留キュー内のリクエストを FIFO 順で再送（flush）する。再送中にエコーとキューが併存しても `clientOpId` / `LogRecord.id` で重複排除する。
+5. `LogTab` は `pantry`（および `ChunkLogManager`）の変更通知を購読して未描画のレコードを描画する。送信時に確定した `contentTin`（`alhalte/generast` Tin）があるレコードはパイプラインを再実行せずそのまま Saignant WASM に渡し、旧形式のレコードのみ `buildGenerastFromText` で拡張機能パイプラインを適用する。
+6. `renderGenerast` は Saignant WASM で Generast を HTML に変換し、`{@html}` で描画する。現在の `characters` から構築した名前マップを渡すため、本文中のメンションや `fluct` / `assign` も現在のキャラクター名で描画される（Issue #163）。WASM 未初期化時は HTML エスケープしたプレーンテキストにフォールバックする。
+7. 入退場システムイベント（`character-came` / `character-gone`）の Tin はラベルに応じて postcard ペイロードをデコードし、`kind: 'system'` の控えめな M3 行として時刻付きで表示する（postcard バイト列を誤って UTF-8 チャット本文としてデコードしない）。
+8. **話者の所有権（Issue #271）**: `speakerId` を持たないレコードはナレーションとして誰でも送信できる。`speakerId` を持つレコードは、実在するキャラクターであり、かつ `std::owner_account` が送信者と一致する場合にのみ送信できる（`admin` は全キャラクターを代演可能）。最終的な認可は `banquette` が `AppendLog` / `EditLog` の検査で行い、違反時は `SpeakerNotOwned` を返す。UI はフッターの話者ピッカーに `speakableCharacters`（`admin` は全件、`participant` は自己所有分、`viewer` / `denied` は空）のみを表示し、既定話者もその先頭（なければナレーション）とする。`SpeakerNotOwned` が返った場合は再試行せず、保留キュー内のレコードは一度だけナレーションへ変換して送り、それでも拒否された場合は破棄する。
 
-### chunk の読み込み（最新・過去）
+### チャンクの読み込み（最新・過去）とログキャッシュ（Issue #302）
 
-- `LogTab` は表示時と scene 切り替え時に `queryLogBiblio(sceneId)` → biblio の head から最新 `chunk_index` を得る → `queryLogChunk(sceneId, chunkIndex)` の順で要求する。scene ごとに in-flight / loaded を管理し、二重ロードしない。
-- biblio は `ChunkLogManager.applyServerBiblio` に渡す。`chunks[i]` を chunk index `i` とみなし、`readLogBiblioChunkIds` が作る stable な chunk id（`log-chunk:<sceneId>:<index>`）を `registerSceneChunks` で登録する。active chunk は `head.chunkIndex` の位置になる。
-- 読み込み中はメッセージ一覧上に contained `LoadingIndicator` を出し、「ログはありません」は出さない。応答後は `ChunkLogManager` に snapshot を取り込み、`id` / `(chunkIndex, position)` で dedupe する。
-- 上端スクロール（`handleScrollEdge('top')`）は「読み込み済みの最小 chunk index の 1 つ前」を 1 回だけ `ChunkLogManager` の fetch handler 経由で `queryLogChunk` する。fetch handler は `tinToLogRecord` で entry を `LogRecord` に変換する。同一 chunk の並行要求は in-flight Promise を共有し、最古 chunk まで到達したら `null` を返して追加要求しない（無限ループしない）。
-- 過去 chunk の挿入時はサーバーの `(chunkIndex, position)` 順で並べ、読み手のスクロール位置を維持する（最下部へジャンプしない）。
-- タイムアウト / 通信エラー時は `OfflineQueueNotice kind="generic"`（「接続が回復したらログを再読み込みします」）を出し、再接続時に再試行する。Saignant 描画は維持する。
+- シーンごとの `biblio`（確定済み `frozen chunk` の `TinId` ポインタ列）、`active chunk`、および `head` は `pantry` が管理し、`LogTab` の表示時やシーン切り替え時にサーバーの `LogBiblioSnapshot` / `LogChunkSnapshot` と同期する。シーンごとに in-flight 状態を管理し、二重ロードを防ぐ。
+- 読み込み中はメッセージ一覧上に contained `LoadingIndicator` を表示し、「ログはありません」とは表示しない。応答後は `(chunkIndex, position)` およびレコード ID で重複排除して反映する。
+- 上端スクロール（`handleScrollEdge('top')`）時は、現在読み込み済みの最小チャンク番号の 1 つ前の `frozen chunk`（`biblio` 内の該当 `TinId` または `queryLogChunk`）を 1 回だけ要求する。同一チャンクへの並行要求は in-flight Promise を共有し、最古のチャンク（インデックス 0）まで到達したら `null` を返してそれ以上の要求を行わない。
+- 過去チャンクの挿入時は `(chunkIndex, position)` 順に整列し、閲覧中のスクロール位置を維持する（最下部へ強制ジャンプしない）。
+- タイムアウトや通信エラー時は `OfflineQueueNotice kind="generic"`（「接続が回復したらログを再読み込みします」）を表示し、オンライン復帰時に `pantry` が再同期する。
+- オフライン時にローカルキャッシュ由来のレコード（`cached: true`）のみを表示している間は、`LogTab` に「キャッシュ表示中」と表示する。サーバーから `LogBiblioSnapshot` / `LogChunkSnapshot` が届いたシーンではサーバー側の状態を正としてキャッシュ由来レコードを置き換える（サーバー上で削除・巻き戻しされたログをローカルキャッシュから復活させない）。
 
-### ログキャッシュと scene graph 復元・絞り込み
+### シーングラフの復元・アカウント絞り込み・リスト表示
 
-- `ChunkLogManager` の cache-origin record は `cached: true` を持ち、`alhalte:room-logs:<roomId>` から復元したものだけが該当する。オフラインで cache-origin record を表示している間は LogTab に「キャッシュ表示中」を出す。
-- `LogBiblioSnapshot` / `LogChunkSnapshot` はサーバー正。biblio が head を持つ scene では cache-origin record を破棄し、chunk snapshot は該当 chunk の entries を置換する（append しない）。head が無い biblio は cache とサーバー由来 chunk を空にし、サーバーで削除されたログをキャッシュから復活させない。live echo だけは空 biblio 応答との race を避けるため保持する。
-- `SceneGraphTab` の `movements` は、ライブの `CharacterMoved` と `character-came` / `character-gone` system record から再構築した履歴を `reconcileMovements` で統合する。came の scene を到着先、直前の gone の scene を出発元として `fromSceneId` を復元し、timestamp が無い system event は `(chunkIndex, position)` の順で並べる。同じ character / route の live move は log record が読み込まれた時点で二重計上しない。再入室・再接続後も、読み込み済み（キャッシュ含む）の came/gone から graph が復元される。
-- **scene graph のアカウント絞り込み（Issue #263）**: participant の graph は、保存済み account ID と `std::owner_account` から保有 character を引き、その移動だけを `V_known` の算出に使う（`filterOwnedMovements` → `collectKnownSceneIds`）。`V_known` は保有 character が参加した scene に、`/`・現在の scene・保有 character が現在在籍する scene を加えた集合で、毎回計算する（キャッシュしない）。graph 自体には全 character の移動を渡すため、既知 scene 間の遷移や他 character が見つけた frontier は失わない。`V_known` 外への移動は、scene ID / 名前を捨てた独立した「？」ノードへの点線 edge にし、同じ実 scene への複数 edge も共有しない。admin / viewer は `can_access_scene` が全 scene を許可するため、従来どおり全 graph を表示する。この絞り込みは UI の可視性だけを変えるもので、認可は banquette の `can_access_scene` / `can_send_to_scene` が最終判断する。
-- **グラフ / リスト（Issue #273）**: `SceneGraphTab` の先頭に `SegmentedButton`（グラフ / リスト、既定グラフ）を置く。リストは `allScenes` を `Divider` 区切りで並べ、行クリックは graph ノードと同じ `onNavigateToScene`（`App.handleSelectScene` → `enterScene`）を通す。現在 scene の行は `aria-current` と check アイコンで示す。削除は `capabilities.isAdmin && id !== "/"` の行だけに右寄せのゴミ箱を出し、graph ノードと同じルート hoist の確認ダイアログ（無ければタブ内フォールバック）を経由する。`scenes` prop が無い standalone 利用では graph ノード（`isUnknown` を除き dedupe）から一覧を導出する。リストは participant / viewer にも全 scene 名を表示する（可視性は #263 の graph と同じ扱いで、書き込みは banquette が拒否する）。
+- `SceneGraphTab` の移動履歴（`movements`）は、ライブの `CharacterMoved` イベントとログ内の `character-came` / `character-gone` システムレコードから再構築した履歴を `reconcileMovements` で統合する。`character-came` のシーンを到着先、直前の `character-gone` のシーンを出発元として `fromSceneId` を復元し、タイムスタンプを持たないシステムイベントは `(chunkIndex, position)` 順に並べる。同一キャラクター・同一経路のライブ移動はログレコード側が読み込まれた時点で重複計上しない。
+- **シーングラフのアカウント絞り込み（Issue #263）**: `participant` のグラフ表示では、自身のアカウント ID と `std::owner_account` から保有キャラクターを特定し、その移動履歴のみを用いて既知シーン集合 `V_known` を算出する（`filterOwnedMovements` → `collectKnownSceneIds`）。`V_known` は「保有キャラクターが過去に参加したシーン」に「ルートシーン `/`」「現在のシーン」「保有キャラクターが現在在籍するシーン」を加えた集合であり、毎回動的に計算する。グラフ構造自体には全キャラクターの移動を渡すことで、既知シーン間の遷移や他キャラクターが開拓したフロンティアを見失わないようにしつつ、`V_known` 外への移動はシーン ID と名前を伏せた独立の「？」ノードへの点線エッジとして描画する（同じ実シーンへの複数エッジも束ねない）。`admin` と `viewer` は全シーンへのアクセスが許可されるため、全グラフを表示する。なお、この絞り込みは UI 上の可視性制御であり、最終的なアクセス・送信認可は `banquette` の `can_access_scene` / `can_send_to_scene` が行う。
+- **グラフ / リスト切り替え（Issue #273）**: `SceneGraphTab` の上部に `SegmentedButton`（グラフ / リスト、既定はグラフ）を配置する。リスト表示では `allScenes` を `Divider` 区切りで並べ、行クリックでグラフのノードと同じ `onNavigateToScene`（`App.handleSelectScene` → `enterScene`）を実行する。現在のシーンの行は `aria-current` とチェックアイコンで示す。シーン削除ボタン（右寄せのゴミ箱アイコン）は `capabilities.isAdmin && id !== "/"` の行にのみ表示し、グラフ表示と同じ確認ダイアログを経由する。
 
 ### メニュー配置
 
-noph-ui の `Menu` は `popover` であり、HTML の UA stylesheet が `position: fixed; inset: 0` を与える。`utils/menuPosition.ts` はアンカーの viewport rect から位置を計算し、`position: fixed !important` / `margin: 0 !important` / `position-area: none !important` / `position-try-fallbacks: none !important` / `align-self: unset !important` / `justify-self: unset !important` で UA の自動配置を打ち消す。
+noph-ui の `Menu` は HTML の `popover` 要素であり、ブラウザの UA スタイルシートによって `position: fixed; inset: 0` が付与される。`utils/menuPosition.ts` はアンカー要素の viewport rect から表示座標を計算し、`position: fixed !important` / `margin: 0 !important` / `position-area: none !important` / `position-try-fallbacks: none !important` / `align-self: unset !important` / `justify-self: unset !important` で UA の自動配置を打ち消す。
 
-- `inset` は shorthand であり、使わない辺を `removeProperty()` で消すと author 宣言が失われ、UA の `0` がその辺に適用される。`position: fixed` + `fit-content` の過剰拘束は LTR で `left` / `top` を優先するため、メニューが x=0 / y=0 に潰れる（Issue #241）。
-- そのため **毎回 4 辺すべてを longhand で設定する**: 使う側は `<px> !important`、使わない側は `auto !important`。文字列パス（`getMenuPositionStyle` が返す `style` 属性）と DOM パス（`applyMenuPosition` の `$effect`）は同じ宣言リストを使う。
-- resize / scroll で再適用しても 4 辺の pin を維持し、`max-height` は利用可能領域から計算する。
+- `inset` は shorthand プロパティであるため、使用しない辺を `removeProperty()` で消すと author 宣言が失われて UA の `0` が復活し、LTR 環境では `left: 0` / `top: 0` が優先されてメニューが左上（`x=0, y=0`）に潰れてしまう（Issue #241）。
+- これを防ぐため、**毎回 4 辺すべてを longhand で明示的に指定する**（固定する辺は `<px> !important`、反対側の辺は `auto !important`）。文字列スタイル生成（`getMenuPositionStyle`）と DOM 直接適用（`applyMenuPosition` の `$effect`）で同一の宣言リストを用い、リサイズやスクロール時の再計算でも 4 辺の指定を維持する。
 
-### BGM / 背景画像
+### BGM / 背景画像と鍵整合性（Issue #298 / #302）
 
-BGM と背景画像は Argenterie の都合であり、banquette はこれらのキー・ラベル・イベントを知らない（Issue #186）。予約は Argenterie 側で行う。
+BGM と背景画像はクライアント（`argenterie` / `pantry`）側で規約化した Scene State キーであり、`banquette` はこれらのキーの内部構造には関与しない（Issue #186）。
 
-- BGM は state のみに書く。専用の log イベントは持たない。track は `std::bgm`（slot 1、旧来の互換）/ `std::bgm<N>`（任意の slot N >= 2）に `{ tinId, mimeType, name }` の JSON Tin で保存する。旧形式の裸の 64 hex 文字列も受理し、MIME 不明時は `audio/mpeg` を使う。
-- **行 = track のある slot**（Issue #249）。`createDefaultJuices` は `bgmSlots: []` を作り、`getNormalizedBgmSlots` は track を持つ slot だけを返す（`bgmSlots` が無い legacy scene は `bgm1..3` の set 済み slot のみ、`bgm::<slot>::removed` の tombstone は常に除外）。「スロット追加」は `max(既存行 ∪ tombstone) + 1` の slot で AssetPicker を開き、選択の ack 後にだけ行を作る。同じ slot 番号は再利用しない。
-- **追加フローの失敗表示（Issue #275）**: 行が無い slot のエラーは `{#each bgmSlots}` の外、BGM 節ヘッダ直下の `bgm-add-error`（`role="status"`）に 1 つだけ出す。prepare の失敗（部屋鍵なし / 取得・復号失敗）、tinId の無い音源、ack の拒否（`PermissionDenied` を含む）がここに現れる。読み取り専用の viewer / denied は「スロット追加」自体を disabled にし、`handleAddBgmSlot` / `handleBgmSelect` でも早期 return する。行がある slot は従来どおり `bgm-error-<slot>` に行内表示する。
-- 再生状態は `bgm::<slot>::playing`（boolean）、音量は `bgm::<slot>::volume`、再生位置は `bgm::<slot>::started_at` / `bgm::<slot>::paused_at`（整数 UNIX ms、Issue #250）。duration は state に持たない。
-  - 再生中: `offset = ((now - started_at) mod D + D) mod D`
-  - 一時停止中: `offset = ((min(now, paused_at) - started_at) mod D + D) mod D`
-  - 再開: `started_at = now - (paused_at - started_at)`、`paused_at` を削除、`playing=true`。新規 track / ⏪ は `started_at = now`、`paused_at` を削除する。
-  - `D` は各クライアントの `HTMLAudioElement.duration`。不明な間は生の非負 offset を `currentTime` に入れ、ブラウザの clamp / loop に任せる。時刻は state を書いたクライアントの壁時計であり、クライアント間の NTP 同期を前提とする。
-- 一時停止は `bgm::<slot>::playing=false` と `paused_at` を書き、選択中の track と復号済みの object URL を保持する（再開で `downloadTin` をやり直さない）。track の削除は NONE と 🗑️ の両方で、`std::bgm<N>` / `volume` / `playing` / `started_at` / `paused_at` を削除し、`bgm::<slot>::removed=true` の tombstone を残す（後から届く stale な track broadcast / snapshot で行が復活しないようにする）。track 変更・削除・scene 切替・unmount では object URL を revoke する。
-- `SceneSettingsTab` は再生 / 一時停止 / 再開 / ⏪ / 選択 / 音量 / 削除を async 化し、track `std::bgm<N>` → `started_at` → `paused_at` 削除 → `playing` の順（一時停止は `paused_at` → `playing=false`）に ack を待って書く。ack が揃ったときだけローカルの `bgmSlots` / `scene.juices` を確定する。送信中は対象 slot の各コントロールを波線 `CircularProgress` にし、二重実行を防ぐ。
-- UI は slot ごとの Connected button group（⏪ `replay` / ▶️・⏸️ `play_arrow`・`pause` / 🎵 `music_note`）と音量 Slider、🗑️ の削除ボタン。viewer / denied は全コントロールを disabled にし、最終認可はサーバー。
-- 再生は `utils/audio.ts` の `AudioManager` が担う。slot ごとに `HTMLAudioElement` を 1 つだけ保持し、`loop=true`、`downloadTin(tinId, roomKey)` で復号した payload から object URL を作る。`StateSnapshot` / `StateUpdated` / scene 入場で `started_at` / `paused_at` / `playing` を反映し、再生中は transport identity（`tinId` / `started_at` / `paused_at`）の変化または 1 秒超のドリフトでだけシークする。同じ snapshot の再適用は冪等で、再生や download を重複させない。
-- autoplay 制限はユーザーに通知しない（Issue #248）。最初の `pointerdown`（capture, once）で、`playing` 意図があり準備済みの slot を導出済み offset から再開する。準備前の操作で消費した場合は次の操作で再試行する。音源取得 / 復号に失敗した slot は row 付近にエラーを表示し、`playing` を確定しない（state を書かない）。
-- 失敗時は変更前へ戻し、slot 付近にエラーを出す。キューには積まない（最終状態のみが意味を持つため、再接続時の自動再送をしない）。
-- `App` は `StateUpdated` / `StateDeleted` の BGM キー（track / playing / volume / started_at / paused_at / removed）を `bgmSlots` と旧 `bgm1..3` へ反映し、現在 scene の音声だけを再生する。`StateSnapshot` は removed → track → timestamps → playing / volume の順に適用する（辞書順に依存しない）。state 更新の可否はサーバーの権限判定に従い、`PermissionDenied` はそのまま表示する。viewer も他クライアントが開始した BGM は再生する（viewer の操作制限は #158 / #159 のまま）。
+- **BGM State キー構造**:
+  - BGM は Scene State のみで管理し、専用のログイベントは持たない。トラック情報は `std::bgm`（スロット 1、後方互換用）および `std::bgm<N>`（任意のスロット $N \ge 2$）に `{ tinId, mimeType, name }` の JSON Tin として保存する（旧形式の 64 文字 hex 文字列も受理し、MIME タイプ不明時は `audio/mpeg` とする）。
+  - **行 = トラックが設定されたスロット（Issue #249）**: `createDefaultJuices` は `bgmSlots: []` で初期化し、`getNormalizedBgmSlots` はトラックが設定されているスロットのみを返す（`bgm::<slot>::removed` の tombstone があるスロットは常に除外する）。「スロット追加」ボタンは $\max(\text{既存行} \cup \text{tombstone}) + 1$ のスロット番号で `AssetPickerModal` を開き、選択後のサーバー ack が返った時点で行を生成する（削除済みスロット番号は再利用しない）。
+  - **追加フローの失敗表示（Issue #275）**: まだ行が存在しないスロットでの追加エラー（部屋鍵なし、Tin の取得・復号失敗、`tinId` 欠落、`PermissionDenied` 等の ack 拒否）は、BGM セクションヘッダ直下の `bgm-add-error`（`role="status"`）に 1 つだけ表示する。既存行に対するエラーは従来どおり各行の `bgm-error-<slot>` に表示する。読み取り専用の `viewer` / `denied` では「スロット追加」ボタン自体を無効化する。
+  - **再生状態・音量・タイムスタンプ（Issue #250）**: 再生状態は `bgm::<slot>::playing`（真偽値）、音量は `bgm::<slot>::volume`、再生基準時刻は `bgm::<slot>::started_at` / `bgm::<slot>::paused_at`（UNIX ミリ秒整数）に保存し、曲長 $D$ は各クライアントの `HTMLAudioElement.duration` から取得する。
+    - 再生中の再生位置: $\text{offset} = (((\text{now} - \text{started\_at}) \bmod D) + D) \bmod D$
+    - 一時停止中の再生位置: $\text{offset} = (((\min(\text{now}, \text{paused\_at}) - \text{started\_at}) \bmod D) + D) \bmod D$
+    - 再開時は `started_at = now - (paused_at - started_at)` に更新して `paused_at` を削除し、`playing = true` とする。新規トラック選択時や先頭巻き戻し（⏪）時は `started_at = now` として `paused_at` を削除する。
+  - 一時停止時は選択中トラックと復号済みの Object URL を保持し、再開時に再ダウンロードしない。トラック削除（`NONE` 選択または 🗑️ ボタン）時は `std::bgm<N>` / `volume` / `playing` / `started_at` / `paused_at` を削除したうえで `bgm::<slot>::removed = true` の tombstone を書き込み、遅延到着した古いブロードキャストやスナップショットで行が復活するのを防ぐ。トラック変更・削除・シーン切り替え・アンマウント時には Object URL を `revokeObjectURL` で解放する。
+  - `SceneSettingsTab` の各操作（再生・一時停止・再開・巻き戻し・曲選択・音量変更・削除）は非同期でサーバー ack を待ち、トラック（`std::bgm<N>`）→ `started_at` → `paused_at` 削除 → `playing` の順（一時停止は `paused_at` → `playing = false`）に確定させてからローカルの `bgmSlots` / `scene.juices` を更新する。送信中は該当スロットのコントロールを波線 `CircularProgress` にして二重操作を防ぐ。
+- **音声再生と Autoplay 制御**:
+  - `utils/audio.ts` の `AudioManager` がスロットごとに単一の `HTMLAudioElement`（`loop = true`）を管理し、`pantry.get`（`downloadTin(tinId, roomKey)`）で復号したペイロードから Object URL を生成する。再生中はトランスポート識別子（`tinId` / `started_at` / `paused_at`）の変化または 1 秒を超えるドリフトが生じた場合にのみシークを行う。
+  - ブラウザの Autoplay 制限はエラー表示せず（Issue #248）、最初のユーザー操作（`pointerdown`, capture, once）で再生意図のあるスロットを算出済みオフセットから開始する。
+- **部屋鍵・WrappedKey の整合性と `invalid polyval tag` の防止（Issue #298）**:
+  - BGM や背景画像の Tin を AES-256-GCM-SIV で復号する際、暗号化時と異なる `roomKey` や不整合な `wrappedKey` / `nonce` を渡すと認証タグ検証が失敗し `invalid polyval tag` エラーが発生する。
+  - 特に、`localStorage`（`alhalte_pantry_assets`）に保存された個人スコープ（`scope: 'personal'`）のアセットを別の部屋でアップロードしたまま現在の部屋で選択した場合、元の Tin が別部屋の `roomKey` で `RoomKey` 暗号化されていると、現在の部屋の `roomKey` では復号できない。また、部屋遷移や訪問済み部屋リスト（`VisitedRoom` / `RecentRoom`）の更新時に URL フラグメント `#<roomKey>` が欠落・変質した場合も鍵不一致の原因となる。
+  - これを防ぐため、以下の規約を徹底する。
+    1. `App`・`pantry`・`SceneSettingsTab`・`AssetPickerModal`・`AudioManager` は常に現在の部屋の正規化された 32 バイト `roomKey`（64 hex）を一貫して共有し、`VisitedRoom` / `RecentRoom` でも `#<roomKey>` フラグメントを保持する。
+    2. アセットの取り込みとアップロードは `pantry.put` を経由し、画像は長辺最大 1920px の WebP、音声は最大 128kbps の Opus へ変換する（Issue #302）。
+    3. 個人アセットを含む既存アセットを現在の部屋の BGM（`std::bgm<N>`）や背景画像（`std::b-img`）に設定する際は、そのアセットの Tin が現在の部屋の `roomKey` で復号可能であること（現在の部屋の `roomKey` で暗号化または `Convergent` の `wrappedKey` が現在の部屋の `roomKey` でラップされて `cellar` に `"putted"` 済みであること）を保証し、別部屋で作成されたアセットは現在の部屋の `roomKey` で再エンコードまたは鍵ラップして `pantry.put` してから State に `tinId` を書き込む。
 
-### scene の管理操作
+### シーンの管理操作
 
-- 「シーンを新規作成」「ログを削除」「シーンを削除」「メンバー移動」は `requestCreateScene` / `requestRewindLog(sceneId, 0, 0)` / `requestDeleteScene` / `requestMoveCharacter` で送り、成功 ack 後にだけローカル state を更新する（楽観更新しない）。
-- **シーン検索と新規作成（Issue #269）**: コントロールパネル共通ヘッダーと「キャラクターを移動」モーダルは同じ `SceneSwitcher` を使う。Enter（モーダルでは「移動」ボタンも同じ `resolve()`）は、入力と完全一致する scene → 先頭の候補 scene → 管理者なら新規作成、の順に解決する。新規作成の id は `generateSceneId()` が作り、`CreateScene { name }` の ack 後にだけローカル一覧へ追加する。ヘッダーの作成は ack 後に `handleSelectScene(id)` を通して `enterScene` まで行う。空結果の案内は管理者では「シーンは新規作成されます」、非管理者では従来の「該当するシーンはありません」で、非管理者には作成導線を出さない（サーバーも `authorize_admin` で拒否する）。
-- **キャラクター移動モーダル（Issue #269）**: キャラクター一覧の行ボタンは旧「別シーンに配置」Menu を置き換え、ルート hoist の「キャラクターを移動」モーダルを開く。既存 scene なら `MoveCharacter` だけ、新規名なら `CreateScene` ack → `MoveCharacter` ack の順で行い、`currentSceneId` は変えない（管理者が curation 中の scene から飛ばされない、Issue #228 の不変条件）。create だけ成功して move が失敗した場合は空の scene がサーバーに残る（自動ロールバックはしない）。
-- シーン作成時の表示名は `CreateScene.name` として送り、banquette が `std::name` へ原子的に書く。リネームは `requestUpdateState(sceneId, 'std::name', name)` の `StateUpdated` ack 後にだけローカル名を確定する。サーバーは create / rename で `SceneInfo` を room へ broadcast し、他クライアントは再読み込みなしで名前を更新する。
-- ログ削除は `RewindLog(0, 0)` で全ログを切り詰め、`LogEventRewound` 後にローカルの chunk をクリアする。
-- 送信中は押したアイコンを波線 `CircularProgress` にし、当該操作を二重実行できない。失敗時は管理領域の下に中央寄せで「サーバーと通信できませんでした」を出す。
-- 接続中は ack 後にだけローカル state を更新する。**未接続時は scene 作成 / 削除 / ログ削除 / メンバー移動を成功扱いにせず**、ローカル一覧を変更せずに同じエラーを表示する（ローカル専用フォールバックは持たない）。`SceneList` broadcast は scene 一覧の権威として反映し、`SceneDeleted` は第二の防護として該当 scene を除く。
+- 「シーンを新規作成」「ログを削除」「シーンを削除」「メンバー移動」はそれぞれ `requestCreateScene` / `requestRewindLog(sceneId, 0, 0)` / `requestDeleteScene` / `requestMoveCharacter` で送信し、成功 ack 後にのみローカル状態を更新する（楽観的更新は行わない）。
+- **シーン検索と新規作成（Issue #269）**: コントロールパネル共通ヘッダーと「キャラクターを移動」モーダルは同一の `SceneSwitcher` コンポーネントを使用する。Enter キー（および移動モーダルの「移動」ボタン）は「入力文字列と完全一致する既存シーン → 先頭の候補シーン → 管理者の場合は新規作成」の優先順で解決する。新規作成時は `generateSceneId()` で ID を採番し、`CreateScene { name }` の ack 後に一覧へ追加する（ヘッダーからの作成時はそのまま `handleSelectScene(id)` で `enterScene` まで行う）。候補が空のときの案内文は、管理者には「シーンは新規作成されます」、非管理者には「該当するシーンはありません」と表示し、非管理者には作成導線を出さない。
+- **キャラクター移動モーダル（Issue #269）**: キャラクター一覧の各行からルートにホイストされた「キャラクターを移動」モーダルを開く。既存シーンへの移動は `MoveCharacter` のみ、新規シーン名を指定した場合は `CreateScene` ack → `MoveCharacter` ack の順で実行し、操作中の `currentSceneId` は変更しない（管理者が作業中のシーンから強制遷移させられない、Issue #228 の不変条件）。
+- シーン作成時の表示名は `CreateScene.name` として送り、`banquette` が `std::name` へ原子的に書き込む。シーン改名は `requestUpdateState(sceneId, 'std::name', name)` の `StateUpdated` ack 後に確定する。`SceneInfo` ブロードキャストにより他クライアントのシーン名もリロードなしで即時更新される。
+- 未接続時はシーン作成・削除・ログ削除・メンバー移動をローカルで成功扱いにせず、管理領域の下部に「サーバーと通信できませんでした」を表示する。
 
-### キャラクター同期
+### キャラクター同期と ccfolia 駒互換読み込み（Issue #300）
 
-- キャラクタータブは表示時に `queryListCharacters` を発行し、問い合わせ中は contained `LoadingIndicator` を出す。タイムアウト時は `OfflineQueueNotice kind="character"` を出し、キャッシュ済み一覧は保持する。
-- `CharacterList` / `CharacterInfo` は `tinMapToCharacter` で全属性を decode する。character tab と field が同じ statuses / parameters / chatPalette / icon / color / piecePosition を表示する。
-- `CreateCharacter` / `UpdateCharacter` 成功時、banquette は room 全体へ `CharacterInfo { character_id, data }` を broadcast する。`App` は `CharacterInfo` を id で upsert する（ack と broadcast の重複は冪等）。`DeleteCharacter` の `CharacterDeleted`、`MoveCharacter` の `CharacterMoved` も同様に全クライアントへ届き、`App` は一覧・`scene.members` を更新する。
-- `scene.members` は `SceneInfo` / `SceneList` の `present_characters` を正として再構築する。reload / reconnect 後もサーバーが永続化した在籍情報から復元され、`character::<id>::scene` のような write-only mirror は使わない。
-- 保存は ack 後にだけ反映する。作成は `CharacterCreated` のサーバー採番 ID を使う。保存中は編集パネルを `aria-busy` + 非活性にし、保存アイコンを波線 `CircularProgress` にする。成功時のみ閉じる。編集の入口は所有者（`isCharacterOwnedBy`）または管理者だけに許す（Issue #267 / #228。サーバーの CRUD も owner または admin）。
-- タイムアウト時は `kind: 'character'` として outbox に積み、再接続 flush で送信して成功後に一覧へ反映する。`PermissionDenied` はキューせずパネルを開いたままエラー表示する。削除も ack 後に行う。
+- キャラクタータブ（`CharacterManagementTab`）は表示時に `queryListCharacters` を発行し、問い合わせ中は contained `LoadingIndicator` を表示する。タイムアウト時は `OfflineQueueNotice kind="character"` を表示し、キャッシュ済み一覧を保持する。
+- **ccfolia 駒互換読み込み（Issue #300）**:
+  - `CharacterManagementTab` のヘッダー領域にある「新規作成」ボタンの隣に「ccfolia 駒互換読み込み」ボタンを配置する。
+  - 押下時にクリップボード（またはペースト入力）から ccfolia の駒出力 JSON（`{ "kind": "character", "data": { "name", "memo", "initiative", "externalUrl", "status": [{ "label", "value", "max" }], "params": [{ "label", "value" }], "commands", "hideStatus", "color", ... } }`）を読み取ってパースし、Alhalte の `Character` 構造（`name`、`statuses`、`parameters`、`chatPalette`、`hideStatus`、`color` など）へマッピングして新規キャラクター作成フローを実行する。
+  - 不正な JSON や `"kind": "character"` 以外のデータが渡された場合は、タブ内に分かりやすいエラーメッセージを表示し、不完全なキャラクター作成を行わない。
+- `CharacterList` / `CharacterInfo` は `tinMapToCharacter` で全属性をデコードし、キャラクタータブとフィールド上の駒で同一の `statuses` / `parameters` / `chatPalette` / `icon` / `color` / `piecePosition` を表示する。
+- `CreateCharacter` / `UpdateCharacter` が成功すると、`banquette` は部屋全体へ `CharacterInfo { character_id, data }` をブロードキャストし、`App` は ID をキーとして冪等に upsert する。`CharacterDeleted` / `CharacterMoved` も同様に全クライアントへ反映される。
+- キャラクター編集の保存・削除はサーバー ack 後にのみ反映し、編集の入口は所有者（`isCharacterOwnedBy`）または管理者（`admin`）のみに許可する（Issue #267 / #228）。タイムアウト時は `kind: 'character'` として outbox に積み、再接続時に再送する（`PermissionDenied` はキューに積まずエラー表示する）。
 
 ### 駒の同期
 
-- 駒の配置・位置は scene state の `piece::<id>::placed` / `piece::<id>::pos` が正。`App` は `StateSnapshot` / `StateUpdated` / `StateDeleted` を適用し、`characters` の `placedAsPiece` / `piecePosition` に反映する。他クライアントの駒も同じ state から描画される。
-- 配置 toggle と drag 後の位置確定は `requestUpdateState` の ack 後にだけローカルへ確定する。drag 中はフィールド描画を即時追従させ、同じ駒の連続 drag は coalesce して最後の位置だけを送る（fire-and-forget しない）。
-- 未接続時は配置 / 位置変更を成功扱いにせず、`piece-action-error`（「ルームに接続していないため、駒を操作できません」）を表示して drag 前の位置へ戻す。ack が失敗した場合も同様に戻す。
-- character 削除時は banquette が `piece::<id>::*` を best-effort で削除し、`StateDeleted` を broadcast する。これにより他クライアントに操作可能な幽霊駒が残らない。
+- フィールド上の駒の配置状態・座標は、各シーンの State キー `piece::<id>::placed` / `piece::<id>::pos` を正とする。`pantry` が `StateSnapshot` / `StateUpdated` / `StateDeleted` を処理して `App` に通知し、`characters` の `placedAsPiece` / `piecePosition` を更新する。
+- 配置の切り替え（toggle）やドラッグ終了時の位置確定は `requestUpdateState` の ack 後に確定する。ドラッグ操作中はフィールド上の描画を即時追従させ、同一駒の連続ドラッグは最後の位置のみに集約（coalesce）して送信する。
+- 未接続時や ack 失敗時は変更を確定せず、`piece-action-error`（「ルームに接続していないため、駒を操作できません」）を表示してドラッグ開始前の位置へ戻す。
+- キャラクター削除時は `banquette` が全シーンの `piece::<id>::*` を削除して `StateDeleted` をブロードキャストするため、他クライアント上に操作不能な幽霊駒が残ることはない。
 
-### 拡張機能
+### 拡張機能とリアルタイム状態同期（Issue #301 / #302）
 
-- メタデータは `/` scene の state key `extension::<id>` に `{ id, name, description, icon, priority, enabled, tinId }` の JSON Tin で保存する。wasm 本体は cellar に RoomKey 暗号化で置き、`tinId` だけを state に持つ（4KiB 制限を守る）。
-- **ABI 2 と自己紹介 id（Issue #274）**: 拡張機能の表示メタデータ（id / name / icon / description）の正は wasm の `self_introduction`。ABI 2 は postcard の `(id, name, icon_svg, description)` を返し、`id` は公式拡張では package 名（= manifest id）と一致する。ホストは ABI 1（`(name, icon_svg, description)`、id なし）と ABI 2 を受け入れ、それ以外を拒否する。ABI 2 の自己紹介 id が manifest id と一致しない wasm は `wasmMissing: true` として実行しない（fail-closed）。`Restaurant.toml` は `id` / wasm path / `enabled` だけを持ち、`name` は持たない。オフライン / テスト用の `DEFAULT_OFFICIAL_EXTENSIONS` はフォールバックとして残すが、staged wasm の自己紹介と一致することをテストで固定する。
-- **一度だけの seed とサーバー正**: 部屋 root state の `extension::__seeded` を seed 済みマーカーとする。マーカーが無い部屋では、拡張機能タブを開いた GM がサーバーに無い公式既定拡張のメタデータを `requestUpdateState` で書き、最後にマーカーを書く（途中で失敗するとマーカーが無いため、再接続時に残りを seed し直す）。既存 room もマーカーが無ければ移行として一度だけ seed し、すでにサーバーにあるメタデータは上書きしない。GM 以外は seed せず、公式既定を読み取り専用で表示する。
-- マーカーがある場合、サーバー state が正。公式既定 id でもサーバーに無ければ削除済みとして扱い、再入室・再接続で再追加しない。マーカーが無い legacy room に限り、サーバーに無い公式既定 id をローカルの wasm ごと保持する。サーバーに無いカスタム id は削除する。同じ id でサーバーの `tinId` が変わった場合だけ wasm を取り直し、それ以外はローカルの `wasmBytes` を保持する。手元に wasm が無い場合は `tinId` から cellar で取得する。
-- **wasm 欠落**: `loadDefaultExtensions` は manifest にある wasm の取得・instantiate に失敗した拡張を `wasmMissing: true` で返す。`applyRemoteExtensions` は `tinId` の download に失敗した拡張も `wasmMissing: true` にする。タブは該当行に「wasm がありません」を出し、有効化 Switch を無効にする（並べ替え・削除は可能）。`ExtensionPipeline.executePipeline` は wasm の無い有効拡張を黙って skip せず、`getLastWarnings()` / `onWarning` に警告を残す。送信時 pipeline の警告はフッター上部の `pipeline-warning` に表示し、原文（ext-io Tin）はそのまま送信する。
-- タブ表示時に `queryState('/')` を発行し、contained `LoadingIndicator` を出す。
-- toggle / delete / reorder / upload は楽観更新せず、`requestUpdateState` / `requestDeleteState` の成功後にだけローカルへ反映する。送信中は該当行のアイコンを波線 `CircularProgress` にする。
-- タイムアウト / エラー時はタブ上部に「サーバーと通信できませんでした」を出し、一覧はスクロール・閲覧できる状態を保つ。暗転・`pointer-events: none` をタブ全体に掛けず、toggle / delete / reorder / upload などの mutation 操作だけを `disabled` / `aria-disabled` にする（Issue #149）。非管理者（participant / viewer / denied）には、行の非操作コンテンツ（名前・説明・アイコン・優先度バッジ）だけを少し暗くして操作不能を視覚的に示す（Issue #244）。シェル・一覧・スクロール領域・オフライン通知・ロック表示・「wasm がありません」は full contrast を保つ。再接続で `queryState('/')` を再試行する。
-- `.wasm` は検証後に `encodeRoomTin` + `uploadTin` で cellar へ保存し、進捗を表示して完了後に state を更新する。
+- 拡張機能のメタデータはルートシーン `/` の State キー `extension::<id>` に `{ id, name, description, icon, priority, enabled, tinId }` の JSON Tin として保存する。WASM 本体は RoomKey 暗号化で `cellar` に格納し、State には `tinId` のみを保持する（State の 4KiB 制限を守るため）。
+- **ABI 2 と自己紹介 ID（Issue #274）**: 拡張機能の表示メタデータ（`id` / `name` / `icon` / `description`）の正は WASM の `self_introduction` エクスポートである。ABI 2 は postcard エンコードされた `(id, name, icon_svg, description)` を返し、公式拡張機能では `id` がパッケージ名（マニフェスト ID）と一致する。ホストは ABI 1（`(name, icon_svg, description)`、ID なし）と ABI 2 を受理し、ABI 2 の自己紹介 ID がマニフェスト ID と一致しない WASM は `wasmMissing: true` として実行を拒否する（fail-closed）。
+- **初回シードとサーバー正**: ルートシーン `/` の `extension::__seeded` をシード完了マーカーとする。マーカーが存在しない部屋では、管理者（GM）がサーバーに未登録の公式既定拡張メタデータを `requestUpdateState` で書き込み、最後に `extension::__seeded` を書き込む。マーカーが存在する部屋ではサーバー側の `/` State を正とし、サーバー上から削除された公式既定拡張を再入室・再接続時に復活させない。
+- **`pantry` による常時同期と即時反映（Issue #301 / #302）**:
+  - ルートシーン `/` の State（`extension::<id>` および `extension::__seeded`）は `pantry` が入室中常時保持・購読する。
+  - 管理者が拡張機能の有効 / 無効（ON/OFF）の切り替え、優先度の並べ替え、カスタム拡張の追加・削除を行うと、`banquette` からの `StateUpdated` / `StateDeleted`（および `StateSnapshot`）が `pantry` に取り込まれ、変更通知を通じて全参加者の `App` と `ExtensionManagementTab` へ即座に反映される。
+  - これにより、参加者が拡張機能タブを開いていない状態や別のシーンに滞在している状態でも、発言送信時に使われる `ExtensionPipeline` の有効拡張一覧と優先順序、および開いている拡張機能タブの UI 表示が再接続やタブの再表示なしでリアルタイムに同期される。
+  - 同一 ID でサーバー上の `tinId` が変化した場合や手元に `wasmBytes` がない場合は、`pantry.get` で `cellar` から WASM を取得してインスタンス化する。
+- **WASM 欠落時の扱い**: WASM の取得やインスタンス化に失敗した拡張機能は `wasmMissing: true` とし、タブの該当行に「wasm がありません」を表示して有効化 Switch を無効化する（並べ替えと削除は可能）。`ExtensionPipeline.executePipeline` は `wasmMissing` の有効拡張を黙ってスキップせず、警告を記録してフッター上部の `pipeline-warning` に表示したうえで原文（ext-io Tin）を送信する。
+- 操作中・エラー時の UI: toggle / delete / reorder / upload は楽観的更新を行わず、`requestUpdateState` / `requestDeleteState` の成功後に反映する。送信中は該当行のアイコンを波線 `CircularProgress` にする。エラー時はタブ上部に「サーバーと通信できませんでした」を表示し、一覧のスクロール・閲覧は維持したまま変更操作のみを無効化する（Issue #149）。非管理者（`participant` / `viewer` / `denied`）には、行の非操作要素（名前・説明・アイコン・優先度バッジ）のコントラストを少し落として編集不可であることを視覚的に示す（Issue #244）。
 
-### アセット
+### アセット管理とメディア変換（Issue #298 / #302）
 
-- `utils/assets.ts` は画像・音声を `FileReader` で data URL にし、localStorage と in-memory の Pantry キャッシュアダプタへ保存する。`AssetPickerModal` は personal / room、image / audio で絞り込み、NONE カードと削除を提供する。
-- アップロードは `encodeRoomTin`（RoomKey 暗号化 + LZ4）→ `uploadTin` で cellar へ送る。進捗は実 XHR の `upload.onprogress` のみを使い、カード内に波線 `LinearProgress` を出す。成功時は `asset.id` に `tinId` を付け、room scope はさらに `/` の state key `asset::<id>` にメタデータ（id, name, mediaType, mimeType, size, tinId, createdAt, ownerAccountId）を `requestUpdateState` で保存する。失敗時はカード内に「アップロードに失敗しました」と再試行ボタンを出す。
-- personal のメタデータは localStorage のみに置き、`tinId` を他者へ公開しない。本体は cellar に置く。
-- シーン背景は `AssetPickerModal` の選択から `encodeRoomTin` + `uploadTin`（部屋鍵）で cellar へ上げ、scene state `std::b-img` に `{ tinId, mimeType }` の小さな JSON Tin として保存する（data URL は state に入れない）。旧形式の 64 hex 文字列も受信側で受理する。幅・高さは `std::b-img::width` / `std::b-img::height` に数値 Tin で保存する。
-- 背景画像の受信側は `tinId` から `downloadTin` で復号し、`juices.bgImage` に data URL を設定する。`std::b-img` の upload / state 更新が失敗した場合はローカルを確定せず、背景カードの下に「サーバーと通信できませんでした」を出す。部屋鍵が無い場合も upload を開始しない。
-- モーダルを開くたびに `syncRoomAssets` が `queryState('/')` で `asset::*` を取得してローカルへマージし、欠けている tin は `downloadTin` で取得する。同期失敗時は静かに既存キャッシュを表示する。アセットは 30 日 TTL の対象外（永続）。
-- `App` は `AssetPickerModal` に `roomSocket` と解決済みの部屋鍵を渡す。`SceneSettingsTab` も同じ `roomKey` を受け取り、背景画像・寸法の state 更新に使う。部屋鍵が無い場合、`AssetPickerModal` / `SceneSettingsTab` の背景・BGM upload は開始せず、カード内に失敗を表示する。
+- アセットのバイナリ本体とアップロード状態は `pantry` の Tin 管理（`get` / `put`）が担い、メタデータ一覧は `utils/assets.ts`（`personal` スコープは `localStorage` の `alhalte_pantry_assets`、`room` スコープはルートシーン `/` の State キー `asset::<id>`）で管理する。
+- **取り込み時の自動再エンコードと `put`（Issue #302）**:
+  - 画像ファイルは取り込み時に長辺最大 1920px の WebP へ、音声ファイルは最大 128kbps の Opus へ `pantry` が再エンコードしてから Tin 化する。
+  - `pantry.put` により `cellar` へ格納し、完了した Tin は `"putted"` として記録する（すでに `"putted"` なら再アップロードしない）。通信失敗時は `"put-failed"` として記録し、カード内に「アップロードに失敗しました」と再試行ボタンを表示するとともに、オンライン復帰時に `pantry` が自動再送する。
+  - アップロード進捗は実 XHR の `upload.onprogress` から取得し、カード内に波線 `LinearProgress` を表示する。
+  - `room` スコープのアセットは `cellar` への格納成功後に `/` の State キー `asset::<id>` へメタデータ（`id`, `name`, `mediaType`, `mimeType`, `size`, `tinId`, `createdAt`, `ownerAccountId`）を保存する。`pantry` の `/` State 同期により、部屋内の他クライアントにも即座に共有される。
+- **シーン背景画像**: `AssetPickerModal` で選択された画像を現在の部屋の `roomKey` で `pantry.put` し、シーンの State キー `std::b-img` に `{ tinId, mimeType }` の JSON Tin として保存する（Data URL 生データは State に入れない）。画像の幅・高さは `std::b-img::width` / `std::b-img::height` に数値 Tin として保存する。受信側は `pantry.get` で復号して `juices.bgImage` に反映する。
 
 ### 権限 UI
 
+アカウント検索（`utils/session.ts` の `searchAccounts`）のみ HTTP を使用し、権限表の読み書きはすべて `RoomSocket` の権限フレームで行う（Issue #201）。
 
-`utils/session.ts` の `searchAccounts` だけが HTTP を使い、権限表そのものは `RoomSocket` の権限 frame で読み書きする（Issue #201）。`RoomPermissionModal` は開くたびに `requestQueryPermissions` で `PermissionsSnapshot` を取り、M3 Search、Divider、Connected Button Group（拒否 / 閲覧者 / 参加者 / 管理者）で行を描画する。一覧は account ID しか持たないため、表示名は `/api/accounts/search?q=<account_id>` で解決し、解決できない行は `#<account_id>` を出す。ロール変更・追加・既定へのリセットは `requestSetMemberPermission` の ack（`PermissionsUpdated`）が返ってから一覧を差し替える（楽観更新しない）。失敗時は一覧を変えずに `permission-error` を出す。「削除」は明示エントリを既定の権限へ戻す操作で、`SetMemberPermission(default_permission)` を送る（banquette にエントリ削除 frame は無い）。既定の権限 selector はモーダルと `CommonHeader` の gear menu にあり、`requestSetDefaultPermission` の ack 後にのみ表示が変わる。`CommonHeader` の旧「部屋の全てをPLに公開」（`SetDone` / `DoneUpdated`）は削除した。
+- `RoomPermissionModal` は開くたびに `requestQueryPermissions` で `PermissionsSnapshot` を取得し、M3 Search、`Divider`、Connected Button Group（拒否 / 閲覧者 / 参加者 / 管理者）で一覧を描画する。権限表はアカウント ID のみを持つため、表示名は `/api/accounts/search?q=<account_id>` で解決し、未解決の行は `#<account_id>` を表示する。
+- ロールの変更・メンバー追加・既定権限へのリセット（「削除」ボタンは `SetMemberPermission(default_permission)` を送信する）は、`requestSetMemberPermission` の ack（`PermissionsUpdated`）が返ってから一覧を更新する（楽観的更新は行わない）。失敗時は一覧を変更せず `permission-error` を表示する。
+- 既定の権限セレクタはモーダル内と `CommonHeader` のギアメニューにあり、`requestSetDefaultPermission` の ack 後にのみ表示を更新する。
 
-`App` は `role` を `ControlPanel` 経由で各タブへ渡し、viewer 判定ではなく `roomRoleCapabilities` で操作を出し分ける。
+`App` は `role` を `ControlPanel` 経由で各タブへ渡し、`roomRoleCapabilities` に基づいて操作可否を制御する。
 
-| role | 送信（log / state） | character CRUD | scene 作成・削除・メンバー移動 | 拡張機能 | 権限表 / 既定の権限 |
+| role | 送信（log / state） | キャラクター CRUD | シーン作成・削除・メンバー移動 | 拡張機能管理 | 権限表 / 既定の権限 |
 | --- | --- | --- | --- | --- | --- |
-| `admin` | 全 scene。話者は全 character（GM 代演、Issue #271） | 可（全 character） | 可 | 可 | 可 |
-| `participant` | アクセス可能 scene（UI は現在の scene のみ送信可とし、最終認可はサーバー）。話者は保有 character のみ | 可（自分のみ。Issue #267） | 不可 | 不可 | 不可 |
+| `admin` | 全シーン可。話者は全キャラクター（GM 代演、Issue #271） | 可（全キャラクター） | 可 | 可 | 可 |
+| `participant` | アクセス可能シーンのみ（UI は現在のシーンと `/` のみ送信可とし、最終認可はサーバー）。話者は自己所有キャラクターのみ | 可（自己所有分のみ、Issue #267） | 不可 | 不可 | 不可 |
 | `viewer` | 不可（入力欄・送信・ダイスを無効化） | 不可 | 不可 | 不可 | 不可 |
 | `denied` | 不可（`GateScreen` を表示） | 不可 | 不可 | 不可 | 不可 |
 
-`PermissionsSnapshot` は `accessible_scenes` を持たないため、participant の「アクセス可能 scene」は UI では現在の scene（と banquette が writer に常時許可する `/`）だけを送信可能として扱う。`accessibleSceneIds`（全 scene）は admin / viewer の graph と書込の可否に使い、participant の graph は `sceneGraphSceneIds`（`V_known`）で絞る（Issue #263）。書込の可否とは独立している。入室拒否時は `GateScreen` を出し、右上の `AccountMenu` からサインイン・アカウント切り替え・サインアウトを行える。
-
 ## 既知の差分・制約
 
-- `contentTin` は送信時に一度だけ生成する。pipeline を実行できない場合（実行エラー）は `content` のみを保存し、表示は従来どおり render 時 pipeline にフォールバックする。wasm の無い有効拡張は適用せず、`pipeline-warning` に表示して ext-io Tin をそのまま `contentTin` にする。
-- システムイベント（BGM / 背景 / 入退場）は banquette の Tin に timestamp を持たないため、ログ上の時刻は 0（1970）になる。kitchen は前後の発言から補間する。scene graph は `(chunkIndex, position)` の順で並べ、表示時刻は 0 のままになる。
-- アセットは cellar へ実アップロードするが、`personal` のメタデータは localStorage のみで、他クライアントとは共有されない。アセット本体は RoomKey で暗号化して cellar に置くが、maitre-d proxy と cellar は `Bytes` でリクエストを全量メモリにバッファする（64 MiB 上限）。大きなファイルほどメモリを消費する。
-- アウトボックス flush は at-least-once。ack を受け取れずにタイムアウトした操作は再送されるため、サーバー側で適用済みの場合は重複する可能性がある（冪等キーは持たない）。
-- 拡張機能タブは開いた時点の `queryState('/')` を正とし、開いている間の `StateUpdated` broadcast は反映しない（再接続・再表示で取り直す）。
-- 公式既定拡張の削除の永続性は `extension::__seeded` マーカーに依存する。マーカーは GM が拡張機能タブを最初に開いたときに書かれるため、それ以前に別クライアントが削除した公式既定は seed で復活し得る（seed は「サーバーに無い公式既定を書く」ため）。サーバー正のマージも拡張機能タブを開いた時点で適用され、タブを開く前の送信 pipeline は App のローカル既定を使う。
-- タイムアウトは 8 秒で、権限問い合わせのようにサーバーが黙って破棄する操作では唯一の失敗シグナルになる。`PermissionDenied` が返らない経路はタイムアウトとして扱う。
-- Saignant WASM は v2 で character 名を受け取る。v2 をエクスポートしない古い wasm を読み込んだ場合だけ mention が `Anonymous` になる。committed artifact は `scripts/build-saignant-wasm.sh` で更新する。
-- 開発エントリ（`main.ts`）は `isAdmin` も `userRole` も渡さない。管理者は `GET /api/rooms/{id}` の `role === "admin"` から決まる。`isAdmin` prop はテスト / プレビュー用の明示 override で、既定は false。`initialRoom` prop も同じくテスト / プレビュー用で preflight をスキップし、そのとき role 未指定なら participant 相当（送信可・管理不可）として扱う。
-- 入室 preflight のネットワーク / 5xx 失敗は 2 秒間隔・最大 5 回で打ち切り、preflight エラー画面の「再試行」ボタンだけを導線にする。403 / 401 / 404 は再試行しない。401 は `GateScreen`（サインイン導線）として扱う。グローバルな接続バナーは無く、失敗は操作したタブ / エディタ内で告知する（Issue #261）。
-- 部屋鍵は URL フラグメントに置く。サーバーへ送らない設計だが、ブラウザ履歴や共有 URL には残る。`App` は `roomKey` prop → `currentRoom.url` のフラグメント → `window.location.hash` の順に解決し、64 hex を検証する。鍵が無い場合、アセット・拡張 wasm の cellar upload は試行せずエラーを表示する。
-- ホーム画面のテーマ設定 UI は Issue #116 で削除した。現在のテーマ選択はコントロールパネル共通ヘッダーの gear menu にあるパレットのみで、light / dark / system の切替 UI は持たない。
-- Google OAuth の `redirect_uri` は maitre-d の固定 URL（`{public_url}/auth/google/callback`）だけを Google Cloud Console に登録する。argenterie の origin / port は登録しない。`return_to` は maitre-d が CORS allow-list と照合する。`/api/session` を Cookie 付きで呼ぶため、開発で Vite dev server を使う場合は `public_url` を Vite の dev origin に合わせる。cafe / ポータブル / `nix run .` では maitre-d が SPA を同一 origin で配信する。
-- `AccountMenu` は account ごとに `GET /api/account/{id}` を呼ぶ。プロフィール取得に失敗してもサインイン状態は維持し、イニシャル表示にフォールバックする。
-- 入室可否は `GET /api/rooms/{id}` の preflight を正とする。`isForbidden`（= `denied`）は WebSocket の `Error` frame / close code でもフォールバックとして立つが、権限表 (`PermissionsSnapshot`) からは導出しない。`PermissionsSnapshot` は要求元にしか返らず、`SetMemberPermission` / `SetDefaultPermission` の ack も broadcast されないため、他クライアントによる降格は再接続時の `QueryPermissions`（`App` は接続のたびに問い合わせる）まで見えない。participant のアクセス可能 scene は `PermissionsSnapshot` に含まれないので、UI は現在の scene だけを送信可能として扱い、最終認可は banquette に委ねる。
+- `contentTin` は発言送信時に一度だけ生成する。拡張機能パイプラインが実行エラーとなった場合は平文の `content` のみを保存し、表示時は描画時パイプラインにフォールバックする。WASM が欠落している有効拡張は適用せず、`pipeline-warning` に警告を表示したうえで ext-io Tin をそのまま `contentTin` とする。
+- システムイベント（入退場など）は `banquette` の Tin にタイムスタンプを持たないため、ログ単体での時刻は `0`（1970 年）となる（`kitchen` での HTML 生成時は前後の発言から補間する）。シーングラフでは `(chunkIndex, position)` 順に整列して扱う。
+- `personal` スコープのアセットメタデータはブラウザの `localStorage` にのみ保存され、他クライアントへは自動公開されない。ただし BGM や背景画像としてシーンに設定される際は、現在の部屋の `roomKey` で復号可能な Tin として `pantry.put` されてからシーンの State に `tinId` が書き込まれる（Issue #298）。なお、`maitre-d` プロキシと `cellar` はアップロードされた `Bytes` をメモリ上にバッファリングする（上限 64 MiB）。
+- 保留キュー（pending queue / outbox）の再送は at-least-once である。サーバー側で適用済みだが通信切断によりクライアントが ack を受け取れなかった操作は、再接続時に再送されて重複適用される可能性がある。
+- 公式既定拡張の削除状態の永続性は、ルートシーン `/` の `extension::__seeded` マーカーに依存する。マーカーが書き込まれる前に削除された公式既定拡張は、初回のシード処理（「サーバーに存在しない公式既定拡張を書き込む」）によって復活し得る。一度シードが完了した後は、`pantry` の State 管理によって拡張機能の ON/OFF・追加・削除が全クライアントへリアルタイムに同期される（Issue #301 / #302）。
+- 操作要求のタイムアウトは 8 秒（`DEFAULT_OPERATION_TIMEOUT_MS = 8000`）であり、サーバーが応答を返さずに破棄する操作ではタイムアウトが失敗シグナルとなる。
+- Saignant WASM は v2 ABI でキャラクター名マップを受け取る。v2 をエクスポートしない古い WASM バイナリを読み込んだ場合のみ、メンション表示が `Anonymous` にフォールバックする。
+- 部屋鍵は URL フラグメント（`#<roomKey>`）に保持し、サーバーへは送信しない。そのためブラウザ履歴や共有 URL にはフラグメントが含まれる。`App` と `pantry` は `roomKey` prop → `currentRoom.url` のフラグメント → `window.location.hash` の順で 64 文字 hex の部屋鍵を解決する。部屋鍵が存在しない場合はアセットや拡張機能 WASM のアップロードを開始せずエラーを表示する。
+- Google OAuth の `redirect_uri` は `maitre-d` の固定 URL（`{public_url}/auth/google/callback`）のみを Google Cloud Console に登録する。開発環境で Vite dev server を使う場合は `maitre-d` の `public_url` を Vite の dev オリジンに合わせる。本番（`cafe` / ポータブル版 / `nix run .`）では `maitre-d` が SPA を同一オリジンで配信する。
+- 入室可否は `GET /api/rooms/{id}` の preflight を正とし、WebSocket の `Error` フレームやクローズコード（`1008` / `4403` / `4404`）でも `GateScreen` へ遷移する。一方、`PermissionsSnapshot` や `PermissionsUpdated` は要求元にしか返らないため、他クライアントによる権限降格は再接続時または次回の権限照会・操作拒否時に検知される。
