@@ -1,0 +1,11 @@
+[package]
+name = "maitred"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio.workspace = true
+uuid.workspace = true
+canner.workspace = true
+sqlx.workspace = true
+hex = "0.4.3"
