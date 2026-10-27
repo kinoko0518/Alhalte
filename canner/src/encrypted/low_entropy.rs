@@ -1,9 +1,12 @@
 use aes_gcm_siv::{
-    Aes256GcmSiv, Key, KeyInit, Nonce,
+    Aes256GcmSiv, KeyInit, Nonce,
     aead::{Aead, Generate},
 };
 
-use crate::CannerError;
+use crate::{
+    CannerError, RoomKey, WrappedKey,
+    encrypted::{ConvergentKey, get_convergent_key},
+};
 
 pub struct LowEntropyCiphertext {
     pub nonce: Nonce,
@@ -12,8 +15,10 @@ pub struct LowEntropyCiphertext {
 
 pub fn low_entropy_encrypt(
     bytes: Vec<u8>,
-    room_key: Key<Aes256GcmSiv>,
-) -> Result<LowEntropyCiphertext, CannerError> {
+    room_key: impl Into<RoomKey>,
+) -> Result<(LowEntropyCiphertext, WrappedKey), CannerError> {
+    let conv_key = get_convergent_key(&bytes);
+
     let padded = {
         let mut padded = (bytes.len() as u64).to_le_bytes().to_vec();
         padded.extend(bytes);
@@ -22,21 +27,24 @@ pub fn low_entropy_encrypt(
         padded
     };
 
-    let cipher = Aes256GcmSiv::new(&room_key);
+    let cipher = Aes256GcmSiv::new(&conv_key.into());
     let nonce = Nonce::generate();
 
     let ciphertext = cipher
         .encrypt(&nonce, &padded[..])
         .map_err(|e| CannerError::AesGcmSivError(e))?;
 
-    Ok(LowEntropyCiphertext { ciphertext, nonce })
+    Ok((
+        LowEntropyCiphertext { ciphertext, nonce },
+        WrappedKey::wrap(conv_key, room_key.into()).map_err(|e| CannerError::AesGcmSivError(e))?,
+    ))
 }
 
 pub fn low_entropy_decrypt(
     ciphertext: LowEntropyCiphertext,
-    room_key: Key<Aes256GcmSiv>,
+    conv_key: ConvergentKey,
 ) -> Result<Vec<u8>, CannerError> {
-    let cipher = Aes256GcmSiv::new(&room_key);
+    let cipher = Aes256GcmSiv::new(&conv_key.into());
     let (nonce, ciphertext) = (ciphertext.nonce, ciphertext.ciphertext);
 
     let data = {

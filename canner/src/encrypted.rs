@@ -18,6 +18,13 @@ pub enum Encryption {
     LowEntropy,
 }
 
+pub const CONV_KEY_SIZE: usize = 32;
+pub type ConvergentKey = [u8; CONV_KEY_SIZE];
+
+pub fn get_convergent_key(original: &[u8]) -> ConvergentKey {
+    blake3::hash(original).into()
+}
+
 impl Encrypted {
     pub fn opener(&self) -> u8 {
         match self {
