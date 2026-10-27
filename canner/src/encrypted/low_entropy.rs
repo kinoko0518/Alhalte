@@ -3,7 +3,7 @@ use aes_gcm_siv::{
     aead::{Aead, Generate},
 };
 
-use crate::{CellarError, compressed::Compressed, tin::Tin};
+use crate::{CannerError, compressed::Compressed, encrypted::Encrypted};
 
 pub struct LowEntropyCiphertext {
     pub nonce: Nonce,
@@ -13,7 +13,7 @@ pub struct LowEntropyCiphertext {
 pub fn low_entropy_encrypt(
     bytes: Vec<u8>,
     room_key: Key<Aes256GcmSiv>,
-) -> Result<Tin, CellarError> {
+) -> Result<Encrypted, CannerError> {
     let padded = {
         let mut padded = (bytes.len() as u64).to_le_bytes().to_vec();
         padded.extend(bytes);
@@ -27,31 +27,34 @@ pub fn low_entropy_encrypt(
 
     let ciphertext = cipher
         .encrypt(&nonce, &padded[..])
-        .map_err(|e| CellarError::AesGcmSivError(e))?;
+        .map_err(|e| CannerError::AesGcmSivError(e))?;
 
-    Ok(Tin::LowEntropy(LowEntropyCiphertext { ciphertext, nonce }))
+    Ok(Encrypted::LowEntropy(LowEntropyCiphertext {
+        ciphertext,
+        nonce,
+    }))
 }
 
 pub fn low_entropy_decrypt(
     ciphertext: LowEntropyCiphertext,
     room_key: Key<Aes256GcmSiv>,
-) -> Result<Compressed, CellarError> {
+) -> Result<Compressed, CannerError> {
     let cipher = Aes256GcmSiv::new(&room_key);
     let (nonce, ciphertext) = (ciphertext.nonce, ciphertext.ciphertext);
 
     let data = {
         let mut decrypted = cipher
             .decrypt(&nonce, &ciphertext[..])
-            .map_err(|e| CellarError::AesGcmSivError(e))?;
-        if decrypted.len() >= 4 {
-            let mut data = decrypted.split_off(4);
-            let len = ((0..4).fold(0_u64, |acc, i| {
-                acc | (decrypted.get(i).cloned().unwrap() as u64) << i * 8
-            })) as usize;
-            data.split_off(len)
-        } else {
-            return Err(CellarError::LenNotFound);
-        }
+            .map_err(|e| CannerError::AesGcmSivError(e))?;
+        (decrypted.len() >= 8)
+            .then(|| {
+                let mut data = decrypted.split_off(8);
+                let len: [u8; 8] = decrypted.try_into().unwrap();
+                let original_len = u64::from_le_bytes(len) as usize;
+                data.truncate(original_len);
+                data
+            })
+            .ok_or(CannerError::LenNotFound)?
     };
 
     Compressed::try_from(data)
