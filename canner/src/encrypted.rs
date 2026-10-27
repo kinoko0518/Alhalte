@@ -27,7 +27,7 @@ impl Encrypted {
         }
     }
 
-    pub fn to_bytes(self) -> Vec<u8> {
+    pub fn into_bytes(self) -> Vec<u8> {
         let mut bytes = vec![self.opener()];
         match self {
             Self::Plaintext(plaintext) => {

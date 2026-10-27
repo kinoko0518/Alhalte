@@ -1,4 +1,4 @@
-use aes_gcm_siv::{Aes256GcmSiv, Key, KeyInit, aead::Aead};
+use aes_gcm_siv::{Aes256GcmSiv, KeyInit, aead::Aead};
 
 use crate::{CannerError, RoomKey};
 
