@@ -3,7 +3,7 @@ use aes_gcm_siv::{
     aead::{Aead, Generate},
 };
 
-use crate::{CannerError, compressed::Compressed, encrypted::Encrypted};
+use crate::CannerError;
 
 pub struct LowEntropyCiphertext {
     pub nonce: Nonce,
@@ -13,7 +13,7 @@ pub struct LowEntropyCiphertext {
 pub fn low_entropy_encrypt(
     bytes: Vec<u8>,
     room_key: Key<Aes256GcmSiv>,
-) -> Result<Encrypted, CannerError> {
+) -> Result<LowEntropyCiphertext, CannerError> {
     let padded = {
         let mut padded = (bytes.len() as u64).to_le_bytes().to_vec();
         padded.extend(bytes);
@@ -29,16 +29,13 @@ pub fn low_entropy_encrypt(
         .encrypt(&nonce, &padded[..])
         .map_err(|e| CannerError::AesGcmSivError(e))?;
 
-    Ok(Encrypted::LowEntropy(LowEntropyCiphertext {
-        ciphertext,
-        nonce,
-    }))
+    Ok(LowEntropyCiphertext { ciphertext, nonce })
 }
 
 pub fn low_entropy_decrypt(
     ciphertext: LowEntropyCiphertext,
     room_key: Key<Aes256GcmSiv>,
-) -> Result<Compressed, CannerError> {
+) -> Result<Vec<u8>, CannerError> {
     let cipher = Aes256GcmSiv::new(&room_key);
     let (nonce, ciphertext) = (ciphertext.nonce, ciphertext.ciphertext);
 
@@ -57,5 +54,5 @@ pub fn low_entropy_decrypt(
             .ok_or(CannerError::LenNotFound)?
     };
 
-    Compressed::try_from(data)
+    Ok(data)
 }

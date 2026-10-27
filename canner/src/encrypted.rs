@@ -1,4 +1,4 @@
-use crate::{CannerError, compressed::Compressed, encrypted::high_entropy::NONCE_SIZE};
+use crate::{CannerError, encrypted::high_entropy::NONCE_SIZE};
 
 mod high_entropy;
 mod low_entropy;
@@ -7,9 +7,15 @@ pub use high_entropy::{HighEntropyCiphertext, high_entropy_decrypt, high_entropy
 pub use low_entropy::{LowEntropyCiphertext, low_entropy_decrypt, low_entropy_encrypt};
 
 pub enum Encrypted {
-    Plaintext(Compressed),
+    Plaintext(Vec<u8>),
     LowEntropy(LowEntropyCiphertext),
     HighEntropy(HighEntropyCiphertext),
+}
+
+pub enum Encryption {
+    Plaintext,
+    HighEntropy,
+    LowEntropy,
 }
 
 impl Encrypted {
@@ -24,8 +30,8 @@ impl Encrypted {
     pub fn to_bytes(self) -> Vec<u8> {
         let mut bytes = vec![self.opener()];
         match self {
-            Self::Plaintext(compressed) => {
-                bytes.extend(compressed.into_bytes());
+            Self::Plaintext(plaintext) => {
+                bytes.extend(plaintext);
             }
             Self::LowEntropy(ciphertext) => {
                 bytes.extend(ciphertext.nonce);
@@ -47,7 +53,7 @@ impl Encrypted {
             Err(CannerError::OpenerByteNotFound)
         }?;
         Ok(match opener {
-            0 => Self::Plaintext(Compressed::try_from_bytes(contents)?),
+            0 => Self::Plaintext(contents),
             1 => Self::LowEntropy({
                 let mut contents = contents;
                 (contents.len() >= NONCE_SIZE)

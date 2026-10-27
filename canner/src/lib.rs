@@ -1,10 +1,9 @@
-pub mod blob;
-pub mod compressed;
 pub mod encrypted;
 
-pub use blob::{Blob, BlobID};
+use aes_gcm_siv::{Aes256GcmSiv, Key};
 
-use crate::encrypted::Encrypted;
+pub use crate::encrypted::Encrypted;
+use crate::encrypted::{high_entropy_encrypt, low_entropy_encrypt};
 
 pub enum CannerError {
     IoError(std::io::Error),
@@ -18,7 +17,8 @@ pub enum CannerError {
     LabelNotFound,
 }
 
-type Label = u64;
+type Label = [u8; 32];
+type RoomKey = Key<Aes256GcmSiv>;
 
 pub struct Tin {
     label: Label,
@@ -26,22 +26,28 @@ pub struct Tin {
 }
 
 impl Tin {
-    pub fn into_bytes(self) -> Vec<u8> {
-        let mut bytes = self.label.to_le_bytes().to_vec();
-        bytes.extend(self.encrypted.to_bytes());
-        bytes
+    pub fn plaintext(label: Label, bytes: Vec<u8>) -> Self {
+        Self {
+            label,
+            encrypted: Encrypted::Plaintext(bytes),
+        }
     }
 
-    pub fn try_from_bytes(mut bytes: Vec<u8>) -> Result<Self, CannerError> {
-        let (label, encrypted) = (bytes.len() >= 4)
-            .then(|| {
-                let encrypted = Encrypted::try_from_bytes(bytes.split_off(4));
-                let label = u64::from_le_bytes(bytes.try_into().unwrap());
-                (label, encrypted)
-            })
-            .ok_or(CannerError::LabelNotFound)?;
-        let encrypted = encrypted?;
+    pub fn high_entropy(
+        label: Label,
+        bytes: Vec<u8>,
+        room_key: impl Into<RoomKey>,
+    ) -> Result<Self, CannerError> {
+        let encrypted = Encrypted::HighEntropy(high_entropy_encrypt(bytes, room_key.into())?);
+        Ok(Self { label, encrypted })
+    }
 
+    pub fn low_entropy(
+        label: Label,
+        bytes: Vec<u8>,
+        room_key: impl Into<RoomKey>,
+    ) -> Result<Self, CannerError> {
+        let encrypted = Encrypted::LowEntropy(low_entropy_encrypt(bytes, room_key.into())?);
         Ok(Self { label, encrypted })
     }
 }
