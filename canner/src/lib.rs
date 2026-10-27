@@ -4,6 +4,7 @@ use aes_gcm_siv::{
     Aes256GcmSiv, Key, KeyInit, Nonce,
     aead::{Aead, Generate},
 };
+use blake3::Hasher;
 
 pub use crate::encrypted::Encrypted;
 use crate::encrypted::{ConvergentKey, high_entropy_encrypt, low_entropy_encrypt};
@@ -27,6 +28,19 @@ type RoomKey = Key<Aes256GcmSiv>;
 /// RoomKeyで暗号化された収束鍵。先頭12byteはNonce。
 pub struct WrappedKey(pub [u8; 32 + 28]);
 
+impl TryFrom<Vec<u8>> for WrappedKey {
+    type Error = String;
+
+    fn try_from(vec: Vec<u8>) -> Result<Self, Self::Error> {
+        let arr: [u8; 60] = vec
+            .try_into()
+            .map_err(|v: Vec<u8>| format!("Expected 60 bytes, got {}", v.len()))?;
+        Ok(Self(arr))
+    }
+}
+
+pub type TinID = [u8; 32];
+
 impl WrappedKey {
     pub fn wrap(conv_key: ConvergentKey, room_key: RoomKey) -> Result<Self, aes_gcm_siv::Error> {
         let cipher = Aes256GcmSiv::new(&room_key);
@@ -45,14 +59,14 @@ pub struct Tin {
 
 impl Tin {
     pub fn plaintext(label: Label, bytes: Vec<u8>) -> Self {
-        Self {
-            label,
-            encrypted: Encrypted::Plaintext(bytes),
-        }
+        let encrypted = Encrypted::Plaintext(bytes);
+
+        Self { label, encrypted }
     }
 
     pub fn high_entropy(label: Label, bytes: Vec<u8>) -> Result<Self, CannerError> {
         let encrypted = Encrypted::HighEntropy(high_entropy_encrypt(bytes)?);
+
         Ok(Self { label, encrypted })
     }
 
@@ -84,5 +98,14 @@ impl Tin {
         let encrypted = Encrypted::try_from_bytes(bytes)?;
 
         Ok(Self { label, encrypted })
+    }
+
+    pub fn get_id(&self) -> TinID {
+        let mut hasher = Hasher::new();
+
+        self.encrypted.hash(&mut hasher);
+        hasher.update(&self.label);
+
+        hasher.finalize().into()
     }
 }

@@ -3,6 +3,7 @@ use crate::{CannerError, encrypted::high_entropy::NONCE_SIZE};
 mod high_entropy;
 mod low_entropy;
 
+use blake3::Hasher;
 pub use high_entropy::{HighEntropyCiphertext, high_entropy_decrypt, high_entropy_encrypt};
 pub use low_entropy::{LowEntropyCiphertext, low_entropy_decrypt, low_entropy_encrypt};
 
@@ -76,5 +77,20 @@ impl Encrypted {
             2 => Self::HighEntropy(HighEntropyCiphertext(contents)),
             _ => return Err(CannerError::UnknownEncryption(opener)),
         })
+    }
+
+    pub fn hash(&self, hasher: &mut Hasher) {
+        match self {
+            Self::Plaintext(bin) => {
+                hasher.update(&bin);
+            }
+            Self::LowEntropy(ciphertext) => {
+                hasher.update(&ciphertext.nonce);
+                hasher.update(&ciphertext.ciphertext);
+            }
+            Self::HighEntropy(ciphertext) => {
+                hasher.update(&ciphertext.0);
+            }
+        }
     }
 }
