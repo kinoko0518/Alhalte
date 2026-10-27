@@ -69,6 +69,14 @@ impl Compressed {
         };
         Ok(Blob::new(decompressed))
     }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.into()
+    }
+
+    pub fn try_from_bytes(bytes: Vec<u8>) -> Result<Self, CellarError> {
+        Self::try_from(bytes)
+    }
 }
 
 impl Into<Vec<u8>> for Compressed {

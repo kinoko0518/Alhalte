@@ -6,8 +6,8 @@ use aes_gcm_siv::{
 use crate::{CellarError, compressed::Compressed, tin::Tin};
 
 pub struct LowEntropyCiphertext {
-    nonce: Nonce,
-    ciphertext: Vec<u8>,
+    pub nonce: Nonce,
+    pub ciphertext: Vec<u8>,
 }
 
 pub fn low_entropy_encrypt(

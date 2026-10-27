@@ -2,9 +2,10 @@ use aes_gcm_siv::{Aes256GcmSiv, Key, KeyInit, aead::Aead};
 
 use crate::{CellarError, compressed::Compressed, tin::Tin};
 
-const ZERO_NONCE: [u8; 12] = [0; 12];
+pub const NONCE_SIZE: usize = 12;
+pub const ZERO_NONCE: [u8; 12] = [0; NONCE_SIZE];
 
-pub struct HighEntropyCiphertext(Vec<u8>);
+pub struct HighEntropyCiphertext(pub Vec<u8>);
 
 pub fn high_entropy_encrypt(
     compressed: Compressed,
