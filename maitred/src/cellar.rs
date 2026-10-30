@@ -4,12 +4,12 @@ use canner::{Tin, TinID, WrappedKey};
 use sqlx::{SqlitePool, query, query_as};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{RoomID, UserID};
+use crate::{RoomID, SessionID, UserID};
 
 enum CellarEvent {
-    Upload(Tin, Option<WrappedKey>),
-    Download(TinID),
-    Unbind(TinID),
+    Upload(RoomID, Tin, UserID, Option<WrappedKey>),
+    Download(RoomID, TinID),
+    Unbind(RoomID, TinID),
 }
 
 enum CellarResponce {
@@ -26,7 +26,7 @@ enum CellarError {
 }
 
 struct CellarOrder {
-    from: UserID,
+    from: SessionID,
     event: CellarEvent,
     sender: oneshot::Sender<Result<CellarResponce, CellarError>>,
 }
@@ -35,25 +35,38 @@ type CellarPool = SqlitePool;
 type CellarResult = Result<CellarResponce, CellarError>;
 
 pub async fn setup_cellar_db(pool: &CellarPool) -> Result<(), sqlx::Error> {
+    // 束縛テーブルを作成
     query(
-        "CREATE TABLE IF NOT EXISTS index (
-            user UUID NOT NULL,
+        "CREATE TABLE IF NOT EXISTS restriction (
             id BLOB NOT NULL,
-            wrapped_key BLOB,
-            room UUID NOT NULL,
-            PRIMARY KEY (room, id)
+            user UUID NOT NULL,
+            PRIMARY KEY (user, id),
         )",
     )
     .execute(pool)
     .await?;
+    // 包装鍵テーブルを作成
+    query(
+        "CREATE TABLE IF NOT EXISTS wkeys (
+            id BLOB NOT NULL,
+            room UUID NOT NULL,
+            wkey BLOB NOT NULL,
+            PRIMARY KEY (id, room),
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
 async fn cellar(mut rx: mpsc::Receiver<CellarOrder>, pool: &CellarPool, save_path: &Path) {
     while let Some(order) = rx.recv().await {
         let _ = order.sender.send(match order.event {
-            CellarEvent::Upload(tin, wkey) => upload(order.from, tin, wkey, save_path, pool).await,
-            CellarEvent::Download(id) =>
+            CellarEvent::Upload(room, tin, user, wkey) => {
+                upload(user, tin, wkey, save_path, pool).await
+            }
+            CellarEvent::Download(room, id) => download(room, id, save_path, pool).await,
         });
     }
 }
@@ -87,16 +100,29 @@ async fn upload(
     Ok(CellarResponce::SuccessfullyUploaded)
 }
 
-pub async fn download(room: RoomID, tin_id: TinID, save_path: &Path, pool: &CellarPool) -> CellarResult {
-    let (id, wrapped_key) = query_as("SELECT id, wrapped_key FROM index WHERE room = $1 AND id = $2")
-        .bind(room)
-        .bind(&tin_id[..])
-        .fetch_optional(pool)
+pub async fn download(
+    room: RoomID,
+    tin_id: TinID,
+    save_path: &Path,
+    pool: &CellarPool,
+) -> CellarResult {
+    let (id, wrapped_key) =
+        query_as("SELECT id, wrapped_key FROM index WHERE room = $1 AND id = $2")
+            .bind(room)
+            .bind(&tin_id[..])
+            .fetch_optional(pool)
+            .await
+            .map_err(CellarError::SqlError)?
+            .ok_or(CellarError::NotFound)?;
+
+    let tin = tokio::fs::read(save_path)
         .await
-        .map_err(CellarError::SqlError)?
-        .ok_or(CellarError::NotFound)?;
+        .map_err(CellarError::IoError)
+        .and_then(|bin| Tin::from_bytes(bin).map_err(CellarError::CannerError))?;
 
-    tokio::fs::read(save_path).await.map_err(CellarError::IoError).and_then(|bin| Tin::from_bytes(bin).map_err(CellarError::CannerError))?;
+    Ok(CellarResponce::SuccessfullyDownloaded(tin, wrapped_key))
+}
 
-    Ok(())
+pub async fn unbind(room: RoomID, tin_id: TinID, pool: &CellarPool) -> CellarResult {
+    query("ALTER TABLE table_name DROP COLUMN column_name")
 }
